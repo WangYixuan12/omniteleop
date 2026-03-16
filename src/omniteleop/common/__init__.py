@@ -5,5 +5,6 @@ from .schemas import (
     ExoJointData as ExoJointData,
     JoyConData as JoyConData,
     SafeJointCommand as SafeJointCommand,
+    VRJointData as VRJointData,
 )
 

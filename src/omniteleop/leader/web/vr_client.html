@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>VR Pose Streamer</title>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <style>
+    body { font-family: monospace; background: #111; color: #eee; padding: 28px; }
+    h2   { color: #7df; margin: 0 0 18px; font-size: 1.3em; }
+    button { padding: 12px 28px; font-size: 16px; border: none; border-radius: 6px;
+             cursor: pointer; background: #2a7; color: #fff; margin-bottom: 16px; }
+    button:disabled { background: #555; cursor: default; }
+    #status { padding: 10px 14px; border-radius: 4px; background: #1a1a1a;
+              border-left: 4px solid #fa0; font-size: 14px; margin-bottom: 10px; }
+    #status.ok  { border-color: #2a7; }
+    #status.err { border-color: #c44; }
+    #fps  { font-size: 12px; color: #888; }
+    #data { margin-top: 10px; font-size: 11px; color: #666; white-space: pre; }
+  </style>
+</head>
+<body>
+<h2>VR Pose Streamer</h2>
+<button id="btn" onclick="startAll()">Start XR</button>
+<div id="status">Ready — tap Start XR</div>
+<div id="fps"></div>
+<div id="data"></div>
+<canvas id="xrcanvas" style="display:none"></canvas>
+
+<script>
+// ─── State ────────────────────────────────────────────────────────────────
+let socket    = null;
+let xrSession = null;
+let xrRefSpace= null;
+let frameCount = 0;
+let lastFpsTs  = performance.now();
+
+// ─── Entry point ─────────────────────────────────────────────────────────
+// requestSession MUST be called directly from a user gesture — do it first,
+// then connect the socket afterward.
+async function startAll() {
+  document.getElementById('btn').disabled = true;
+
+  // 1. Request XR session immediately — still in user gesture context
+  if (!await startXR()) {
+    document.getElementById('btn').disabled = false;
+    return;
+  }
+
+  // 2. Connect Socket.IO after XR is granted
+  setStatus('XR active — connecting socket…', 'ok');
+  socket = io({ reconnectionDelay: 500 });
+  socket.on('connect',       () => setStatus('XR active — streaming…', 'ok'));
+  socket.on('disconnect',    () => setStatus('Socket disconnected — reconnecting…', ''));
+  socket.on('connect_error', (e) => setStatus(`Socket error: ${e.message}`, 'err'));
+}
+
+// ─── WebXR ────────────────────────────────────────────────────────────────
+// Returns true on success, false on failure.
+async function startXR() {
+  if (!navigator.xr) { setStatus('WebXR not supported.', 'err'); return false; }
+
+  // Try immersive-ar (passthrough) first, fall back to immersive-vr
+  let mode = 'immersive-ar';
+  if (!await navigator.xr.isSessionSupported('immersive-ar')) {
+    if (!await navigator.xr.isSessionSupported('immersive-vr')) {
+      setStatus('No immersive XR supported on this device.', 'err'); return false;
+    }
+    mode = 'immersive-vr';
+  }
+
+  try {
+    setStatus('Requesting XR session…', '');
+    const sessionInit = {
+      requiredFeatures: ['local-floor'],
+      optionalFeatures: mode === 'immersive-ar' ? ['dom-overlay'] : [],
+    };
+    if (mode === 'immersive-ar' && sessionInit.optionalFeatures.includes('dom-overlay')) {
+      sessionInit.domOverlay = { root: document.body };
+    }
+    xrSession = await navigator.xr.requestSession(mode, sessionInit);
+    xrRefSpace = await xrSession.requestReferenceSpace('local-floor');
+
+    // Required: attach a WebGL render target so the XR runtime schedules frames
+    const canvas = document.getElementById('xrcanvas');
+    const gl = canvas.getContext('webgl2', { xrCompatible: true });
+    await gl.makeXRCompatible();
+    xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
+
+    xrSession.addEventListener('end', () => {
+      setStatus('XR session ended.', '');
+      document.getElementById('btn').disabled = false;
+    });
+    xrSession.requestAnimationFrame(onXRFrame);
+    return true;
+  } catch (err) {
+    setStatus(`XR error: ${err.message}`, 'err');
+    return false;
+  }
+}
+
+// ─── Per-frame callback ───────────────────────────────────────────────────
+function onXRFrame(t, frame) {
+  if (!xrSession) return;
+  xrSession.requestAnimationFrame(onXRFrame);
+
+  const viewerPose = frame.getViewerPose(xrRefSpace);
+  if (!viewerPose) return;
+
+  const head = poseToDict(viewerPose.transform);
+  let leftWrist  = identityPose();
+  let rightWrist = identityPose();
+  let leftCtrl   = defaultCtrl();
+  let rightCtrl  = defaultCtrl();
+
+  for (const src of frame.session.inputSources) {
+    if (!src.gripSpace) continue;
+    const gp = frame.getPose(src.gripSpace, xrRefSpace);
+    if (!gp) continue;
+    const pd = poseToDict(gp.transform);
+    if (src.handedness === 'left') {
+      leftWrist = pd;
+      if (src.gamepad) leftCtrl = readGamepad(src.gamepad);
+    } else if (src.handedness === 'right') {
+      rightWrist = pd;
+      if (src.gamepad) rightCtrl = readGamepad(src.gamepad);
+    }
+  }
+
+  const msg = {
+    head, left_wrist: leftWrist, right_wrist: rightWrist,
+    left_index_trigger:     leftCtrl.index,
+    right_index_trigger:    rightCtrl.index,
+    left_squeeze:           leftCtrl.squeeze,
+    right_squeeze:          rightCtrl.squeeze,
+    left_thumbstick:        leftCtrl.stick,
+    right_thumbstick:       rightCtrl.stick,
+    left_thumbstick_click:  leftCtrl.stickClick,
+    right_thumbstick_click: rightCtrl.stickClick,
+  };
+
+  if (socket && socket.connected) socket.emit('pose_data', msg);
+
+  updateFps();
+  updatePreview(msg);
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+function poseToDict(tf) {
+  const p = tf.position, q = tf.orientation;
+  return { pos: [p.x, p.y, p.z], quat: [q.w, q.x, q.y, q.z] };
+}
+function identityPose() { return { pos: [0,0,0], quat: [1,0,0,0] }; }
+function defaultCtrl()   { return { index: 0, squeeze: 0, stick: [0,0], stickClick: false }; }
+
+function readGamepad(gp) {
+  const b = (i) => gp.buttons[i] ? gp.buttons[i].value   : 0;
+  const p = (i) => gp.buttons[i] ? gp.buttons[i].pressed : false;
+  return { index: b(0), squeeze: b(1), stick: [gp.axes[2]??0, gp.axes[3]??0], stickClick: p(3) };
+}
+
+function updateFps() {
+  frameCount++;
+  const now = performance.now();
+  if (now - lastFpsTs >= 1000) {
+    document.getElementById('fps').textContent = `${(frameCount*1000/(now-lastFpsTs)).toFixed(1)} fps`;
+    frameCount = 0; lastFpsTs = now;
+  }
+}
+
+function updatePreview(m) {
+  const fmt = (v) => v.toFixed(3);
+  document.getElementById('data').textContent =
+    `head     [${m.head.pos.map(fmt)}]\n` +
+    `L.wrist  [${m.left_wrist.pos.map(fmt)}]  sq=${m.left_squeeze.toFixed(2)}  idx=${m.left_index_trigger.toFixed(2)}\n` +
+    `R.wrist  [${m.right_wrist.pos.map(fmt)}]  sq=${m.right_squeeze.toFixed(2)}  idx=${m.right_index_trigger.toFixed(2)}`;
+}
+
+function setStatus(text, cls) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = cls;
+}
+</script>
+</body>
+</html>

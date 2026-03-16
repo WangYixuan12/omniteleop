@@ -42,6 +42,7 @@ from omniteleop.follower.input_handlers.base_handler import (
     ArmCommandType,
 )
 from omniteleop.follower.input_handlers.exo_joycon_handler import ExoJoyconHandler
+from omniteleop.follower.input_handlers.vr_handler import VRHandler
 from dexbot_utils import RobotInfo
 
 class CommandProcessor():
@@ -230,7 +231,10 @@ class CommandProcessor():
             logger.info("Created ExoJoyconHandler for exoskeleton + JoyCon input")
             return handler
         elif self.teleop_mode == "vr":
-            handler = VRHandler(handler_config, self.namespace, self.motion_manager)
+            handler_config["topics"] = {
+                "vr_joints": self.config.get_topic("vr_joints", "vr/joints"),
+            }
+            handler = VRHandler(handler_config, self.namespace)
             logger.info("Created VRHandler for VR input")
             return handler
 

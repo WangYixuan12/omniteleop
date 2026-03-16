@@ -68,15 +68,18 @@ class HeadProcessor(BaseComponentProcessor):
                 head_positions = np.array(self.head_fixed_position)
 
             elif self.head_mode == "manual":
-                # Manual mode: Only process if head input is present
+                # Manual mode: process input if present.
+                # Respects the per-command mode field:
+                #   CommandMode.ABSOLUTE → treat pos as absolute joint targets
+                #   CommandMode.RELATIVE (default) → treat pos as deltas
                 if input_data is not None:
-                    deltas = np.array(input_data.get("pos", [0.0, 0.0, 0.0]))
-
-                    # Get current head positions
-                    current_head_pos = self.motion_manager.head.get_joint_pos()
-
-                    # Apply deltas to get target positions
-                    head_positions = current_head_pos + deltas
+                    cmd_mode = input_data.get("mode", CommandMode.RELATIVE)
+                    positions = np.array(input_data.get("pos", [0.0, 0.0, 0.0]))
+                    if cmd_mode == CommandMode.ABSOLUTE:
+                        head_positions = positions
+                    else:
+                        current_head_pos = self.motion_manager.head.get_joint_pos()
+                        head_positions = current_head_pos + positions
 
             # Clip head positions to joint limits and apply
             if head_positions is not None:

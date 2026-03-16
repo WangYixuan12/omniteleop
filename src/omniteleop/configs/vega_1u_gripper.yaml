@@ -58,6 +58,9 @@ topics:
   telemetry: "robot/telemetry"
   recorder_control: "recorder/control"
 
+  # VR teleop topics
+  vr_joints: "vr/joints"                 # IK-solved joint positions from VR leader
+
 # Control rates (Hz)
 rates:
   input_rate: 20
