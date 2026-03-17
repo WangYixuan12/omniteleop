@@ -435,7 +435,7 @@ class CommandProcessor():
 
         # Solve IK
         with suppress_loguru_module("dexmotion", enabled=True):
-            solution, is_collision, within_limits = self.motion_manager.ik(
+            solution, is_collision, within_limits = self.motion_manager.local_ik_solver.solve_ik(
                 target_pose=target_poses, type="pink"
             )
 

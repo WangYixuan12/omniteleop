@@ -46,12 +46,6 @@ import numpy as np
 from loguru import logger
 from pytransform3d import transformations as pt
 
-from omniteleop.leader.communication.openxr_socket_client import (
-    rotate_head,
-    transform,
-)
-from omniteleop.leader.communication.base_socket_client import LEFT2RIGHT_HAND_CONVENTION
-
 import socketio
 import aiohttp.web
 
@@ -73,7 +67,7 @@ def head_transform(qworld_t_xrquest: np.ndarray) -> np.ndarray:
     robworld_t_opencvquest = np.linalg.inv(qworld_t_robworld) @ qworld_t_xrquest @ xrquest_t_opencvquest
     return robworld_t_opencvquest
 
-def eef_transform(qworld_t_xrquest: np.ndarray) -> np.ndarray:
+def right_eef_transform(qworld_t_xrquest: np.ndarray) -> np.ndarray:
     qworld_t_robworld = np.array(
         [[0, -1, 0, 0],
          [0, 0, 1, 0],
@@ -81,8 +75,24 @@ def eef_transform(qworld_t_xrquest: np.ndarray) -> np.ndarray:
          [0, 0, 0, 1]]
     )
     xrquest_t_opencvquest = np.array(
+        [[-1, 0, 0, 0],
+         [0, 1, 0, 0],
+         [0, 0, -1, 0],
+         [0, 0, 0, 1]]
+    )
+    robworld_t_opencvquest = np.linalg.inv(qworld_t_robworld) @ qworld_t_xrquest @ xrquest_t_opencvquest
+    return robworld_t_opencvquest
+
+def left_eef_transform(qworld_t_xrquest: np.ndarray) -> np.ndarray:
+    qworld_t_robworld = np.array(
         [[0, -1, 0, 0],
+         [0, 0, 1, 0],
          [-1, 0, 0, 0],
+         [0, 0, 0, 1]]
+    )
+    xrquest_t_opencvquest = np.array(
+        [[1, 0, 0, 0],
+         [0, -1, 0, 0],
          [0, 0, -1, 0],
          [0, 0, 0, 1]]
     )
@@ -106,8 +116,8 @@ def _json_pose_to_matrix(pos: list, quat: list) -> np.ndarray:
 def _process_frame(frame: dict) -> dict:
     """Convert raw JSON pose frame from browser to robot-frame matrices."""
     head_mat = head_transform(_json_pose_to_matrix(frame["head"]["pos"], frame["head"]["quat"]))
-    left_wrist  = eef_transform(_json_pose_to_matrix(frame["left_wrist"]["pos"],  frame["left_wrist"]["quat"]))
-    right_wrist = eef_transform(_json_pose_to_matrix(frame["right_wrist"]["pos"], frame["right_wrist"]["quat"]))
+    left_wrist  = left_eef_transform(_json_pose_to_matrix(frame["left_wrist"]["pos"],  frame["left_wrist"]["quat"]))
+    right_wrist = right_eef_transform(_json_pose_to_matrix(frame["right_wrist"]["pos"], frame["right_wrist"]["quat"]))
     return {
         "head":                   head_mat,
         "left_wrist":             left_wrist,

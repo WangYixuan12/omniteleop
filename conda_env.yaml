@@ -1,0 +1,13 @@
+name: dexmate
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip=24.2
+  - uv
+  - pip:
+    - git+https://github.com/WangYixuan12/yixuan_utilities.git
+    - git+https://github.com/WangYixuan12/urdfpy.git
+    - ompl==1.7.0
+    - sapien==3.0.3
+    - aiohttp==3.13.3

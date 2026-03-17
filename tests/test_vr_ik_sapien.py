@@ -61,6 +61,11 @@ from rich.console import Console
 
 from yixuan_utilities.kinematics_helper import KinHelper
 from omniteleop.leader.communication.webxr_vr_reader import WebXRVRReader
+from dexmotion.motion_manager import MotionManager
+from omniteleop.common import get_config
+from omniteleop.common.log_utils import suppress_loguru_module
+from omniteleop.follower.component_processors import ArmProcessor
+from dexbot_utils import RobotInfo
 
 # ── Robot and EEF link name configuration ─────────────────────────────────────
 # Update these if the link names differ in your URDF.  Run with --inspect-only
@@ -73,11 +78,10 @@ RIGHT_ARM_EEF_LINK = "R_ee"
 DEFAULT_SERVER_URL = "http://localhost:5066"
 
 # Joint name sets (should not need changing for standard Vega builds)
-HEAD_JOINTS = frozenset(
-    {"torso_j1", "torso_j2", "torso_j3", "head_j2", "head_j3"}
-)
-LEFT_ARM_JOINTS = frozenset(f"L_arm_j{i}" for i in range(1, 8))
-RIGHT_ARM_JOINTS = frozenset(f"R_arm_j{i}" for i in range(1, 8))
+HEAD_JOINTS = ["torso_j1", "torso_j2", "torso_j3", "head_j2", "head_j3"]
+LEFT_ARM_JOINTS = [f"L_arm_j{i}" for i in range(1, 8)]
+RIGHT_ARM_JOINTS = [f"R_arm_j{i}" for i in range(1, 8)]
+TORSO_JOINTS = ["torso_j1", "torso_j2", "torso_j3"]
 
 URDF_PATH = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"
 
@@ -191,6 +195,65 @@ def inspect_and_resolve(kin: KinHelper) -> dict | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# EEF / target visualisation helpers  — proper coordinate frames
+# ─────────────────────────────────────────────────────────────────────────────
+
+_AXIS_LEN    = 0.15    # full axis length in metres
+_AXIS_RADIUS = 0.007   # capsule radius
+
+# Pre-computed rotations: capsule local axis is X, so we need to rotate
+# the Y-axis actor by +90° around Z and the Z-axis actor by -90° around Y.
+_ROT_Z_P90 = Rotation.from_euler("z",  90, degrees=True)  # X → Y
+_ROT_Y_N90 = Rotation.from_euler("y", -90, degrees=True)  # X → Z
+
+
+def _make_capsule(scene: sapien.Scene, color_rgb, name):
+    builder = scene.create_actor_builder()
+    builder.add_capsule_visual(
+        sapien.Pose(), radius=_AXIS_RADIUS, half_length=_AXIS_LEN / 2, material=color_rgb
+    )
+    entity = builder.build_kinematic(name=name)
+    return entity
+
+
+def _make_origin_sphere(scene: sapien.Scene, color_rgb, name):
+    builder = scene.create_actor_builder()
+    builder.add_sphere_visual(radius=_AXIS_RADIUS * 2.0, material=color_rgb)
+    entity = builder.build_kinematic(name=name)
+    return entity
+
+
+def make_frame_markers(scene, origin_color, name_prefix):
+    """Return a 4-tuple (origin_sphere, X_capsule, Y_capsule, Z_capsule).
+
+    Axes use canonical RGB colouring (X=red, Y=green, Z=blue).
+    The origin sphere uses *origin_color* to distinguish different frames.
+    """
+    return (
+        _make_origin_sphere(scene, origin_color, name=f"{name_prefix}_origin"),  # origin
+        _make_capsule(scene, [1.0, 0.15, 0.15], name=f"{name_prefix}_x"),   # X — red
+        _make_capsule(scene, [0.15, 1.0, 0.15], name=f"{name_prefix}_y"),   # Y — green
+        _make_capsule(scene, [0.15, 0.15, 1.0], name=f"{name_prefix}_z"),   # Z — blue
+    )
+
+
+def update_frame_markers(markers, mat4):
+    p = mat4[:3, 3]
+    frame_rot = Rotation.from_matrix(mat4[:3, :3])
+    half = _AXIS_LEN / 2
+
+    def _pose(center, rot):
+        q = rot.as_quat()  # (x, y, z, w) → Sapien wants (w, x, y, z)
+        return sapien.Pose(p=center, q=[q[3], q[0], q[1], q[2]])
+
+    R = mat4[:3, :3]
+    markers[0].set_pose(sapien.Pose(p=p))                                            # origin
+    markers[1].set_pose(_pose(p + R[:, 0] * half, frame_rot))                       # X axis
+    markers[2].set_pose(_pose(p + R[:, 1] * half, frame_rot * _ROT_Z_P90))          # Y axis
+    markers[3].set_pose(_pose(p + R[:, 2] * half, frame_rot * _ROT_Y_N90))          # Z axis
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Live VR simulation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -223,14 +286,47 @@ def run_live_sim(
         for shape in link.get_collision_shapes():
             shape.set_collision_groups([1, 1, 17, 0])
 
+    # ── Joint name map (needed to write arm solution back to Sapien qpos) ──────
+    active_robot_joints = robot.get_active_joints()
+    sapien_joint_names = [j.name for j in active_robot_joints]
+    joint_name_to_idx  = {name: i for i, name in enumerate(sapien_joint_names)}
+
     robot.set_root_pose(sapien.Pose([0, 0, 0], [1, 0, 0, 0]))
+    init_qpos_dict = {
+        "L_arm_j1": np.pi / 2.0,
+        "L_arm_j4": -np.pi / 2.0,
+        "R_arm_j1": -np.pi / 2.0,
+        "R_arm_j4": -np.pi / 2.0,
+    }
     init_qpos = np.zeros(robot.dof)
+    for name, val in init_qpos_dict.items():
+        init_qpos[joint_name_to_idx[name]] = val
     robot.set_qpos(init_qpos)
 
-    active_robot_joints = robot.get_active_joints()
     for ji, joint in enumerate(active_robot_joints):
         joint.set_drive_property(stiffness=4000, damping=500, force_limit=1000, mode="force")
         joint.set_drive_target(init_qpos[ji])
+
+    # ── MotionManager + ArmProcessors (mirrors command_processor.py) ──────────
+    console.print("Initialising MotionManager (pink IK + self-collision avoidance)…")
+    mm = MotionManager(init_visualizer=False,joint_regions_to_lock=["BASE"])
+    left_init = init_qpos[[joint_name_to_idx[n] for n in LEFT_ARM_JOINTS]]
+    right_init = init_qpos[[joint_name_to_idx[n] for n in RIGHT_ARM_JOINTS]]
+    torso_init = init_qpos[[joint_name_to_idx[n] for n in TORSO_JOINTS]]
+    mm.left_arm.set_joint_pos(left_init.tolist())
+    mm.right_arm.set_joint_pos(right_init.tolist())
+    mm.torso.set_joint_pos(torso_init.tolist())
+    config      = get_config()
+    robot_info  = RobotInfo()
+    left_proc   = ArmProcessor("left",  config, mm, robot_info, "vr")
+    right_proc  = ArmProcessor("right", config, mm, robot_info, "vr")
+    console.print("[bold green]MotionManager ready.[/]")
+
+    # ── EEF / target pose visualisation markers ───────────────────────────────
+    l_target_mrk = make_frame_markers(scene, [0.2, 0.5, 1.0], "l_tgt")    # blue   — left  IK target
+    r_target_mrk = make_frame_markers(scene, [1.0, 0.5, 0.2], "r_tgt")    # orange — right IK target
+    l_eef_mrk    = make_frame_markers(scene, [0.5, 0.85, 1.0], "l_curr") # cyan   — left  EEF current
+    r_eef_mrk    = make_frame_markers(scene, [1.0, 0.85, 0.3], "r_curr") # yellow — right EEF current
 
     # ── Connect to Quest 3 ────────────────────────────────────────────────────
     console.print("(Make sure the Unity OpenXR Teleop app is running on the headset)")
@@ -245,8 +341,6 @@ def run_live_sim(
     left_arm_eef_idx = cfg["left_arm_eef_idx"]
     right_arm_eef_idx = cfg["right_arm_eef_idx"]
     head_qmask = cfg["head_qmask"]
-    left_arm_qmask = cfg["left_arm_qmask"]
-    right_arm_qmask = cfg["right_arm_qmask"]
 
     current_qpos = init_qpos.copy()
     calib_stage = "0"  # 0 -> A -> B -> C
@@ -287,6 +381,7 @@ def run_live_sim(
     # ── Main render/IK loop ───────────────────────────────────────────────────
     while not viewer.closed:
         transforms = quest.get_latest_transformation()
+        print(f"right index trigger: {transforms["right_index_trigger"]}", end="\r")
         if transforms is None:
             scene.update_render()
             viewer.render()
@@ -307,17 +402,22 @@ def run_live_sim(
                 eef_idx=head_eef_idx, active_qmask=head_qmask,
                 damp=1000.0,
             )
+            mm.torso.set_joint_pos(head_qpos[[joint_name_to_idx[n] for n in TORSO_JOINTS]])
             for i in np.where(head_qmask)[0]:
                 current_qpos[i] = head_qpos[i]
 
         # ── Arm IK (stage B_approach + B live) ───────────────────
-        invalid_pose = np.array([[ 0.,  0.,  1.,  0.],
-                                   [ 0.,  1.,  0.,  0.],
+        invalid_right_pose = np.array([[ 0.,  0.,  1.,  0.],
+                                   [ 1.,  0.,  0.,  0.],
+                                   [0.,  1.,  0.,  0.],
+                                   [ 0.,  0.,  0.,  1.]])
+        invalid_left_pose = np.array([[ 0.,  0.,  1.,  0.],
                                    [-1.,  0.,  0.,  0.],
+                                   [ 0., -1.,  0.,  0.],
                                    [ 0.,  0.,  0.,  1.]])
         valid_wrists = (
-            not np.allclose(vr_base_t_left_wrist,  invalid_pose) and
-            not np.allclose(vr_base_t_right_wrist, invalid_pose)
+            not np.allclose(vr_base_t_left_wrist,  invalid_left_pose) and
+            not np.allclose(vr_base_t_right_wrist, invalid_right_pose)
         )
 
         if calib_stage in ("B_approach", "B") and valid_wrists:
@@ -335,6 +435,7 @@ def run_live_sim(
                     r_new  = Rotation.from_matrix(new_target[:3, :3])
                     curr_target[:3, :3] = Slerp([0, 1], Rotation.concatenate([r_curr, r_new]))([_INTERP_ALPHA]).as_matrix()[0]
 
+                
                 dist_left  = np.linalg.norm(curr_left_target[:3, 3]  - robot_base_t_left_wrist[:3, 3])
                 dist_right = np.linalg.norm(curr_right_target[:3, 3] - robot_base_t_right_wrist[:3, 3])
                 print(f"Approaching target — L: {dist_left:.3f} m   R: {dist_right:.3f} m")
@@ -349,23 +450,43 @@ def run_live_sim(
                 # Stage B: direct tracking, no interpolation
                 ik_left_target  = robot_base_t_left_wrist
                 ik_right_target = robot_base_t_right_wrist
-                print(f"robot_base_t_left_wrist:\n{robot_base_t_left_wrist}")
-                print(f"robot_base_t_right_wrist:\n{robot_base_t_right_wrist}")
 
-            left_qpos = kin.compute_ik_from_mat(
-                head_qpos, ik_left_target,
-                eef_idx=left_arm_eef_idx, active_qmask=left_arm_qmask,
-                damp=1000.0,
-            )
-            right_qpos = kin.compute_ik_from_mat(
-                head_qpos, ik_right_target,
-                eef_idx=right_arm_eef_idx, active_qmask=right_arm_qmask,
-                damp=1000.0,
-            )
-            for i in np.where(left_arm_qmask)[0]:
-                current_qpos[i] = left_qpos[i]
-            for i in np.where(right_arm_qmask)[0]:
-                current_qpos[i] = right_qpos[i]
+            # ── Arm IK with self-collision avoidance (MotionManager / pink) ──
+            with suppress_loguru_module("dexmotion", enabled=True):
+                arm_solution, in_collision, within_limits = mm.ik(
+                    target_pose={LEFT_ARM_EEF_LINK: ik_left_target, RIGHT_ARM_EEF_LINK: ik_right_target},
+                    type="pink",
+                )
+
+            if not arm_solution or in_collision or not within_limits:
+                if in_collision:
+                    console.print("[bold red]Self-collision — holding arm position[/]")
+                elif not within_limits:
+                    console.print("[yellow]Arm IK out of limits — holding arm position[/]")
+            else:
+                left_positions  = [arm_solution[f"L_arm_j{i}"] for i in range(1, 8)]
+                right_positions = [arm_solution[f"R_arm_j{i}"] for i in range(1, 8)]
+                safe_left  = left_proc.limit_joint_step(left_positions)
+                safe_right = right_proc.limit_joint_step(right_positions)
+                left_proc.apply_positions(safe_left)
+                right_proc.apply_positions(safe_right)
+                for i, name in enumerate(left_proc.joint_names):
+                    if name in joint_name_to_idx:
+                        current_qpos[joint_name_to_idx[name]] = safe_left[i]
+                for i, name in enumerate(right_proc.joint_names):
+                    if name in joint_name_to_idx:
+                        current_qpos[joint_name_to_idx[name]] = safe_right[i]
+
+            # ── EEF visualisation ─────────────────────────────────────────────
+            curr_l_fk = kin.compute_fk_from_link_idx(current_qpos, [left_arm_eef_idx])[0]
+            curr_r_fk = kin.compute_fk_from_link_idx(current_qpos, [right_arm_eef_idx])[0]
+            update_frame_markers(l_target_mrk, ik_left_target)
+            update_frame_markers(r_target_mrk, ik_right_target)
+            update_frame_markers(l_eef_mrk,    curr_l_fk)
+            update_frame_markers(r_eef_mrk,    curr_r_fk)
+            dist_l = np.linalg.norm(curr_l_fk[:3, 3] - ik_left_target[:3, 3])
+            dist_r = np.linalg.norm(curr_r_fk[:3, 3] - ik_right_target[:3, 3])
+            print(f"EEF→target  L: {dist_l:.3f} m   R: {dist_r:.3f} m")
 
         # ── Stage transitions ─────────────────────────────────────────────
         if calib_stage == "0" and _is_confirm(transforms):

@@ -35,6 +35,10 @@ let xrRefSpace= null;
 let frameCount = 0;
 let lastFpsTs  = performance.now();
 
+const SEND_HZ  = 30;                   // socket emit rate — keeps Quest cool
+const SEND_MS  = 1000 / SEND_HZ;
+let   lastSendTs = 0;
+
 // ─── Entry point ─────────────────────────────────────────────────────────
 // requestSession MUST be called directly from a user gesture — do it first,
 // then connect the socket afterward.
@@ -139,7 +143,10 @@ function onXRFrame(t, frame) {
     right_thumbstick_click: rightCtrl.stickClick,
   };
 
-  if (socket && socket.connected) socket.emit('pose_data', msg);
+  if (socket && socket.connected && (t - lastSendTs >= SEND_MS)) {
+    socket.emit('pose_data', msg);
+    lastSendTs = t;
+  }
 
   updateFps();
   updatePreview(msg);
