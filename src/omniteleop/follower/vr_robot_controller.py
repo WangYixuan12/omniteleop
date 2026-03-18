@@ -87,19 +87,14 @@ class VRRobotController:
         self.joint_pub = self.node.create_publisher(joint_topic, encoder=DictDataCodec.encode)
 
         self._latest: Optional[VRJointData] = None
-        self._lock   = threading.Lock()
         self._mode   = _Mode.STOP
         self.robot: Optional[Robot] = None
 
     # ── Zenoh callback ─────────────────────────────────────────────────────────
 
     def _on_vr_joints(self, data: dict) -> None:
-        try:
-            vr = VRJointData(**data)
-            with self._lock:
-                self._latest = vr
-        except Exception as e:
-            logger.warning(f"Bad VRJointData frame: {e}")
+        vr = VRJointData(**data)
+        self._latest = vr
 
     # ── Initialisation ─────────────────────────────────────────────────────────
 
@@ -112,7 +107,6 @@ class VRRobotController:
         logger.success("VRRobotController ready.")
 
     def _set_home_position(self) -> None:
-        import ipdb; ipdb.set_trace()  # DEBUG
         torso_init = [np.pi/6.0, np.pi/3.0, np.pi/6.0]
         head_init  = [0.0, 0.0, 0.0]
         left_arm_init  = [np.pi/2.0, 0.0, 0.0, -np.pi/2.0, 0.0, 0.0, 0.0]
@@ -192,8 +186,7 @@ class VRRobotController:
 
         try:
             while True:
-                with self._lock:
-                    vr = self._latest
+                vr = self._latest
 
                 if vr is None:
                     rate.sleep()
@@ -206,10 +199,7 @@ class VRRobotController:
                         self._mode = _Mode.STOP
                     # Head still moves during A/B stages (estop=True but head tracks)
                     if vr.head_pos:
-                        try:
-                            self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
-                        except Exception as e:
-                            logger.debug(f"Head command error: {e}")
+                        self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
                     rate.sleep()
                     continue
 
@@ -219,19 +209,13 @@ class VRRobotController:
                     self._mode = _Mode.RUNNING
 
                 # ── Head ──────────────────────────────────────────────────────
-                import ipdb; ipdb.set_trace()  # DEBUG
                 if vr.head_pos:
-                    try:
-                        self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
-                    except Exception as e:
-                        logger.debug(f"Head command error: {e}")
+                    self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
 
                 # ── Arms + grippers + chassis (stage C only) ──────────────────
                 if vr.calib_stage == "C":
-                    if vr.left_arm_pos:
-                        self.robot.left_arm.set_joint_pos(vr.left_arm_pos, wait_time=0.0)
-                    if vr.right_arm_pos:
-                        self.robot.right_arm.set_joint_pos(vr.right_arm_pos, wait_time=0.0)
+                    self.robot.left_arm.set_joint_pos(vr.left_arm_pos, wait_time=0.0)
+                    self.robot.right_arm.set_joint_pos(vr.right_arm_pos, wait_time=0.0)
 
                     if self.has_chassis and (vr.chassis_vx or vr.chassis_vy or vr.chassis_wz):
                         self.robot.chassis.set_velocity(

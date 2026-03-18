@@ -39,6 +39,8 @@ dependencies = [
     "opencv-python>=4.5.0",  # For image processing in recorder
     "dexcomm>=0.4.0",
     "dexmotion>=0.4.0",
+    "dexmate-urdf==0.8.0",
+    "dextop>=0.4.4",
     "hatch",
     "joycon-lib",
 ]
