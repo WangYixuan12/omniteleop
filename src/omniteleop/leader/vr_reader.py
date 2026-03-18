@@ -84,7 +84,7 @@ INVALID_RIGHT_POSE = np.array([
     [ 0.,  0.,  0.,  1.],
 ])
 
-_HEAD_IK_JOINTS  = {"torso_j1", "torso_j2", "torso_j3", "head_j1", "head_j2", "head_j3"}
+_HEAD_IK_JOINTS  = {"head_j1", "head_j2", "head_j3"}
 _HEAD_MOTOR_JOINTS = ["head_j1", "head_j2", "head_j3"]
 _TORSO_JOINTS    = ["torso_j1", "torso_j2", "torso_j3"]
 _LEFT_ARM_JOINTS  = [f"L_arm_j{i}" for i in range(1, 8)]

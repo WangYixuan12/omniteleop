@@ -44,6 +44,7 @@ from omniteleop import LIB_PATH
 from omniteleop.common import get_config
 from omniteleop.common.logging import setup_logging
 from omniteleop.common.schemas import VRJointData
+from omniteleop.common.debug_display import get_debug_display
 from dexbot_utils import RobotInfo
 
 
@@ -89,6 +90,8 @@ class VRRobotController:
         self._latest: Optional[VRJointData] = None
         self._mode   = _Mode.STOP
         self.robot: Optional[Robot] = None
+
+        self._debug_display = get_debug_display("VRRobotController", self.control_rate, refresh_rate=10) if debug else None
 
     # ── Zenoh callback ─────────────────────────────────────────────────────────
 
@@ -200,6 +203,11 @@ class VRRobotController:
                     # Head still moves during A/B stages (estop=True but head tracks)
                     if vr.head_pos:
                         self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
+                    if self._debug_display is not None and vr.head_pos:
+                        self._debug_display.print_robot_command(
+                            {"head": {"pos": vr.head_pos}},
+                            safety_flags={"estop": True},
+                        )
                     rate.sleep()
                     continue
 
@@ -224,6 +232,21 @@ class VRRobotController:
                             wz=vr.chassis_wz,
                             sequential_steering=abs(vr.chassis_vy) > 0.02,
                         )
+
+                if self._debug_display is not None:
+                    components: dict = {}
+                    if vr.head_pos:
+                        components["head"] = {"pos": vr.head_pos}
+                    if vr.left_arm_pos:
+                        components["left_arm"] = {"pos": vr.left_arm_pos}
+                    if vr.right_arm_pos:
+                        components["right_arm"] = {"pos": vr.right_arm_pos}
+                    if self.has_chassis:
+                        components["chassis"] = {"vx": vr.chassis_vx, "vy": vr.chassis_vy, "wz": vr.chassis_wz}
+                    self._debug_display.print_robot_command(
+                        components,
+                        safety_flags={"estop": vr.estop},
+                    )
 
                 rate.sleep()
 
