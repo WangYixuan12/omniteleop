@@ -68,6 +68,10 @@ class VRJointData:
     # Gripper scale [0.0 = open, 1.0 = fully closed] mapped from controller trigger
     left_gripper: float = 0.0
     right_gripper: float = 0.0
+    # Base velocity from Quest thumbsticks (m/s, rad/s)
+    chassis_vx: float = 0.0   # forward (+) / back (-)
+    chassis_vy: float = 0.0   # left (+) / right (-)
+    chassis_wz: float = 0.0   # counter-clockwise (+)
     # Control flags
     estop: bool = True          # Default True (safe) until calibration completes
     exit_requested: bool = False

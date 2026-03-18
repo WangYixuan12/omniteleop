@@ -140,7 +140,16 @@ def run_live_sim(kin: KinHelper, cfg: dict) -> None:
     joint_name_to_idx = {j.name: i for i, j in enumerate(active_joints)}
 
     init_qpos = np.zeros(robot.dof)
-    for name, val in {"L_arm_j1": np.pi/2, "L_arm_j4": -np.pi/2, "R_arm_j1": -np.pi/2, "R_arm_j4": -np.pi/2}.items():
+    init_qpos_dict = {
+        "torso_j1": np.pi/6,
+        "torso_j2": np.pi/3,
+        "torso_j3": np.pi/6,
+        "L_arm_j1": np.pi/2,
+        "L_arm_j4": -np.pi/2,
+        "R_arm_j1": -np.pi/2,
+        "R_arm_j4": -np.pi/2
+    }
+    for name, val in init_qpos_dict.items():
         init_qpos[joint_name_to_idx[name]] = val
     robot.set_qpos(init_qpos)
     for ji, joint in enumerate(active_joints):
