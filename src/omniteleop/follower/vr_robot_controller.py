@@ -222,8 +222,10 @@ class VRRobotController:
 
                 # ── Arms + grippers + chassis (stage C only) ──────────────────
                 if vr.calib_stage == "C":
-                    self.robot.left_arm.set_joint_pos(vr.left_arm_pos, wait_time=0.0)
-                    self.robot.right_arm.set_joint_pos(vr.right_arm_pos, wait_time=0.0)
+                    if vr.left_arm_pos:
+                        self.robot.left_arm.set_joint_pos(vr.left_arm_pos, wait_time=0.0)
+                    if vr.right_arm_pos:
+                        self.robot.right_arm.set_joint_pos(vr.right_arm_pos, wait_time=0.0)
 
                     if self.has_chassis and (vr.chassis_vx or vr.chassis_vy or vr.chassis_wz):
                         self.robot.chassis.set_velocity(
