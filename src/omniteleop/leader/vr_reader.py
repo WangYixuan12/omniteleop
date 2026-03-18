@@ -84,13 +84,57 @@ INVALID_RIGHT_POSE = np.array([
     [ 0.,  0.,  0.,  1.],
 ])
 
-_HEAD_IK_JOINTS  = {"head_j1", "head_j2", "head_j3"}
+_HEAD_IK_JOINTS    = {"head_j2", "head_j3"}
 _HEAD_MOTOR_JOINTS = ["head_j1", "head_j2", "head_j3"]
 _TORSO_JOINTS    = ["torso_j1", "torso_j2", "torso_j3"]
 _LEFT_ARM_JOINTS  = [f"L_arm_j{i}" for i in range(1, 8)]
 _RIGHT_ARM_JOINTS = [f"R_arm_j{i}" for i in range(1, 8)]
 
 _INTERP_ALPHA = 0.1   # approach interpolation step per frame
+
+# ── Sapien visualisation helpers ───────────────────────────────────────────────
+
+_AXIS_LEN    = 0.15
+_AXIS_RADIUS = 0.007
+_ROT_Z_P90   = Rotation.from_euler("z",  90, degrees=True)
+_ROT_Y_N90   = Rotation.from_euler("y", -90, degrees=True)
+
+
+def _make_kinematic(scene, build_fn):
+    b = scene.create_actor_builder()
+    build_fn(b)
+    return b.build_kinematic()
+
+
+def make_frame_markers(scene, color):
+    """Return (origin, X, Y, Z) kinematic capsule actors."""
+    def sphere(b):
+        b.add_sphere_visual(radius=_AXIS_RADIUS * 2, material=color)
+    def axis(c):
+        def build(b):
+            import sapien
+            b.add_capsule_visual(sapien.Pose(), radius=_AXIS_RADIUS, half_length=_AXIS_LEN / 2, material=c)
+        return build
+    return (
+        _make_kinematic(scene, sphere),
+        _make_kinematic(scene, axis([1.0, 0.15, 0.15])),  # X — red
+        _make_kinematic(scene, axis([0.15, 1.0, 0.15])),  # Y — green
+        _make_kinematic(scene, axis([0.15, 0.15, 1.0])),  # Z — blue
+    )
+
+
+def update_frame_markers(markers, mat4):
+    import sapien
+    p, R = mat4[:3, 3], mat4[:3, :3]
+    rot  = Rotation.from_matrix(R)
+    half = _AXIS_LEN / 2
+    def pose(center, r):
+        q = r.as_quat()
+        return sapien.Pose(p=center, q=[q[3], q[0], q[1], q[2]])
+    markers[0].set_pose(sapien.Pose(p=p))
+    markers[1].set_pose(pose(p + R[:, 0] * half, rot))
+    markers[2].set_pose(pose(p + R[:, 1] * half, rot * _ROT_Z_P90))
+    markers[3].set_pose(pose(p + R[:, 2] * half, rot * _ROT_Y_N90))
 
 
 class VRReader:
@@ -109,6 +153,8 @@ class VRReader:
         stick_deadzone: float = 0.1,
         publish_rate: float = 40.0,
         debug: bool = False,
+        visualize: bool = False,
+        urdf_path: Optional[str] = None,
     ) -> None:
         self.stick_max_vx   = stick_max_vx
         self.stick_max_vy   = stick_max_vy
@@ -136,19 +182,40 @@ class VRReader:
         # MotionManager + ArmProcessors
         logger.info("Initialising MotionManager ...")
         robot_info      = RobotInfo()
-        init_pos_config = config.get("init_pos", {})
         self.mm = MotionManager(init_visualizer=False, joint_regions_to_lock=["BASE"])
-        self.mm.left_arm.set_joint_pos(init_pos_config.get("left_arm",  [0.0] * 7))
-        self.mm.right_arm.set_joint_pos(init_pos_config.get("right_arm", [0.0] * 7))
-        if robot_info.has_torso:
-            self.mm.torso.set_joint_pos(init_pos_config.get("torso", [0.0] * 3))
+        torso_init = [np.pi/6.0, np.pi/3.0, np.pi/6.0]
+        head_init  = [0.0, 0.0, 0.0]
+        left_arm_init  = [np.pi/2.0, 0.0, 0.0, -np.pi/2.0, 0.0, 0.0, 0.0]
+        right_arm_init = [-np.pi/2.0, 0.0, 0.0, -np.pi/2.0, 0.0, 0.0, 0.0]
+        self.mm.left_arm.set_joint_pos(left_arm_init)
+        self.mm.right_arm.set_joint_pos(right_arm_init)
+        self.mm.torso.set_joint_pos(torso_init)
+        self.mm.head.set_joint_pos(head_init)
         self.left_proc  = ArmProcessor("left",  config, self.mm, robot_info, "vr")
         self.right_proc = ArmProcessor("right", config, self.mm, robot_info, "vr")
 
         # Warm-start qpos for head IK
-        self.current_qpos = self._build_init_qpos(init_pos_config)
+        active_joints     = self.kin.sapien_robot.get_active_joints()
+        joint_name_to_idx = {j.name: i for i, j in enumerate(active_joints)}
+        init_qpos = np.zeros(self.kin.sapien_robot.dof)
+        init_qpos_dict = {
+            "torso_j1": np.pi/6,
+            "torso_j2": np.pi/3,
+            "torso_j3": np.pi/6,
+            "L_arm_j1": np.pi/2,
+            "L_arm_j4": -np.pi/2,
+            "R_arm_j1": -np.pi/2,
+            "R_arm_j4": -np.pi/2
+        }
+        for name, val in init_qpos_dict.items():
+            init_qpos[joint_name_to_idx[name]] = val
+        self.current_qpos = init_qpos
 
         self._trigger_start: Optional[float] = None
+
+        self._viewer = None
+        if visualize:
+            self._setup_sapien_viewer(urdf_path)
 
     # ── Setup helpers ──────────────────────────────────────────────────────────
 
@@ -192,18 +259,32 @@ class VRReader:
             f"head_DOF={self.head_qmask.sum()}"
         )
 
-    def _build_init_qpos(self, init_pos_config: dict) -> np.ndarray:
-        qpos = np.zeros(len(self.joint_names))
-        for comp, joints in [
-            ("left_arm",  _LEFT_ARM_JOINTS),
-            ("right_arm", _RIGHT_ARM_JOINTS),
-            ("torso",     _TORSO_JOINTS),
-        ]:
-            vals = init_pos_config.get(comp, [])
-            for idx, jname in enumerate(joints):
-                if idx < len(vals) and jname in self.joint_name_to_idx:
-                    qpos[self.joint_name_to_idx[jname]] = vals[idx]
-        return qpos
+    def _setup_sapien_viewer(self, urdf_path: Optional[str]) -> None:
+        import sapien
+        scene = sapien.Scene()
+        scene.add_ground(-0.1)
+        scene.set_ambient_light([0.5, 0.5, 0.5])
+        scene.add_directional_light([0, 1, -1], [0.5, 0.5, 0.5])
+        self._scene = scene
+
+        self._viewer = scene.create_viewer()
+        self._viewer.set_camera_xyz(x=-2, y=0, z=1)
+        self._viewer.set_camera_rpy(r=0, p=-0.3, y=0)
+
+        loader = scene.create_urdf_loader()
+        loader.fix_root_link = True
+        loader.load_multiple_collisions_from_file = True
+        self._viz_robot = loader.load(urdf_path)
+        for link in self._viz_robot.get_links():
+            for shape in link.get_collision_shapes():
+                shape.set_collision_groups([1, 1, 17, 0])
+        self._viz_robot.set_qpos(self.current_qpos)
+
+        self._l_target_mrk = make_frame_markers(scene, [0.2, 0.5, 1.0])   # blue
+        self._r_target_mrk = make_frame_markers(scene, [1.0, 0.5, 0.2])   # orange
+        self._l_eef_mrk    = make_frame_markers(scene, [0.5, 0.85, 1.0])  # cyan
+        self._r_eef_mrk    = make_frame_markers(scene, [1.0, 0.85, 0.3])  # yellow
+        logger.info("Sapien viewer ready.")
 
     # ── Per-frame helpers ──────────────────────────────────────────────────────
 
@@ -303,6 +384,8 @@ class VRReader:
                 )
                 left_arm_pos:  list[float] = []
                 right_arm_pos: list[float] = []
+                ik_left_target  = None
+                ik_right_target = None
 
                 if calib_stage in ("B_approach", "B") and valid_wrists:
                     robot_l = robot_base_t_vr_base @ vr_l_wrist
@@ -354,6 +437,10 @@ class VRReader:
                         self.right_proc.apply_positions(safe_right)
                         left_arm_pos  = safe_left.tolist()
                         right_arm_pos = safe_right.tolist()
+                        for i, n in enumerate(self.left_proc.joint_names):
+                            self.current_qpos[self.joint_name_to_idx[n]] = safe_left[i]
+                        for i, n in enumerate(self.right_proc.joint_names):
+                            self.current_qpos[self.joint_name_to_idx[n]] = safe_right[i]
                         if self._debug_display:
                             joints = {f"L_arm_j{i+1}": left_arm_pos[i]  for i in range(7)}
                             joints.update({f"R_arm_j{i+1}": right_arm_pos[i] for i in range(7)})
@@ -401,6 +488,20 @@ class VRReader:
                     calib_stage=published_stage,
                 )
                 self.vr_pub.publish(asdict(data))
+
+                if self._viewer is not None:
+                    self._viz_robot.set_qpos(self.current_qpos)
+                    curr_l_fk = self.kin.compute_fk_from_link_idx(self.current_qpos, [self.left_arm_eef_idx])[0]
+                    curr_r_fk = self.kin.compute_fk_from_link_idx(self.current_qpos, [self.right_arm_eef_idx])[0]
+                    update_frame_markers(self._l_eef_mrk, curr_l_fk)
+                    update_frame_markers(self._r_eef_mrk, curr_r_fk)
+                    if ik_left_target is not None:
+                        update_frame_markers(self._l_target_mrk, ik_left_target)
+                        update_frame_markers(self._r_target_mrk, ik_right_target)
+                    self._scene.update_render()
+                    self._viewer.render()
+                    if self._viewer.closed:
+                        break
 
                 rate_limiter.sleep()
 
@@ -457,6 +558,12 @@ def main() -> None:
         debug: bool = False
         """Print calculated arm joint positions to terminal"""
 
+        visualize: bool = True
+        """Open Sapien viewer to visualize IK in real time"""
+
+        urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"
+        """Path to robot URDF for Sapien visualizer (required if --visualize)"""
+
     args = tyro.cli(Args)
 
     reader = VRReader(
@@ -470,6 +577,8 @@ def main() -> None:
         stick_max_wz=args.stick_max_wz,
         stick_deadzone=args.stick_deadzone,
         debug=args.debug,
+        visualize=args.visualize,
+        urdf_path=args.urdf_path,
     )
     reader.run()
 

@@ -30,7 +30,7 @@ HEAD_LINK          = "zed_depth_frame"
 LEFT_ARM_EEF_LINK  = "L_ee"
 RIGHT_ARM_EEF_LINK = "R_ee"
 
-HEAD_JOINTS      = ["torso_j1", "torso_j2", "torso_j3", "head_j2", "head_j3"]
+HEAD_JOINTS      = ["head_j2", "head_j3"]
 LEFT_ARM_JOINTS  = [f"L_arm_j{i}" for i in range(1, 8)]
 RIGHT_ARM_JOINTS = [f"R_arm_j{i}" for i in range(1, 8)]
 TORSO_JOINTS     = ["torso_j1", "torso_j2", "torso_j3"]
