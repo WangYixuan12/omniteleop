@@ -103,6 +103,19 @@ async function startXR() {
   }
 }
 
+function isControllerSource(src) {
+  const profiles = src.profiles || [];
+
+  // Quest Touch controllers usually expose gamepad input and tracked-pointer
+  if (!src.gamepad) return false;
+  if (src.targetRayMode !== 'tracked-pointer') return false;
+
+  // Reject hand-tracking related profiles if present
+  if (profiles.some(p => p.toLowerCase().includes('hand'))) return false;
+
+  return !!src.gripSpace;
+}
+
 // ─── Per-frame callback ───────────────────────────────────────────────────
 function onXRFrame(t, frame) {
   if (!xrSession) return;
@@ -116,18 +129,18 @@ function onXRFrame(t, frame) {
   let rightWrist = identityPose();
   let leftCtrl   = defaultCtrl();
   let rightCtrl  = defaultCtrl();
-
   for (const src of frame.session.inputSources) {
-    if (!src.gripSpace) continue;
+    if (!isControllerSource(src)) continue;
+
     const gp = frame.getPose(src.gripSpace, xrRefSpace);
     if (!gp) continue;
     const pd = poseToDict(gp.transform);
     if (src.handedness === 'left') {
       leftWrist = pd;
-      if (src.gamepad) leftCtrl = readGamepad(src.gamepad);
+      leftCtrl = readGamepad(src.gamepad);
     } else if (src.handedness === 'right') {
       rightWrist = pd;
-      if (src.gamepad) rightCtrl = readGamepad(src.gamepad);
+      rightCtrl = readGamepad(src.gamepad);
     }
   }
 
