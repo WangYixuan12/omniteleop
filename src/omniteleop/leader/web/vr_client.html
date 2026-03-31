@@ -17,6 +17,15 @@
     #status.err { border-color: #c44; }
     #fps  { font-size: 12px; color: #888; }
     #data { margin-top: 10px; font-size: 11px; color: #666; white-space: pre; }
+    #cameras { display: none; position: fixed; bottom: 10px; right: 10px;
+               background: rgba(0,0,0,0.6); border-radius: 6px; padding: 4px;
+               display: flex; flex-direction: column; gap: 3px; z-index: 100; }
+    #cameras.hidden { display: none !important; }
+    .cam-row { display: flex; gap: 3px; }
+    .cam-row img { width: 240px; height: 135px; object-fit: cover;
+                   border-radius: 3px; background: #222; display: block; }
+    #cam-depth { width: 240px; height: 135px; object-fit: cover;
+                 border-radius: 3px; background: #222; display: block; }
   </style>
 </head>
 <body>
@@ -26,6 +35,13 @@
 <div id="fps"></div>
 <div id="data"></div>
 <canvas id="xrcanvas" style="display:none"></canvas>
+<div id="cameras" class="hidden">
+  <div class="cam-row">
+    <img id="cam-left"  alt="L RGB"/>
+    <img id="cam-right" alt="R RGB"/>
+  </div>
+  <img id="cam-depth" alt="Depth"/>
+</div>
 
 <script>
 // ─── State ────────────────────────────────────────────────────────────────
@@ -57,6 +73,13 @@ async function startAll() {
   socket.on('connect',       () => setStatus('XR active — streaming…', 'ok'));
   socket.on('disconnect',    () => setStatus('Socket disconnected — reconnecting…', ''));
   socket.on('connect_error', (e) => setStatus(`Socket error: ${e.message}`, 'err'));
+  socket.on('camera_frame', (d) => {
+    const panel = document.getElementById('cameras');
+    panel.classList.remove('hidden');
+    if (d.left_rgb)  document.getElementById('cam-left').src  = 'data:image/jpeg;base64,' + d.left_rgb;
+    if (d.right_rgb) document.getElementById('cam-right').src = 'data:image/jpeg;base64,' + d.right_rgb;
+    if (d.depth)     document.getElementById('cam-depth').src = 'data:image/jpeg;base64,' + d.depth;
+  });
 }
 
 // ─── WebXR ────────────────────────────────────────────────────────────────

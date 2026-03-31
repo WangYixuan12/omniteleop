@@ -49,7 +49,6 @@ dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
     "ruff",
-    "isort>=5.12.0",
     "pyright",
     "pre-commit",
 ]
@@ -75,9 +74,50 @@ include = [
     "LICENSE",
 ]
 
-[tool.black]
+[tool.ruff]
 line-length = 100
-target-version = ['py310', 'py311', 'py312', 'py313']
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # Pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "D101",   # Missing docstring in public class
+    "D102",   # Missing docstring in public method
+    "D2",     # pydocstyle: whitespace conventions
+    "D3",     # pydocstyle: blank line conventions
+    "D402",   # First line should not be the function's signature
+    "D404",   # First word of the docstring should not be "This"
+    "D417",   # Missing argument descriptions in the docstring
+    "D419",   # Docstring is empty
+    "SLF001", # flake8-self: private member access
+    "RET501", # Do not explicitly return None in function if it is the only possible return value
+    "RET502", # Do not implicitly return None if any branch explicitly returns a value
+    "RET503", # Missing explicit return at the end of function able to return non-None value
+    "RUF",    # Ruff-specific rules
+    "PLC",    # Pylint: convention
+    "PLE",    # Pylint: error
+    "PLW",    # Pylint: warning
+    "PIE",    # flake8-pie
+    "FLY",    # flynt: f-string conversion
+]
+ignore = [
+    "D203",    # incompatible with D211 (no-blank-line-before-class)
+    "D213",    # incompatible with D212 (multi-line-summary-first-line)
+    "E731",    # allow lambda assignments
+    "PLC0105", # type parameter variance naming conventions
+    "PLW0603", # allow global statements
+    "PLW2901", # allow overwriting loop variable
+    "RUF010",  # allow f-string without explicit conversion specifiers
+    "B035",    # removed in later ruff versions
+    "RUF012",  # allow mutable class defaults without ClassVar annotation
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.mypy]
 python_version = "3.10"

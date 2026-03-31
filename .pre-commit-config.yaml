@@ -1,0 +1,50 @@
+# See https://pre-commit.com for more information
+# Run `pre-commit autoupdate` periodically to keep hook versions current.
+default_language_version:
+    python: python3
+
+repos:
+
+# ── Linting & formatting ──────────────────────────────────────────────────────
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.6.0
+  hooks:
+  - id: ruff          # linting + import sorting (replaces flake8, isort, etc.)
+    args: [--fix]
+  - id: ruff-format   # formatting (replaces black)
+
+# ── File hygiene ──────────────────────────────────────────────────────────────
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v4.6.0
+  hooks:
+  - id: check-yaml
+    args: [--unsafe]  # --unsafe allows custom tags (e.g. ROS/URDF YAML files)
+                      # see https://github.com/pre-commit/pre-commit-hooks/issues/701
+  - id: check-toml
+  - id: check-json
+  - id: check-added-large-files
+    args: [--enforce-all, --maxkb, '500']  # raise if research data files get committed
+  - id: end-of-file-fixer
+  - id: trailing-whitespace
+  - id: check-merge-conflict
+  - id: check-executables-have-shebangs
+  - id: check-shebang-scripts-are-executable
+  - id: debug-statements  # catches pdb.set_trace() / breakpoint() etc.
+  - id: requirements-txt-fixer
+
+# ── Type checking ─────────────────────────────────────────────────────────────
+- repo: https://github.com/pre-commit/mirrors-mypy
+  rev: v1.11.0
+  hooks:
+  - id: mypy
+    args:
+    - --follow-imports=skip
+    - --ignore-missing-imports
+    - --show-error-codes
+    - --pretty
+    - --no-error-summary
+    - --disallow-untyped-defs
+    - --disallow-incomplete-defs
+    additional_dependencies:
+    - types-PyYAML
+    - types-requests
