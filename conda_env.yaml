@@ -12,3 +12,4 @@ dependencies:
     - sapien==3.0.3
     - aiohttp==3.13.3
     - ipdb==0.13.13
+    - h5py==3.16.0

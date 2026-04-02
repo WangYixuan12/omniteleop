@@ -17,106 +17,219 @@
     #status.err { border-color: #c44; }
     #fps  { font-size: 12px; color: #888; }
     #data { margin-top: 10px; font-size: 11px; color: #666; white-space: pre; }
-    #cameras { display: none; position: fixed; bottom: 10px; right: 10px;
-               background: rgba(0,0,0,0.6); border-radius: 6px; padding: 4px;
-               display: flex; flex-direction: column; gap: 3px; z-index: 100; }
-    #cameras.hidden { display: none !important; }
-    .cam-row { display: flex; gap: 3px; }
-    .cam-row img { width: 240px; height: 135px; object-fit: cover;
-                   border-radius: 3px; background: #222; display: block; }
-    #cam-depth { width: 240px; height: 135px; object-fit: cover;
-                 border-radius: 3px; background: #222; display: block; }
   </style>
 </head>
 <body>
 <h2>VR Pose Streamer</h2>
 <button id="btn" onclick="startAll()">Start XR</button>
 <div id="status">Ready — tap Start XR</div>
+<div id="rec" style="color:#f55;font-weight:bold;font-size:14px;min-height:18px;"></div>
 <div id="fps"></div>
 <div id="data"></div>
 <canvas id="xrcanvas" style="display:none"></canvas>
-<div id="cameras" class="hidden">
-  <div class="cam-row">
-    <img id="cam-left"  alt="L RGB"/>
-    <img id="cam-right" alt="R RGB"/>
-  </div>
-  <img id="cam-depth" alt="Depth"/>
-</div>
+<!-- Camera images are rendered as WebGL quads inside the XR scene.
+     No dom-overlay → browser panel stays hidden → controller inputs are not intercepted. -->
 
 <script>
 // ─── State ────────────────────────────────────────────────────────────────
-let socket    = null;
-let xrSession = null;
-let xrRefSpace= null;
+let socket     = null;
+let xrSession  = null;
+let xrRefSpace = null;
+let xrMode     = null;   // 'immersive-ar' or 'immersive-vr'
 let frameCount = 0;
 let lastFpsTs  = performance.now();
 
-const SEND_HZ  = 30;                   // socket emit rate — keeps Quest cool
-const SEND_MS  = 1000 / SEND_HZ;
-let   lastSendTs = 0;
+const SEND_HZ = 30;
+const SEND_MS = 1000 / SEND_HZ;
+let lastSendTs = 0;
+
+// Grip (squeeze) used for calibration — not intercepted by the browser panel
+let rightSqueezeDown = false;
+
+// ─── WebGL camera image renderer ─────────────────────────────────────────
+let gl      = null;
+let xrProg  = null;
+let quadBuf = null;
+let idxBuf  = null;
+let camTex      = {};  // key → WebGLTexture
+let camDecoding = {};  // key → bool, true while an Image decode is in-flight
+let camPending  = {};  // key → latest b64jpeg waiting to be decoded
+let loc         = {};  // cached GL attribute/uniform locations
+
+function compileShader(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  return sh;
+}
+
+function initXRRenderer() {
+  const vs = `#version 300 es
+    in vec3 aPos; in vec2 aUV;
+    uniform mat4 uProj, uView, uModel;
+    out vec2 vUV;
+    void main() { gl_Position = uProj * uView * uModel * vec4(aPos,1); vUV = aUV; }`;
+  const fs = `#version 300 es
+    precision mediump float;
+    in vec2 vUV; uniform sampler2D uTex; out vec4 c;
+    void main() { c = texture(uTex, vUV); }`;
+
+  xrProg = gl.createProgram();
+  gl.attachShader(xrProg, compileShader(gl.VERTEX_SHADER,   vs));
+  gl.attachShader(xrProg, compileShader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(xrProg);
+
+  loc.aPos  = gl.getAttribLocation(xrProg,  'aPos');
+  loc.aUV   = gl.getAttribLocation(xrProg,  'aUV');
+  loc.uProj  = gl.getUniformLocation(xrProg, 'uProj');
+  loc.uView  = gl.getUniformLocation(xrProg, 'uView');
+  loc.uModel = gl.getUniformLocation(xrProg, 'uModel');
+  loc.uTex   = gl.getUniformLocation(xrProg, 'uTex');
+
+  // Unit quad in the xy-plane. UV flipped vertically so JPEG images appear right-side up.
+  quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -0.5, -0.5, 0,   0, 1,
+     0.5, -0.5, 0,   1, 1,
+     0.5,  0.5, 0,   1, 0,
+    -0.5,  0.5, 0,   0, 0,
+  ]), gl.STATIC_DRAW);
+
+  idxBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,
+    new Uint16Array([0,1,2, 0,2,3]), gl.STATIC_DRAW);
+}
+
+function _decodeCamTex(key, b64jpeg) {
+  camDecoding[key] = true;
+  const img = new Image();
+  img.onload = () => {
+    if (!camTex[key]) {
+      camTex[key] = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, camTex[key]);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, camTex[key]);
+    }
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    // immediately decode the latest pending frame if one arrived while we were busy
+    const next = camPending[key];
+    if (next) { delete camPending[key]; _decodeCamTex(key, next); }
+    else       { camDecoding[key] = false; }
+  };
+  img.onerror = () => { camDecoding[key] = false; };
+  img.src = 'data:image/jpeg;base64,' + b64jpeg;
+}
+
+function updateCamTex(key, b64jpeg) {
+  if (!gl || !b64jpeg) return;
+  if (camDecoding[key]) { camPending[key] = b64jpeg; return; }  // store latest, drop the rest
+  _decodeCamTex(key, b64jpeg);
+}
+
+// Draw one textured quad at world position (tx,ty,tz) with size (w × h metres).
+function drawQuad(proj, view, tx, ty, tz, w, h, tex) {
+  if (!tex) return;
+  gl.useProgram(xrProg);
+  gl.disable(gl.CULL_FACE);
+  gl.enable(gl.DEPTH_TEST);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+  gl.enableVertexAttribArray(loc.aPos);
+  gl.enableVertexAttribArray(loc.aUV);
+  gl.vertexAttribPointer(loc.aPos, 3, gl.FLOAT, false, 20,  0);
+  gl.vertexAttribPointer(loc.aUV,  2, gl.FLOAT, false, 20, 12);
+
+  // Column-major scale + translate model matrix
+  gl.uniformMatrix4fv(loc.uProj,  false, proj);
+  gl.uniformMatrix4fv(loc.uView,  false, view);
+  gl.uniformMatrix4fv(loc.uModel, false, new Float32Array([
+     w, 0, 0, 0,
+     0, h, 0, 0,
+     0, 0, 1, 0,
+    tx,ty,tz, 1,
+  ]));
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(loc.uTex, 0);
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+}
+
+// Render left/right camera images as floating panels in the XR world.
+function renderCameras(pose) {
+  if (!xrProg || !pose) return;
+  const layer = xrSession.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+  for (const view of pose.views) {
+    const vp = layer.getViewport(view);
+    gl.viewport(vp.x, vp.y, vp.width, vp.height);
+    const proj = view.projectionMatrix;
+    const vm   = view.transform.inverse.matrix;
+    // Side-by-side, 1.2 m ahead, at roughly eye height
+    if (camTex.left_rgb)  drawQuad(proj, vm, -0.28, 1.5, -1.2, 0.45, 0.27, camTex.left_rgb);
+    if (camTex.right_rgb) drawQuad(proj, vm,  0.28, 1.5, -1.2, 0.45, 0.27, camTex.right_rgb);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
 
 // ─── Entry point ─────────────────────────────────────────────────────────
-// requestSession MUST be called directly from a user gesture — do it first,
-// then connect the socket afterward.
 async function startAll() {
   document.getElementById('btn').disabled = true;
-
-  // 1. Request XR session immediately — still in user gesture context
-  if (!await startXR()) {
-    document.getElementById('btn').disabled = false;
-    return;
-  }
-
-  // 2. Connect Socket.IO after XR is granted
+  if (!await startXR()) { document.getElementById('btn').disabled = false; return; }
   setStatus('XR active — connecting socket…', 'ok');
   socket = io({ reconnectionDelay: 500 });
   socket.on('connect',       () => setStatus('XR active — streaming…', 'ok'));
   socket.on('disconnect',    () => setStatus('Socket disconnected — reconnecting…', ''));
   socket.on('connect_error', (e) => setStatus(`Socket error: ${e.message}`, 'err'));
-  socket.on('camera_frame', (d) => {
-    const panel = document.getElementById('cameras');
-    panel.classList.remove('hidden');
-    if (d.left_rgb)  document.getElementById('cam-left').src  = 'data:image/jpeg;base64,' + d.left_rgb;
-    if (d.right_rgb) document.getElementById('cam-right').src = 'data:image/jpeg;base64,' + d.right_rgb;
-    if (d.depth)     document.getElementById('cam-depth').src = 'data:image/jpeg;base64,' + d.depth;
+  socket.on('camera_frame',  (d) => {
+    updateCamTex('left_rgb',  d.left_rgb);
+    updateCamTex('right_rgb', d.right_rgb);
   });
 }
 
 // ─── WebXR ────────────────────────────────────────────────────────────────
-// Returns true on success, false on failure.
 async function startXR() {
   if (!navigator.xr) { setStatus('WebXR not supported.', 'err'); return false; }
-
-  // Try immersive-ar (passthrough) first, fall back to immersive-vr
-  let mode = 'immersive-ar';
+  xrMode = 'immersive-ar';
   if (!await navigator.xr.isSessionSupported('immersive-ar')) {
     if (!await navigator.xr.isSessionSupported('immersive-vr')) {
-      setStatus('No immersive XR supported on this device.', 'err'); return false;
+      setStatus('No immersive XR supported.', 'err'); return false;
     }
-    mode = 'immersive-vr';
+    xrMode = 'immersive-vr';
   }
-
   try {
     setStatus('Requesting XR session…', '');
-    const sessionInit = {
+    // No dom-overlay: the browser panel will not be shown during the XR session,
+    // so the Quest OS will not intercept controller inputs for panel interaction.
+    xrSession = await navigator.xr.requestSession(xrMode, {
       requiredFeatures: ['local-floor'],
-      optionalFeatures: mode === 'immersive-ar' ? ['dom-overlay'] : [],
-    };
-    if (mode === 'immersive-ar' && sessionInit.optionalFeatures.includes('dom-overlay')) {
-      sessionInit.domOverlay = { root: document.body };
-    }
-    xrSession = await navigator.xr.requestSession(mode, sessionInit);
+    });
     xrRefSpace = await xrSession.requestReferenceSpace('local-floor');
 
-    // Required: attach a WebGL render target so the XR runtime schedules frames
     const canvas = document.getElementById('xrcanvas');
-    const gl = canvas.getContext('webgl2', { xrCompatible: true });
+    gl = canvas.getContext('webgl2', { xrCompatible: true, alpha: true });
     await gl.makeXRCompatible();
-    xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl) });
+    xrSession.updateRenderState({
+      baseLayer: new XRWebGLLayer(xrSession, gl, { alpha: true }),
+    });
+    initXRRenderer();
 
     xrSession.addEventListener('end', () => {
+      rightSqueezeDown = false;
       setStatus('XR session ended.', '');
       document.getElementById('btn').disabled = false;
+    });
+    xrSession.addEventListener('squeezestart', (ev) => {
+      if (ev.inputSource.handedness === 'right') rightSqueezeDown = true;
+    });
+    xrSession.addEventListener('squeezeend', (ev) => {
+      if (ev.inputSource.handedness === 'right') rightSqueezeDown = false;
     });
     xrSession.requestAnimationFrame(onXRFrame);
     return true;
@@ -127,15 +240,9 @@ async function startXR() {
 }
 
 function isControllerSource(src) {
-  const profiles = src.profiles || [];
-
-  // Quest Touch controllers usually expose gamepad input and tracked-pointer
   if (!src.gamepad) return false;
   if (src.targetRayMode !== 'tracked-pointer') return false;
-
-  // Reject hand-tracking related profiles if present
-  if (profiles.some(p => p.toLowerCase().includes('hand'))) return false;
-
+  if ((src.profiles || []).some(p => p.toLowerCase().includes('hand'))) return false;
   return !!src.gripSpace;
 }
 
@@ -147,6 +254,15 @@ function onXRFrame(t, frame) {
   const viewerPose = frame.getViewerPose(xrRefSpace);
   if (!viewerPose) return;
 
+  // Clear XR framebuffer — alpha=0 gives passthrough in AR, alpha=1 gives black in VR
+  const layer = xrSession.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+  gl.clearColor(0, 0, 0, xrMode === 'immersive-ar' ? 0 : 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  renderCameras(viewerPose);
+
   const head = poseToDict(viewerPose.transform);
   let leftWrist  = identityPose();
   let rightWrist = identityPose();
@@ -154,17 +270,11 @@ function onXRFrame(t, frame) {
   let rightCtrl  = defaultCtrl();
   for (const src of frame.session.inputSources) {
     if (!isControllerSource(src)) continue;
-
     const gp = frame.getPose(src.gripSpace, xrRefSpace);
     if (!gp) continue;
     const pd = poseToDict(gp.transform);
-    if (src.handedness === 'left') {
-      leftWrist = pd;
-      leftCtrl = readGamepad(src.gamepad);
-    } else if (src.handedness === 'right') {
-      rightWrist = pd;
-      rightCtrl = readGamepad(src.gamepad);
-    }
+    if (src.handedness === 'left')       { leftWrist  = pd; leftCtrl  = readGamepad(src.gamepad); }
+    else if (src.handedness === 'right') { rightWrist = pd; rightCtrl = readGamepad(src.gamepad); }
   }
 
   const msg = {
@@ -172,41 +282,46 @@ function onXRFrame(t, frame) {
     left_index_trigger:     leftCtrl.index,
     right_index_trigger:    rightCtrl.index,
     left_squeeze:           leftCtrl.squeeze,
-    right_squeeze:          rightCtrl.squeeze,
+    right_squeeze:          rightSqueezeDown ? 1.0 : rightCtrl.squeeze,
     left_thumbstick:        leftCtrl.stick,
     right_thumbstick:       rightCtrl.stick,
     left_thumbstick_click:  leftCtrl.stickClick,
     right_thumbstick_click: rightCtrl.stickClick,
+    right_a_button:         rightCtrl.a,
+    right_b_button:         rightCtrl.b_btn,
+    left_x_button:          leftCtrl.a,    // X on left controller (buttons[4])
+    left_y_button:          leftCtrl.b_btn, // Y on left controller (buttons[5])
   };
 
   if (socket && socket.connected && (t - lastSendTs >= SEND_MS)) {
     socket.emit('pose_data', msg);
     lastSendTs = t;
   }
-
   updateFps();
   updatePreview(msg);
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────
 function poseToDict(tf) {
   const p = tf.position, q = tf.orientation;
   return { pos: [p.x, p.y, p.z], quat: [q.w, q.x, q.y, q.z] };
 }
 function identityPose() { return { pos: [0,0,0], quat: [1,0,0,0] }; }
-function defaultCtrl()   { return { index: 0, squeeze: 0, stick: [0,0], stickClick: false }; }
+function defaultCtrl()  { return { index:0, squeeze:0, stick:[0,0], stickClick:false, a:false, b_btn:false }; }
 
 function readGamepad(gp) {
   const b = (i) => gp.buttons[i] ? gp.buttons[i].value   : 0;
   const p = (i) => gp.buttons[i] ? gp.buttons[i].pressed : false;
-  return { index: b(0), squeeze: b(1), stick: [gp.axes[2]??0, gp.axes[3]??0], stickClick: p(3) };
+  return { index:b(0), squeeze:b(1), stick:[gp.axes[2]??0, gp.axes[3]??0],
+           stickClick:p(3), a:p(4), b_btn:p(5) };
 }
 
 function updateFps() {
   frameCount++;
   const now = performance.now();
   if (now - lastFpsTs >= 1000) {
-    document.getElementById('fps').textContent = `${(frameCount*1000/(now-lastFpsTs)).toFixed(1)} fps`;
+    document.getElementById('fps').textContent =
+      `${(frameCount*1000/(now-lastFpsTs)).toFixed(1)} fps`;
     frameCount = 0; lastFpsTs = now;
   }
 }
@@ -221,8 +336,7 @@ function updatePreview(m) {
 
 function setStatus(text, cls) {
   const el = document.getElementById('status');
-  el.textContent = text;
-  el.className = cls;
+  el.textContent = text; el.className = cls;
 }
 </script>
 </body>

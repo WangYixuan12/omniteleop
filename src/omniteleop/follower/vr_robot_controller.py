@@ -11,13 +11,13 @@ Data flow::
     VRRobotController
         ├─ estop handling
         ├─ head joint positions
-        ├─ arm joint positions  (stage C only)
-        └─ chassis velocity     (stage C only, if robot has base)
+        ├─ arm joint positions  (whole_body stage only)
+        └─ chassis velocity     (whole_body stage only, if robot has base)
 
 Calibration stages (as published by vr_reader):
-  A  — head tracking, estop=True  → robot head moves, arms frozen
-  B  — approaching, estop=True    → same as A from controller perspective
-  C  — live teleop, estop=False   → all components active
+  static / head          — estop=True  → robot head moves, arms frozen
+  whole_body_alignment   — estop=True  → same as above from controller perspective
+  whole_body             — estop=False → all components active
 
 Usage::
 
@@ -32,26 +32,32 @@ import time
 from enum import Enum
 from typing import Optional
 
-import tyro
-from loguru import logger
 import numpy as np
-
+import tyro
+from dexbot_utils import RobotInfo
 from dexcomm import Node, RateLimiter
 from dexcomm.codecs import DictDataCodec
 from dexcontrol.robot import Robot
+from loguru import logger
 
 from omniteleop import LIB_PATH
 from omniteleop.common import get_config
+from omniteleop.common.debug_display import get_debug_display
 from omniteleop.common.logging import setup_logging
 from omniteleop.common.schemas import VRJointData
-from omniteleop.common.debug_display import get_debug_display
-from dexbot_utils import RobotInfo
+from omniteleop.common.vr_mode_const import (
+    INIT_HEAD_JOINTS,
+    INIT_LEFT_ARM_JOINTS,
+    INIT_RIGHT_ARM_JOINTS,
+    INIT_TORSO_JOINTS,
+)
+from omniteleop.follower.robotiq import build_hande_command, send_activate
 
 
 class _Mode(Enum):
     RUNNING = "running"
-    STOP    = "stop"
-    EXIT    = "exit"
+    STOP = "stop"
+    EXIT = "exit"
 
 
 class VRRobotController:
@@ -65,8 +71,8 @@ class VRRobotController:
     ) -> None:
         self.node = Node(name="vr_robot_controller", namespace=namespace)
 
-        robot_info      = RobotInfo()
-        self.has_torso   = robot_info.has_torso
+        robot_info = RobotInfo()
+        self.has_torso = robot_info.has_torso
         self.has_chassis = robot_info.has_chassis
 
         config_path = None
@@ -74,8 +80,8 @@ class VRRobotController:
             config_path = LIB_PATH / "configs" / f"{config_name}.yaml"
         self.config = get_config(config_path)
 
-        self.control_rate  = self.config.get_rate("control_rate",  100)
-        self.feedback_rate = self.config.get_rate("feedback_rate",  50)
+        self.control_rate = self.config.get_rate("control_rate", 100)
+        self.feedback_rate = self.config.get_rate("feedback_rate", 50)
 
         # Zenoh subscriber for VR joint data
         vr_topic = self.config.get_topic("vr_joints", "vr/joints")
@@ -88,10 +94,14 @@ class VRRobotController:
         self.joint_pub = self.node.create_publisher(joint_topic, encoder=DictDataCodec.encode)
 
         self._latest: Optional[VRJointData] = None
-        self._mode   = _Mode.STOP
-        self.robot: Optional[Robot] = None
+        self._mode = _Mode.STOP
+        self.initialize()
 
-        self._debug_display = get_debug_display("VRRobotController", self.control_rate, refresh_rate=10) if debug else None
+        self._debug_display = (
+            get_debug_display("VRRobotController", self.control_rate, refresh_rate=10)
+            if debug
+            else None
+        )
 
     # ── Zenoh callback ─────────────────────────────────────────────────────────
 
@@ -106,48 +116,60 @@ class VRRobotController:
         logger.info("Initialising robot hardware ...")
         self.robot = Robot()
         self._set_home_position()
+        send_activate(self.robot.left_arm)
+        send_activate(self.robot.right_arm)
         self._mode = _Mode.STOP
         logger.success("VRRobotController ready.")
 
     def _set_home_position(self) -> None:
-        torso_init = [np.pi/6.0, np.pi/3.0, np.pi/6.0]
-        head_init  = [0.0, 0.0, 0.0]
-        left_arm_init  = [np.pi/2.0, 0.0, 0.0, -np.pi/2.0, 0.0, 0.0, 0.0]
-        right_arm_init = [-np.pi/2.0, 0.0, 0.0, -np.pi/2.0, 0.0, 0.0, 0.0]
-
         self.robot.estop.deactivate()
         time.sleep(0.1)
 
         joint_delta = 0.01
-        
+
         # interpolate torso to target position
         curr_torso = self.robot.torso.get_joint_pos()
-        steps = int(max(abs(np.array(torso_init) - np.array(curr_torso))) / joint_delta)
+        steps = int(max(abs(np.array(INIT_TORSO_JOINTS) - np.array(curr_torso))) / joint_delta)
         for i in range(steps):
-            interp_torso = np.array(curr_torso) + (np.array(torso_init) - np.array(curr_torso)) * (i+1) / steps
+            interp_torso = (
+                np.array(curr_torso)
+                + (np.array(INIT_TORSO_JOINTS) - np.array(curr_torso)) * (i + 1) / steps
+            )
             self.robot.torso.set_joint_pos(interp_torso.tolist(), wait_time=0.1, exit_on_reach=True)
-        
+
         # interpolate left arm to target position
         curr_left = self.robot.left_arm.get_joint_pos()
-        steps = int(max(abs(np.array(left_arm_init) - np.array(curr_left))) / joint_delta)
+        steps = int(max(abs(np.array(INIT_LEFT_ARM_JOINTS) - np.array(curr_left))) / joint_delta)
         for i in range(steps):
-            interp_left = np.array(curr_left) + (np.array(left_arm_init) - np.array(curr_left)) * (i+1) / steps
-            self.robot.left_arm.set_joint_pos(interp_left.tolist(), wait_time=0.1, exit_on_reach=True)
-        
+            interp_left = (
+                np.array(curr_left)
+                + (np.array(INIT_LEFT_ARM_JOINTS) - np.array(curr_left)) * (i + 1) / steps
+            )
+            self.robot.left_arm.set_joint_pos(
+                interp_left.tolist(), wait_time=0.1, exit_on_reach=True
+            )
+
         # interpolate right arm to target position
         curr_right = self.robot.right_arm.get_joint_pos()
-        steps = int(max(abs(np.array(right_arm_init) - np.array(curr_right))) / joint_delta)
+        steps = int(max(abs(np.array(INIT_RIGHT_ARM_JOINTS) - np.array(curr_right))) / joint_delta)
         for i in range(steps):
-            interp_right = np.array(curr_right) + (np.array(right_arm_init) - np.array(curr_right)) * (i+1) / steps
-            self.robot.right_arm.set_joint_pos(interp_right.tolist(), wait_time=0.1, exit_on_reach=True)
-        
+            interp_right = (
+                np.array(curr_right)
+                + (np.array(INIT_RIGHT_ARM_JOINTS) - np.array(curr_right)) * (i + 1) / steps
+            )
+            self.robot.right_arm.set_joint_pos(
+                interp_right.tolist(), wait_time=0.1, exit_on_reach=True
+            )
+
         # interpolate head to target position
         curr_head = self.robot.head.get_joint_pos()
-        steps = int(max(abs(np.array(head_init) - np.array(curr_head))) / joint_delta)
+        steps = int(max(abs(np.array(INIT_HEAD_JOINTS) - np.array(curr_head))) / joint_delta)
         for i in range(steps):
-            interp_head = np.array(curr_head) + (np.array(head_init) - np.array(curr_head)) * (i+1) / steps
+            interp_head = (
+                np.array(curr_head)
+                + (np.array(INIT_HEAD_JOINTS) - np.array(curr_head)) * (i + 1) / steps
+            )
             self.robot.head.set_joint_pos(interp_head.tolist(), wait_time=0.1, exit_on_reach=True)
-        
 
         self.robot.estop.activate()
         logger.info("Robot at home position.")
@@ -160,17 +182,19 @@ class VRRobotController:
         while self._feedback_running:
             try:
                 positions = {
-                    "left_arm":  self.robot.left_arm.get_joint_pos().tolist(),
+                    "left_arm": self.robot.left_arm.get_joint_pos().tolist(),
                     "right_arm": self.robot.right_arm.get_joint_pos().tolist(),
-                    "head":      self.robot.head.get_joint_pos().tolist(),
+                    "head": self.robot.head.get_joint_pos().tolist(),
                 }
                 if self.has_torso:
                     positions["torso"] = self.robot.torso.get_joint_pos().tolist()
 
-                self.joint_pub.publish({
-                    "timestamp_ns": time.time_ns(),
-                    "joints": positions,
-                })
+                self.joint_pub.publish(
+                    {
+                        "timestamp_ns": time.time_ns(),
+                        "joints": positions,
+                    }
+                )
             except Exception as e:
                 logger.warning(f"Joint feedback error: {e}")
             rate.sleep()
@@ -178,6 +202,7 @@ class VRRobotController:
     # ── Control loop ───────────────────────────────────────────────────────────
 
     def run(self) -> None:
+        """Main control loop: read latest VRJointData and drive robot hardware."""
         self._feedback_running = True
         feedback_thread = threading.Thread(
             target=self._publish_joint_feedback, daemon=True, name="JointFeedback"
@@ -220,12 +245,21 @@ class VRRobotController:
                 if vr.head_pos:
                     self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
 
-                # ── Arms + grippers + chassis (stage C only) ──────────────────
-                if vr.calib_stage == "C":
+                # ── Arms (resetting + whole_body) ─────────────────────────────
+                if vr.calib_stage in ("resetting", "whole_body"):
                     if vr.left_arm_pos:
                         self.robot.left_arm.set_joint_pos(vr.left_arm_pos, wait_time=0.0)
                     if vr.right_arm_pos:
                         self.robot.right_arm.set_joint_pos(vr.right_arm_pos, wait_time=0.0)
+
+                # ── Grippers + chassis (whole_body only) ──────────────────────
+                if vr.calib_stage == "whole_body":
+                    # self.robot.left_arm.send_ee_pass_through_message(
+                    #     build_hande_command(vr.left_gripper)
+                    # )
+                    self.robot.right_arm.send_ee_pass_through_message(
+                        build_hande_command(vr.right_gripper)
+                    )
 
                     if self.has_chassis and (vr.chassis_vx or vr.chassis_vy or vr.chassis_wz):
                         self.robot.chassis.set_velocity(
@@ -244,7 +278,11 @@ class VRRobotController:
                     if vr.right_arm_pos:
                         components["right_arm"] = {"pos": vr.right_arm_pos}
                     if self.has_chassis:
-                        components["chassis"] = {"vx": vr.chassis_vx, "vy": vr.chassis_vy, "wz": vr.chassis_wz}
+                        components["chassis"] = {
+                            "vx": vr.chassis_vx,
+                            "vy": vr.chassis_vy,
+                            "wz": vr.chassis_wz,
+                        }
                     self._debug_display.print_robot_command(
                         components,
                         safety_flags={"estop": vr.estop},
@@ -260,6 +298,7 @@ class VRRobotController:
             self.cleanup()
 
     def cleanup(self) -> None:
+        """Clean up resources on shutdown."""
         if self.robot:
             self.robot.estop.activate()
             self.robot.shutdown()
@@ -268,6 +307,7 @@ class VRRobotController:
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
+
 
 def main(
     namespace: str = "",
@@ -281,7 +321,6 @@ def main(
     """
     setup_logging(debug)
     ctrl = VRRobotController(namespace=namespace, debug=debug, config_name=config_name)
-    ctrl.initialize()
     ctrl.run()
 
 

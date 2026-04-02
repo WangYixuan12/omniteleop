@@ -41,7 +41,7 @@ import asyncio
 import os
 import threading
 import time
-from typing import Optional
+from typing import Optional, TypedDict
 
 import aiohttp.web
 import numpy as np
@@ -50,6 +50,28 @@ from loguru import logger
 from pytransform3d import transformations as pt
 
 _HTML_PATH = os.path.join(os.path.dirname(__file__), "..", "web", "vr_client.html")
+
+
+class VRFrame(TypedDict):
+    """Processed pose frame exposed by WebXRVRReader.get_latest_transformation()."""
+
+    head: np.ndarray
+    left_wrist: np.ndarray
+    right_wrist: np.ndarray
+    left_hand_trigger: float
+    right_hand_trigger: float
+    left_index_trigger: float
+    right_index_trigger: float
+    left_grip_trigger: float
+    right_grip_trigger: float
+    left_thumbstick: list[float]
+    right_thumbstick: list[float]
+    left_thumbstick_click: bool
+    right_thumbstick_click: bool
+    right_a_button: bool
+    right_b_button: bool
+    left_x_button: bool
+    left_y_button: bool
 
 
 def head_transform(qworld_t_xrquest: np.ndarray) -> np.ndarray:
@@ -94,7 +116,7 @@ def _json_pose_to_matrix(pos: list, quat: list) -> np.ndarray:
     return mat
 
 
-def _process_frame(frame: dict) -> dict:
+def _process_frame(frame: dict) -> VRFrame:
     """Convert raw JSON pose frame from browser to robot-frame matrices."""
     head_mat = head_transform(_json_pose_to_matrix(frame["head"]["pos"], frame["head"]["quat"]))
     left_wrist = left_eef_transform(
@@ -103,21 +125,25 @@ def _process_frame(frame: dict) -> dict:
     right_wrist = right_eef_transform(
         _json_pose_to_matrix(frame["right_wrist"]["pos"], frame["right_wrist"]["quat"])
     )
-    return {
-        "head": head_mat,
-        "left_wrist": left_wrist,
-        "right_wrist": right_wrist,
-        "left_hand_trigger": float(frame.get("left_squeeze", 0.0)),
-        "right_hand_trigger": float(frame.get("right_squeeze", 0.0)),
-        "left_index_trigger": float(frame.get("left_index_trigger", 0.0)),
-        "right_index_trigger": float(frame.get("right_index_trigger", 0.0)),
-        "left_grip_trigger": float(frame.get("left_squeeze", 0.0)),
-        "right_grip_trigger": float(frame.get("right_squeeze", 0.0)),
-        "left_thumbstick": list(frame.get("left_thumbstick", [0.0, 0.0])),
-        "right_thumbstick": list(frame.get("right_thumbstick", [0.0, 0.0])),
-        "left_thumbstick_click": bool(frame.get("left_thumbstick_click", False)),
-        "right_thumbstick_click": bool(frame.get("right_thumbstick_click", False)),
-    }
+    return VRFrame(
+        head=head_mat,
+        left_wrist=left_wrist,
+        right_wrist=right_wrist,
+        left_hand_trigger=float(frame.get("left_squeeze", 0.0)),
+        right_hand_trigger=float(frame.get("right_squeeze", 0.0)),
+        left_index_trigger=float(frame.get("left_index_trigger", 0.0)),
+        right_index_trigger=float(frame.get("right_index_trigger", 0.0)),
+        left_grip_trigger=float(frame.get("left_squeeze", 0.0)),
+        right_grip_trigger=float(frame.get("right_squeeze", 0.0)),
+        left_thumbstick=list(frame.get("left_thumbstick", [0.0, 0.0])),
+        right_thumbstick=list(frame.get("right_thumbstick", [0.0, 0.0])),
+        left_thumbstick_click=bool(frame.get("left_thumbstick_click", False)),
+        right_thumbstick_click=bool(frame.get("right_thumbstick_click", False)),
+        right_a_button=bool(frame.get("right_a_button", False)),
+        right_b_button=bool(frame.get("right_b_button", False)),
+        left_x_button=bool(frame.get("left_x_button", False)),
+        left_y_button=bool(frame.get("left_y_button", False)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +174,7 @@ class WebXRVRReader:
         self.ssl_certfile = ssl_certfile
         self.ssl_keyfile = ssl_keyfile
 
-        self._latest: dict[str, np.ndarray] = {}
+        self._latest: Optional[VRFrame] = None
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
@@ -192,7 +218,7 @@ class WebXRVRReader:
         scheme = "https" if self.ssl_certfile else "http"
         logger.info(f"WebXRVRReader: serving on {scheme}://{self.host}:{self.port}")
 
-    def get_latest_transformation(self) -> dict[str, np.ndarray]:
+    def get_latest_transformation(self) -> Optional[VRFrame]:
         """Return the most recent processed pose frame, or None if no data yet."""
         with self._lock:
             return self._latest
