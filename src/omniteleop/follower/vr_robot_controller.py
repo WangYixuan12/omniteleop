@@ -123,6 +123,7 @@ class VRRobotController:
 
     def _set_home_position(self) -> None:
         self.robot.estop.deactivate()
+        self.robot.head.set_mode("enable")
         time.sleep(0.1)
 
         joint_delta = 0.01
@@ -239,6 +240,7 @@ class VRRobotController:
                 # ── Estop released ────────────────────────────────────────────
                 if self._mode == _Mode.STOP:
                     self.robot.estop.deactivate()
+                    self.robot.head.set_mode("enable")
                     self._mode = _Mode.RUNNING
 
                 # ── Head ──────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 import time
 
-from dexcontrol.robot import Arm, Robot
+from dexcontrol.robot import Robot
+from dexcontrol.core.arm import Arm
 
 SLAVE_ID = 0x09
 
