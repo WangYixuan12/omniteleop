@@ -426,10 +426,10 @@ class VRReader:
             cv2.putText(
                 img,
                 text,
-                (20, 60),
+                (10, 30),
                 fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                fontScale=2,
-                thickness=4,
+                fontScale=1,
+                thickness=2,
                 color=(255, 255, 255),
             )
             small = cv2.resize(img[:, :, ::-1], (320, 180))
