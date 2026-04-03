@@ -122,8 +122,8 @@ class VRRobotController:
         logger.success("VRRobotController ready.")
 
     def _set_home_position(self) -> None:
-        self.robot.estop.deactivate()
-        self.robot.head.set_mode("enable")
+        # self.robot.estop.deactivate()
+        # self.robot.head.set_mode("enable")
         time.sleep(0.1)
 
         joint_delta = 0.01
@@ -172,7 +172,7 @@ class VRRobotController:
             )
             self.robot.head.set_joint_pos(interp_head.tolist(), wait_time=0.1, exit_on_reach=True)
 
-        self.robot.estop.activate()
+        # self.robot.estop.activate()
         logger.info("Robot at home position.")
 
     # ── Joint feedback ─────────────────────────────────────────────────────────
@@ -224,7 +224,7 @@ class VRRobotController:
                 # ── Estop ─────────────────────────────────────────────────────
                 if vr.estop:
                     if self._mode != _Mode.STOP:
-                        self.robot.estop.activate()
+                        # self.robot.estop.activate()
                         self._mode = _Mode.STOP
                     # Head still moves during A/B stages (estop=True but head tracks)
                     if vr.head_pos:
@@ -239,8 +239,8 @@ class VRRobotController:
 
                 # ── Estop released ────────────────────────────────────────────
                 if self._mode == _Mode.STOP:
-                    self.robot.estop.deactivate()
-                    self.robot.head.set_mode("enable")
+                    # self.robot.estop.deactivate()
+                    # self.robot.head.set_mode("enable")
                     self._mode = _Mode.RUNNING
 
                 # ── Head ──────────────────────────────────────────────────────
@@ -248,11 +248,21 @@ class VRRobotController:
                     self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
 
                 # ── Arms (resetting + whole_body) ─────────────────────────────
-                if vr.calib_stage in ("resetting", "whole_body"):
+                if vr.calib_stage in ("resetting", "whole_body", "whole_body_alignment"):
                     if vr.left_arm_pos:
-                        self.robot.left_arm.set_joint_pos(vr.left_arm_pos, wait_time=0.0)
+                        self.robot.left_arm.set_joint_pos(vr.left_arm_pos)
+                        left_arm_error = np.abs(np.array(vr.left_arm_pos) - self.robot.left_arm.get_joint_pos())
+                        if np.any(left_arm_error > 0.2):
+                            logger.info(f"Commanded left arm pos: {vr.left_arm_pos}")
+                            logger.info(f"Current left arm pos: {self.robot.left_arm.get_joint_pos()}")
+                            print("Warning: Large left arm error:", left_arm_error)
                     if vr.right_arm_pos:
-                        self.robot.right_arm.set_joint_pos(vr.right_arm_pos, wait_time=0.0)
+                        self.robot.right_arm.set_joint_pos(vr.right_arm_pos)
+                        right_arm_error = np.abs(np.array(vr.right_arm_pos) - self.robot.right_arm.get_joint_pos())
+                        if np.any(right_arm_error > 0.2):
+                            logger.info("Commanded right arm pos:", vr.right_arm_pos)
+                            logger.info("Current right arm pos:", self.robot.right_arm.get_joint_pos())
+                            print("Warning: Large right arm error:", right_arm_error)
 
                 # ── Grippers + chassis (whole_body only) ──────────────────────
                 if vr.calib_stage == "whole_body":
@@ -302,7 +312,7 @@ class VRRobotController:
     def cleanup(self) -> None:
         """Clean up resources on shutdown."""
         if self.robot:
-            self.robot.estop.activate()
+            # self.robot.estop.activate()
             self.robot.shutdown()
         self.node.shutdown()
         logger.info("VRRobotController cleaned up.")
