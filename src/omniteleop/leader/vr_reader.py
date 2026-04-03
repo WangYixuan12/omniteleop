@@ -414,18 +414,12 @@ class VRReader:
     # ── Camera polling ─────────────────────────────────────────────────────────
 
     def _camera_poll(self) -> None:
-        imgs = self._cam_robot.sensors.head_camera.get_obs(
-            obs_keys=["left_rgb", "right_rgb", "depth"]
-        )
-        self._last_imgs = imgs
-        self._last_depth_u16 = np.clip(imgs["depth"] * 1000, 0, 65535).astype(np.uint16)
-
         vis_imgs = []
         for key in ("left_rgb", "right_rgb"):
-            img = imgs[key]
+            img = self._last_imgs[key]
             small = cv2.resize(img[:, :, ::-1], (320, 180))
             vis_imgs.append(small)
-        depth = imgs["depth"]
+        depth = self._last_imgs["depth"]
         finite = depth[np.isfinite(depth) & (depth > 0)]
         if len(finite) == 0:
             normalized = np.zeros(depth.shape[:2], dtype=np.uint8)
@@ -442,7 +436,7 @@ class VRReader:
         if self.recorder.recording:
             text += f", Recording! Step: {self.recorder.num_frames()}"
         cv2.putText(
-            img,
+            vis_img,
             text,
             (10, 30),
             fontFace=cv2.FONT_HERSHEY_SIMPLEX,
@@ -753,13 +747,20 @@ class VRReader:
         console.rule("[bold cyan]Stage static — hold right trigger ≥ 1 s to start head tracking")
 
         try:
+            step = 0
             while self.running:
                 transforms = self.quest.get_latest_transformation()
                 if transforms is None:
                     rate_limiter.sleep()
                     continue
 
-                # self._camera_poll()
+                imgs = self._cam_robot.sensors.head_camera.get_obs(
+                    obs_keys=["left_rgb", "right_rgb", "depth"]
+                )
+                self._last_imgs = imgs
+                self._last_depth_u16 = np.clip(imgs["depth"] * 1000, 0, 65535).astype(np.uint16)
+                if step % 4 == 0:
+                    self._camera_poll()
                 vr_head = transforms["head"]
                 vr_l = transforms["left_wrist"]
                 vr_r = transforms["right_wrist"]
