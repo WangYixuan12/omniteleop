@@ -71,6 +71,7 @@ from omniteleop.common.debug_display import get_debug_display
 from omniteleop.common.log_utils import suppress_loguru_module
 from omniteleop.common.logging import setup_logging
 from omniteleop.common.schemas import VRJointData
+from omniteleop.common.vis_utils import concat_img_h
 from omniteleop.common.vr_mode_const import (
     INIT_HEAD_JOINTS,
     INIT_JOINTS_DICT,
@@ -226,7 +227,7 @@ class VRReader:
         stick_max_vy: float = 0.2,
         stick_max_wz: float = 0.5,
         stick_deadzone: float = 0.1,
-        publish_rate: float = 10.0,
+        publish_rate: float = 40.0,
         debug: bool = False,
         visualize: bool = False,
         urdf_path: Optional[str] = None,
@@ -273,7 +274,9 @@ class VRReader:
         # MotionManager + ArmProcessors
         logger.info("Initialising MotionManager ...")
         robot_info = RobotInfo()
-        self.mm = MotionManager(init_visualizer=False, joint_regions_to_lock=["BASE"])
+        self.mm = MotionManager(
+            init_visualizer=False, visualizer_type="viser", joint_regions_to_lock=["BASE"]
+        )
         self.mm.left_arm.set_joint_pos(INIT_LEFT_ARM_JOINTS)
         self.mm.right_arm.set_joint_pos(INIT_RIGHT_ARM_JOINTS)
         self.mm.torso.set_joint_pos(INIT_TORSO_JOINTS)
@@ -417,24 +420,11 @@ class VRReader:
         self._last_imgs = imgs
         self._last_depth_u16 = np.clip(imgs["depth"] * 1000, 0, 65535).astype(np.uint16)
 
+        vis_imgs = []
         for key in ("left_rgb", "right_rgb"):
             img = imgs[key]
-            episode_id: int = self.recorder.episode_id
-            text: str = f"Episode: {episode_id}"
-            if self.recorder.recording:
-                text += f", Recording! Step: {self.recorder.num_frames()}"
-            cv2.putText(
-                img,
-                text,
-                (10, 30),
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                fontScale=1,
-                thickness=2,
-                color=(255, 255, 255),
-            )
             small = cv2.resize(img[:, :, ::-1], (320, 180))
-            _, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 40])
-            self.quest.set_frame_vis(key, base64.b64encode(buf).decode())
+            vis_imgs.append(small)
         depth = imgs["depth"]
         finite = depth[np.isfinite(depth) & (depth > 0)]
         if len(finite) == 0:
@@ -443,8 +433,25 @@ class VRReader:
             mn, mx = finite.min(), np.percentile(finite, 95)
             normalized = np.clip((depth - mn) / (mx - mn + 1e-6) * 255, 0, 255).astype(np.uint8)
         colored = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
-        _, buf = cv2.imencode(".jpg", colored, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        self.quest.set_frame_vis("depth", base64.b64encode(buf).decode())
+        colored = cv2.resize(colored, (320, 180))
+        vis_imgs.append(colored)
+
+        vis_img = concat_img_h(vis_imgs)
+        episode_id: int = self.recorder.episode_id
+        text: str = f"Episode: {episode_id}"
+        if self.recorder.recording:
+            text += f", Recording! Step: {self.recorder.num_frames()}"
+        cv2.putText(
+            img,
+            text,
+            (10, 30),
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=1,
+            thickness=2,
+            color=(255, 255, 255),
+        )
+        _, buf = cv2.imencode(".jpg", vis_img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        self.quest.set_frame_vis("img", base64.b64encode(buf).decode())
 
     # ── Per-step methods ───────────────────────────────────────────────────────
 
@@ -458,7 +465,7 @@ class VRReader:
             active_qmask=self.head_qmask,
             damp=1000.0,
         )
-        self.mm.torso.set_joint_pos(head_qpos[self.torso_indices].tolist())
+        # self.mm.torso.set_joint_pos(head_qpos[self.torso_indices].tolist())
         for i in np.where(self.head_qmask)[0]:
             self.current_qpos[i] = head_qpos[i]
         return [float(head_qpos[i]) for i in self.head_motor_indices]
@@ -684,7 +691,7 @@ class VRReader:
         chassis_vy: float,
         chassis_wz: float,
     ) -> None:
-        estop = self._calib_stage in ("static", "head", "whole_body_alignment")
+        estop = self._calib_stage in ("static", "head")
         data = VRJointData(
             timestamp_ns=time.time_ns(),
             head_pos=head_pos,
@@ -698,6 +705,7 @@ class VRReader:
             estop=estop,
             calib_stage=self._calib_stage,
         )
+        # logger.info(f"left_arm: {left_arm_pos}")
         self.vr_pub.publish(asdict(data))
 
     def _update_visualization(self, ik_l: Optional[np.ndarray], ik_r: Optional[np.ndarray]) -> bool:
@@ -751,7 +759,7 @@ class VRReader:
                     rate_limiter.sleep()
                     continue
 
-                self._camera_poll()
+                # self._camera_poll()
                 vr_head = transforms["head"]
                 vr_l = transforms["left_wrist"]
                 vr_r = transforms["right_wrist"]

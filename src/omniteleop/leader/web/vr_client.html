@@ -161,7 +161,10 @@ function drawQuad(proj, view, tx, ty, tz, w, h, tex) {
   gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
 }
 
-// Render left/right camera images as floating panels in the XR world.
+// Identity view matrix — renders quads in eye space so they follow head motion.
+const _eyeView = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+
+// Render left/right camera images as HUD panels locked to the viewer's gaze.
 function renderCameras(pose) {
   if (!xrProg || !pose) return;
   const layer = xrSession.renderState.baseLayer;
@@ -170,10 +173,8 @@ function renderCameras(pose) {
     const vp = layer.getViewport(view);
     gl.viewport(vp.x, vp.y, vp.width, vp.height);
     const proj = view.projectionMatrix;
-    const vm   = view.transform.inverse.matrix;
-    // Side-by-side, 1.2 m ahead, at roughly eye height
-    if (camTex.left_rgb)  drawQuad(proj, vm, -0.28, 1.5, -1.2, 0.45, 0.27, camTex.left_rgb);
-    if (camTex.right_rgb) drawQuad(proj, vm,  0.28, 1.5, -1.2, 0.45, 0.27, camTex.right_rgb);
+    // Use identity view → positions are in eye space (y=0 = eye height, -z = forward)
+    if (camTex.img)  drawQuad(proj, _eyeView, 0.0, -0.3, -1.2, 1.35, 0.27, camTex.img);
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
@@ -188,8 +189,7 @@ async function startAll() {
   socket.on('disconnect',    () => setStatus('Socket disconnected — reconnecting…', ''));
   socket.on('connect_error', (e) => setStatus(`Socket error: ${e.message}`, 'err'));
   socket.on('camera_frame',  (d) => {
-    updateCamTex('left_rgb',  d.left_rgb);
-    updateCamTex('right_rgb', d.right_rgb);
+    updateCamTex('img',  d.img);
   });
 }
 

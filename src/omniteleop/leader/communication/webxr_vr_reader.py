@@ -194,7 +194,6 @@ class WebXRVRReader:
         """Push a base64-encoded JPEG frame to be emitted to the browser.
 
         Called from outside (e.g. vr_reader.py camera callbacks).
-        ``key`` should be one of ``"left_rgb"``, ``"right_rgb"``, ``"depth"``.
         """
         with self._camera_lock:
             self._camera_frames[key] = b64_jpeg
