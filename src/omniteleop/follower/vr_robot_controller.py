@@ -252,23 +252,23 @@ class VRRobotController:
                     if vr.left_arm_pos:
                         self.robot.left_arm.set_joint_pos(vr.left_arm_pos)
                         left_arm_error = np.abs(np.array(vr.left_arm_pos) - self.robot.left_arm.get_joint_pos())
-                        if np.any(left_arm_error > 0.2):
+                        if np.any(left_arm_error > 0.3):
                             logger.info(f"Commanded left arm pos: {vr.left_arm_pos}")
                             logger.info(f"Current left arm pos: {self.robot.left_arm.get_joint_pos()}")
-                            print("Warning: Large left arm error:", left_arm_error)
+                            logger.warning(f"Warning: Large left arm error: {left_arm_error}")
                     if vr.right_arm_pos:
                         self.robot.right_arm.set_joint_pos(vr.right_arm_pos)
                         right_arm_error = np.abs(np.array(vr.right_arm_pos) - self.robot.right_arm.get_joint_pos())
-                        if np.any(right_arm_error > 0.2):
-                            logger.info("Commanded right arm pos:", vr.right_arm_pos)
-                            logger.info("Current right arm pos:", self.robot.right_arm.get_joint_pos())
-                            print("Warning: Large right arm error:", right_arm_error)
+                        if np.any(right_arm_error > 0.3):
+                            logger.info(f"Commanded right arm pos: {vr.right_arm_pos}")
+                            logger.info(f"Current right arm pos: {self.robot.right_arm.get_joint_pos()}")
+                            logger.warning(f"Warning: Large right arm error: {right_arm_error}")
 
                 # ── Grippers + chassis (whole_body only) ──────────────────────
                 if vr.calib_stage == "whole_body":
-                    # self.robot.left_arm.send_ee_pass_through_message(
-                    #     build_hande_command(vr.left_gripper)
-                    # )
+                    self.robot.left_arm.send_ee_pass_through_message(
+                        build_hande_command(vr.left_gripper)
+                    )
                     self.robot.right_arm.send_ee_pass_through_message(
                         build_hande_command(vr.right_gripper)
                     )
