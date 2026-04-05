@@ -59,6 +59,8 @@ import tyro
 from dexbot_utils import RobotInfo
 from dexcomm import Node, RateLimiter
 from dexcomm.codecs import DictDataCodec
+from dexcontrol.core.config import get_robot_config
+from dexcontrol.robot import Robot as _Robot
 from dexmotion.motion_manager import MotionManager
 from loguru import logger
 from rich.console import Console
@@ -101,6 +103,13 @@ INVALID_RIGHT_POSE = np.array(
         [0.0, 0.0, 0.0, 1.0],
     ]
 )
+
+# HARDCODED right now
+fx = 770.1868 / 2.0
+fy = 770.1868 / 2.0
+cx = 990.2711 / 2.0
+cy = 637.7721 / 2.0
+ZED_K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
 
 _HEAD_IK_JOINTS = {"head_j2", "head_j3"}
 _HEAD_MOTOR_JOINTS = ["head_j1", "head_j2", "head_j3"]
@@ -258,8 +267,6 @@ class VRReader:
         )
 
         # Camera polling via Robot API
-        from dexcontrol.core.config import get_robot_config
-        from dexcontrol.robot import Robot as _Robot
 
         configs = get_robot_config()
         configs.sensors["head_camera"].enabled = True
@@ -408,7 +415,7 @@ class VRReader:
         # stick y: up = negative on Quest → negate for forward = positive
         vx = -dz(left_thumbstick[1]) * self.stick_max_vx
         vy = -dz(left_thumbstick[0]) * self.stick_max_vy
-        wz = dz(right_thumbstick[0]) * self.stick_max_wz
+        wz = -dz(right_thumbstick[0]) * self.stick_max_wz
         return vx, vy, wz
 
     # ── Camera polling ─────────────────────────────────────────────────────────
@@ -670,6 +677,7 @@ class VRReader:
                     "left_rgb": self._last_imgs["left_rgb"],
                     "right_rgb": self._last_imgs["right_rgb"],
                     "depth": self._last_depth_u16,
+                    "instrinsic": ZED_K.astype(np.float32),
                 },
             },
         }
