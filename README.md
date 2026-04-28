@@ -7,7 +7,8 @@
 ## 📦 Installation
 
 ```shell
-pip install omniteleop
+git clone git@github.com:WangYixuan12/omniteleop.git
+pip install -e omniteleop/
 ```
 
 ## ✨ Features
