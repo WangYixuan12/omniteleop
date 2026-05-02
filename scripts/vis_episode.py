@@ -108,7 +108,7 @@ def voxel_downsample(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--hdf5", type=str, default="data/episode_0.hdf5", help="Path to episode HDF5 file"
+        "--hdf5", type=str, default="/media/yifan/portable_ssd/Dexmate/raw_data/episode_0.hdf5", help="Path to episode HDF5 file"
     )
     parser.add_argument("--fps", type=float, default=10.0, help="Playback speed (Hz)")
     parser.add_argument(

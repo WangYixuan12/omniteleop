@@ -661,6 +661,10 @@ class VRReader:
                     "chassis_vy": np.float32(vy),
                     "chassis_wz": np.float32(wz),
                 },
+                "gripper": {                                                                                                                                         
+                    "left": np.float32(transforms["left_index_trigger"]),                                                                                          
+                    "right": np.float32(transforms["right_index_trigger"]),                                                                                          
+                }, 
             },
             "obs": {
                 "joint": {
@@ -863,7 +867,7 @@ def main() -> None:
         urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"  # noqa
         """Path to robot URDF for Sapien visualizer (required if --visualize)"""
 
-        save_dir: str = "data"
+        save_dir: str = "/media/yifan/portable_ssd/Dexmate/raw_data/"
         """Directory to save HDF5 episodes (A=start, B=stop)"""
 
     args = tyro.cli(Args)

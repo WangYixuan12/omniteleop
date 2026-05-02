@@ -1,7 +1,7 @@
 import numpy as np
 
-INIT_HEAD_JOINTS = [-np.pi / 3.0, 0.0, 0.0]
-INIT_TORSO_JOINTS = [np.pi / 3.0, np.pi / 2.0, -np.pi / 6.0]
+INIT_HEAD_JOINTS = [-np.pi / 8.0, 0.0, 0.0]
+INIT_TORSO_JOINTS = [np.pi / 2.0, np.pi, np.pi / 8.0]
 INIT_LEFT_ARM_JOINTS = [np.pi / 3.0, 0.0, 0.0, -np.pi * 2.0 / 3.0, 0.0, 0.0, 0.0]
 INIT_RIGHT_ARM_JOINTS = [-np.pi / 3.0, 0.0, 0.0, -np.pi * 2.0 / 3.0, 0.0, 0.0, 0.0]
 INIT_JOINTS_DICT = {

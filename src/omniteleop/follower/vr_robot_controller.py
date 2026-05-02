@@ -227,8 +227,9 @@ class VRRobotController:
                         # self.robot.estop.activate()
                         self._mode = _Mode.STOP
                     # Head still moves during A/B stages (estop=True but head tracks)
-                    if vr.head_pos:
-                        self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
+                    # commented out to avoid head moving during A/B stages
+                    # if vr.head_pos:
+                    #     self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
                     if self._debug_display is not None and vr.head_pos:
                         self._debug_display.print_robot_command(
                             {"head": {"pos": vr.head_pos}},
@@ -244,8 +245,9 @@ class VRRobotController:
                     self._mode = _Mode.RUNNING
 
                 # ── Head ──────────────────────────────────────────────────────
-                if vr.head_pos:
-                    self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
+                # commented out to avoid head moving during A/B stages
+                # if vr.head_pos:
+                #     self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
 
                 # ── Arms (resetting + whole_body) ─────────────────────────────
                 if vr.calib_stage in ("resetting", "whole_body", "whole_body_alignment"):
