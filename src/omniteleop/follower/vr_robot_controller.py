@@ -83,6 +83,13 @@ class VRRobotController:
         self.control_rate = self.config.get_rate("control_rate", 100)
         self.feedback_rate = self.config.get_rate("feedback_rate", 50)
 
+        # "track" → follow vr.head_pos; "fixed" → hold at INIT_HEAD_JOINTS
+        self.head_mode = self.config.get("head_mode", "track")
+        if self.head_mode not in ("track", "fixed"):
+            raise ValueError(
+                f"Invalid head_mode={self.head_mode!r}; expected 'track' or 'fixed'"
+            )
+
         # Zenoh subscriber for VR joint data
         vr_topic = self.config.get_topic("vr_joints", "vr/joints")
         self.vr_sub = self.node.create_subscriber(
@@ -227,12 +234,16 @@ class VRRobotController:
                         # self.robot.estop.activate()
                         self._mode = _Mode.STOP
                     # Head still moves during A/B stages (estop=True but head tracks)
-                    # commented out to avoid head moving during A/B stages
-                    # if vr.head_pos:
-                    #     self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
-                    if self._debug_display is not None and vr.head_pos:
+                    head_target = (
+                        vr.head_pos if self.head_mode == "track" else INIT_HEAD_JOINTS
+                    )
+                    if head_target:
+                        self.robot.head.set_joint_pos(head_target, wait_time=0.0)
+                        print(f"Commanded head pos: {head_target}")
+                        print(f"Current head pos: {self.robot.head.get_joint_pos()}")
+                    if self._debug_display is not None and head_target:
                         self._debug_display.print_robot_command(
-                            {"head": {"pos": vr.head_pos}},
+                            {"head": {"pos": head_target}},
                             safety_flags={"estop": True},
                         )
                     rate.sleep()
@@ -245,25 +256,35 @@ class VRRobotController:
                     self._mode = _Mode.RUNNING
 
                 # ── Head ──────────────────────────────────────────────────────
-                # commented out to avoid head moving during A/B stages
-                # if vr.head_pos:
-                #     self.robot.head.set_joint_pos(vr.head_pos, wait_time=0.0)
+                head_target = (
+                    vr.head_pos if self.head_mode == "track" else INIT_HEAD_JOINTS
+                )
+                if head_target:
+                    self.robot.head.set_joint_pos(head_target, wait_time=0.0)
 
                 # ── Arms (resetting + whole_body) ─────────────────────────────
                 if vr.calib_stage in ("resetting", "whole_body", "whole_body_alignment"):
                     if vr.left_arm_pos:
                         self.robot.left_arm.set_joint_pos(vr.left_arm_pos)
-                        left_arm_error = np.abs(np.array(vr.left_arm_pos) - self.robot.left_arm.get_joint_pos())
+                        left_arm_error = np.abs(
+                            np.array(vr.left_arm_pos) - self.robot.left_arm.get_joint_pos()
+                        )
                         if np.any(left_arm_error > 0.3):
                             logger.info(f"Commanded left arm pos: {vr.left_arm_pos}")
-                            logger.info(f"Current left arm pos: {self.robot.left_arm.get_joint_pos()}")
+                            logger.info(
+                                f"Current left arm pos: {self.robot.left_arm.get_joint_pos()}"
+                            )
                             logger.warning(f"Warning: Large left arm error: {left_arm_error}")
                     if vr.right_arm_pos:
                         self.robot.right_arm.set_joint_pos(vr.right_arm_pos)
-                        right_arm_error = np.abs(np.array(vr.right_arm_pos) - self.robot.right_arm.get_joint_pos())
+                        right_arm_error = np.abs(
+                            np.array(vr.right_arm_pos) - self.robot.right_arm.get_joint_pos()
+                        )
                         if np.any(right_arm_error > 0.3):
                             logger.info(f"Commanded right arm pos: {vr.right_arm_pos}")
-                            logger.info(f"Current right arm pos: {self.robot.right_arm.get_joint_pos()}")
+                            logger.info(
+                                f"Current right arm pos: {self.robot.right_arm.get_joint_pos()}"
+                            )
                             logger.warning(f"Warning: Large right arm error: {right_arm_error}")
 
                 # ── Grippers + chassis (whole_body only) ──────────────────────
@@ -285,8 +306,8 @@ class VRRobotController:
 
                 if self._debug_display is not None:
                     components: dict = {}
-                    if vr.head_pos:
-                        components["head"] = {"pos": vr.head_pos}
+                    if head_target:
+                        components["head"] = {"pos": head_target}
                     if vr.left_arm_pos:
                         components["left_arm"] = {"pos": vr.left_arm_pos}
                     if vr.right_arm_pos:

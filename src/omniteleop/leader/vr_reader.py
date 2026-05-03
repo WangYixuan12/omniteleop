@@ -661,10 +661,10 @@ class VRReader:
                     "chassis_vy": np.float32(vy),
                     "chassis_wz": np.float32(wz),
                 },
-                "gripper": {                                                                                                                                         
-                    "left": np.float32(transforms["left_index_trigger"]),                                                                                          
-                    "right": np.float32(transforms["right_index_trigger"]),                                                                                          
-                }, 
+                "gripper": {
+                    "left": np.float32(transforms["left_index_trigger"]),
+                    "right": np.float32(transforms["right_index_trigger"]),
+                },
             },
             "obs": {
                 "joint": {
