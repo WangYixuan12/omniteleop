@@ -180,6 +180,17 @@ class VRRobotController:
             self.robot.head.set_joint_pos(interp_head.tolist(), wait_time=0.1, exit_on_reach=True)
 
         # self.robot.estop.activate()
+        # print("=" * 60)
+        # print("Home position reached. Commanded vs actual joint values:")
+        # print(f"  torso     cmd: {list(INIT_TORSO_JOINTS)}")
+        # print(f"  torso     act: {list(self.robot.torso.get_joint_pos())}")
+        # print(f"  left_arm  cmd: {list(INIT_LEFT_ARM_JOINTS)}")
+        # print(f"  left_arm  act: {list(self.robot.left_arm.get_joint_pos())}")
+        # print(f"  right_arm cmd: {list(INIT_RIGHT_ARM_JOINTS)}")
+        # print(f"  right_arm act: {list(self.robot.right_arm.get_joint_pos())}")
+        # print(f"  head      cmd: {list(INIT_HEAD_JOINTS)}")
+        # print(f"  head      act: {list(self.robot.head.get_joint_pos())}")
+        # print("=" * 60)
         logger.info("Robot at home position.")
 
     # ── Joint feedback ─────────────────────────────────────────────────────────
@@ -239,8 +250,8 @@ class VRRobotController:
                     )
                     if head_target:
                         self.robot.head.set_joint_pos(head_target, wait_time=0.0)
-                        print(f"Commanded head pos: {head_target}")
-                        print(f"Current head pos: {self.robot.head.get_joint_pos()}")
+                        # print(f"Commanded head pos: {head_target}")
+                        # print(f"Current head pos: {self.robot.head.get_joint_pos()}")
                     if self._debug_display is not None and head_target:
                         self._debug_display.print_robot_command(
                             {"head": {"pos": head_target}},

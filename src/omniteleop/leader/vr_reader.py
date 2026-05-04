@@ -453,6 +453,8 @@ class VRReader:
         )
         _, buf = cv2.imencode(".jpg", vis_img, [cv2.IMWRITE_JPEG_QUALITY, 60])
         self.quest.set_frame_vis("img", base64.b64encode(buf).decode())
+        cv2.imshow("VR see-through", vis_img)
+        cv2.waitKey(1)
 
     # ── Per-step methods ───────────────────────────────────────────────────────
 
