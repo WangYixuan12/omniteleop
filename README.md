@@ -1,8 +1,6 @@
-<div align="center">
-  <h1>🎮 Omniteleop - Teleoperation Stack for Dexmate Robots</h1>
-</div>
+# 🎮 Omniteleop - Teleoperation Stack for Dexmate Robots
 
-![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)
+Python
 
 ## 📦 Installation
 
@@ -30,25 +28,30 @@ omni-recorder  # MDP recorder for policy learning
 omni-telemetry # Telemetry viewer
 ```
 
-## 📄 Licensing
+## Data collection
 
-This project is **dual-licensed**:
+1. ssh dexmate
+2. run 'dextop node start' and '(dexmate) dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera' in tmux
+3. ssh lambda
+4. run '(dexmate) vr_robot_controller.py' and '(dexmate) vr_reader.py' # paras in main()
 
-### 🔓 Open Source License
-This software is available under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
-See the [LICENSE](./LICENSE) file for details.
 
-### 💼 Commercial License
-For businesses that want to use this software in proprietary applications without the AGPL requirements, commercial licenses are available.
 
-**📧 Contact us for commercial licensing:** contact@dexmate.ai
+```bash
+Follow exactly:
 
----
+follow_hand mode:
+1. Trigger (track head)
+2. Trigger (track hand)
+3. X
+4. Move to new position
+5. Y (track head, initialize hand, track hand)
+6. A-Manip-B-X
+7. Repeat 3-6
 
-<div align="center">
-  <h3>🤝 Ready to teleoperate robots?</h3>
-  <p>
-    <a href="mailto:contact@dexmate.ai">📧 Contact Us</a>
-  </p>
-</div>
-
+fixed_pose mode: 
+1. Move to new position
+2. Y (initialize hand, track head)
+3. A-Trigger (track hand)-Manip-B-X
+4. Repeat 2-3
+```

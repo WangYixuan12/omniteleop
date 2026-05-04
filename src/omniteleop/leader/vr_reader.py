@@ -50,7 +50,7 @@ import pathlib
 import time
 from collections.abc import Callable
 from dataclasses import asdict
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import cv2
 import numpy as np
@@ -75,12 +75,16 @@ from omniteleop.common.logging import setup_logging
 from omniteleop.common.schemas import VRJointData
 from omniteleop.common.vis_utils import concat_img_h
 from omniteleop.common.vr_mode_const import (
+    FIXED_LEFT_ARM_JOINTS,
+    FIXED_RIGHT_ARM_JOINTS,
     INIT_HEAD_JOINTS,
     INIT_JOINTS_DICT,
     INIT_LEFT_ARM_JOINTS,
     INIT_RIGHT_ARM_JOINTS,
     INIT_TORSO_JOINTS,
 )
+
+StartMode = Literal["follow_hand", "fixed_pose"]
 from omniteleop.follower.component_processors import ArmProcessor
 from omniteleop.leader.communication.webxr_vr_reader import VRFrame, WebXRVRReader
 
@@ -241,6 +245,7 @@ class VRReader:
         visualize: bool = False,
         urdf_path: Optional[str] = None,
         save_dir: str = "data",
+        start_mode: StartMode = "follow_hand",
     ) -> None:
         self.stick_max_vx = stick_max_vx
         self.stick_max_vy = stick_max_vy
@@ -248,6 +253,7 @@ class VRReader:
         self.stick_deadzone = stick_deadzone
         self.publish_rate = publish_rate
         self.running = False
+        self.start_mode: StartMode = start_mode
 
         self._debug_display = (
             get_debug_display("VRReader", publish_rate, refresh_rate=10) if debug else None
@@ -319,6 +325,12 @@ class VRReader:
         self._robot_base_t_vr_base: np.ndarray = np.eye(4)
         self._curr_left_target: np.ndarray = np.eye(4)
         self._curr_right_target: np.ndarray = np.eye(4)
+
+        # Per-arm calibration for fixed_pose mode: target = T @ vr_wrist.
+        # Recomputed each frame in whole_body_alignment, locked on trigger
+        # advance to whole_body.
+        self._vr_to_robot_left: Optional[np.ndarray] = None
+        self._vr_to_robot_right: Optional[np.ndarray] = None
 
         self.visualize = visualize
         if visualize:
@@ -528,12 +540,47 @@ class VRReader:
             return [], [], None, None
         if np.allclose(vr_l, INVALID_LEFT_POSE) or np.allclose(vr_r, INVALID_RIGHT_POSE):
             return [], [], None, None
+        if self.start_mode == "fixed_pose":
+            return self._fixed_pose_arm_step(vr_l, vr_r)
         robot_l = self._robot_base_t_vr_base @ vr_l
         robot_r = self._robot_base_t_vr_base @ vr_r
         if self._calib_stage == "whole_body_alignment":
             ik_l, ik_r = self._approach_step(robot_l, robot_r)
         else:
             ik_l, ik_r = robot_l, robot_r
+        left_pos, right_pos = self._solve_and_apply_arm_ik(ik_l, ik_r)
+        return left_pos, right_pos, ik_l, ik_r
+
+    def _fixed_pose_arm_step(
+        self, vr_l: np.ndarray, vr_r: np.ndarray
+    ) -> tuple[list[float], list[float], Optional[np.ndarray], Optional[np.ndarray]]:
+        if self._calib_stage == "whole_body_alignment":
+            # Arm is held at FIXED (set by resetting). Recompute per-arm
+            # calibration each frame so it reflects the user's current hand
+            # pose; locked when the user trigger-advances to whole_body.
+            left_fk = self.kin.compute_fk_from_link_idx(
+                self.current_qpos, [self.left_arm_eef_idx]
+            )[0]
+            right_fk = self.kin.compute_fk_from_link_idx(
+                self.current_qpos, [self.right_arm_eef_idx]
+            )[0]
+            self._vr_to_robot_left = left_fk @ np.linalg.inv(vr_l)
+            self._vr_to_robot_right = right_fk @ np.linalg.inv(vr_r)
+            safe_left = self.left_proc.limit_joint_step(list(FIXED_LEFT_ARM_JOINTS))
+            safe_right = self.right_proc.limit_joint_step(list(FIXED_RIGHT_ARM_JOINTS))
+            self.left_proc.apply_positions(safe_left)
+            self.right_proc.apply_positions(safe_right)
+            for i, n in enumerate(self.left_proc.joint_names):
+                self.current_qpos[self.joint_name_to_idx[n]] = safe_left[i]
+            for i, n in enumerate(self.right_proc.joint_names):
+                self.current_qpos[self.joint_name_to_idx[n]] = safe_right[i]
+            return safe_left.tolist(), safe_right.tolist(), left_fk, right_fk
+
+        # whole_body: use locked per-arm calibration
+        if self._vr_to_robot_left is None or self._vr_to_robot_right is None:
+            return [], [], None, None
+        ik_l = self._vr_to_robot_left @ vr_l
+        ik_r = self._vr_to_robot_right @ vr_r
         left_pos, right_pos = self._solve_and_apply_arm_ik(ik_l, ik_r)
         return left_pos, right_pos, ik_l, ik_r
 
@@ -569,20 +616,43 @@ class VRReader:
 
         return head_pos, left_pos, right_pos
 
+    def _arm_at_fixed(self, atol: float = 0.05) -> bool:
+        """Check arm joints in current_qpos are within `atol` rad of FIXED."""
+        left = np.array(
+            [self.current_qpos[self.joint_name_to_idx[n]] for n in self.left_proc.joint_names]
+        )
+        right = np.array(
+            [self.current_qpos[self.joint_name_to_idx[n]] for n in self.right_proc.joint_names]
+        )
+        return bool(
+            np.allclose(left, FIXED_LEFT_ARM_JOINTS, atol=atol)
+            and np.allclose(right, FIXED_RIGHT_ARM_JOINTS, atol=atol)
+        )
+
     def _handle_stage_transition(self, transforms: VRFrame) -> None:
         x_now = transforms["left_x_button"]
         y_now = transforms["left_y_button"]
 
         if x_now and not self._prev_x:
             self._calib_stage = "static"
+            self._vr_to_robot_left = None
+            self._vr_to_robot_right = None
             console.rule("[bold red]Stage reset → static (left X)")
 
         if y_now and not self._prev_y:
             target = self.current_qpos.copy()
+            left_arm_init = (
+                FIXED_LEFT_ARM_JOINTS if self.start_mode == "fixed_pose" else INIT_LEFT_ARM_JOINTS
+            )
+            right_arm_init = (
+                FIXED_RIGHT_ARM_JOINTS
+                if self.start_mode == "fixed_pose"
+                else INIT_RIGHT_ARM_JOINTS
+            )
             for i, n in enumerate(self.left_proc.joint_names):
-                target[self.joint_name_to_idx[n]] = INIT_LEFT_ARM_JOINTS[i]
+                target[self.joint_name_to_idx[n]] = left_arm_init[i]
             for i, n in enumerate(self.right_proc.joint_names):
-                target[self.joint_name_to_idx[n]] = INIT_RIGHT_ARM_JOINTS[i]
+                target[self.joint_name_to_idx[n]] = right_arm_init[i]
             for i, idx in enumerate(self.torso_indices):
                 target[idx] = INIT_TORSO_JOINTS[i]
             for i, idx in enumerate(self.head_motor_indices):
@@ -604,6 +674,12 @@ class VRReader:
             self._calib_stage = "head"
             console.rule("[bold cyan]Stage head — hold trigger → arm approach")
         elif self._calib_stage == "head":
+            if self.start_mode == "fixed_pose" and not self._arm_at_fixed():
+                console.print(
+                    "[bold red]fixed_pose: press Y first to reset arms to FIXED before "
+                    "advancing to whole_body_alignment[/]"
+                )
+                return
             self._calib_stage = "whole_body_alignment"
             self._curr_left_target = self.kin.compute_fk_from_link_idx(
                 self.current_qpos, [self.left_arm_eef_idx]
@@ -611,7 +687,23 @@ class VRReader:
             self._curr_right_target = self.kin.compute_fk_from_link_idx(
                 self.current_qpos, [self.right_arm_eef_idx]
             )[0].copy()
-            console.rule("[bold cyan]Stage whole_body_alignment — approaching arm targets…")
+            if self.start_mode == "fixed_pose":
+                console.rule(
+                    "[bold cyan]Stage whole_body_alignment — position your hands, "
+                    "hold trigger to lock calibration"
+                )
+            else:
+                console.rule("[bold cyan]Stage whole_body_alignment — approaching arm targets…")
+        elif (
+            self._calib_stage == "whole_body_alignment" and self.start_mode == "fixed_pose"
+        ):
+            if self._vr_to_robot_left is None or self._vr_to_robot_right is None:
+                console.print(
+                    "[bold red]fixed_pose: calibration not yet computed — wait one frame[/]"
+                )
+                return
+            self._calib_stage = "whole_body"
+            console.rule("[bold green]Calibration locked → whole_body")
 
     def _handle_recording(
         self,
@@ -872,6 +964,13 @@ def main() -> None:
         save_dir: str = "/media/yifan/portable_ssd/Dexmate/raw_data/"
         """Directory to save HDF5 episodes (A=start, B=stop)"""
 
+        start_mode: StartMode = "fixed_pose"
+        """Episode start behaviour. 'follow_hand': arm interpolates to current
+        controller pose after Y-reset (existing behaviour). 'fixed_pose': arm
+        holds at FIXED_*_ARM_JOINTS so every recording begins from an identical
+        configuration; user trigger-advances out of whole_body_alignment to
+        lock the per-arm calibration."""
+
     args = tyro.cli(Args)
 
     reader = VRReader(
@@ -888,6 +987,7 @@ def main() -> None:
         visualize=args.visualize,
         urdf_path=args.urdf_path,
         save_dir=args.save_dir,
+        start_mode=args.start_mode,
     )
     reader.run()
 
