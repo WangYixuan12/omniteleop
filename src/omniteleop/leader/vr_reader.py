@@ -961,7 +961,7 @@ def main() -> None:
         urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"  # noqa
         """Path to robot URDF for Sapien visualizer (required if --visualize)"""
 
-        save_dir: str = "/media/yifan/portable_ssd/Dexmate/raw_data/"
+        save_dir: str = "/home/yixuan/omniteleop/Dexmate"
         """Directory to save HDF5 episodes (A=start, B=stop)"""
 
         start_mode: StartMode = "fixed_pose"

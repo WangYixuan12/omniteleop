@@ -31,7 +31,7 @@ omni-telemetry # Telemetry viewer
 ## Data collection
 
 1. ssh dexmate
-2. run 'dextop node start' and '(dexmate) dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera' in tmux
+2. run '(dexmate) dextop node start' and 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera' in tmux
 3. ssh lambda
 4. run '(dexmate) vr_robot_controller.py' and '(dexmate) vr_reader.py' # paras in main()
 
