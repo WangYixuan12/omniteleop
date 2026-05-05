@@ -30,16 +30,15 @@ omni-telemetry # Telemetry viewer
 
 ## Data collection
 
-1. ssh dexmate
+1. ssh dexmate, conda activate dexmate
 2. run '(dexmate) dextop node start' and 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera' in tmux
 3. ssh lambda
-4. run '(dexmate) vr_robot_controller.py' and '(dexmate) vr_reader.py' # paras in main()
-
-
+4. run '(dexmate) vr_robot_controller.py' and '(dexmate) vr_reader.py'
+5. revise head_mode and left_arm_mode in src/omniteleop/configs/vega_1_f5d6.yaml
 
 ```bash
 Follow exactly:
-
+# start_mode in main()
 follow_hand mode:
 1. Trigger (track head)
 2. Trigger (track hand)
@@ -55,3 +54,4 @@ fixed_pose mode:
 3. A-Trigger (track hand)-Manip-B-X
 4. Repeat 2-3
 ```
+

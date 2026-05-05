@@ -47,6 +47,8 @@ from __future__ import annotations
 import base64
 import dataclasses
 import pathlib
+import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict
@@ -65,7 +67,6 @@ from dexmotion.motion_manager import MotionManager
 from loguru import logger
 from rich.console import Console
 from scipy.spatial.transform import Rotation, Slerp
-from yixuan_utilities.hdf5_utils import save_dict_to_hdf5
 from yixuan_utilities.kinematics_helper import KinHelper
 
 from omniteleop.common import get_config
@@ -75,8 +76,6 @@ from omniteleop.common.logging import setup_logging
 from omniteleop.common.schemas import VRJointData
 from omniteleop.common.vis_utils import concat_img_h
 from omniteleop.common.vr_mode_const import (
-    FIXED_LEFT_ARM_JOINTS,
-    FIXED_RIGHT_ARM_JOINTS,
     INIT_HEAD_JOINTS,
     INIT_JOINTS_DICT,
     INIT_LEFT_ARM_JOINTS,
@@ -187,15 +186,78 @@ def _recursive_np_stack(list_of_dicts: list[dict]) -> dict:
     return result
 
 
+def _count_leaves(d: dict) -> int:
+    n = 0
+    for v in d.values():
+        n += _count_leaves(v) if isinstance(v, dict) else 1
+    return n
+
+
+def _save_dict_with_progress(
+    data: dict, path: str, on_progress: Callable[[float], None]
+) -> None:
+    """Save nested dict-of-ndarrays to HDF5; ``on_progress(frac in [0,1])`` is
+    called repeatedly as datasets are written. Large arrays are chunked along
+    axis 0 so the bar advances smoothly mid-leaf."""
+    import h5py
+
+    total = max(1, _count_leaves(data))
+    done = [0.0]
+
+    def step(frac_in_leaf: float) -> None:
+        on_progress(min(1.0, (done[0] + frac_in_leaf) / total))
+
+    def end_leaf() -> None:
+        done[0] += 1.0
+        on_progress(min(1.0, done[0] / total))
+
+    def recurse(group: Any, prefix: str, sub: dict) -> None:
+        for key, item in sub.items():
+            if isinstance(item, np.ndarray):
+                dset = group.create_dataset(prefix + key, shape=item.shape, dtype=item.dtype)
+                if item.ndim >= 1 and item.shape[0] > 1 and item.nbytes > 32 * 1024 * 1024:
+                    n = item.shape[0]
+                    step_size = max(1, n // 8)
+                    for start in range(0, n, step_size):
+                        end = min(start + step_size, n)
+                        dset[start:end] = item[start:end]
+                        step(end / n)
+                else:
+                    dset[...] = item
+                end_leaf()
+            elif isinstance(item, dict):
+                recurse(group, prefix + key + "/", item)
+            else:
+                raise ValueError(f"Cannot save {type(item)}")
+
+    on_progress(0.0)
+    with h5py.File(path, "w") as h5file:
+        recurse(h5file, "/", data)
+
+
+def _progress_bar(p: float, width: int = 15) -> str:
+    p = max(0.0, min(1.0, p))
+    filled = int(round(width * p))
+    return "[" + "#" * filled + "-" * (width - filled) + f"] {p * 100:3.0f}%"
+
+
 class EpisodeRecorder:
     """Accumulates per-frame data and saves to HDF5 on stop()."""
+
+    _ID_RE = re.compile(r"episode_(\d+)\.hdf5$")
 
     def __init__(self, save_dir: str) -> None:
         self._save_dir = pathlib.Path(save_dir)
         self._save_dir.mkdir(parents=True, exist_ok=True)
         self._frames: list[dict] = []
         self.recording = False
-        self.episode_id = len(list(self._save_dir.glob("episode_*.hdf5")))
+        self.saving = False
+        self.save_progress: float = 0.0
+        self._save_thread: Optional[threading.Thread] = None
+        # Count only `episode_<N>.hdf5` files; skip `episode_<N>_debug.hdf5`.
+        self.episode_id = sum(
+            1 for p in self._save_dir.glob("episode_*.hdf5") if self._ID_RE.search(p.name)
+        )
 
     def start(self) -> None:
         """Start a new episode recording."""
@@ -208,22 +270,99 @@ class EpisodeRecorder:
         self._frames.append(frame)
 
     def stop(self) -> Optional[str]:
-        """Stop recording and save to HDF5. Returns path if saved, else None."""
+        """Stop recording; spawn background thread to save HDF5. Returns the
+        target path immediately (file is written asynchronously)."""
         self.recording = False
         if not self._frames:
             logger.warning("EpisodeRecorder: 0 frames — skipping save")
             return None
         path = self._save_dir / f"episode_{self.episode_id}.hdf5"
-        data = _recursive_np_stack(self._frames)
-        save_dict_to_hdf5(data, {}, str(path))
-        logger.info(f"EpisodeRecorder: {len(self._frames)} frames → {path}")
+        frames = self._frames
         self._frames = []
         self.episode_id += 1
+        self.saving = True
+        self.save_progress = 0.0
+        self._save_thread = threading.Thread(
+            target=self._save_worker, args=(frames, str(path)), daemon=True
+        )
+        self._save_thread.start()
         return str(path)
+
+    def _save_worker(self, frames: list[dict], path: str) -> None:
+        try:
+            data = _recursive_np_stack(frames)
+
+            def on_progress(p: float) -> None:
+                self.save_progress = p
+
+            _save_dict_with_progress(data, path, on_progress)
+            logger.info(f"EpisodeRecorder: {len(frames)} frames → {path}")
+        except Exception:
+            logger.exception("EpisodeRecorder: save failed")
+        finally:
+            self.saving = False
 
     def num_frames(self) -> int:
         """Return number of frames recorded so far"""
         return len(self._frames)
+
+
+class DebugEpisodeRecorder:
+    """Parallel recorder for the debug HDF5 (`episode_<N>_debug.hdf5`).
+
+    Holds every intermediate stage of the teleop pipeline (raw VR pose, IK
+    target, IK status, raw IK output, calibration matrices, exact published
+    payload, timing). Frame layout is fixed-shape: failures use NaN, never `[]`.
+    """
+
+    def __init__(self, save_dir: str) -> None:
+        self._save_dir = pathlib.Path(save_dir)
+        self._save_dir.mkdir(parents=True, exist_ok=True)
+        self._frames: list[dict] = []
+        self.recording = False
+        self.saving = False
+        self.save_progress: float = 0.0
+        self._save_thread: Optional[threading.Thread] = None
+        self._episode_id: int = 0
+
+    def start(self, episode_id: int) -> None:
+        self._frames = []
+        self._episode_id = episode_id
+        self.recording = True
+        logger.info(f"DebugEpisodeRecorder: recording started (episode_{episode_id})")
+
+    def record(self, frame: dict) -> None:
+        self._frames.append(frame)
+
+    def stop(self) -> Optional[str]:
+        self.recording = False
+        if not self._frames:
+            logger.warning("DebugEpisodeRecorder: 0 frames — skipping save")
+            return None
+        path = self._save_dir / f"episode_{self._episode_id}_debug.hdf5"
+        frames = self._frames
+        self._frames = []
+        self.saving = True
+        self.save_progress = 0.0
+        self._save_thread = threading.Thread(
+            target=self._save_worker, args=(frames, str(path)), daemon=True
+        )
+        self._save_thread.start()
+        return str(path)
+
+    def _save_worker(self, frames: list[dict], path: str) -> None:
+        try:
+            data = _recursive_np_stack(frames)
+
+            def on_progress(p: float) -> None:
+                self.save_progress = p
+
+            _save_dict_with_progress(data, path, on_progress)
+            logger.info(f"DebugEpisodeRecorder: {len(frames)} frames → {path}")
+        except Exception:
+            logger.exception("DebugEpisodeRecorder: save failed")
+        finally:
+            self.saving = False
 
 
 class VRReader:
@@ -246,6 +385,7 @@ class VRReader:
         urdf_path: Optional[str] = None,
         save_dir: str = "data",
         start_mode: StartMode = "follow_hand",
+        save_debug: bool = True,
     ) -> None:
         self.stick_max_vx = stick_max_vx
         self.stick_max_vy = stick_max_vy
@@ -254,6 +394,7 @@ class VRReader:
         self.publish_rate = publish_rate
         self.running = False
         self.start_mode: StartMode = start_mode
+        self.save_debug = save_debug
 
         self._debug_display = (
             get_debug_display("VRReader", publish_rate, refresh_rate=10) if debug else None
@@ -307,12 +448,27 @@ class VRReader:
 
         # Recording
         self.recorder = EpisodeRecorder(save_dir)
+        self.debug_recorder = DebugEpisodeRecorder(save_dir)
         self._last_imgs: dict[str, np.ndarray] = {}
         self._last_depth_u16: Optional[np.ndarray] = None
         self._prev_a: bool = False
         self._prev_b: bool = False
         self._prev_x: bool = False
         self._prev_y: bool = False
+
+        # IK / timing telemetry — populated by _solve_and_apply_arm_ik (or
+        # set to NaN/skip-reason on every bypass path) and read by
+        # _handle_recording when building a debug frame.
+        self._last_ik_target_left: np.ndarray = np.full((4, 4), np.nan, dtype=np.float32)
+        self._last_ik_target_right: np.ndarray = np.full((4, 4), np.nan, dtype=np.float32)
+        self._last_ik_raw_left: np.ndarray = np.full(7, np.nan, dtype=np.float32)
+        self._last_ik_raw_right: np.ndarray = np.full(7, np.nan, dtype=np.float32)
+        self._last_ik_success: bool = False
+        self._last_ik_in_collision: bool = False
+        self._last_ik_within_limits: bool = False
+        self._last_ik_failure_reason: str = "skipped_stage"
+        self._last_ik_solve_ms: float = float("nan")
+        self._last_publish_ms: float = float("nan")
 
         # Reset interpolation state (set when entering "resetting" stage)
         self._reset_start_qpos: np.ndarray = np.eye(1)
@@ -454,6 +610,10 @@ class VRReader:
         text: str = f"Episode: {episode_id}"
         if self.recorder.recording:
             text += f", Recording! Step: {self.recorder.num_frames()}"
+        elif self.recorder.saving:
+            text += f", Saving {_progress_bar(self.recorder.save_progress)}"
+        elif self.debug_recorder.saving:
+            text += f", Saving debug {_progress_bar(self.debug_recorder.save_progress)}"
         cv2.putText(
             vis_img,
             text,
@@ -463,6 +623,16 @@ class VRReader:
             thickness=2,
             color=(255, 255, 255),
         )
+        if self.recorder.recording and self._last_ik_in_collision:
+            cv2.putText(
+                vis_img,
+                "Left/Right Arm Self-collision!",
+                (10, 65),
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                fontScale=1,
+                thickness=2,
+                color=(0, 0, 255),
+            )
         _, buf = cv2.imencode(".jpg", vis_img, [cv2.IMWRITE_JPEG_QUALITY, 60])
         self.quest.set_frame_vis("img", base64.b64encode(buf).decode())
         cv2.imshow("VR see-through", vis_img)
@@ -510,15 +680,45 @@ class VRReader:
     def _solve_and_apply_arm_ik(
         self, l_target: np.ndarray, r_target: np.ndarray
     ) -> tuple[list[float], list[float]]:
+        # Stash the actual IK target for the debug recorder. This is the
+        # canonical "what was passed to IK", different from the main HDF5's
+        # `action/eef/*` (which is hardcoded to `_robot_base_t_vr_base @ vr_*`
+        # even in fixed_pose mode).
+        self._last_ik_target_left = l_target.astype(np.float32, copy=True)
+        self._last_ik_target_right = r_target.astype(np.float32, copy=True)
+
+        t0 = time.perf_counter()
         with suppress_loguru_module("dexmotion", enabled=True):
             arm_solution, in_collision, within_limits = self.mm.ik(
                 target_pose={"L_ee": l_target, "R_ee": r_target},
                 type="pink",
             )
+        self._last_ik_solve_ms = (time.perf_counter() - t0) * 1000.0
+        self._last_ik_in_collision = bool(in_collision)
+        self._last_ik_within_limits = bool(within_limits)
+
         if not arm_solution or in_collision or not within_limits:
             if in_collision:
                 console.print("[red]Self-collision — holding arm position[/]")
+            self._last_ik_success = False
+            self._last_ik_raw_left = np.full(7, np.nan, dtype=np.float32)
+            self._last_ik_raw_right = np.full(7, np.nan, dtype=np.float32)
+            self._last_ik_failure_reason = (
+                "in_collision"
+                if in_collision
+                else ("limits" if not within_limits else "no_solution")
+            )
             return [], []
+
+        self._last_ik_success = True
+        self._last_ik_failure_reason = "ok"
+        self._last_ik_raw_left = np.asarray(
+            [arm_solution[f"L_arm_j{i}"] for i in range(1, 8)], dtype=np.float32
+        )
+        self._last_ik_raw_right = np.asarray(
+            [arm_solution[f"R_arm_j{i}"] for i in range(1, 8)], dtype=np.float32
+        )
+
         safe_left = self.left_proc.limit_joint_step(
             [arm_solution[f"L_arm_j{i}"] for i in range(1, 8)]
         )
@@ -533,12 +733,26 @@ class VRReader:
             self.current_qpos[self.joint_name_to_idx[n]] = safe_right[i]
         return safe_left.tolist(), safe_right.tolist()
 
+    def _mark_ik_skipped(self, reason: str) -> None:
+        """Reset IK telemetry to NaN/skipped when no IK call was made this frame."""
+        self._last_ik_target_left = np.full((4, 4), np.nan, dtype=np.float32)
+        self._last_ik_target_right = np.full((4, 4), np.nan, dtype=np.float32)
+        self._last_ik_raw_left = np.full(7, np.nan, dtype=np.float32)
+        self._last_ik_raw_right = np.full(7, np.nan, dtype=np.float32)
+        self._last_ik_success = False
+        self._last_ik_in_collision = False
+        self._last_ik_within_limits = False
+        self._last_ik_failure_reason = reason
+        self._last_ik_solve_ms = float("nan")
+
     def _arm_ik_step(
         self, vr_l: np.ndarray, vr_r: np.ndarray
     ) -> tuple[list[float], list[float], Optional[np.ndarray], Optional[np.ndarray]]:
         if self._calib_stage not in ("whole_body_alignment", "whole_body"):
+            self._mark_ik_skipped("skipped_stage")
             return [], [], None, None
         if np.allclose(vr_l, INVALID_LEFT_POSE) or np.allclose(vr_r, INVALID_RIGHT_POSE):
+            self._mark_ik_skipped("skipped_invalid_pose")
             return [], [], None, None
         if self.start_mode == "fixed_pose":
             return self._fixed_pose_arm_step(vr_l, vr_r)
@@ -566,18 +780,20 @@ class VRReader:
             )[0]
             self._vr_to_robot_left = left_fk @ np.linalg.inv(vr_l)
             self._vr_to_robot_right = right_fk @ np.linalg.inv(vr_r)
-            safe_left = self.left_proc.limit_joint_step(list(FIXED_LEFT_ARM_JOINTS))
-            safe_right = self.right_proc.limit_joint_step(list(FIXED_RIGHT_ARM_JOINTS))
+            safe_left = self.left_proc.limit_joint_step(list(INIT_LEFT_ARM_JOINTS))
+            safe_right = self.right_proc.limit_joint_step(list(INIT_RIGHT_ARM_JOINTS))
             self.left_proc.apply_positions(safe_left)
             self.right_proc.apply_positions(safe_right)
             for i, n in enumerate(self.left_proc.joint_names):
                 self.current_qpos[self.joint_name_to_idx[n]] = safe_left[i]
             for i, n in enumerate(self.right_proc.joint_names):
                 self.current_qpos[self.joint_name_to_idx[n]] = safe_right[i]
+            self._mark_ik_skipped("skipped_alignment_fixed")
             return safe_left.tolist(), safe_right.tolist(), left_fk, right_fk
 
         # whole_body: use locked per-arm calibration
         if self._vr_to_robot_left is None or self._vr_to_robot_right is None:
+            self._mark_ik_skipped("skipped_no_calibration")
             return [], [], None, None
         ik_l = self._vr_to_robot_left @ vr_l
         ik_r = self._vr_to_robot_right @ vr_r
@@ -617,7 +833,7 @@ class VRReader:
         return head_pos, left_pos, right_pos
 
     def _arm_at_fixed(self, atol: float = 0.05) -> bool:
-        """Check arm joints in current_qpos are within `atol` rad of FIXED."""
+        """Check arm joints in current_qpos are within `atol` rad of INIT."""
         left = np.array(
             [self.current_qpos[self.joint_name_to_idx[n]] for n in self.left_proc.joint_names]
         )
@@ -625,8 +841,8 @@ class VRReader:
             [self.current_qpos[self.joint_name_to_idx[n]] for n in self.right_proc.joint_names]
         )
         return bool(
-            np.allclose(left, FIXED_LEFT_ARM_JOINTS, atol=atol)
-            and np.allclose(right, FIXED_RIGHT_ARM_JOINTS, atol=atol)
+            np.allclose(left, INIT_LEFT_ARM_JOINTS, atol=atol)
+            and np.allclose(right, INIT_RIGHT_ARM_JOINTS, atol=atol)
         )
 
     def _handle_stage_transition(self, transforms: VRFrame) -> None:
@@ -641,18 +857,10 @@ class VRReader:
 
         if y_now and not self._prev_y:
             target = self.current_qpos.copy()
-            left_arm_init = (
-                FIXED_LEFT_ARM_JOINTS if self.start_mode == "fixed_pose" else INIT_LEFT_ARM_JOINTS
-            )
-            right_arm_init = (
-                FIXED_RIGHT_ARM_JOINTS
-                if self.start_mode == "fixed_pose"
-                else INIT_RIGHT_ARM_JOINTS
-            )
             for i, n in enumerate(self.left_proc.joint_names):
-                target[self.joint_name_to_idx[n]] = left_arm_init[i]
+                target[self.joint_name_to_idx[n]] = INIT_LEFT_ARM_JOINTS[i]
             for i, n in enumerate(self.right_proc.joint_names):
-                target[self.joint_name_to_idx[n]] = right_arm_init[i]
+                target[self.joint_name_to_idx[n]] = INIT_RIGHT_ARM_JOINTS[i]
             for i, idx in enumerate(self.torso_indices):
                 target[idx] = INIT_TORSO_JOINTS[i]
             for i, idx in enumerate(self.head_motor_indices):
@@ -725,12 +933,19 @@ class VRReader:
             and not self._prev_a
             and self._calib_stage == "whole_body"
             and not self.recorder.recording
+            and not self.recorder.saving
+            and not self.debug_recorder.saving
         ):
+            if self.save_debug:
+                self.debug_recorder.start(self.recorder.episode_id)
             self.recorder.start()
             console.print("[bold green]Recording started (press B to stop)[/]")
         if b_now and not self._prev_b and self.recorder.recording:
             path = self.recorder.stop()
-            console.print(f"[bold yellow]Recording saved → {path}[/]")
+            console.print(f"[bold yellow]Saving in background → {path}[/]")
+            if self.save_debug:
+                debug_path = self.debug_recorder.stop()
+                console.print(f"[bold yellow]Debug saving in background → {debug_path}[/]")
 
         self._prev_a = a_now
         self._prev_b = b_now
@@ -781,6 +996,93 @@ class VRReader:
         }
         self.recorder.record(frame)
 
+        if not self.save_debug:
+            return
+
+        nan44 = np.full((4, 4), np.nan, dtype=np.float32)
+        nan7 = np.full(7, np.nan, dtype=np.float32)
+        nan3 = np.full(3, np.nan, dtype=np.float32)
+        vr_l_log = (
+            vr_l.astype(np.float32) if not np.allclose(vr_l, INVALID_LEFT_POSE) else nan44.copy()
+        )
+        vr_r_log = (
+            vr_r.astype(np.float32) if not np.allclose(vr_r, INVALID_RIGHT_POSE) else nan44.copy()
+        )
+        vr_to_l = (
+            self._vr_to_robot_left.astype(np.float32)
+            if self._vr_to_robot_left is not None
+            else nan44.copy()
+        )
+        vr_to_r = (
+            self._vr_to_robot_right.astype(np.float32)
+            if self._vr_to_robot_right is not None
+            else nan44.copy()
+        )
+
+        debug_frame = {
+            "timestamp_ns": np.int64(time.time_ns()),
+            "timing": {
+                "monotonic_ns": np.int64(time.monotonic_ns()),
+                "ik_solve_ms": np.float32(self._last_ik_solve_ms),
+                "publish_ms": np.float32(self._last_publish_ms),
+            },
+            "calib_stage": np.bytes_(self._calib_stage),
+            "vr_raw": {
+                "head": transforms["head"].astype(np.float32),
+                "left_wrist": vr_l_log,
+                "right_wrist": vr_r_log,
+                "left_thumbstick": np.asarray(transforms["left_thumbstick"], dtype=np.float32),
+                "right_thumbstick": np.asarray(transforms["right_thumbstick"], dtype=np.float32),
+                "left_trigger": np.float32(transforms["left_index_trigger"]),
+                "right_trigger": np.float32(transforms["right_index_trigger"]),
+            },
+            "calib": {
+                "robot_base_t_vr_base": self._robot_base_t_vr_base.astype(np.float32),
+                "vr_to_robot_left": vr_to_l,
+                "vr_to_robot_right": vr_to_r,
+            },
+            "target": {
+                "eef_used_by_ik": {
+                    "left": self._last_ik_target_left,
+                    "right": self._last_ik_target_right,
+                },
+                "eef_recorded_main": {
+                    "left": (self._robot_base_t_vr_base @ vr_l).astype(np.float32),
+                    "right": (self._robot_base_t_vr_base @ vr_r).astype(np.float32),
+                },
+            },
+            "ik": {
+                "left_arm_raw": self._last_ik_raw_left,
+                "right_arm_raw": self._last_ik_raw_right,
+                "status": {
+                    "success": np.bool_(self._last_ik_success),
+                    "in_collision": np.bool_(self._last_ik_in_collision),
+                    "within_limits": np.bool_(self._last_ik_within_limits),
+                    "failure_reason": np.bytes_(self._last_ik_failure_reason),
+                },
+            },
+            "publish": {
+                "payload": {
+                    "head_pos": (
+                        np.asarray(head_pos, dtype=np.float32) if head_pos else nan3.copy()
+                    ),
+                    "left_arm_pos": (
+                        np.asarray(left_pos, dtype=np.float32) if left_pos else nan7.copy()
+                    ),
+                    "right_arm_pos": (
+                        np.asarray(right_pos, dtype=np.float32) if right_pos else nan7.copy()
+                    ),
+                    "left_gripper": np.float32(transforms["left_index_trigger"]),
+                    "right_gripper": np.float32(transforms["right_index_trigger"]),
+                    "chassis_vx": np.float32(vx),
+                    "chassis_vy": np.float32(vy),
+                    "chassis_wz": np.float32(wz),
+                    "estop": np.bool_(self._calib_stage in ("static", "head")),
+                },
+            },
+        }
+        self.debug_recorder.record(debug_frame)
+
     def _publish(
         self,
         head_pos: list[float],
@@ -806,7 +1108,9 @@ class VRReader:
             calib_stage=self._calib_stage,
         )
         # logger.info(f"left_arm: {left_arm_pos}")
+        t0 = time.perf_counter()
         self.vr_pub.publish(asdict(data))
+        self._last_publish_ms = (time.perf_counter() - t0) * 1000.0
 
     def _update_visualization(self, ik_l: Optional[np.ndarray], ik_r: Optional[np.ndarray]) -> bool:
         """Update Sapien viewer. Returns False if viewer was closed."""
@@ -873,6 +1177,7 @@ class VRReader:
 
                 if self._calib_stage == "resetting":
                     head_pos, left_pos, right_pos = self._resetting_step(transforms)
+                    self._mark_ik_skipped("skipped_resetting")
                     ik_l, ik_r = None, None
                 else:
                     head_pos = self._head_ik_step(vr_head)
@@ -911,6 +1216,12 @@ class VRReader:
             self.running = False
             if self.recorder.recording:
                 self.recorder.stop()
+            if self.debug_recorder.recording:
+                self.debug_recorder.stop()
+            for r in (self.recorder, self.debug_recorder):
+                if r._save_thread is not None and r._save_thread.is_alive():
+                    logger.info(f"Waiting for {type(r).__name__} save to finish ...")
+                    r._save_thread.join()
             if self._debug_display:
                 self._debug_display.stop()
             self.quest.close()
@@ -961,7 +1272,7 @@ def main() -> None:
         urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"  # noqa
         """Path to robot URDF for Sapien visualizer (required if --visualize)"""
 
-        save_dir: str = "/home/yixuan/omniteleop/Dexmate"
+        save_dir: str = "/home/yixuan/omniteleop/Dexmate/raw_data/"
         """Directory to save HDF5 episodes (A=start, B=stop)"""
 
         start_mode: StartMode = "fixed_pose"
@@ -970,6 +1281,10 @@ def main() -> None:
         holds at FIXED_*_ARM_JOINTS so every recording begins from an identical
         configuration; user trigger-advances out of whole_body_alignment to
         lock the per-arm calibration."""
+
+        save_debug: bool = True
+        """If False, skip building and saving episode_<N>_debug.hdf5 to reduce
+        per-frame overhead and shorten save time."""
 
     args = tyro.cli(Args)
 
@@ -988,6 +1303,7 @@ def main() -> None:
         urdf_path=args.urdf_path,
         save_dir=args.save_dir,
         start_mode=args.start_mode,
+        save_debug=args.save_debug,
     )
     reader.run()
 

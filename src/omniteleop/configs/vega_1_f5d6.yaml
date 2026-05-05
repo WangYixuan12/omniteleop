@@ -5,10 +5,15 @@
 # Options: "exo_joycon" (exoskeleton + JoyCon), "vr" (VR controllers), "keyboard" (testing)
 teleop_mode: 'exo_joycon'
 
-# Head behavior for vr_robot_controller:
+# affects vr_robot_controller:
 #   'track' → follow vr.head_pos (operator's VR headset)
 #   'fixed' → hold at INIT_HEAD_JOINTS from common/vr_mode_const.py
 head_mode: 'fixed'
+
+# affects vr_robot_controller:
+#   'track' → follow vr.left_arm_pos (IK-solved from VR controller)
+#   'fixed' → hold at FIXED_LEFT_ARM_JOINTS from common/vr_mode_const.py
+left_arm_mode: 'fixed'
 
 # Input handler configurations for different teleop modes
 input_handlers:

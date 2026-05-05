@@ -90,6 +90,13 @@ class VRRobotController:
                 f"Invalid head_mode={self.head_mode!r}; expected 'track' or 'fixed'"
             )
 
+        # "track" → follow vr.left_arm_pos; "fixed" → hold at INIT_LEFT_ARM_JOINTS
+        self.left_arm_mode = self.config.get("left_arm_mode", "track")
+        if self.left_arm_mode not in ("track", "fixed"):
+            raise ValueError(
+                f"Invalid left_arm_mode={self.left_arm_mode!r}; expected 'track' or 'fixed'"
+            )
+
         # Zenoh subscriber for VR joint data
         vr_topic = self.config.get_topic("vr_joints", "vr/joints")
         self.vr_sub = self.node.create_subscriber(
@@ -274,14 +281,19 @@ class VRRobotController:
                     self.robot.head.set_joint_pos(head_target, wait_time=0.0)
 
                 # ── Arms (resetting + whole_body) ─────────────────────────────
+                left_arm_target = (
+                    vr.left_arm_pos
+                    if self.left_arm_mode == "track"
+                    else list(INIT_LEFT_ARM_JOINTS)
+                )
                 if vr.calib_stage in ("resetting", "whole_body", "whole_body_alignment"):
-                    if vr.left_arm_pos:
-                        self.robot.left_arm.set_joint_pos(vr.left_arm_pos)
+                    if left_arm_target:
+                        self.robot.left_arm.set_joint_pos(left_arm_target)
                         left_arm_error = np.abs(
-                            np.array(vr.left_arm_pos) - self.robot.left_arm.get_joint_pos()
+                            np.array(left_arm_target) - self.robot.left_arm.get_joint_pos()
                         )
                         if np.any(left_arm_error > 0.3):
-                            logger.info(f"Commanded left arm pos: {vr.left_arm_pos}")
+                            logger.info(f"Commanded left arm pos: {left_arm_target}")
                             logger.info(
                                 f"Current left arm pos: {self.robot.left_arm.get_joint_pos()}"
                             )
@@ -319,8 +331,8 @@ class VRRobotController:
                     components: dict = {}
                     if head_target:
                         components["head"] = {"pos": head_target}
-                    if vr.left_arm_pos:
-                        components["left_arm"] = {"pos": vr.left_arm_pos}
+                    if left_arm_target:
+                        components["left_arm"] = {"pos": left_arm_target}
                     if vr.right_arm_pos:
                         components["right_arm"] = {"pos": vr.right_arm_pos}
                     if self.has_chassis:
