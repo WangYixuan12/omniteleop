@@ -1,23 +1,22 @@
-"""Visualise a recorded VR teleoperation episode.
+"""Visualise a recorded VR teleoperation episode in rerun.
+
+Logs RGB-D, the colored point cloud, robot meshes, EEF and camera frames
+under a single ``frame`` timeline so the rerun viewer's scrubber doubles as
+prev/next/jump navigation.
 
 Usage::
 
-    python scripts/vis_episode.py data/episode_0.hdf5
-    python scripts/vis_episode.py data/episode_0.hdf5 --fps 10 --voxel 0.01
-    python scripts/vis_episode.py data/episode_0.hdf5 --fx 525 --fy 525 --cx 480 --cy 300
+    python scripts/vis_episode.py --hdf5 data/episode_0.hdf5
+    python scripts/vis_episode.py --hdf5 data/episode_0.hdf5 --voxel 0.01
 """
 
 from __future__ import annotations
 
 import argparse
-import time
 
-import cv2
-import matplotlib.pyplot as plt
 import numpy as np
+import rerun as rr
 import torch
-import transforms3d as t3d
-import viser
 from yixuan_utilities.hdf5_utils import load_dict_from_hdf5
 from yixuan_utilities.kinematics_helper import KinHelper
 from yixuan_utilities.robot_mesh_generator import RobotMeshGenerator
@@ -48,40 +47,25 @@ _OBS_NAMES = [
 ]
 
 
-def mat_to_wxyz_pos(mat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    wxyz = t3d.quaternions.mat2quat(mat[:3, :3])
-    return wxyz, mat[:3, 3]
-
-
 def unproject_depth(
     depth_m: np.ndarray, K: np.ndarray, world_t_cam: np.ndarray, max_depth: float = 3.0
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Unproject a depth image to a colored point cloud in world frame.
-
-    Args:
-        depth_m:     (H, W) float32, metres
-        K:           (3, 3) camera intrinsics
-        world_t_cam: (4, 4) camera pose in world frame
-        max_depth:   discard points beyond this distance
-
-    Returns:
-        pts:    (M, 3) float32 world-frame XYZ
-    """
+    """Unproject a depth image to world-frame XYZ. Returns (pts, mask)."""
     H, W = depth_m.shape
-    v, u = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")  # (H,W) each
+    v, u = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
     mask = (depth_m > 0.05) & (depth_m < max_depth)
     z = depth_m[mask]
     x = (u[mask] - K[0, 2]) / K[0, 0] * z
     y = (v[mask] - K[1, 2]) / K[1, 1] * z
-    pts_cam = np.stack([x, y, z, np.ones_like(z)], axis=-1)  # (M, 4)
-    pts_world = (world_t_cam @ pts_cam.T).T[:, :3]  # (M, 3)
+    pts_cam = np.stack([x, y, z, np.ones_like(z)], axis=-1)
+    pts_world = (world_t_cam @ pts_cam.T).T[:, :3]
     return pts_world.astype(np.float32), mask
 
 
 def voxel_downsample(
     pts: np.ndarray, colors: np.ndarray, voxel_size: float
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Simple voxel downsample using torch if CUDA available, else numpy."""
+    """Voxel-average downsample on CUDA when available; random subsample otherwise."""
     if pts.shape[0] == 0:
         return pts, colors
     try:
@@ -100,7 +84,6 @@ def voxel_downsample(
         out_cols = (out_cols / cnt.unsqueeze(1)).cpu().numpy().astype(np.uint8)
         return out_pts, out_cols
     except Exception:
-        # Fallback: random subsample
         idx = np.random.choice(len(pts), min(len(pts), 50000), replace=False)
         return pts[idx], colors[idx]
 
@@ -113,17 +96,12 @@ def main() -> None:
         default="/media/yixuan/portable_ssd/Dexmate/raw_data/episode_0.hdf5",
         help="Path to episode HDF5 file",
     )
-    parser.add_argument("--fps", type=float, default=10.0, help="Playback speed (Hz)")
     parser.add_argument(
         "--voxel", type=float, default=0.008, help="Voxel size for PCD downsample (m)"
     )
     args = parser.parse_args()
 
     data, _ = load_dict_from_hdf5(args.hdf5)
-    fx = 770.1868 / 2.0
-    fy = 770.1868 / 2.0
-    cx = 990.2711 / 2.0
-    cy = 637.7721 / 2.0
 
     # ── load arrays ──────────────────────────────────────────────────────────
     left_rgb = np.array(data["obs"]["images"]["left_rgb"]).astype(np.uint8)
@@ -139,27 +117,78 @@ def main() -> None:
     eef_right = np.array(data["action"]["eef"]["right"])  # (N,4,4)
 
     N = left_rgb.shape[0]
-    print(f"Episode: {N} frames  |  images: {left_rgb.shape[1]}x{left_rgb.shape[2]}")
+    H, W = left_rgb.shape[1], left_rgb.shape[2]
+    print(f"Episode: {N} frames  |  images: {H}x{W}")
 
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+    # ── intrinsics: prefer per-episode if recorded, else hardcoded ZED ───────
+    img_group = data["obs"]["images"]
+    if "intrinsic" in img_group:
+        K_arr = np.array(img_group["intrinsic"])
+        K = K_arr[0] if K_arr.ndim == 3 else K_arr
+        K = K.astype(np.float64)
+    else:
+        fx = fy = 770.1868 / 2.0
+        cx = 990.2711 / 2.0
+        cy = 637.7721 / 2.0
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
 
-    # ── KinHelper for camera FK ───────────────────────────────────────────────
+    # ── extrinsics: prefer saved, else FK from observed joints ───────────────
     kin = KinHelper("vega_no_effector")
     joint_names_kin = [j.name for j in kin.sapien_robot.get_active_joints()]
     name_to_idx_kin = {n: i for i, n in enumerate(joint_names_kin)}
     cam_link_idx = kin.link_name_to_idx["zed_depth_frame"]
 
-    # ── viser server ─────────────────────────────────────────────────────────
-    server = viser.ViserServer()
-    server.scene.set_up_direction("+z")
+    if "extrinsic" in img_group:
+        extrinsics = np.array(img_group["extrinsic"]).astype(np.float64)
+        print("Using saved obs/images/extrinsic")
+    else:
+        print("No saved extrinsic — computing per-frame FK ...")
+        extrinsics = np.zeros((N, 4, 4), dtype=np.float64)
+        for idx in range(N):
+            qpos = np.zeros(kin.sapien_robot.dof)
+            joint_vals = (
+                obs_torso[idx].tolist()
+                + obs_left_arm[idx].tolist()
+                + obs_right_arm[idx].tolist()
+                + obs_head[idx].tolist()
+            )
+            for name, val in zip(_OBS_NAMES, joint_vals, strict=True):
+                if name in name_to_idx_kin:
+                    qpos[name_to_idx_kin[name]] = val
+            extrinsics[idx] = kin.compute_fk_from_link_idx(qpos, [cam_link_idx])[0]
+
     robot_mesh_gen = RobotMeshGenerator("vega_no_effector")
 
-    cmap_depth = plt.colormaps.get_cmap("plasma")
+    # ── rerun ────────────────────────────────────────────────────────────────
+    rr.init("vis_episode", spawn=True)
+    rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+
+    K32 = K.astype(np.float32)
 
     for idx in range(N):
-        t0 = time.perf_counter()
+        rr.set_time("frame", sequence=idx)
 
-        # ── build joint vector ────────────────────────────────────────────
+        world_t_cam = extrinsics[idx]
+
+        # ── camera: pose + intrinsics + 2D streams attached in image space ──
+        rr.log(
+            "world/camera",
+            rr.Transform3D(translation=world_t_cam[:3, 3], mat3x3=world_t_cam[:3, :3]),
+        )
+        rr.log("world/camera", rr.Pinhole(image_from_camera=K32, width=W, height=H))
+        rr.log("world/camera/rgb", rr.Image(left_rgb[idx]))
+        rr.log("world/camera/depth", rr.DepthImage(depth_mm[idx], meter=1000.0))
+        # Right RGB is monocular only — log under /image so it shows in 2D views.
+        rr.log("image/right_rgb", rr.Image(right_rgb[idx]))
+
+        # ── colored point cloud (manual unproject + voxel downsample) ───────
+        depth_m = depth_mm[idx] / 1000.0
+        pts, mask = unproject_depth(depth_m, K, world_t_cam)
+        cols = left_rgb[idx][mask]
+        pts, cols = voxel_downsample(pts, cols, args.voxel)
+        rr.log("world/pcd", rr.Points3D(pts, colors=cols, radii=0.003))
+
+        # ── robot meshes (already in world frame from compute_robot_meshes) ──
         joints_vals = (
             [0.0] * len(_WHEEL_NAMES)
             + obs_torso[idx].tolist()
@@ -170,81 +199,25 @@ def main() -> None:
         joint_names = _WHEEL_NAMES + _OBS_NAMES
         joints_arr = np.array(joints_vals)
         joints_arr = robot_mesh_gen.convert_to_sapien_joint_order(joints_arr, joint_names)
-
-        # ── camera pose via FK ────────────────────────────────────────────
-        qpos = np.zeros(kin.sapien_robot.dof)
-        for name, val in zip(joint_names, joints_vals, strict=False):
-            if name in name_to_idx_kin:
-                qpos[name_to_idx_kin[name]] = val
-        world_t_cam = kin.compute_fk_from_link_idx(qpos, [cam_link_idx])[0]  # (4,4)
-
-        # ── point cloud for this frame ────────────────────────────────────
-        depth_m = depth_mm[idx] / 1000.0
-        pts, mask = unproject_depth(depth_m, K, world_t_cam)
-        cols = left_rgb[idx][mask].astype(np.uint8)  # (M,3) RGB
-
-        pts, cols = voxel_downsample(pts, cols, args.voxel)
-
-        # ── viser: point cloud ────────────────────────────────────────────
-        server.scene.add_point_cloud(
-            name="/pcd",
-            points=pts,
-            colors=cols,
-            point_size=0.003,
-        )
-
-        # ── viser: robot meshes ───────────────────────────────────────────
         meshes = robot_mesh_gen.compute_robot_meshes(joints_arr)
         for i, mesh in enumerate(meshes):
-            server.scene.add_mesh_trimesh(name=f"/robot/link_{i}", mesh=mesh)
+            rr.log(
+                f"world/robot/link_{i}",
+                rr.Mesh3D(
+                    vertex_positions=np.asarray(mesh.vertices, dtype=np.float32),
+                    triangle_indices=np.asarray(mesh.faces, dtype=np.uint32),
+                ),
+            )
 
-        # ── viser: EEF frames ─────────────────────────────────────────────
-        wxyz, pos = mat_to_wxyz_pos(eef_left[idx])
-        server.scene.add_frame(
-            "/eef/left", wxyz=wxyz, position=pos, axes_length=0.1, axes_radius=0.005
-        )
-        wxyz, pos = mat_to_wxyz_pos(eef_right[idx])
-        server.scene.add_frame(
-            "/eef/right", wxyz=wxyz, position=pos, axes_length=0.1, axes_radius=0.005
-        )
-
-        # ── viser: camera frame ───────────────────────────────────────────
-        wxyz, pos = mat_to_wxyz_pos(world_t_cam)
-        server.scene.add_frame(
-            "/camera", wxyz=wxyz, position=pos, axes_length=0.05, axes_radius=0.003
-        )
-
-        # ── cv2: image panel ──────────────────────────────────────────────
-        rgb_vis = np.concatenate(
-            [
-                cv2.resize(left_rgb[idx], (480, 300)),
-                cv2.resize(right_rgb[idx], (480, 300)),
-            ],
-            axis=1,
-        )
-        rgb_vis = cv2.cvtColor(rgb_vis, cv2.COLOR_RGB2BGR)
-
-        d_norm = np.clip(depth_mm[idx] / 3000.0, 0.0, 1.0)
-        depth_vis = (cmap_depth(d_norm)[..., :3] * 255).astype(np.uint8)
-        depth_vis = cv2.resize(cv2.cvtColor(depth_vis, cv2.COLOR_RGB2BGR), (480, 300))
-
-        frame_vis = np.concatenate([rgb_vis, depth_vis], axis=1)
-        cv2.putText(
-            frame_vis, f"{idx+1}/{N}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
-        )
-        cv2.imshow("episode", frame_vis)
-        if cv2.waitKey(1) == ord("q"):
-            break
-
-        if idx == 0:
-            time.sleep(2.0)  # wait for viser browser to connect
-
-        elapsed = time.perf_counter() - t0
-        time.sleep(max(0.0, 1.0 / args.fps - elapsed))
-
-    cv2.destroyAllWindows()
-    while True:
-        time.sleep(1.0)
+        # ── EEF frames (skip frames where IK was bypassed → NaN) ────────────
+        for name, mat in (("world/eef/left", eef_left[idx]), ("world/eef/right", eef_right[idx])):
+            if not np.all(np.isfinite(mat)):
+                rr.log(name, rr.Clear(recursive=True))
+                continue
+            rr.log(
+                name,
+                rr.Transform3D(translation=mat[:3, 3], mat3x3=mat[:3, :3]),
+            )
 
 
 if __name__ == "__main__":

@@ -1002,6 +1002,27 @@ class VRReader:
         eef_left = self._last_ik_target_left.astype(np.float32, copy=True)
         eef_right = self._last_ik_target_right.astype(np.float32, copy=True)
 
+        # Sample observed joints once and FK them to the head camera link to
+        # get world_t_cam (matches scripts/compute_extrinsics.py output).
+        obs_torso = np.array(self._cam_robot.torso.get_joint_pos(), dtype=np.float32)
+        obs_left_arm = np.array(self._cam_robot.left_arm.get_joint_pos(), dtype=np.float32)
+        obs_right_arm = np.array(self._cam_robot.right_arm.get_joint_pos(), dtype=np.float32)
+        obs_head = np.array(self._cam_robot.head.get_joint_pos(), dtype=np.float32)
+        obs_qpos = np.zeros(self.kin.sapien_robot.dof, dtype=np.float64)
+        for i, n in enumerate(_TORSO_JOINTS):
+            if n in self.joint_name_to_idx:
+                obs_qpos[self.joint_name_to_idx[n]] = obs_torso[i]
+        for i, n in enumerate(self.left_proc.joint_names):
+            obs_qpos[self.joint_name_to_idx[n]] = obs_left_arm[i]
+        for i, n in enumerate(self.right_proc.joint_names):
+            obs_qpos[self.joint_name_to_idx[n]] = obs_right_arm[i]
+        for i, n in enumerate(_HEAD_MOTOR_JOINTS):
+            if n in self.joint_name_to_idx:
+                obs_qpos[self.joint_name_to_idx[n]] = obs_head[i]
+        extrinsic = self.kin.compute_fk_from_link_idx(
+            obs_qpos, [self.head_eef_idx]
+        )[0].astype(np.float32)
+
         frame = {
             "timestamp_ns": np.int64(time.time_ns()),
             "action": {
@@ -1024,20 +1045,17 @@ class VRReader:
             },
             "obs": {
                 "joint": {
-                    "left_arm": np.array(
-                        self._cam_robot.left_arm.get_joint_pos(), dtype=np.float32
-                    ),
-                    "right_arm": np.array(
-                        self._cam_robot.right_arm.get_joint_pos(), dtype=np.float32
-                    ),
-                    "head": np.array(self._cam_robot.head.get_joint_pos(), dtype=np.float32),
-                    "torso": np.array(self._cam_robot.torso.get_joint_pos(), dtype=np.float32),
+                    "left_arm": obs_left_arm,
+                    "right_arm": obs_right_arm,
+                    "head": obs_head,
+                    "torso": obs_torso,
                 },
                 "images": {
                     "left_rgb": self._last_imgs["left_rgb"],
                     "right_rgb": self._last_imgs["right_rgb"],
                     "depth": self._last_depth_u16,
-                    "instrinsic": ZED_K.astype(np.float32),
+                    "intrinsic": ZED_K.astype(np.float32),
+                    "extrinsic": extrinsic,
                 },
             },
         }

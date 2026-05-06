@@ -4,9 +4,16 @@ Drives one or both Hand-E grippers through a step sequence, polls the actual
 encoder position via FC03 over the existing dexcontrol EE pass-through reply
 channel, and writes a CSV plus PNG of cmd / actual plus latency summary per side.
 
+Modes:
+  * stepped: traverse the requested step sequence once and send a gripper
+    command only when the command value changes.
+  * continuous: repeat a 0.01-resolution ramp at the tick rate and resend the
+    gripper command on every tick, matching VRRobotController's whole-body
+    control_rate by default.
+
 The collector uses two independent rates inside one thread:
-  * Tick rate (default 20 Hz) issues cmd writes (when the value changes) and
-    FC03 status requests; emits one "tick" row per side per tick.
+  * Tick rate issues cmd writes and FC03 status requests; emits one "tick" row
+    per side per tick.
   * Drain rate (~500 Hz) reads each side's response slot nonblockingly and
     emits one "sample" row whenever a fresh, parseable FC03 reply lands.
 
@@ -23,6 +30,7 @@ Hardware preconditions:
 
 Run:
     python scripts/robotiq_gripper_cmd_actual.py
+    python scripts/robotiq_gripper_cmd_actual.py --mode continuous
     python scripts/robotiq_gripper_cmd_actual.py --sides right --duration 15
 """
 
@@ -40,6 +48,7 @@ import numpy as np
 from dexcontrol.core.arm import Arm
 from dexcontrol.robot import Robot
 
+from omniteleop.common import get_config
 from omniteleop.follower.robotiq import (
     build_hande_command,
     build_hande_status_request,
@@ -50,6 +59,12 @@ from omniteleop.follower.robotiq import (
 )
 
 DEFAULT_STEPS = (0.0, 1.0, 0.5, 1.0, 0.0)
+CONTINUOUS_STEP_SIZE = 0.01
+CONTINUOUS_STEPS = tuple(round(i * CONTINUOUS_STEP_SIZE, 2) for i in range(101)) + tuple(
+    round(i * CONTINUOUS_STEP_SIZE, 2) for i in range(99, 0, -1)
+)
+DEFAULT_STEPPED_RATE_HZ = 20.0
+DEFAULT_WHOLE_BODY_RATE_HZ = 100.0
 DEFAULT_HOLD_S = 3.0
 DRAIN_PERIOD_S = 0.002  # ~500 Hz nonblocking drain
 PRE_MOTION_WINDOW_S = 0.25
@@ -78,27 +93,56 @@ CSV_FIELDS = [
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument(
+        "--mode",
+        choices=("stepped", "continuous"),
+        default="continuous",
+        help=(
+            "stepped sends only when the command changes; continuous sends a "
+            "0.00->1.00->0.00 ramp, one command per tick, at the whole-body "
+            "control rate by default"
+        ),
+    )
+    p.add_argument(
         "--sides",
         default="right",
         help="comma-separated sides to drive (default: right)",
     )
-    p.add_argument("--rate", type=float, default=20.0, help="tick rate in Hz")
+    p.add_argument(
+        "--rate",
+        type=float,
+        default=None,
+        help=(
+            "tick rate in Hz (default: "
+            f"{DEFAULT_STEPPED_RATE_HZ:.0f} in stepped mode; "
+            "whole-body control_rate in continuous mode)"
+        ),
+    )
     p.add_argument(
         "--duration",
         type=float,
         default=None,
-        help="run duration in seconds (default: len(steps)*hold + 2.0, one-shot)",
+        help=(
+            "run duration in seconds (default: stepped len(steps)*hold + 2.0; "
+            "continuous one ramp cycle + 2.0)"
+        ),
     )
     p.add_argument(
         "--hold",
         type=float,
         default=DEFAULT_HOLD_S,
-        help=f"seconds per step (default: {DEFAULT_HOLD_S:.1f})",
+        help=(
+            f"seconds per step in stepped mode (default: {DEFAULT_HOLD_S:.1f}); "
+            "continuous mode advances one command per tick"
+        ),
     )
     p.add_argument(
         "--steps",
-        default=",".join(str(s) for s in DEFAULT_STEPS),
-        help="comma-separated step sequence in [0,1]",
+        default=None,
+        help=(
+            "comma-separated step sequence in [0,1] "
+            f"(default: {DEFAULT_STEPS} in stepped; "
+            "0.00->1.00->0.00 by 0.01 in continuous)"
+        ),
     )
     p.add_argument(
         "--function-code",
@@ -117,6 +161,11 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def whole_body_control_rate_hz() -> float:
+    """Match VRRobotController's whole-body gripper command loop rate."""
+    return float(get_config().get_rate("control_rate", DEFAULT_WHOLE_BODY_RATE_HZ))
+
+
 def get_arm(robot: Robot, side: str) -> Arm:
     if side == "left":
         return robot.left_arm
@@ -131,6 +180,11 @@ def step_for_time(t_s: float, steps: tuple, hold_s: float) -> float:
     if t_s >= cycle_s:
         return float(steps[-1])
     return float(steps[int(t_s // hold_s)])
+
+
+def repeating_step_for_tick(tick_index: int, steps: tuple) -> float:
+    """Repeating one-command-per-tick traversal for continuous resend tests."""
+    return float(steps[tick_index % len(steps)])
 
 
 def warmup_check(arm: Arm, side: str, function_code: int, timeout_s: float = 0.5) -> bool:
@@ -506,6 +560,97 @@ def print_latencies(latencies: Dict[str, Dict[str, List[Dict]]]) -> None:
                 )
 
 
+def compute_continuous_peak_latencies(
+    rows: List[Dict],
+    sides: List[str],
+    cmd_target: float = 1.0,
+    cmd_tol: float = SETTLED_TOL,
+) -> Dict[str, List[Dict]]:
+    """Find latency from cmd=1.0 ticks to the later actual maximum per cycle."""
+    results: Dict[str, List[Dict]] = {side: [] for side in sides}
+    for side in sides:
+        side_ticks = [
+            r for r in rows if r["kind"] == "tick" and r["side"] == side
+        ]
+        side_samples = [
+            r for r in rows if r["kind"] == "sample" and r["side"] == side
+        ]
+        side_ticks.sort(key=lambda r: r["tick_t_monotonic_s"])
+        side_samples.sort(key=lambda r: r["sample_t_monotonic_s"])
+
+        cmd_peak_ticks: List[Dict] = []
+        prev_cmd: Optional[float] = None
+        for r in side_ticks:
+            cmd = float(r["cmd"])
+            is_target = abs(cmd - cmd_target) <= cmd_tol
+            was_target = prev_cmd is not None and abs(prev_cmd - cmd_target) <= cmd_tol
+            if is_target and not was_target:
+                cmd_peak_ticks.append(r)
+            prev_cmd = cmd
+
+        for i, tick in enumerate(cmd_peak_ticks):
+            t_send = tick["tick_t_monotonic_s"]
+            t_next_peak = (
+                cmd_peak_ticks[i + 1]["tick_t_monotonic_s"]
+                if i + 1 < len(cmd_peak_ticks)
+                else float("inf")
+            )
+            window = [
+                r
+                for r in side_samples
+                if t_send <= r["sample_t_monotonic_s"] < t_next_peak
+            ]
+            if not window:
+                results[side].append(
+                    {
+                        "t_send": t_send,
+                        "peak_ms": None,
+                        "actual_max": None,
+                        "t_peak": None,
+                    }
+                )
+                continue
+
+            actual_max = max(float(r["actual"]) for r in window)
+            peak_sample = next(r for r in window if float(r["actual"]) >= actual_max)
+            t_peak = peak_sample["sample_t_monotonic_s"]
+            results[side].append(
+                {
+                    "t_send": t_send,
+                    "peak_ms": (t_peak - t_send) * 1000.0,
+                    "actual_max": actual_max,
+                    "t_peak": t_peak,
+                }
+            )
+    return results
+
+
+def print_continuous_peak_latencies(
+    peak_latencies: Dict[str, List[Dict]],
+) -> None:
+    print()
+    print("Continuous latency (cmd=1.0 → actual maximum in cycle):")
+    for side, entries in peak_latencies.items():
+        if not entries:
+            print(f"  {side}: no cmd=1.0 ticks found")
+            continue
+        print(f"  {side}:")
+        for e in entries:
+            peak_str = "n/a" if e["peak_ms"] is None else f"{e['peak_ms']:.1f} ms"
+            actual_str = "n/a" if e["actual_max"] is None else f"{e['actual_max']:.3f}"
+            print(
+                f"    [cmd=1.00 @ t={e['t_send']:.2f}s] "
+                f"peak={peak_str}, actual_max={actual_str}"
+            )
+        values = [e["peak_ms"] for e in entries if e["peak_ms"] is not None]
+        if values:
+            print(
+                f"    peak agg: mean={np.mean(values):.1f}, "
+                f"median={np.median(values):.1f}, "
+                f"max={np.max(values):.1f} ms (n={len(values)})"
+            )
+
+
 def mean_latency_label(latencies: Dict[str, Dict[str, List[Dict]]], side: str) -> str:
     entries: List[Dict] = []
     for direction in ("close", "open"):
@@ -545,12 +690,31 @@ def mean_latency_label(latencies: Dict[str, Dict[str, List[Dict]]], side: str) -
     )
 
 
+def continuous_peak_latency_label(
+    peak_latencies: Dict[str, List[Dict]],
+    side: str,
+) -> str:
+    entries = peak_latencies.get(side, [])
+    values = [e["peak_ms"] for e in entries if e["peak_ms"] is not None]
+    actual_maxes = [e["actual_max"] for e in entries if e["actual_max"] is not None]
+
+    peak_mean = "n/a" if not values else f"{np.mean(values):.1f} ms"
+    actual_mean = "n/a" if not actual_maxes else f"{np.mean(actual_maxes):.3f}"
+    return (
+        f"continuous latency (n={len(values)})\n"
+        f"cmd 1→actual max: {peak_mean}\n"
+        f"mean actual max: {actual_mean}"
+    )
+
+
 def plot_results(
     rows: List[Dict],
     sides: List[str],
     path: Path,
     stamp: str,
     latencies: Dict[str, Dict[str, List[Dict]]],
+    mode: str,
+    peak_latencies: Optional[Dict[str, List[Dict]]] = None,
 ) -> None:
     n = len(sides)
     fig, axes = plt.subplots(n, 1, sharex=True, figsize=(10, 3 * n))
@@ -578,7 +742,11 @@ def plot_results(
         ax.text(
             0.02,
             0.98,
-            mean_latency_label(latencies, side),
+            (
+                continuous_peak_latency_label(peak_latencies or {}, side)
+                if mode == "continuous"
+                else mean_latency_label(latencies, side)
+            ),
             transform=ax.transAxes,
             ha="left",
             va="top",
@@ -604,16 +772,31 @@ def main() -> None:
     if not sides:
         raise ValueError("--sides resolved to empty list")
 
-    steps = tuple(float(x) for x in args.steps.split(","))
+    if args.steps is None:
+        steps = CONTINUOUS_STEPS if args.mode == "continuous" else DEFAULT_STEPS
+    else:
+        steps = tuple(float(x) for x in args.steps.split(","))
     if not steps or any(not 0.0 <= s <= 1.0 for s in steps):
         raise ValueError(f"--steps must be a list of values in [0,1]; got {steps}")
 
-    if args.duration is None:
-        args.duration = len(steps) * args.hold + 2.0
+    if args.rate is None:
+        args.rate = (
+            whole_body_control_rate_hz()
+            if args.mode == "continuous"
+            else DEFAULT_STEPPED_RATE_HZ
+        )
 
-    if args.rate <= 0 or args.duration <= 0 or args.hold <= 0:
-        raise ValueError("--rate, --duration, and --hold must be positive")
+    if args.rate <= 0 or args.hold <= 0:
+        raise ValueError("--rate and --hold must be positive")
     period_s = 1.0 / args.rate
+
+    if args.duration is None:
+        if args.mode == "continuous":
+            args.duration = len(steps) * period_s + 2.0
+        else:
+            args.duration = len(steps) * args.hold + 2.0
+    if args.duration <= 0:
+        raise ValueError("--duration must be positive")
 
     if args.function_code not in (0x03, 0x04):
         raise ValueError(
@@ -648,10 +831,15 @@ def main() -> None:
         for side, arm in arms.items():
             warmup_check(arm, side, args.function_code)
 
+        mode_detail = (
+            f"ramp_steps={len(steps)}, cycle={len(steps) * period_s:.2f}s"
+            if args.mode == "continuous"
+            else f"steps={steps}, hold={args.hold:.2f}s"
+        )
         print(
             f"Logging for {args.duration:.1f} s with tick {args.rate:.1f} Hz "
             f"and ~{1.0/DRAIN_PERIOD_S:.0f} Hz drain "
-            f"(steps={steps}, hold={args.hold:.2f}s) → {csv_path}"
+            f"(mode={args.mode}, {mode_detail}) → {csv_path}"
         )
 
         # Persistent per-side state.
@@ -663,6 +851,7 @@ def main() -> None:
 
         t0 = time.monotonic()
         next_tick = t0
+        tick_index = 0
         overruns = 0
 
         while not interrupted["flag"]:
@@ -691,9 +880,12 @@ def main() -> None:
 
             # 2. Tick: schedule cmd writes and status requests.
             if now >= next_tick:
-                cmd = step_for_time(elapsed, steps, args.hold)
+                if args.mode == "continuous":
+                    cmd = repeating_step_for_tick(tick_index, steps)
+                else:
+                    cmd = step_for_time(elapsed, steps, args.hold)
                 for side, arm in arms.items():
-                    if cmd != last_cmd[side]:
+                    if args.mode == "continuous" or cmd != last_cmd[side]:
                         arm.send_ee_pass_through_message(build_hande_command(cmd))
                         last_cmd[side] = cmd
                     arm.send_ee_pass_through_message(
@@ -703,6 +895,7 @@ def main() -> None:
                         make_tick_row(tick_elapsed=elapsed, side=side, cmd=cmd)
                     )
                 next_tick += period_s
+                tick_index += 1
                 if next_tick <= time.monotonic():
                     overruns += 1
                     next_tick = time.monotonic() + period_s
@@ -724,9 +917,21 @@ def main() -> None:
             print()
             print_summary(rows, sides, args.duration, args.hold)
             latencies = compute_latencies(rows, sides)
-            print_latencies(latencies)
+            peak_latencies = compute_continuous_peak_latencies(rows, sides)
+            if args.mode == "continuous":
+                print_continuous_peak_latencies(peak_latencies)
+            else:
+                print_latencies(latencies)
             if not args.no_plot:
-                plot_results(rows, sides, png_path, stamp, latencies)
+                plot_results(
+                    rows,
+                    sides,
+                    png_path,
+                    stamp,
+                    latencies,
+                    args.mode,
+                    peak_latencies,
+                )
                 print(f"Wrote {png_path}")
         else:
             print("No rows captured; nothing to write.")
