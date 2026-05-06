@@ -12,14 +12,54 @@ Data flow::
     Quest 3 (WebXR browser)
         ↓  Socket.IO  (head + wrist poses + triggers/sticks)
     WebXRVRReader
-        ↓  4x4 transforms in robot-global frame
-    VRReader._run_loop()
-        ├─ KinHelper.compute_ik_from_mat()      (head/torso)
-        ├─ MotionManager.ik(type="pink")         (arms, self-collision avoidance)
-        ├─ thumbstick → chassis velocity
-        └─ Zenoh publisher → "vr/joints"         (VRJointData)
-                                                      ↓
-                                              VRRobotController (follower)
+        ↓  latest VRFrame:
+           head, left_wrist, right_wrist 4x4 poses in VR frame
+           triggers, buttons, left/right thumbsticks
+    VRReader.run()
+        ├─ camera poll/cache
+        │     head_camera RGB/depth cached for episode recording and browser preview
+        ├─ calibration/state machine
+        │     static → head → whole_body_alignment → whole_body
+        │     left X resets to static; left Y interpolates joints through resetting
+        ├─ head path
+        │     if stage != static:
+        │       robot_base_t_vr_base @ vr_head
+        │       → KinHelper.compute_ik_from_mat()
+        │       → head_pos command
+        ├─ arm target path
+        │     skipped unless stage is whole_body_alignment/whole_body
+        │     invalid controller pose → skip with NaN debug telemetry
+        │     follow_hand:
+        │       target = robot_base_t_vr_base @ vr_wrist
+        │       alignment stage interpolates target before live tracking
+        │     fixed_pose:
+        │       alignment stage holds INIT arm joints and computes vr_to_robot_*
+        │       whole_body target = vr_to_robot_* @ vr_wrist
+        ├─ arm IK path
+        │     target EEF poses
+        │       → MotionManager.ik(type="pink")
+        │       → "ik_raw"
+        │       → ArmProcessor.limit_joint_step()  (10 deg max per joint/frame)
+        │       → "cmd"
+        │       → MotionManager/current_qpos warm start for next frame
+        ├─ chassis/gripper path
+        │     thumbsticks → chassis_vx/chassis_vy/chassis_wz
+        │     index triggers → left_gripper/right_gripper
+        ├─ recording path  (only while recording in whole_body)
+        │     main HDF5:
+        │       action/joint/* = safe published commands
+        │       action/eef/* = EEF targets used by IK in the robot/world frame
+        │       obs/joint/* = robot joint feedback sampled through Robot API
+        │     debug HDF5:
+        │       raw VR wrist poses, calibration matrices, EEF target used by IK,
+        │       raw IK solution/status, and exact publish payload.
+        │       Every dataset named eef/* is in the robot/world frame used by IK.
+        └─ publish path
+              VRJointData(head_pos, arm_pos, grippers, chassis, estop, calib_stage)
+              → Zenoh "vr/joints"
+              → VRRobotController (follower)
+                    estop=True: head only
+                    estop=False: head, arms, grippers, chassis are applied
 
 Calibration stages
 ------------------
@@ -31,9 +71,10 @@ whole_body_alignment  Arms interpolate toward current controller positions.
 whole_body          Live tracking with self-collision avoidance.
 
 Published calib_stage (VRJointData):
-  internal static/head          → "A",  estop=True
-  internal whole_body_alignment → "B",  estop=True
-  internal whole_body           → "C",  estop=False
+  The literal internal stage string is published: "static", "head",
+  "resetting", "whole_body_alignment", or "whole_body".
+  estop=True only for "static" and "head"; the follower applies arm commands
+  during "resetting", "whole_body_alignment", and "whole_body".
 
 Usage::
 
@@ -681,9 +722,9 @@ class VRReader:
         self, l_target: np.ndarray, r_target: np.ndarray
     ) -> tuple[list[float], list[float]]:
         # Stash the actual IK target for the debug recorder. This is the
-        # canonical "what was passed to IK", different from the main HDF5's
-        # `action/eef/*` (which is hardcoded to `_robot_base_t_vr_base @ vr_*`
-        # even in fixed_pose mode).
+        # canonical "what was passed to IK"; the main HDF5 mirrors this as
+        # `action/eef/*` so training sees robot/world-frame EEF actions
+        # independent of start_mode.
         self._last_ik_target_left = l_target.astype(np.float32, copy=True)
         self._last_ik_target_right = r_target.astype(np.float32, copy=True)
 
@@ -955,12 +996,18 @@ class VRReader:
         if not self._last_imgs or self._last_depth_u16 is None:
             return
 
+        # Training actions and debug EEF targets must use the same frame:
+        # the robot/world-frame EEF poses that were passed to arm IK. Raw VR
+        # wrist poses stay under debug vr_raw/* and are not logged as EEF.
+        eef_left = self._last_ik_target_left.astype(np.float32, copy=True)
+        eef_right = self._last_ik_target_right.astype(np.float32, copy=True)
+
         frame = {
             "timestamp_ns": np.int64(time.time_ns()),
             "action": {
                 "eef": {
-                    "left": (self._robot_base_t_vr_base @ vr_l).astype(np.float32),
-                    "right": (self._robot_base_t_vr_base @ vr_r).astype(np.float32),
+                    "left": eef_left,
+                    "right": eef_right,
                 },
                 "joint": {
                     "left_arm": np.array(left_pos, dtype=np.float32),
@@ -1043,12 +1090,12 @@ class VRReader:
             },
             "target": {
                 "eef_used_by_ik": {
-                    "left": self._last_ik_target_left,
-                    "right": self._last_ik_target_right,
+                    "left": eef_left,
+                    "right": eef_right,
                 },
                 "eef_recorded_main": {
-                    "left": (self._robot_base_t_vr_base @ vr_l).astype(np.float32),
-                    "right": (self._robot_base_t_vr_base @ vr_r).astype(np.float32),
+                    "left": eef_left,
+                    "right": eef_right,
                 },
             },
             "ik": {

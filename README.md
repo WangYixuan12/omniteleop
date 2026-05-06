@@ -55,3 +55,8 @@ fixed_pose mode:
 4. Repeat 2-3
 ```
 
+## Train
+VR controller → fixed_pose calibration → robot-base EEF target → IK → robot motion
+
+## Infer
+camera/proprio obs → robot-base EEF target → IK → check speed/workspace/collision → robot motion

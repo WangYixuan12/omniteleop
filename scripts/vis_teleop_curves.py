@@ -8,9 +8,9 @@ Stages visualised
 -----------------
 - Per-joint commanded vs actual (arms, head)
 - Raw IK output before rate-limiting (debug file)
-- Commanded EEF target — both `eef_used_by_ik` (correct per mode) and
-  `eef_recorded_main` (always `_robot_base_t_vr_base @ vr_*`) — vs FK-derived
-  actual EEF (KinHelper)
+- Commanded EEF target — main `action/eef` plus debug `eef_used_by_ik`.
+  These must match: every EEF dataset is the robot-frame target used by IK,
+  independent of start mode.
 - Rate-limit clipping size and joint-tracking-error histograms
 - Loop period and timing breakdown (IK solve, publish)
 - Stage-equivalence: published payload vs rate-limited cmd (must be 0)
@@ -149,12 +149,12 @@ def fig_head_joints(
 def fig_eef_xyz(
     t: np.ndarray,
     target_used: np.ndarray,
-    target_recorded: np.ndarray,
+    target_main: np.ndarray,
     actual_eef: Optional[np.ndarray],
     side: str,
     fig_id: int,
 ) -> plt.Figure:
-    """target_used / target_recorded: (N,4,4); actual_eef: (N,3) FK-derived."""
+    """target_used / target_main: (N,4,4); actual_eef: (N,3) FK-derived."""
     fig, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 6))
     labels = "xyz"
     for i in range(3):
@@ -162,11 +162,11 @@ def fig_eef_xyz(
         ax.plot(t, target_used[:, i, 3], color="C0", lw=1.4, label="target (used_by_ik)")
         ax.plot(
             t,
-            target_recorded[:, i, 3],
+            target_main[:, i, 3],
             color="gray",
             lw=0.9,
             ls=":",
-            label="target (main HDF5)",
+            label="target (main action/eef)",
         )
         if actual_eef is not None:
             ax.plot(t, actual_eef[:, i], color="C3", lw=1.0, label="actual (FK)")
@@ -225,36 +225,34 @@ def fig_chassis(
     return fig
 
 
-def fig_loop_period(t_ns: np.ndarray, fig_id: int) -> plt.Figure:
+def fig_loop_and_timing(
+    t_ns: np.ndarray, dbg: Optional[dict], fig_id: int
+) -> plt.Figure:
+    """Combined: loop period + per-frame ik_solve / publish timings."""
     dt_ms = np.diff(t_ns).astype(np.float64) / 1e6
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(dt_ms, lw=0.7, color="C0")
-    mean = float(np.mean(dt_ms))
-    std = float(np.std(dt_ms))
-    p95 = float(np.percentile(dt_ms, 95))
-    ax.axhline(mean, color="C3", ls="--", lw=1.0, label=f"mean = {mean:.2f} ms")
-    ax.axhline(p95, color="C1", ls=":", lw=1.0, label=f"p95 = {p95:.2f} ms")
-    ax.set_xlabel("frame index (between-frame gap)")
-    ax.set_ylabel("loop period (ms)")
-    ax.set_title(
-        f"Fig {fig_id}: loop period (mean={mean:.2f}ms std={std:.2f}ms p95={p95:.2f}ms)"
+    fig, ax = plt.subplots(figsize=(10, 5))
+    loop_x = np.arange(1, len(dt_ms) + 1)
+    ax.plot(loop_x, dt_ms, lw=0.8, color="C0", label="loop period")
+    if dbg is not None:
+        x = np.arange(len(dbg["ik_solve_ms"]))
+        ax.plot(x, dbg["ik_solve_ms"], lw=0.8, color="C1", label="ik_solve_ms")
+        ax.plot(x, dbg["publish_ms"], lw=0.8, color="C2", label="publish_ms")
+    mean = float(np.mean(dt_ms)) if len(dt_ms) else float("nan")
+    std = float(np.std(dt_ms)) if len(dt_ms) else float("nan")
+    p95 = float(np.percentile(dt_ms, 95)) if len(dt_ms) else float("nan")
+    ax.axhline(
+        mean, color="C3", ls="--", lw=0.9, alpha=0.6, label=f"loop mean = {mean:.2f} ms"
     )
-    ax.legend()
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    return fig
-
-
-def fig_timing_breakdown(dbg: dict, fig_id: int) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(10, 4))
-    n = len(dbg["ik_solve_ms"])
-    x = np.arange(n)
-    ax.plot(x, dbg["ik_solve_ms"], lw=0.8, color="C0", label="ik_solve_ms")
-    ax.plot(x, dbg["publish_ms"], lw=0.8, color="C2", label="publish_ms")
+    ax.axhline(
+        p95, color="C3", ls=":", lw=0.9, alpha=0.6, label=f"loop p95 = {p95:.2f} ms"
+    )
     ax.set_xlabel("frame index")
     ax.set_ylabel("ms")
-    ax.set_title(f"Fig {fig_id}: per-frame timing breakdown")
-    ax.legend()
+    ax.set_title(
+        f"Fig {fig_id}: loop period + timing breakdown "
+        f"(loop mean={mean:.2f}ms std={std:.2f}ms p95={p95:.2f}ms)"
+    )
+    ax.legend(loc="upper right", fontsize=8)
     ax.grid(alpha=0.3)
     fig.tight_layout()
     return fig
@@ -368,6 +366,25 @@ def estimate_lag_ms(cmd: np.ndarray, actual: np.ndarray, dt_s: float) -> float:
     return lag_idx * dt_s * 1000.0
 
 
+def assert_eef_targets_match(main: dict, dbg: dict, atol: float = 1e-5) -> None:
+    """Require all EEF datasets to be the same robot-frame IK target."""
+    checks = [
+        ("left", main["cmd_eef_left"], dbg["eef_used_by_ik_left"]),
+        ("left", main["cmd_eef_left"], dbg["eef_recorded_main_left"]),
+        ("right", main["cmd_eef_right"], dbg["eef_used_by_ik_right"]),
+        ("right", main["cmd_eef_right"], dbg["eef_recorded_main_right"]),
+    ]
+    for side, main_eef, debug_eef in checks:
+        diff = np.abs(main_eef - debug_eef)
+        max_diff = float(np.nanmax(diff))
+        if max_diff > atol:
+            raise ValueError(
+                f"{side} EEF mismatch: main action/eef and debug EEF differ by "
+                f"max {max_diff:.6g}. Regenerate the episode with vr_reader.py so "
+                "all EEF datasets are the robot-frame targets used by IK."
+            )
+
+
 def print_summary(main: dict, dbg: Optional[dict]) -> None:
     ts_ns = main["ts_ns"]
     dt_ns = np.diff(ts_ns).astype(np.float64)
@@ -438,8 +455,7 @@ def _maybe_show_or_save(figs: dict, save_dir: Optional[str]) -> None:
             path = out / f"{name}.png"
             fig.savefig(path, dpi=120, bbox_inches="tight")
             print(f"saved {path}")
-    else:
-        plt.show()
+    plt.show()
 
 
 def main_fn() -> None:
@@ -479,6 +495,7 @@ def main_fn() -> None:
                 f"frame count mismatch: main={main['ts_ns'].shape[0]} "
                 f"debug={dbg['ts_ns'].shape[0]}"
             )
+        assert_eef_targets_match(main, dbg)
     else:
         dbg = None
         print(
@@ -516,8 +533,8 @@ def main_fn() -> None:
 
     target_used_l = dbg["eef_used_by_ik_left"] if dbg else main["cmd_eef_left"]
     target_used_r = dbg["eef_used_by_ik_right"] if dbg else main["cmd_eef_right"]
-    target_main_l = dbg["eef_recorded_main_left"] if dbg else main["cmd_eef_left"]
-    target_main_r = dbg["eef_recorded_main_right"] if dbg else main["cmd_eef_right"]
+    target_main_l = main["cmd_eef_left"]
+    target_main_r = main["cmd_eef_right"]
 
     figs["fig04_left_eef"] = fig_eef_xyz(
         t, target_used_l, target_main_l, actual_eef_l, "L", 4
@@ -530,21 +547,7 @@ def main_fn() -> None:
     figs["fig07_chassis"] = fig_chassis(
         t, main["vx"], main["vy"], main["wz"], dbg, 7
     )
-    figs["fig08_loop_period"] = fig_loop_period(main["ts_ns"], 8)
-
-    if dbg is not None:
-        figs["fig09_timing"] = fig_timing_breakdown(dbg, 9)
-
-    figs["fig10_left_err_hist"] = fig_error_hist(
-        main["cmd_left"], main["act_left"], dbg["ik_raw_left"] if dbg else None, "L", 10
-    )
-    figs["fig11_right_err_hist"] = fig_error_hist(
-        main["cmd_right"],
-        main["act_right"],
-        dbg["ik_raw_right"] if dbg else None,
-        "R",
-        11,
-    )
+    figs["fig08_loop_and_timing"] = fig_loop_and_timing(main["ts_ns"], dbg, 8)
 
     if dbg is not None:
         figs["fig12_stage_eq"] = fig_stage_eq(

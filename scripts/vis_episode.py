@@ -110,7 +110,7 @@ def main() -> None:
     parser.add_argument(
         "--hdf5",
         type=str,
-        default="/media/yifan/portable_ssd/Dexmate/raw_data/episode_0.hdf5",
+        default="/media/yixuan/portable_ssd/Dexmate/raw_data/episode_0.hdf5",
         help="Path to episode HDF5 file",
     )
     parser.add_argument("--fps", type=float, default=10.0, help="Playback speed (Hz)")
