@@ -155,9 +155,7 @@ def parse_args() -> argparse.Namespace:
         default="/home/yixuan/omniteleop/Dexmate/debug/plots/gripper",
         help="output directory (default: Dexmate/debug/plots/gripper)",
     )
-    p.add_argument(
-        "--no-plot", action="store_true", help="skip matplotlib output"
-    )
+    p.add_argument("--no-plot", action="store_true", help="skip matplotlib output")
     return p.parse_args()
 
 
@@ -256,15 +254,11 @@ def write_csv(rows: List[Dict], path: Path) -> None:
         w.writerows(rows)
 
 
-def print_summary(
-    rows: List[Dict], sides: List[str], duration_s: float, hold_s: float
-) -> None:
+def print_summary(rows: List[Dict], sides: List[str], duration_s: float, hold_s: float) -> None:
     settle_s = min(0.3, hold_s * 0.3)
     sample_rows = [r for r in rows if r["kind"] == "sample"]
     tick_rows = [r for r in rows if r["kind"] == "tick"]
-    print(
-        f"Captured {len(tick_rows)} tick rows and {len(sample_rows)} sample rows."
-    )
+    print(f"Captured {len(tick_rows)} tick rows and {len(sample_rows)} sample rows.")
     for side in sides:
         side_samples = [r for r in sample_rows if r["side"] == side]
         if not side_samples:
@@ -404,19 +398,13 @@ def compute_latencies(
       * `close` if the new cmd > old cmd (gripper moves toward fully closed).
       * `open`  if the new cmd < old cmd (gripper moves toward fully open).
     """
-    results: Dict[str, Dict[str, List[Dict]]] = {
-        s: {"close": [], "open": []} for s in sides
-    }
+    results: Dict[str, Dict[str, List[Dict]]] = {s: {"close": [], "open": []} for s in sides}
     for side in sides:
         side_rows: List[tuple] = []
         for r in rows:
             if r["side"] != side:
                 continue
-            t = (
-                r["tick_t_monotonic_s"]
-                if r["kind"] == "tick"
-                else r["sample_t_monotonic_s"]
-            )
+            t = r["tick_t_monotonic_s"] if r["kind"] == "tick" else r["sample_t_monotonic_s"]
             side_rows.append((t, r))
         side_rows.sort(key=lambda x: x[0])
 
@@ -443,11 +431,7 @@ def compute_latencies(
         for i, tr in enumerate(transitions):
             target = tr["to"]
             t_send = tr["t_send"]
-            t_next = (
-                transitions[i + 1]["t_send"]
-                if i + 1 < len(transitions)
-                else float("inf")
-            )
+            t_next = transitions[i + 1]["t_send"] if i + 1 < len(transitions) else float("inf")
             actual_at_send = tr["actual_at_send"]
             direction = "close" if tr["to"] > tr["from"] else "open"
             pre_motion = classify_pre_motion(
@@ -486,11 +470,7 @@ def compute_latencies(
                     endpoint_tol=endpoint_tol,
                 ):
                     complete_ms = (t - t_send) * 1000.0
-                if (
-                    echo_ms is not None
-                    and motion_ms is not None
-                    and complete_ms is not None
-                ):
+                if echo_ms is not None and motion_ms is not None and complete_ms is not None:
                     break
 
             results[side][direction].append(
@@ -521,12 +501,8 @@ def print_latencies(latencies: Dict[str, Dict[str, List[Dict]]]) -> None:
             print(f"  {side} {direction}:")
             for e in entries:
                 echo_str = "n/a" if e["echo_ms"] is None else f"{e['echo_ms']:.1f} ms"
-                motion_str = (
-                    "n/a" if e["motion_ms"] is None else f"{e['motion_ms']:.1f} ms"
-                )
-                complete_str = (
-                    "n/a" if e["complete_ms"] is None else f"{e['complete_ms']:.1f} ms"
-                )
+                motion_str = "n/a" if e["motion_ms"] is None else f"{e['motion_ms']:.1f} ms"
+                complete_str = "n/a" if e["complete_ms"] is None else f"{e['complete_ms']:.1f} ms"
                 span = e.get("pre_actual_span")
                 span_str = "" if span is None else f", pre_span={span:.3f}"
                 print(
@@ -569,12 +545,8 @@ def compute_continuous_peak_latencies(
     """Find latency from cmd=1.0 ticks to the later actual maximum per cycle."""
     results: Dict[str, List[Dict]] = {side: [] for side in sides}
     for side in sides:
-        side_ticks = [
-            r for r in rows if r["kind"] == "tick" and r["side"] == side
-        ]
-        side_samples = [
-            r for r in rows if r["kind"] == "sample" and r["side"] == side
-        ]
+        side_ticks = [r for r in rows if r["kind"] == "tick" and r["side"] == side]
+        side_samples = [r for r in rows if r["kind"] == "sample" and r["side"] == side]
         side_ticks.sort(key=lambda r: r["tick_t_monotonic_s"])
         side_samples.sort(key=lambda r: r["sample_t_monotonic_s"])
 
@@ -595,11 +567,7 @@ def compute_continuous_peak_latencies(
                 if i + 1 < len(cmd_peak_ticks)
                 else float("inf")
             )
-            window = [
-                r
-                for r in side_samples
-                if t_send <= r["sample_t_monotonic_s"] < t_next_peak
-            ]
+            window = [r for r in side_samples if t_send <= r["sample_t_monotonic_s"] < t_next_peak]
             if not window:
                 results[side].append(
                     {
@@ -735,10 +703,7 @@ def plot_results(
 
         ax.set_ylim(-0.05, 1.05)
         ax.set_ylabel(f"{side} pos")
-        ax.set_title(
-            f"{side} gripper "
-            f"(ticks={len(side_ticks)}, samples={len(side_samples)})"
-        )
+        ax.set_title(f"{side} gripper " f"(ticks={len(side_ticks)}, samples={len(side_samples)})")
         ax.text(
             0.02,
             0.98,
@@ -781,9 +746,7 @@ def main() -> None:
 
     if args.rate is None:
         args.rate = (
-            whole_body_control_rate_hz()
-            if args.mode == "continuous"
-            else DEFAULT_STEPPED_RATE_HZ
+            whole_body_control_rate_hz() if args.mode == "continuous" else DEFAULT_STEPPED_RATE_HZ
         )
 
     if args.rate <= 0 or args.hold <= 0:
@@ -799,9 +762,7 @@ def main() -> None:
         raise ValueError("--duration must be positive")
 
     if args.function_code not in (0x03, 0x04):
-        raise ValueError(
-            f"--function-code must be 3 or 4; got {args.function_code:#x}"
-        )
+        raise ValueError(f"--function-code must be 3 or 4; got {args.function_code:#x}")
 
     out_dir = Path(args.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -845,8 +806,7 @@ def main() -> None:
         # Persistent per-side state.
         last_cmd: Dict[str, Optional[float]] = {side: None for side in sides}
         last_token: Dict[str, object] = {
-            side: response_token(arm.get_ee_pass_through_response())
-            for side, arm in arms.items()
+            side: response_token(arm.get_ee_pass_through_response()) for side, arm in arms.items()
         }
 
         t0 = time.monotonic()
@@ -888,12 +848,8 @@ def main() -> None:
                     if args.mode == "continuous" or cmd != last_cmd[side]:
                         arm.send_ee_pass_through_message(build_hande_command(cmd))
                         last_cmd[side] = cmd
-                    arm.send_ee_pass_through_message(
-                        build_hande_status_request(args.function_code)
-                    )
-                    rows.append(
-                        make_tick_row(tick_elapsed=elapsed, side=side, cmd=cmd)
-                    )
+                    arm.send_ee_pass_through_message(build_hande_status_request(args.function_code))
+                    rows.append(make_tick_row(tick_elapsed=elapsed, side=side, cmd=cmd))
                 next_tick += period_s
                 tick_index += 1
                 if next_tick <= time.monotonic():

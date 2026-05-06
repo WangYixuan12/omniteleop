@@ -129,9 +129,7 @@ def fig_arm_joints(
     return fig
 
 
-def fig_head_joints(
-    t: np.ndarray, cmd: np.ndarray, actual: np.ndarray, fig_id: int
-) -> plt.Figure:
+def fig_head_joints(t: np.ndarray, cmd: np.ndarray, actual: np.ndarray, fig_id: int) -> plt.Figure:
     fig, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 6))
     for i in range(3):
         axes[i].plot(t, cmd[:, i], color="C0", lw=1.4, label="cmd")
@@ -203,7 +201,7 @@ def fig_chassis(
 ) -> plt.Figure:
     fig, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 6))
     cmds = [(vx, "vx (m/s)"), (vy, "vy (m/s)"), (wz, "wz (rad/s)")]
-    for ax, (cmd, lbl) in zip(axes, cmds):
+    for ax, (cmd, lbl) in zip(axes, cmds, strict=False):
         ax.plot(t, cmd, color="C0", lw=1.2, label="cmd")
         ax.set_ylabel(lbl)
         ax.grid(alpha=0.3)
@@ -214,7 +212,7 @@ def fig_chassis(
         ls = dbg["left_thumbstick"]
         rs = dbg["right_thumbstick"]
         raws = [-ls[:, 1], -ls[:, 0], -rs[:, 0]]
-        for ax, raw in zip(axes, raws):
+        for ax, raw in zip(axes, raws, strict=False):
             ax2 = ax.twinx()
             ax2.plot(t, raw, color="lightgray", lw=0.8, label="raw stick")
             ax2.set_ylabel("stick", color="gray", fontsize=8)
@@ -225,9 +223,7 @@ def fig_chassis(
     return fig
 
 
-def fig_loop_and_timing(
-    t_ns: np.ndarray, dbg: Optional[dict], fig_id: int
-) -> plt.Figure:
+def fig_loop_and_timing(t_ns: np.ndarray, dbg: Optional[dict], fig_id: int) -> plt.Figure:
     """Combined: loop period + per-frame ik_solve / publish timings."""
     dt_ms = np.diff(t_ns).astype(np.float64) / 1e6
     fig, ax = plt.subplots(figsize=(10, 5))
@@ -240,12 +236,8 @@ def fig_loop_and_timing(
     mean = float(np.mean(dt_ms)) if len(dt_ms) else float("nan")
     std = float(np.std(dt_ms)) if len(dt_ms) else float("nan")
     p95 = float(np.percentile(dt_ms, 95)) if len(dt_ms) else float("nan")
-    ax.axhline(
-        mean, color="C3", ls="--", lw=0.9, alpha=0.6, label=f"loop mean = {mean:.2f} ms"
-    )
-    ax.axhline(
-        p95, color="C3", ls=":", lw=0.9, alpha=0.6, label=f"loop p95 = {p95:.2f} ms"
-    )
+    ax.axhline(mean, color="C3", ls="--", lw=0.9, alpha=0.6, label=f"loop mean = {mean:.2f} ms")
+    ax.axhline(p95, color="C3", ls=":", lw=0.9, alpha=0.6, label=f"loop p95 = {p95:.2f} ms")
     ax.set_xlabel("frame index")
     ax.set_ylabel("ms")
     ax.set_title(
@@ -271,9 +263,7 @@ def fig_error_hist(
             valid = ~np.isnan(ik_raw[:, i])
             clip = cmd[valid, i] - ik_raw[valid, i]
             axes[i, 0].hist(clip, bins=60, color="C0")
-            axes[i, 0].set_title(
-                f"{side}_j{i+1}  cmd − ik_raw (rate-limit clip)", fontsize=8
-            )
+            axes[i, 0].set_title(f"{side}_j{i+1}  cmd − ik_raw (rate-limit clip)", fontsize=8)
         else:
             axes[i, 0].axis("off")
         err = actual[:, i] - cmd[:, i]
@@ -300,9 +290,7 @@ def fig_stage_eq(
     fig, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 7))
     axes[0].plot(np.max(np.abs(dbg["publish_left_arm_pos"] - cmd_left), axis=1), color="C0")
     axes[0].set_ylabel("max |Δ| left_arm")
-    axes[1].plot(
-        np.max(np.abs(dbg["publish_right_arm_pos"] - cmd_right), axis=1), color="C0"
-    )
+    axes[1].plot(np.max(np.abs(dbg["publish_right_arm_pos"] - cmd_right), axis=1), color="C0")
     axes[1].set_ylabel("max |Δ| right_arm")
     axes[2].plot(np.max(np.abs(dbg["publish_head_pos"] - cmd_head), axis=1), color="C0")
     axes[2].set_ylabel("max |Δ| head")
@@ -424,7 +412,7 @@ def print_summary(main: dict, dbg: Optional[dict]) -> None:
         print()
         print("══════ IK status breakdown ══════")
         reasons, counts = np.unique(dbg["ik_failure_reason"], return_counts=True)
-        for r, c in zip(reasons, counts):
+        for r, c in zip(reasons, counts, strict=False):
             r_str = r.decode() if isinstance(r, (bytes, np.bytes_)) else str(r)
             print(f"  {r_str:<30} {int(c)}")
 
@@ -460,9 +448,15 @@ def _maybe_show_or_save(figs: dict, save_dir: Optional[str]) -> None:
 
 def main_fn() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hdf5", default="/home/yixuan/omniteleop/Dexmate/raw_data/episode_0.hdf5", help="Path to main episode HDF5")
     parser.add_argument(
-        "--debug", default="/home/yixuan/omniteleop/Dexmate/raw_data/episode_0_debug.hdf5", help="Path to debug HDF5 (auto-derived if omitted)"
+        "--hdf5",
+        default="/home/yixuan/omniteleop/Dexmate/raw_data/episode_0.hdf5",
+        help="Path to main episode HDF5",
+    )
+    parser.add_argument(
+        "--debug",
+        default="/home/yixuan/omniteleop/Dexmate/raw_data/episode_0_debug.hdf5",
+        help="Path to debug HDF5 (auto-derived if omitted)",
     )
     parser.add_argument(
         "--save-dir",
@@ -538,17 +532,11 @@ def main_fn() -> None:
     target_main_l = main["cmd_eef_left"]
     target_main_r = main["cmd_eef_right"]
 
-    figs["fig04_left_eef"] = fig_eef_xyz(
-        t, target_used_l, target_main_l, actual_eef_l, "L", 4
-    )
-    figs["fig05_right_eef"] = fig_eef_xyz(
-        t, target_used_r, target_main_r, actual_eef_r, "R", 5
-    )
+    figs["fig04_left_eef"] = fig_eef_xyz(t, target_used_l, target_main_l, actual_eef_l, "L", 4)
+    figs["fig05_right_eef"] = fig_eef_xyz(t, target_used_r, target_main_r, actual_eef_r, "R", 5)
 
     figs["fig06_grippers"] = fig_grippers(t, main["grip_left"], main["grip_right"], 6)
-    figs["fig07_chassis"] = fig_chassis(
-        t, main["vx"], main["vy"], main["wz"], dbg, 7
-    )
+    figs["fig07_chassis"] = fig_chassis(t, main["vx"], main["vy"], main["wz"], dbg, 7)
     figs["fig08_loop_and_timing"] = fig_loop_and_timing(main["ts_ns"], dbg, 8)
 
     if dbg is not None:

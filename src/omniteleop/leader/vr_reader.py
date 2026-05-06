@@ -234,12 +234,11 @@ def _count_leaves(d: dict) -> int:
     return n
 
 
-def _save_dict_with_progress(
-    data: dict, path: str, on_progress: Callable[[float], None]
-) -> None:
+def _save_dict_with_progress(data: dict, path: str, on_progress: Callable[[float], None]) -> None:
     """Save nested dict-of-ndarrays to HDF5; ``on_progress(frac in [0,1])`` is
     called repeatedly as datasets are written. Large arrays are chunked along
-    axis 0 so the bar advances smoothly mid-leaf."""
+    axis 0 so the bar advances smoothly mid-leaf.
+    """
     import h5py
 
     total = max(1, _count_leaves(data))
@@ -315,7 +314,8 @@ class EpisodeRecorder:
 
     def stop(self) -> Optional[str]:
         """Stop recording; spawn background thread to save HDF5. Returns the
-        target path immediately (file is written asynchronously)."""
+        target path immediately (file is written asynchronously).
+        """
         self.recording = False
         if not self._frames:
             logger.warning("EpisodeRecorder: 0 frames — skipping save")
@@ -817,9 +817,9 @@ class VRReader:
             # Arm is held at FIXED (set by resetting). Recompute per-arm
             # calibration each frame so it reflects the user's current hand
             # pose; locked when the user trigger-advances to whole_body.
-            left_fk = self.kin.compute_fk_from_link_idx(
-                self.current_qpos, [self.left_arm_eef_idx]
-            )[0]
+            left_fk = self.kin.compute_fk_from_link_idx(self.current_qpos, [self.left_arm_eef_idx])[
+                0
+            ]
             right_fk = self.kin.compute_fk_from_link_idx(
                 self.current_qpos, [self.right_arm_eef_idx]
             )[0]
@@ -947,9 +947,7 @@ class VRReader:
                 )
             else:
                 console.rule("[bold cyan]Stage whole_body_alignment — approaching arm targets…")
-        elif (
-            self._calib_stage == "whole_body_alignment" and self.start_mode == "fixed_pose"
-        ):
+        elif self._calib_stage == "whole_body_alignment" and self.start_mode == "fixed_pose":
             if self._vr_to_robot_left is None or self._vr_to_robot_right is None:
                 console.print(
                     "[bold red]fixed_pose: calibration not yet computed — wait one frame[/]"
@@ -1023,9 +1021,9 @@ class VRReader:
         for i, n in enumerate(_HEAD_MOTOR_JOINTS):
             if n in self.joint_name_to_idx:
                 obs_qpos[self.joint_name_to_idx[n]] = obs_head[i]
-        extrinsic = self.kin.compute_fk_from_link_idx(
-            obs_qpos, [self.head_eef_idx]
-        )[0].astype(np.float32)
+        extrinsic = self.kin.compute_fk_from_link_idx(obs_qpos, [self.head_eef_idx])[0].astype(
+            np.float32
+        )
 
         frame = {
             "timestamp_ns": np.int64(time.time_ns()),
