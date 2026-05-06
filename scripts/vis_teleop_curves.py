@@ -465,7 +465,9 @@ def main_fn() -> None:
         "--debug", default="/home/yixuan/omniteleop/Dexmate/raw_data/episode_0_debug.hdf5", help="Path to debug HDF5 (auto-derived if omitted)"
     )
     parser.add_argument(
-        "--save-dir", default="/home/yixuan/omniteleop/Dexmate/plots", help="If set, save PNGs instead of plt.show()"
+        "--save-dir",
+        default="/home/yixuan/omniteleop/Dexmate/debug/plots",
+        help="If set, save PNGs instead of plt.show()",
     )
     parser.add_argument(
         "--no-fk",

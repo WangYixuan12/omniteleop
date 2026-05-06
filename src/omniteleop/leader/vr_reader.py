@@ -295,10 +295,13 @@ class EpisodeRecorder:
         self.saving = False
         self.save_progress: float = 0.0
         self._save_thread: Optional[threading.Thread] = None
-        # Count only `episode_<N>.hdf5` files; skip `episode_<N>_debug.hdf5`.
-        self.episode_id = sum(
-            1 for p in self._save_dir.glob("episode_*.hdf5") if self._ID_RE.search(p.name)
+        # Skip debug files and continue after the highest existing episode id.
+        existing_ids = (
+            int(match.group(1))
+            for p in self._save_dir.glob("episode_*.hdf5")
+            if (match := self._ID_RE.fullmatch(p.name)) is not None
         )
+        self.episode_id = max(existing_ids, default=-1) + 1
 
     def start(self) -> None:
         """Start a new episode recording."""
@@ -424,7 +427,8 @@ class VRReader:
         debug: bool = False,
         visualize: bool = False,
         urdf_path: Optional[str] = None,
-        save_dir: str = "data",
+        save_dir: str = "/home/yixuan/omniteleop/Dexmate/data/raw_data",
+        debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/debug_data",
         start_mode: StartMode = "follow_hand",
         save_debug: bool = True,
     ) -> None:
@@ -489,7 +493,7 @@ class VRReader:
 
         # Recording
         self.recorder = EpisodeRecorder(save_dir)
-        self.debug_recorder = DebugEpisodeRecorder(save_dir)
+        self.debug_recorder = DebugEpisodeRecorder(debug_save_dir)
         self._last_imgs: dict[str, np.ndarray] = {}
         self._last_depth_u16: Optional[np.ndarray] = None
         self._prev_a: bool = False
@@ -1337,8 +1341,11 @@ def main() -> None:
         urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"  # noqa
         """Path to robot URDF for Sapien visualizer (required if --visualize)"""
 
-        save_dir: str = "/home/yixuan/omniteleop/Dexmate/raw_data/"
-        """Directory to save HDF5 episodes (A=start, B=stop)"""
+        save_dir: str = "/home/yixuan/omniteleop/Dexmate/data/raw_data"
+        """Directory to save episode_<N>.hdf5 files (A=start, B=stop)"""
+
+        debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/debug_data"
+        """Directory to save episode_<N>_debug.hdf5 files"""
 
         start_mode: StartMode = "fixed_pose"
         """Episode start behaviour. 'follow_hand': arm interpolates to current
@@ -1347,7 +1354,7 @@ def main() -> None:
         configuration; user trigger-advances out of whole_body_alignment to
         lock the per-arm calibration."""
 
-        save_debug: bool = True
+        save_debug: bool = False
         """If False, skip building and saving episode_<N>_debug.hdf5 to reduce
         per-frame overhead and shorten save time."""
 
@@ -1367,6 +1374,7 @@ def main() -> None:
         visualize=args.visualize,
         urdf_path=args.urdf_path,
         save_dir=args.save_dir,
+        debug_save_dir=args.debug_save_dir,
         start_mode=args.start_mode,
         save_debug=args.save_debug,
     )

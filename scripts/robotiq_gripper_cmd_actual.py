@@ -152,8 +152,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--out-dir",
-        default="/home/yixuan/omniteleop/Dexmate/plots/gripper",
-        help="output directory (default: Dexmate/plots/gripper)",
+        default="/home/yixuan/omniteleop/Dexmate/debug/plots/gripper",
+        help="output directory (default: Dexmate/debug/plots/gripper)",
     )
     p.add_argument(
         "--no-plot", action="store_true", help="skip matplotlib output"
