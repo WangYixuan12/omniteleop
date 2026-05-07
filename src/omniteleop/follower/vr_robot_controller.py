@@ -50,6 +50,8 @@ from omniteleop.common.vr_mode_const import (
     INIT_LEFT_ARM_JOINTS,
     INIT_RIGHT_ARM_JOINTS,
     INIT_TORSO_JOINTS,
+    SAFE_LEFT_ARM_JOINTS,
+    SAFE_RIGHT_ARM_JOINTS,
 )
 from omniteleop.follower.robotiq import build_hande_command, send_activate
 
@@ -152,29 +154,33 @@ class VRRobotController:
             )
             self.robot.torso.set_joint_pos(interp_torso.tolist(), wait_time=0.1, exit_on_reach=True)
 
-        # interpolate left arm to target position
+        # interpolate left arm: current → SAFE → INIT
         curr_left = self.robot.left_arm.get_joint_pos()
-        steps = int(max(abs(np.array(INIT_LEFT_ARM_JOINTS) - np.array(curr_left))) / joint_delta)
-        for i in range(steps):
-            interp_left = (
-                np.array(curr_left)
-                + (np.array(INIT_LEFT_ARM_JOINTS) - np.array(curr_left)) * (i + 1) / steps
-            )
-            self.robot.left_arm.set_joint_pos(
-                interp_left.tolist(), wait_time=0.1, exit_on_reach=True
-            )
+        for waypoint in (SAFE_LEFT_ARM_JOINTS, INIT_LEFT_ARM_JOINTS):
+            steps = int(max(abs(np.array(waypoint) - np.array(curr_left))) / joint_delta)
+            for i in range(steps):
+                interp_left = (
+                    np.array(curr_left)
+                    + (np.array(waypoint) - np.array(curr_left)) * (i + 1) / steps
+                )
+                self.robot.left_arm.set_joint_pos(
+                    interp_left.tolist(), wait_time=0.1, exit_on_reach=True
+                )
+            curr_left = waypoint
 
-        # interpolate right arm to target position
+        # interpolate right arm: current → SAFE → INIT
         curr_right = self.robot.right_arm.get_joint_pos()
-        steps = int(max(abs(np.array(INIT_RIGHT_ARM_JOINTS) - np.array(curr_right))) / joint_delta)
-        for i in range(steps):
-            interp_right = (
-                np.array(curr_right)
-                + (np.array(INIT_RIGHT_ARM_JOINTS) - np.array(curr_right)) * (i + 1) / steps
-            )
-            self.robot.right_arm.set_joint_pos(
-                interp_right.tolist(), wait_time=0.1, exit_on_reach=True
-            )
+        for waypoint in (SAFE_RIGHT_ARM_JOINTS, INIT_RIGHT_ARM_JOINTS):
+            steps = int(max(abs(np.array(waypoint) - np.array(curr_right))) / joint_delta)
+            for i in range(steps):
+                interp_right = (
+                    np.array(curr_right)
+                    + (np.array(waypoint) - np.array(curr_right)) * (i + 1) / steps
+                )
+                self.robot.right_arm.set_joint_pos(
+                    interp_right.tolist(), wait_time=0.1, exit_on_reach=True
+                )
+            curr_right = waypoint
 
         # interpolate head to target position
         curr_head = self.robot.head.get_joint_pos()

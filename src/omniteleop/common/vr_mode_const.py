@@ -2,6 +2,8 @@ import numpy as np
 
 INIT_HEAD_JOINTS = [-np.pi / 8.0, 0.0, 0.0]
 INIT_TORSO_JOINTS = [np.pi / 2.0, np.pi, np.pi / 8.0]
+SAFE_LEFT_ARM_JOINTS = [np.pi / 3.0, 0.0, 0.0, -np.pi * 2.0 / 3.0, 0.0, 0.0, 0.0]
+SAFE_RIGHT_ARM_JOINTS = [-np.pi / 3.0, 0.0, 0.0, -np.pi * 2.0 / 3.0, 0.0, 0.0, 0.0]
 INIT_LEFT_ARM_JOINTS = [
     1.4998975,
     0.19498293,

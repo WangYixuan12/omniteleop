@@ -122,6 +122,8 @@ from omniteleop.common.vr_mode_const import (
     INIT_LEFT_ARM_JOINTS,
     INIT_RIGHT_ARM_JOINTS,
     INIT_TORSO_JOINTS,
+    SAFE_LEFT_ARM_JOINTS,
+    SAFE_RIGHT_ARM_JOINTS,
 )
 
 StartMode = Literal["follow_hand", "fixed_pose"]
@@ -515,11 +517,14 @@ class VRReader:
         self._last_ik_solve_ms: float = float("nan")
         self._last_publish_ms: float = float("nan")
 
-        # Reset interpolation state (set when entering "resetting" stage)
+        # Reset interpolation state (set when entering "resetting" stage).
+        # Reset is two-phase: phase 1 brings arms to SAFE_*_ARM_JOINTS, phase 2
+        # brings everything (incl. arms) to INIT_*_JOINTS.
         self._reset_start_qpos: np.ndarray = np.eye(1)
         self._reset_target_qpos: np.ndarray = np.eye(1)
         self._reset_total_steps: int = 1
         self._reset_step_idx: int = 0
+        self._reset_phase: int = 0
 
         # Loop state (set in run() before main loop)
         self._calib_stage: str = "static"
@@ -846,7 +851,9 @@ class VRReader:
         return left_pos, right_pos, ik_l, ik_r
 
     def _resetting_step(self, transforms: VRFrame) -> tuple[list[float], list[float], list[float]]:
-        """Interpolate joints toward init pose; on completion compute new base transform."""
+        """Interpolate joints toward reset target; on phase 1 completion advance
+        to phase 2 (INIT); on phase 2 completion compute new base transform.
+        """
         self._reset_step_idx += 1
         alpha = min(1.0, self._reset_step_idx / self._reset_total_steps)
         qpos = self._reset_start_qpos + alpha * (self._reset_target_qpos - self._reset_start_qpos)
@@ -863,6 +870,26 @@ class VRReader:
         self.mm.head.set_joint_pos(head_pos)
 
         if alpha >= 1.0:
+            if self._reset_phase == 1:
+                # Phase 1 (arms → SAFE) done; queue phase 2 (all → INIT).
+                target = self.current_qpos.copy()
+                for i, n in enumerate(self.left_proc.joint_names):
+                    target[self.joint_name_to_idx[n]] = INIT_LEFT_ARM_JOINTS[i]
+                for i, n in enumerate(self.right_proc.joint_names):
+                    target[self.joint_name_to_idx[n]] = INIT_RIGHT_ARM_JOINTS[i]
+                for i, idx in enumerate(self.torso_indices):
+                    target[idx] = INIT_TORSO_JOINTS[i]
+                for i, idx in enumerate(self.head_motor_indices):
+                    target[idx] = INIT_HEAD_JOINTS[i]
+                self._reset_start_qpos = self.current_qpos.copy()
+                self._reset_target_qpos = target
+                max_dist = float(np.max(np.abs(target - self.current_qpos)))
+                self._reset_total_steps = max(1, int(max_dist / (_RESET_SPEED / self.publish_rate)))
+                self._reset_step_idx = 0
+                self._reset_phase = 2
+                console.rule("[bold cyan]Safe pose reached → resetting to init pose…")
+                return head_pos, left_pos, right_pos
+
             self._robot_base_t_vr_base = self.kin.compute_fk_from_link_idx(
                 self.current_qpos, [self.head_eef_idx]
             )[0] @ np.linalg.inv(transforms["head"])
@@ -901,22 +928,21 @@ class VRReader:
             console.rule("[bold red]Stage reset → static (left X)")
 
         if y_now and not self._prev_y:
+            # Phase 1: arms → SAFE (torso/head stay put). Phase 2 (all → INIT)
+            # is queued by _resetting_step when phase 1 completes.
             target = self.current_qpos.copy()
             for i, n in enumerate(self.left_proc.joint_names):
-                target[self.joint_name_to_idx[n]] = INIT_LEFT_ARM_JOINTS[i]
+                target[self.joint_name_to_idx[n]] = SAFE_LEFT_ARM_JOINTS[i]
             for i, n in enumerate(self.right_proc.joint_names):
-                target[self.joint_name_to_idx[n]] = INIT_RIGHT_ARM_JOINTS[i]
-            for i, idx in enumerate(self.torso_indices):
-                target[idx] = INIT_TORSO_JOINTS[i]
-            for i, idx in enumerate(self.head_motor_indices):
-                target[idx] = INIT_HEAD_JOINTS[i]
+                target[self.joint_name_to_idx[n]] = SAFE_RIGHT_ARM_JOINTS[i]
             self._reset_start_qpos = self.current_qpos.copy()
             self._reset_target_qpos = target
             max_dist = float(np.max(np.abs(target - self.current_qpos)))
             self._reset_total_steps = max(1, int(max_dist / (_RESET_SPEED / self.publish_rate)))
             self._reset_step_idx = 0
+            self._reset_phase = 1
             self._calib_stage = "resetting"
-            console.rule("[bold cyan]Resetting to init pose… (left Y)")
+            console.rule("[bold cyan]Resetting to safe pose… (left Y)")
 
         self._prev_x = x_now
         self._prev_y = y_now
