@@ -54,6 +54,9 @@ from omniteleop.common.vr_mode_const import (
     SAFE_RIGHT_ARM_JOINTS,
 )
 from omniteleop.follower.robotiq import build_hande_command, send_activate
+from omniteleop.follower.workspace_check import WorkspaceChecker
+
+workspace_check = False
 
 
 class _Mode(Enum):
@@ -70,6 +73,7 @@ class VRRobotController:
         namespace: str = "",
         debug: bool = False,
         config_name: Optional[str] = None,
+        workspace_check: bool = workspace_check,
     ) -> None:
         self.node = Node(name="vr_robot_controller", namespace=namespace)
 
@@ -111,6 +115,12 @@ class VRRobotController:
 
         self._latest: Optional[VRJointData] = None
         self._mode = _Mode.STOP
+
+        self._workspace_checker = WorkspaceChecker() if workspace_check else None
+        self._last_workspace_warn_t = 0.0
+        if self._workspace_checker is None:
+            logger.warning("Right-arm workspace check disabled.")
+
         self.initialize()
 
         self._debug_display = (
@@ -305,16 +315,39 @@ class VRRobotController:
                             )
                             logger.warning(f"Warning: Large left arm error: {left_arm_error}")
                     if vr.right_arm_pos:
-                        self.robot.right_arm.set_joint_pos(vr.right_arm_pos)
-                        right_arm_error = np.abs(
-                            np.array(vr.right_arm_pos) - self.robot.right_arm.get_joint_pos()
-                        )
-                        if np.any(right_arm_error > 0.3):
-                            logger.info(f"Commanded right arm pos: {vr.right_arm_pos}")
-                            logger.info(
-                                f"Current right arm pos: {self.robot.right_arm.get_joint_pos()}"
+                        in_bounds = True
+                        eef_xyz = None
+                        if self._workspace_checker is not None:
+                            head_for_fk = head_target if head_target else list(INIT_HEAD_JOINTS)
+                            in_bounds, eef_xyz = self._workspace_checker.is_in_workspace(
+                                right_arm=vr.right_arm_pos,
+                                head=head_for_fk,
+                                torso=list(INIT_TORSO_JOINTS),
                             )
-                            logger.warning(f"Warning: Large right arm error: {right_arm_error}")
+                        if in_bounds:
+                            self.robot.right_arm.set_joint_pos(vr.right_arm_pos)
+                            right_arm_error = np.abs(
+                                np.array(vr.right_arm_pos) - self.robot.right_arm.get_joint_pos()
+                            )
+                            if np.any(right_arm_error > 0.3):
+                                logger.info(f"Commanded right arm pos: {vr.right_arm_pos}")
+                                logger.info(
+                                    f"Current right arm pos: {self.robot.right_arm.get_joint_pos()}"
+                                )
+                                logger.warning(
+                                    f"Warning: Large right arm error: {right_arm_error}"
+                                )
+                        else:
+                            now = time.monotonic()
+                            if now - self._last_workspace_warn_t > 0.5:
+                                self._last_workspace_warn_t = now
+                                bounds = self._workspace_checker.bounds
+                                logger.warning(
+                                    f"Right EEF out of workspace: "
+                                    f"xyz={eef_xyz.round(3).tolist()} "
+                                    f"(bounds x{bounds['x']}, y{bounds['y']}, "
+                                    f"z{bounds['z']}) — freezing right arm."
+                                )
 
                 # ── Grippers + chassis (whole_body only) ──────────────────────
                 if vr.calib_stage == "whole_body":
@@ -377,14 +410,24 @@ def main(
     namespace: str = "",
     debug: bool = False,
     config_name: Optional[str] = None,
+    workspace_check: bool = workspace_check,
 ) -> None:
     """Follower robot controller for VR teleoperation.
 
     Subscribes to vr/joints (VRJointData) published by omni-vr and drives
     the robot hardware directly.
+
+    Args:
+        workspace_check: Gate right-arm commands on the configured Cartesian
+            workspace bounds. Pass --workspace-check to enable.
     """
     setup_logging(debug)
-    ctrl = VRRobotController(namespace=namespace, debug=debug, config_name=config_name)
+    ctrl = VRRobotController(
+        namespace=namespace,
+        debug=debug,
+        config_name=config_name,
+        workspace_check=workspace_check,
+    )
     ctrl.run()
 
 
