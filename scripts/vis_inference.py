@@ -1,13 +1,18 @@
-"""Visualise a recorded VR teleoperation episode in rerun.
+"""Visualise an EEF trajectory as marker points overlaid on the recorded pcd.
 
-Logs RGB-D, the colored point cloud, robot meshes, EEF and camera frames
-under a single ``frame`` timeline so the rerun viewer's scrubber doubles as
-prev/next/jump navigation.
+Builds on ``scripts/vis_episode.py``: same point-cloud / robot-mesh / camera
+layout under a single ``frame`` timeline, plus per-frame logging of the
+**future** EEF trajectory under ``world/eef_traj/{left,right}``. At frame
+``t`` only frames ``t+1..N-1`` are logged, so markers naturally disappear
+as the rerun scrubber passes them.
+
+For now the trajectory is loaded from ``action/eef/{left,right}`` in the raw
+HDF5 — there are no inference outputs yet. Once ``infer_dexmate.py`` writes
+``pred_vs_gt.npz`` we can plumb the predicted EEF poses in alongside the GT.
 
 Usage::
 
-    python scripts/vis_episode.py --hdf5 data/episode_0.hdf5
-    python scripts/vis_episode.py --hdf5 data/episode_0.hdf5 --voxel 0.01
+    python scripts/vis_inference.py --hdf5 Dexmate/data/raw_data/episode_1.hdf5
 """
 
 from __future__ import annotations
@@ -21,7 +26,6 @@ from yixuan_utilities.hdf5_utils import load_dict_from_hdf5
 from yixuan_utilities.kinematics_helper import KinHelper
 from yixuan_utilities.robot_mesh_generator import RobotMeshGenerator
 
-# ── joint name order expected by convert_to_sapien_joint_order ───────────────
 _WHEEL_NAMES = ["B_wheel_j1", "B_wheel_j2", "R_wheel_j1", "R_wheel_j2", "L_wheel_j1", "L_wheel_j2"]
 _OBS_NAMES = [
     "torso_j1",
@@ -93,11 +97,17 @@ def main() -> None:
     parser.add_argument(
         "--hdf5",
         type=str,
-        default="/media/yixuan/portable_ssd/Dexmate/data/raw_data/episode_1.hdf5",
+        default="/home/yixuan/omniteleop/Dexmate/data/raw_data/episode_1.hdf5",
         help="Path to episode HDF5 file",
     )
     parser.add_argument(
         "--voxel", type=float, default=0.008, help="Voxel size for PCD downsample (m)"
+    )
+    parser.add_argument(
+        "--marker-radius",
+        type=float,
+        default=0.01,
+        help="Radius (m) for trajectory marker points",
     )
     args = parser.parse_args()
 
@@ -108,19 +118,25 @@ def main() -> None:
     right_rgb = np.array(data["obs"]["images"]["right_rgb"]).astype(np.uint8)
     depth_mm = np.array(data["obs"]["images"]["depth"])
 
-    obs_torso = np.array(data["obs"]["joint"]["torso"])  # (N,3)
-    obs_left_arm = np.array(data["obs"]["joint"]["left_arm"])  # (N,7)
-    obs_right_arm = np.array(data["obs"]["joint"]["right_arm"])  # (N,7)
-    obs_head = np.array(data["obs"]["joint"]["head"])  # (N,3)
+    obs_torso = np.array(data["obs"]["joint"]["torso"])
+    obs_left_arm = np.array(data["obs"]["joint"]["left_arm"])
+    obs_right_arm = np.array(data["obs"]["joint"]["right_arm"])
+    obs_head = np.array(data["obs"]["joint"]["head"])
 
-    eef_left = np.array(data["action"]["eef"]["left"])  # (N,4,4)
-    eef_right = np.array(data["action"]["eef"]["right"])  # (N,4,4)
+    eef_left = np.array(data["action"]["eef"]["left"])  # (N, 4, 4)
+    eef_right = np.array(data["action"]["eef"]["right"])  # (N, 4, 4)
+
+    # Translation-only marker positions; finite mask filters bypassed-IK frames.
+    eef_left_xyz = eef_left[:, :3, 3].astype(np.float32)
+    eef_right_xyz = eef_right[:, :3, 3].astype(np.float32)
+    left_valid = np.isfinite(eef_left_xyz).all(axis=1)
+    right_valid = np.isfinite(eef_right_xyz).all(axis=1)
 
     N = left_rgb.shape[0]
     H, W = left_rgb.shape[1], left_rgb.shape[2]
     print(f"Episode: {N} frames  |  images: {H}x{W}")
 
-    # ── intrinsics: prefer per-episode if recorded, else hardcoded ZED ───────
+    # ── intrinsics ───────────────────────────────────────────────────────────
     img_group = data["obs"]["images"]
     if "intrinsic" in img_group:
         K_arr = np.array(img_group["intrinsic"])
@@ -132,7 +148,7 @@ def main() -> None:
         cy = 637.7721 / 2.0
         K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
 
-    # ── extrinsics: prefer saved, else FK from observed joints ───────────────
+    # ── extrinsics ───────────────────────────────────────────────────────────
     kin = KinHelper("vega_no_effector")
     joint_names_kin = [j.name for j in kin.sapien_robot.get_active_joints()]
     name_to_idx_kin = {n: i for i, n in enumerate(joint_names_kin)}
@@ -160,17 +176,20 @@ def main() -> None:
     robot_mesh_gen = RobotMeshGenerator("vega_no_effector")
 
     # ── rerun ────────────────────────────────────────────────────────────────
-    rr.init("vis_episode", spawn=True)
+    rr.init("vis_inference", spawn=True)
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
 
     K32 = K.astype(np.float32)
+
+    LEFT_COLOR = np.array([255, 80, 80], dtype=np.uint8)  # red — left EEF future
+    RIGHT_COLOR = np.array([80, 80, 255], dtype=np.uint8)  # blue — right EEF future
 
     for idx in range(N):
         rr.set_time("frame", sequence=idx)
 
         world_t_cam = extrinsics[idx]
 
-        # ── camera: pose + intrinsics + 2D streams attached in image space ──
+        # ── camera ──────────────────────────────────────────────────────────
         rr.log(
             "world/camera",
             rr.Transform3D(translation=world_t_cam[:3, 3], mat3x3=world_t_cam[:3, :3]),
@@ -178,17 +197,16 @@ def main() -> None:
         rr.log("world/camera", rr.Pinhole(image_from_camera=K32, width=W, height=H))
         rr.log("world/camera/rgb", rr.Image(left_rgb[idx]))
         rr.log("world/camera/depth", rr.DepthImage(depth_mm[idx], meter=1000.0))
-        # Right RGB is monocular only — log under /image so it shows in 2D views.
         rr.log("image/right_rgb", rr.Image(right_rgb[idx]))
 
-        # ── colored point cloud (manual unproject + voxel downsample) ───────
+        # ── colored point cloud ─────────────────────────────────────────────
         depth_m = depth_mm[idx] / 1000.0
         pts, mask = unproject_depth(depth_m, K, world_t_cam)
         cols = left_rgb[idx][mask]
         pts, cols = voxel_downsample(pts, cols, args.voxel)
         rr.log("world/pcd", rr.Points3D(pts, colors=cols, radii=0.003))
 
-        # ── robot meshes (already in world frame from compute_robot_meshes) ──
+        # ── robot meshes ────────────────────────────────────────────────────
         joints_vals = (
             [0.0] * len(_WHEEL_NAMES)
             + obs_torso[idx].tolist()
@@ -209,15 +227,33 @@ def main() -> None:
                 ),
             )
 
-        # ── EEF frames (skip frames where IK was bypassed → NaN) ────────────
+        # ── current EEF coordinate frames (skip NaN frames) ─────────────────
         for name, mat in (("world/eef/left", eef_left[idx]), ("world/eef/right", eef_right[idx])):
             if not np.all(np.isfinite(mat)):
                 rr.log(name, rr.Clear(recursive=True))
                 continue
+            rr.log(name, rr.Transform3D(translation=mat[:3, 3], mat3x3=mat[:3, :3]))
+
+        # ── future EEF trajectory markers (frames idx+1..N-1) ───────────────
+        # Re-logging the same path each frame replaces the prior payload, so
+        # markers behind the scrubber drop out without explicit cleanup.
+        future_l = eef_left_xyz[idx + 1 :][left_valid[idx + 1 :]]
+        if future_l.size:
             rr.log(
-                name,
-                rr.Transform3D(translation=mat[:3, 3], mat3x3=mat[:3, :3]),
+                "world/eef_traj/left",
+                rr.Points3D(future_l, colors=LEFT_COLOR, radii=args.marker_radius),
             )
+        else:
+            rr.log("world/eef_traj/left", rr.Clear(recursive=False))
+
+        future_r = eef_right_xyz[idx + 1 :][right_valid[idx + 1 :]]
+        if future_r.size:
+            rr.log(
+                "world/eef_traj/right",
+                rr.Points3D(future_r, colors=RIGHT_COLOR, radii=args.marker_radius),
+            )
+        else:
+            rr.log("world/eef_traj/right", rr.Clear(recursive=False))
 
 
 if __name__ == "__main__":
