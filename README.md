@@ -33,9 +33,8 @@ omni-telemetry # Telemetry viewer
 1. ssh dexmate, conda activate dexmate
 2. run '(dexmate) dextop node start' and 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera' in tmux
 3. ssh lambda
-4. run 
-    (dexmate) vr_robot_controller.py # workspace_check = True, joint positions in vr_mode_const
-    # read head_mode and left_arm_mode in src/omniteleop/configs/vega_1_f5d6.yaml
+4. run
+  (dexmate) vr_robot_controller.py # workspace_check = True, joint positions in vr_mode_const, head_mode and left_arm_mode in src/omniteleop/configs/vega_1_f5d6.yaml
     (dexmate) vr_reader.py # start-mode=fixed_pose
 
 ```bash
@@ -55,10 +54,10 @@ fixed_pose mode:
 2. Y (initialize hand, track head)
 3. A-Trigger (track hand)-Manip-B-X
 4. Repeat 2-3
+# if you forgot position last time, run scripts/save_first_rgb_print_fps.py
 ```
 
-## Train
-VR controller → fixed_pose calibration → robot-base EEF target → IK → robot motion
+5. scripts/vis_episode.py
+6. scripts/rename_raw_data.py
 
-## Infer
-camera/proprio obs → robot-base EEF target → IK → check speed/workspace/collision → robot motion
+Then run policy, check README.md in policy dir

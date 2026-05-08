@@ -428,7 +428,8 @@ class VRReader:
         stick_max_vy: float = 0.2,
         stick_max_wz: float = 0.5,
         stick_deadzone: float = 0.1,
-        publish_rate: float = 40.0,
+        publish_rate: float = 15.0,
+        record_rate: float = 15.0,
         debug: bool = False,
         visualize: bool = False,
         urdf_path: Optional[str] = None,
@@ -443,6 +444,18 @@ class VRReader:
         self.stick_max_wz = stick_max_wz
         self.stick_deadzone = stick_deadzone
         self.publish_rate = publish_rate
+        if record_rate <= 0:
+            raise ValueError(f"record_rate must be > 0, got {record_rate}")
+        if record_rate > publish_rate:
+            raise ValueError(
+                f"record_rate ({record_rate}) must be ≤ publish_rate ({publish_rate}); "
+                "raise publish_rate or lower record_rate."
+            )
+        self.record_rate = record_rate
+        self._record_period_s = 1.0 / record_rate
+        # Monotonic timestamp of the next ideal record. 0.0 means "anchor on the
+        # next call to _handle_recording" (set on episode start).
+        self._next_record_t: float = 0.0
         self.running = False
         self.start_mode: StartMode = start_mode
         self.save_debug = save_debug
@@ -1069,7 +1082,11 @@ class VRReader:
             if self.save_debug:
                 self.debug_recorder.start(self.recorder.episode_id)
             self.recorder.start()
-            console.print("[bold green]Recording started (press B to stop)[/]")
+            self._next_record_t = 0.0  # anchor cadence to the first recorded frame
+            console.print(
+                f"[bold green]Recording started at {self.record_rate:g} Hz "
+                "(press B to stop)[/]"
+            )
         if b_now and not self._prev_b and self.recorder.recording:
             path = self.recorder.stop()
             console.print(f"[bold yellow]Saving in background → {path}[/]")
@@ -1084,6 +1101,18 @@ class VRReader:
             return
         if not self._last_imgs or self._last_depth_u16 is None:
             return
+
+        # Throttle to record_rate so saved HDF5 has a consistent FPS independent
+        # of publish_rate. Cadence is locked to ideal timestamps; if the loop
+        # falls behind by >1 period we re-anchor to avoid burst catch-up.
+        now_t = time.monotonic()
+        if self._next_record_t == 0.0:
+            self._next_record_t = now_t
+        if now_t < self._next_record_t:
+            return
+        self._next_record_t += self._record_period_s
+        if now_t > self._next_record_t:
+            self._next_record_t = now_t + self._record_period_s
 
         # Training actions and debug EEF targets must use the same frame:
         # the robot/world-frame EEF poses that were passed to arm IK. Raw VR
@@ -1416,6 +1445,16 @@ def main() -> None:
         stick_deadzone: float = 0.1
         """Thumbstick deadzone"""
 
+        publish_rate: float = 15.0
+        """Main loop rate (Hz). VR-pose poll, IK solve and command publish all
+        run at this rate. Default matches record_rate so each loop iter records
+        one frame (no throttle skipping). Must be ≥ record_rate; pick an integer
+        multiple of record_rate for zero-jitter recording (e.g. 30 → 15)."""
+
+        record_rate: float = 15.0
+        """Episode recording rate (Hz). Frames are throttled so saved HDF5
+        files have a consistent FPS independent of publish_rate."""
+
         namespace: str = ""
         """Zenoh topic namespace prefix"""
 
@@ -1462,6 +1501,8 @@ def main() -> None:
         stick_max_vy=args.stick_max_vy,
         stick_max_wz=args.stick_max_wz,
         stick_deadzone=args.stick_deadzone,
+        publish_rate=args.publish_rate,
+        record_rate=args.record_rate,
         debug=args.debug,
         visualize=args.visualize,
         urdf_path=args.urdf_path,

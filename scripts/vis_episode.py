@@ -93,7 +93,7 @@ def main() -> None:
     parser.add_argument(
         "--hdf5",
         type=str,
-        default="/media/yixuan/portable_ssd/Dexmate/data/raw_data/episode_1.hdf5",
+        default="/media/yixuan/portable_ssd/Dexmate/data/raw_data/episode_7.hdf5",
         help="Path to episode HDF5 file",
     )
     parser.add_argument(
