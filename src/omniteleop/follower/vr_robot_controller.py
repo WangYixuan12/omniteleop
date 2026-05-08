@@ -56,7 +56,7 @@ from omniteleop.common.vr_mode_const import (
 from omniteleop.follower.robotiq import build_hande_command, send_activate
 from omniteleop.follower.workspace_check import WorkspaceChecker
 
-workspace_check = False
+workspace_check = True
 
 
 class _Mode(Enum):

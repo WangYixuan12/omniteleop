@@ -128,7 +128,10 @@ from omniteleop.common.vr_mode_const import (
 
 StartMode = Literal["follow_hand", "fixed_pose"]
 from omniteleop.follower.component_processors import ArmProcessor
+from omniteleop.follower.workspace_check import DEFAULT_RIGHT_BOUNDS
 from omniteleop.leader.communication.webxr_vr_reader import VRFrame, WebXRVRReader
+
+workspace_check = True
 
 console = Console()
 
@@ -433,6 +436,7 @@ class VRReader:
         debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/debug_data",
         start_mode: StartMode = "follow_hand",
         save_debug: bool = True,
+        workspace_check: bool = workspace_check,
     ) -> None:
         self.stick_max_vx = stick_max_vx
         self.stick_max_vy = stick_max_vy
@@ -442,6 +446,9 @@ class VRReader:
         self.running = False
         self.start_mode: StartMode = start_mode
         self.save_debug = save_debug
+        self._workspace_check_enabled = workspace_check
+        if not self._workspace_check_enabled:
+            logger.warning("Right-arm workspace check disabled.")
 
         self._debug_display = (
             get_debug_display("VRReader", publish_rate, refresh_rate=10) if debug else None
@@ -492,6 +499,10 @@ class VRReader:
         self.current_qpos = init_qpos
 
         self._trigger_start: Optional[float] = None
+
+        # Right-arm EEF workspace status — set per frame, read by _camera_poll.
+        self._right_eef_oob: bool = False
+        self._right_eef_xyz: np.ndarray = np.full(3, np.nan, dtype=np.float32)
 
         # Recording
         self.recorder = EpisodeRecorder(save_dir)
@@ -673,11 +684,31 @@ class VRReader:
             thickness=2,
             color=(255, 255, 255),
         )
+        cv2.putText(
+            vis_img,
+            f"Stage: {self._calib_stage}",
+            (10, vis_img.shape[0] - 15),
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=1,
+            thickness=2,
+            color=(0, 255, 255),
+        )
         if self.recorder.recording and self._last_ik_in_collision:
             cv2.putText(
                 vis_img,
                 "Left/Right Arm Self-collision!",
                 (10, 65),
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                fontScale=1,
+                thickness=2,
+                color=(0, 0, 255),
+            )
+        if self._right_eef_oob:
+            xyz = self._right_eef_xyz
+            cv2.putText(
+                vis_img,
+                f"WARNING: out of workspace xyz=[{xyz[0]:+.2f},{xyz[1]:+.2f},{xyz[2]:+.2f}]",
+                (10, 100),
                 fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                 fontScale=1,
                 thickness=2,
@@ -782,6 +813,36 @@ class VRReader:
         for i, n in enumerate(self.right_proc.joint_names):
             self.current_qpos[self.joint_name_to_idx[n]] = safe_right[i]
         return safe_left.tolist(), safe_right.tolist()
+
+    def _update_right_eef_workspace_status(self, right_pos: list[float]) -> None:
+        """FK the commanded right-arm joints and check against workspace bounds.
+
+        Mirrors the gate in vr_robot_controller — when this flag is True the
+        follower will freeze the right arm, so the headset overlay matches.
+        """
+        if not right_pos or self._calib_stage not in (
+            "resetting",
+            "whole_body",
+            "whole_body_alignment",
+        ):
+            self._right_eef_oob = False
+            self._right_eef_xyz = np.full(3, np.nan, dtype=np.float32)
+            return
+        eef_xyz = self.kin.compute_fk_from_link_idx(
+            self.current_qpos, [self.right_arm_eef_idx]
+        )[0][:3, 3]
+        bx, by, bz = (
+            DEFAULT_RIGHT_BOUNDS["x"],
+            DEFAULT_RIGHT_BOUNDS["y"],
+            DEFAULT_RIGHT_BOUNDS["z"],
+        )
+        in_bounds = (
+            bx[0] <= eef_xyz[0] <= bx[1]
+            and by[0] <= eef_xyz[1] <= by[1]
+            and bz[0] <= eef_xyz[2] <= bz[1]
+        )
+        self._right_eef_oob = not in_bounds
+        self._right_eef_xyz = np.asarray(eef_xyz, dtype=np.float32)
 
     def _mark_ik_skipped(self, reason: str) -> None:
         """Reset IK telemetry to NaN/skipped when no IK call was made this frame."""
@@ -1275,6 +1336,8 @@ class VRReader:
                 else:
                     head_pos = self._head_ik_step(vr_head)
                     left_pos, right_pos, ik_l, ik_r = self._arm_ik_step(vr_l, vr_r)
+                if self._workspace_check_enabled:
+                    self._update_right_eef_workspace_status(right_pos)
                 chassis_vx, chassis_vy, chassis_wz = self._thumbstick_to_chassis(transforms)
 
                 self._handle_stage_transition(transforms)
@@ -1382,6 +1445,11 @@ def main() -> None:
         """If False, skip building and saving episode_<N>_debug.hdf5 to reduce
         per-frame overhead and shorten save time."""
 
+        workspace_check: bool = workspace_check
+        """Compute right-arm EEF FK each frame and overlay 'WARNING: out of
+        workspace' on the headset view when the commanded EEF leaves the
+        configured Cartesian bounds. Pass --workspace-check to enable."""
+
     args = tyro.cli(Args)
 
     reader = VRReader(
@@ -1401,6 +1469,7 @@ def main() -> None:
         debug_save_dir=args.debug_save_dir,
         start_mode=args.start_mode,
         save_debug=args.save_debug,
+        workspace_check=args.workspace_check,
     )
     reader.run()
 
