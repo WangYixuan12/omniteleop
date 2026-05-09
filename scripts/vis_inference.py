@@ -1,23 +1,26 @@
-"""Visualise an EEF trajectory as marker points overlaid on the recorded pcd.
+"""Visualise the right-arm EEF trajectory (GT vs. predicted) as marker points.
 
 Builds on ``scripts/vis_episode.py``: same point-cloud / robot-mesh / camera
 layout under a single ``frame`` timeline, plus per-frame logging of the
-**future** EEF trajectory under ``world/eef_traj/{left,right}``. At frame
-``t`` only frames ``t+1..N-1`` are logged, so markers naturally disappear
-as the rerun scrubber passes them.
+**future** right-EEF trajectory under ``world/eef_traj/{right,right_pred}``.
+At frame ``t`` only frames ``t+1..N-1`` are logged, so markers naturally
+disappear as the rerun scrubber passes them.
 
-For now the trajectory is loaded from ``action/eef/{left,right}`` in the raw
-HDF5 — there are no inference outputs yet. Once ``infer_dexmate.py`` writes
-``pred_vs_gt.npz`` we can plumb the predicted EEF poses in alongside the GT.
+The left arm is fixed in the dataset and is not visualized. Predicted
+right-EEF positions come from ``pred_vs_gt.npz`` produced by
+``examples/dexmate/infer_dexmate.py``.
 
 Usage::
 
-    python scripts/vis_inference.py --hdf5 Dexmate/data/raw_data/episode_1.hdf5
+    python scripts/vis_inference.py \\
+        --hdf5 Dexmate/data/raw_data_renamed/test/episode_1.hdf5 \\
+        --pred-npz Dexmate/infer/<run_id>/pred_vs_gt.npz
 """
 
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 import numpy as np
 import rerun as rr
@@ -106,8 +109,20 @@ def main() -> None:
     parser.add_argument(
         "--marker-radius",
         type=float,
-        default=0.01,
+        default=0.005,
         help="Radius (m) for trajectory marker points",
+    )
+    parser.add_argument(
+        "--pred-npz",
+        type=str,
+        default=None,
+        help="Path to pred_vs_gt.npz produced by examples/dexmate/infer_dexmate.py.",
+    )
+    parser.add_argument(
+        "--episode",
+        type=int,
+        default=None,
+        help="Episode index in the LeRobot dataset; if omitted, parsed from --hdf5 filename.",
     )
     args = parser.parse_args()
 
@@ -123,18 +138,39 @@ def main() -> None:
     obs_right_arm = np.array(data["obs"]["joint"]["right_arm"])
     obs_head = np.array(data["obs"]["joint"]["head"])
 
-    eef_left = np.array(data["action"]["eef"]["left"])  # (N, 4, 4)
     eef_right = np.array(data["action"]["eef"]["right"])  # (N, 4, 4)
 
     # Translation-only marker positions; finite mask filters bypassed-IK frames.
-    eef_left_xyz = eef_left[:, :3, 3].astype(np.float32)
     eef_right_xyz = eef_right[:, :3, 3].astype(np.float32)
-    left_valid = np.isfinite(eef_left_xyz).all(axis=1)
     right_valid = np.isfinite(eef_right_xyz).all(axis=1)
 
     N = left_rgb.shape[0]
     H, W = left_rgb.shape[1], left_rgb.shape[2]
     print(f"Episode: {N} frames  |  images: {H}x{W}")
+
+    # Optional: overlay predicted right-EEF trajectory from infer_dexmate.py.
+    pred_xyz: np.ndarray | None = None
+    pred_valid: np.ndarray | None = None
+    if args.pred_npz:
+        npz = np.load(args.pred_npz)
+        ep = args.episode
+        if ep is None:
+            stem = Path(args.hdf5).stem  # e.g. "episode_3"
+            ep = int(stem.split("_")[-1])
+        ep_ids = npz["episode_ids"].tolist()
+        if ep not in ep_ids:
+            raise ValueError(f"Episode {ep} not in npz episode_ids {ep_ids}")
+        idx = ep_ids.index(ep)
+        lengths = npz["episode_lengths"]
+        start = int(lengths[:idx].sum())
+        end = start + int(lengths[idx])
+        if end - start != N:
+            raise ValueError(
+                f"Frame count mismatch: HDF5 has {N}, npz episode {ep} has {end - start}"
+            )
+        pred_xyz = npz["pred"][start:end, :3].astype(np.float32)
+        pred_valid = np.isfinite(pred_xyz).all(axis=1)
+        print(f"Loaded predictions: ep={ep}, frames={end - start}")
 
     # ── intrinsics ───────────────────────────────────────────────────────────
     img_group = data["obs"]["images"]
@@ -181,8 +217,8 @@ def main() -> None:
 
     K32 = K.astype(np.float32)
 
-    LEFT_COLOR = np.array([255, 80, 80], dtype=np.uint8)  # red — left EEF future
-    RIGHT_COLOR = np.array([80, 80, 255], dtype=np.uint8)  # blue — right EEF future
+    RIGHT_COLOR = np.array([255, 80, 80], dtype=np.uint8)  # red — right EEF future (GT)
+    PRED_COLOR = np.array([60, 220, 80], dtype=np.uint8)  # green — predicted right EEF
 
     for idx in range(N):
         rr.set_time("frame", sequence=idx)
@@ -227,25 +263,19 @@ def main() -> None:
                 ),
             )
 
-        # ── current EEF coordinate frames (skip NaN frames) ─────────────────
-        for name, mat in (("world/eef/left", eef_left[idx]), ("world/eef/right", eef_right[idx])):
-            if not np.all(np.isfinite(mat)):
-                rr.log(name, rr.Clear(recursive=True))
-                continue
-            rr.log(name, rr.Transform3D(translation=mat[:3, 3], mat3x3=mat[:3, :3]))
-
-        # ── future EEF trajectory markers (frames idx+1..N-1) ───────────────
-        # Re-logging the same path each frame replaces the prior payload, so
-        # markers behind the scrubber drop out without explicit cleanup.
-        future_l = eef_left_xyz[idx + 1 :][left_valid[idx + 1 :]]
-        if future_l.size:
+        # ── current right-EEF coordinate frame (skip NaN frames) ────────────
+        mat = eef_right[idx]
+        if np.all(np.isfinite(mat)):
             rr.log(
-                "world/eef_traj/left",
-                rr.Points3D(future_l, colors=LEFT_COLOR, radii=args.marker_radius),
+                "world/eef/right",
+                rr.Transform3D(translation=mat[:3, 3], mat3x3=mat[:3, :3]),
             )
         else:
-            rr.log("world/eef_traj/left", rr.Clear(recursive=False))
+            rr.log("world/eef/right", rr.Clear(recursive=True))
 
+        # ── future right-EEF trajectory markers (frames idx+1..N-1) ─────────
+        # Re-logging the same path each frame replaces the prior payload, so
+        # markers behind the scrubber drop out without explicit cleanup.
         future_r = eef_right_xyz[idx + 1 :][right_valid[idx + 1 :]]
         if future_r.size:
             rr.log(
@@ -254,6 +284,16 @@ def main() -> None:
             )
         else:
             rr.log("world/eef_traj/right", rr.Clear(recursive=False))
+
+        if pred_xyz is not None:
+            future_p = pred_xyz[idx + 1 :][pred_valid[idx + 1 :]]
+            if future_p.size:
+                rr.log(
+                    "world/eef_traj/right_pred",
+                    rr.Points3D(future_p, colors=PRED_COLOR, radii=args.marker_radius),
+                )
+            else:
+                rr.log("world/eef_traj/right_pred", rr.Clear(recursive=False))
 
 
 if __name__ == "__main__":

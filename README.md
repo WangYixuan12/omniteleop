@@ -60,4 +60,9 @@ fixed_pose mode:
 5. scripts/vis_episode.py
 6. scripts/rename_raw_data.py
 
-Then run policy, check README.md in policy dir
+## Policy
+See [Lerobot README](../lerobot_yifan/README.md).
+Run infer_dexmate.py before deploy.
+
+## Deploy
+python -m omniteleop.follower.policy_rollout --policy-path /home/yixuan/omniteleop/Dexmate/model/act/act_abs_joint_eef/checkpoints/400000/pretrained_model
