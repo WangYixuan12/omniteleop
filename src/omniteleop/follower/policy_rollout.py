@@ -13,7 +13,9 @@ Two-rate loop:
   inner ────  15 Hz  (matches training fps)      ─── policy.select_action
 
 The inner tick is gated on ``round(control_rate / policy_fps)`` outer
-ticks, so per training-time ``n_action_steps``/queue dynamics are preserved.
+ticks. By default ACT checkpoints are overridden to run with
+``n_action_steps=1`` and ``temporal_ensemble_coeff=0.01``; pass ``None`` for
+those ACT override options to keep the checkpoint's saved queue dynamics.
 
 Safety guards (applied to the **command actually being sent**):
 
@@ -34,6 +36,7 @@ Run::
 
 from __future__ import annotations
 
+import pathlib
 import sys
 import time
 from dataclasses import dataclass
@@ -55,6 +58,7 @@ from loguru import logger
 
 from omniteleop.common import get_config
 from omniteleop.common.logging import setup_logging
+from omniteleop.common.recorder import EpisodeRecorder
 from omniteleop.common.vr_mode_const import (
     INIT_HEAD_JOINTS,
     INIT_LEFT_ARM_JOINTS,
@@ -124,6 +128,10 @@ class PolicyRolloutController:
         camera_key: str = "right_rgb",
         image_h: int = 240,
         image_w: int = 320,
+        act_n_action_steps: Optional[int] = 1,
+        act_temporal_ensemble_coeff: Optional[float] = 0.01,
+        record: bool = True,
+        record_dir: Optional[str] = None,
     ) -> None:
         self.node = Node(name="policy_rollout", namespace=namespace)
 
@@ -164,7 +172,24 @@ class PolicyRolloutController:
 
         # Hardware + policy.
         self.initialize_robot()
-        self.initialize_policy(policy_path)
+        self.initialize_policy(
+            policy_path,
+            act_n_action_steps=act_n_action_steps,
+            act_temporal_ensemble_coeff=act_temporal_ensemble_coeff,
+        )
+
+        if record:
+            if record_dir is None:
+                tag = pathlib.Path(policy_path).parents[2].name
+                record_dir = f"/home/yixuan/Dexmate/deploy/{tag}"
+            self._recorder: Optional[EpisodeRecorder] = EpisodeRecorder(record_dir)
+            logger.info(f"Recording rollouts to {record_dir}")
+        else:
+            self._recorder = None
+
+        self._last_obs_img_hwc: Optional[np.ndarray] = None
+        self._last_obs_right_arm_qpos: Optional[np.ndarray] = None
+        self._last_obs_eef_9d: Optional[np.ndarray] = None
 
         self._mode = _Mode.HOMING
 
@@ -199,14 +224,39 @@ class PolicyRolloutController:
         self._last_cmd_right = np.array(self.robot.right_arm.get_joint_pos())
         logger.success("Robot ready (home, gripper open).")
 
-    def initialize_policy(self, policy_path: str) -> None:
+    def initialize_policy(
+        self,
+        policy_path: str,
+        act_n_action_steps: Optional[int] = 1,
+        act_temporal_ensemble_coeff: Optional[float] = 0.01,
+    ) -> None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self._device = device
 
         pcfg = PreTrainedConfig.from_pretrained(policy_path)
+        if pcfg.type == "act":
+            cli_overrides: list[str] = []
+            if act_n_action_steps is not None:
+                cli_overrides.append(f"--n_action_steps={int(act_n_action_steps)}")
+            if act_temporal_ensemble_coeff is not None:
+                cli_overrides.append(
+                    f"--temporal_ensemble_coeff={float(act_temporal_ensemble_coeff)}"
+                )
+            if cli_overrides:
+                pcfg = PreTrainedConfig.from_pretrained(
+                    policy_path,
+                    cli_overrides=cli_overrides,
+                )
+                logger.info(
+                    "Applied ACT checkpoint config overrides: "
+                    + ", ".join(arg.removeprefix("--") for arg in cli_overrides)
+                )
         pcfg.pretrained_path = policy_path
         self._policy = (
-            get_policy_class(pcfg.type).from_pretrained(policy_path).to(device).eval()
+            get_policy_class(pcfg.type)
+            .from_pretrained(policy_path, config=pcfg)
+            .to(device)
+            .eval()
         )
         # ACT/Diffusion processors are saved with the checkpoint (no need to
         # supply dataset_stats — only Gr00t needs the override path).
@@ -236,6 +286,7 @@ class PolicyRolloutController:
         chunk = getattr(pcfg, "chunk_size", None) or getattr(pcfg, "horizon", None)
         n_act = getattr(pcfg, "n_action_steps", None)
         n_obs = getattr(pcfg, "n_obs_steps", None)
+        self._n_action_steps = max(1, int(n_act)) if n_act is not None else 1
         logger.info(
             f"Policy: type={pcfg.type} state_dim={state_dim} action_dim={action_dim} "
             f"chunk/horizon={chunk} n_action_steps={n_act} n_obs_steps={n_obs} "
@@ -406,15 +457,23 @@ class PolicyRolloutController:
         right_arm = np.asarray(self.robot.right_arm.get_joint_pos(), dtype=np.float32)
         if self.variant.state_is_eef:
             T_ee = self._current_eef_pose()
+            obs_eef_9d = _mat_to_pos6d(T_ee)
             state = np.concatenate(
-                [_mat_to_pos6d(T_ee), [self._last_gripper_cmd]]
+                [obs_eef_9d, [self._last_gripper_cmd]]
             ).astype(np.float32)
         else:
+            if self._motion_manager is not None:
+                obs_eef_9d = _mat_to_pos6d(self._current_eef_pose())
+            else:
+                obs_eef_9d = np.full(9, np.nan, dtype=np.float32)
             state = np.concatenate(
                 [right_arm, [self._last_gripper_cmd]]
             ).astype(np.float32)
 
         img_hwc = self._read_camera_240x320_uint8()
+        self._last_obs_img_hwc = img_hwc
+        self._last_obs_right_arm_qpos = right_arm.copy()
+        self._last_obs_eef_9d = obs_eef_9d.astype(np.float32)
         # Mirror what LeRobotDataset.__getitem__ returns: CHW float32 in [0, 1].
         img_chw = (
             torch.from_numpy(img_hwc).permute(2, 0, 1).float() / 255.0
@@ -427,14 +486,38 @@ class PolicyRolloutController:
 
     # ── policy step ──────────────────────────────────────────────────────────
 
-    def _policy_step(self) -> np.ndarray:
-        """Run one policy tick: returns (action_dim,) numpy in absolute space."""
+    def _policy_action_queue_len(self) -> int:
+        """Peek at the policy's internal action queue (ACT or Diffusion)."""
+        q = getattr(self._policy, "_action_queue", None)
+        if q is not None:
+            return len(q)
+        queues = getattr(self._policy, "_queues", None)
+        if queues is not None and "action" in queues:
+            return len(queues["action"])
+        return -1
+
+    def _policy_step(self) -> tuple[np.ndarray, dict]:
+        """Run one policy tick: returns (absolute action, timing info)."""
+        qlen_before = self._policy_action_queue_len()
+        t_obs_ns_wallclock = time.time_ns()
+        t_obs_start = time.monotonic()
         sample = self._build_observation()
+        t_obs_end = time.monotonic()
         sample = self._pre(sample)
+        t_inf_start = time.monotonic()
         with torch.no_grad():
             a = self._policy.select_action(sample)
+        t_inf_end = time.monotonic()
         a_abs = self._post(a)
-        return a_abs.squeeze(0).detach().cpu().numpy()
+        info = {
+            "t_obs_ns_wallclock": t_obs_ns_wallclock,
+            "t_obs_end": t_obs_end,
+            "obs_build_ms": (t_obs_end - t_obs_start) * 1000.0,
+            "inference_ms": (t_inf_end - t_inf_start) * 1000.0,
+            # qlen_before == 0 (or -1 on unknown impl) → this call ran the model.
+            "replan": qlen_before <= 0,
+        }
+        return a_abs.squeeze(0).detach().cpu().numpy(), info
 
     def _action_to_joint_target(
         self, action: np.ndarray
@@ -483,6 +566,46 @@ class PolicyRolloutController:
                 "7-DOF right arm target passed right-arm checks."
             )
         return joint_target, gripper, "ok"
+
+    def _action_eef_records(
+        self,
+        action: np.ndarray,
+        sent_joint: Optional[np.ndarray],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return (SE(3) 4x4, pos6d 9-D) for the policy's proposed eef.
+
+        - action_is_eef: rebuild from the policy's 10-D output.
+        - else, when MotionManager is available and ``sent_joint`` is finite:
+          FK on the proposed joint vector.
+        - else: NaN-filled arrays (shape preserved so np.stack works).
+        """
+        if self.variant.action_is_eef:
+            T = np.eye(4, dtype=np.float32)
+            T[:3, :3] = _gram_schmidt_6d_to_R(action[3:9].astype(np.float64)).astype(np.float32)
+            T[:3, 3] = action[:3].astype(np.float32)
+            pos6d = action[:9].astype(np.float32)
+            return T, pos6d
+
+        if (
+            self._motion_manager is not None
+            and sent_joint is not None
+            and np.all(np.isfinite(sent_joint))
+        ):
+            qd = self._motion_manager_state_dict()
+            for i in range(7):
+                qd[f"R_arm_j{i + 1}"] = float(sent_joint[i])
+            self._motion_manager.set_joint_pos(qd)
+            fk = self._motion_manager.fk(
+                frame_names=self._motion_manager.target_frames,
+                qpos=self._motion_manager.get_joint_pos(),
+            )
+            T = np.asarray(fk["R_ee"].np, dtype=np.float32)  # type: ignore[attr-defined]
+            return T, _mat_to_pos6d(T)
+
+        return (
+            np.full((4, 4), np.nan, dtype=np.float32),
+            np.full((9,), np.nan, dtype=np.float32),
+        )
 
     # ── safety ───────────────────────────────────────────────────────────────
 
@@ -586,6 +709,10 @@ class PolicyRolloutController:
         gripper_target = self._last_gripper_cmd
         consecutive_rejects = 0
         REJECT_LIMIT = 30  # ~0.3 s at 100 Hz
+        chunk_idx = -1
+        last_replan_log_t = 0.0
+        if self._recorder is not None:
+            self._recorder.start()
 
         try:
             tick = 0
@@ -605,9 +732,13 @@ class PolicyRolloutController:
                     self._mode = _Mode.RUNNING
 
                 # ─── inner: policy at policy_fps ──────────────────────────────
+                step_info: Optional[dict] = None
+                cand_target: Optional[np.ndarray] = None
+                cand_gripper: float = 0.0
+                action: Optional[np.ndarray] = None
                 if tick % self._policy_period_ticks == 0:
                     try:
-                        action = self._policy_step()
+                        action, step_info = self._policy_step()
                     except Exception as e:
                         logger.error(f"Policy step failed: {e}")
                         rate.sleep()
@@ -638,6 +769,16 @@ class PolicyRolloutController:
                     self.robot.right_arm.send_ee_pass_through_message(
                         build_hande_command(gripper_target)
                     )
+                    t_send = time.monotonic()
+                    if step_info is not None and step_info["replan"]:
+                        if t_send - last_replan_log_t > 0.95:
+                            last_replan_log_t = t_send
+                            obs_to_send_ms = (t_send - step_info["t_obs_end"]) * 1000.0
+                            logger.info(
+                                f"chunk replan: obs_build={step_info['obs_build_ms']:.1f}ms "
+                                f"inference={step_info['inference_ms']:.1f}ms "
+                                f"obs→send={obs_to_send_ms:.1f}ms"
+                            )
                     self._last_cmd_right = command_target
                     self._last_gripper_cmd = gripper_target
                     consecutive_rejects = 0
@@ -653,6 +794,55 @@ class PolicyRolloutController:
                         )
                         break
 
+                # ─── record (per inner policy tick) ──────────────────────────
+                if step_info is not None and action is not None:
+                    if step_info["replan"]:
+                        chunk_idx = 0
+                    else:
+                        chunk_idx = (chunk_idx + 1) % self._n_action_steps
+
+                    if self._recorder is not None:
+                        try:
+                            if not self.variant.action_is_eef:
+                                proposed_joint = action[:7].astype(np.float32)
+                            elif cand_target is not None:
+                                proposed_joint = cand_target.astype(np.float32)
+                            else:
+                                proposed_joint = np.full(7, np.nan, dtype=np.float32)
+
+                            proposed_gripper = np.float32(
+                                1.0 if cand_gripper >= self.gripper_threshold else 0.0
+                            )
+                            eef_4x4, eef_9d = self._action_eef_records(action, proposed_joint)
+                            obs_img = self._last_obs_img_hwc
+                            obs_qpos = self._last_obs_right_arm_qpos
+                            obs_eef_9d = self._last_obs_eef_9d
+                            assert (
+                                obs_img is not None
+                                and obs_qpos is not None
+                                and obs_eef_9d is not None
+                            )
+                            self._recorder.record({
+                                "time": {
+                                    "timestamp_ns": np.int64(step_info["t_obs_ns_wallclock"]),
+                                    "obs_flag": np.bool_(step_info["replan"]),
+                                    "action_number": np.int32(chunk_idx),
+                                },
+                                "obs": {
+                                    "joint": {"right_arm": obs_qpos},
+                                    "eef_9d": {"right": obs_eef_9d},
+                                    "images": {"right_rgb": obs_img},
+                                },
+                                "action": {
+                                    "eef": {"right": eef_4x4},
+                                    "eef_9d": {"right": eef_9d},
+                                    "joint": {"right_arm": proposed_joint},
+                                    "gripper": {"right": proposed_gripper},
+                                },
+                            })
+                        except Exception as e:
+                            logger.warning(f"Recorder.record() failed: {e}")
+
                 tick += 1
                 rate.sleep()
 
@@ -664,6 +854,17 @@ class PolicyRolloutController:
             self.cleanup()
 
     def cleanup(self) -> None:
+        recorder = getattr(self, "_recorder", None)
+        if recorder is not None and recorder.recording:
+            path = recorder.stop()
+            if path is not None:
+                deadline = time.monotonic() + 10.0
+                while recorder.saving and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if recorder.saving:
+                    logger.warning(f"Recorder still saving at exit: {path}")
+                else:
+                    logger.info(f"Recorded rollout → {path}")
         if hasattr(self, "robot") and self.robot is not None:
             try:
                 self.robot.shutdown()
@@ -687,6 +888,10 @@ def main(
     workspace_check: bool = True,
     policy_fps: int = 15,
     gripper_threshold: float = 0.5,
+    act_n_action_steps: Optional[int] = 1,
+    act_temporal_ensemble_coeff: Optional[float] = 0.01,
+    record: bool = True,
+    record_dir: Optional[str] = None,
 ) -> None:
     """Run live policy rollout on a Dexmate right arm.
 
@@ -703,6 +908,14 @@ def main(
             training (15 for our Dexmate variants).
         gripper_threshold: Binarise the policy's gripper output at this value
             (matches the dataset's binarisation in port_dexmate_hdf5.py).
+        act_n_action_steps: ACT-only checkpoint config override. Defaults to
+            1 so temporal ensembling can query the policy on every policy tick.
+        act_temporal_ensemble_coeff: ACT-only checkpoint config override.
+            Defaults to 0.01, matching the original ACT temporal ensemble value.
+        record: Dump per-policy-tick frames to HDF5 for debug analysis.
+        record_dir: Override save directory; defaults to
+            ``/home/yixuan/Dexmate/deploy/name=<model-variant>`` derived from
+            ``policy_path``.
     """
     setup_logging(debug)
     ctrl = PolicyRolloutController(
@@ -713,6 +926,10 @@ def main(
         workspace_check=workspace_check,
         policy_fps=policy_fps,
         gripper_threshold=gripper_threshold,
+        act_n_action_steps=act_n_action_steps,
+        act_temporal_ensemble_coeff=act_temporal_ensemble_coeff,
+        record=record,
+        record_dir=record_dir,
     )
     ctrl.run()
 
