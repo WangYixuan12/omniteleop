@@ -24,13 +24,16 @@ pip install omniteleop
   - [Depth sensing](https://www.stereolabs.com/docs/depth-sensing)
 
 ## Data collection
-
+0. check network on lambda, dexmate
 1. ssh dexmate, conda activate dexmate
 2. run '(dexmate) dextop node start' and 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera' in tmux
 3. ssh lambda
 4. run
   (dexmate) python src/omniteleop/follower/vr_robot_controller.py # workspace_check = True, joint positions in vr_mode_const, head_mode and left_arm_mode in src/omniteleop/configs/vega_1_f5d6.yaml  
     (dexmate) python src/omniteleop/leader/vr_reader.py # start-mode=fixed_pose
+
+> /action/eef/right: IK input
+> /action/joint/right_arm: IK output + step clamping
 
 ```bash
 Follow exactly:
@@ -52,8 +55,13 @@ fixed_pose mode:
 # if you forgot position last time, run scripts/save_first_rgb_print_fps.py
 ```
 
-1. scripts/vis_episode.py
-2. scripts/rename_raw_data.py
+- scripts/vis_episode.py (Optional)
+
+```bash
+1. scripts/rename_raw_data.py  # revise train/val/test range
+```
+
+- scripts/vis_teleop_curves.py (Optional) (Need to save_debug in vr_reader)
 
 ## Policy
 
@@ -65,5 +73,15 @@ Run infer_dexmate.py before deploy.
 ```bash
 python -m omniteleop.follower.policy_rollout --policy-path /home/yixuan/omniteleop/Dexmate/model/act/act_abs_joint_eef/checkpoints/400000/pretrained_model
 # act_n_action_steps=1, act_temporal_ensemble_coeff=0.01 for ACT eval
+```
+
+```bash
+python /home/yixuan/Dexmate/deploy/dump_subset.py --input_path /home/yixuan/Dexmate/deploy/act_abs_eef_eef/episode_0.hdf5
+# visualize in csv
+```
+
+```bash
+python /home/yixuan/omniteleop/scripts/vis_episode_online.py # rerun, transmission latency plot under debug/
+python /home/yixuan/omniteleop/scripts/vis_eef_curves.py
 ```
 

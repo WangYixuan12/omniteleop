@@ -1338,10 +1338,10 @@ def main() -> None:
         urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"  # noqa
         """Path to robot URDF for Sapien visualizer (required if --visualize)"""
 
-        save_dir: str = "/home/yixuan/omniteleop/Dexmate/data/raw_data/tmp"
+        save_dir: str = "/home/yixuan/omniteleop/Dexmate/data/raw_data"
         """Directory to save episode_<N>.hdf5 files (A=start, B=stop)"""
 
-        debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/debug_data/tmp"
+        debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/debug_data"
         """Directory to save episode_<N>_debug.hdf5 files"""
 
         start_mode: StartMode = "fixed_pose"
@@ -1351,7 +1351,7 @@ def main() -> None:
         configuration; user trigger-advances out of whole_body_alignment to
         lock the per-arm calibration."""
 
-        save_debug: bool = False
+        save_debug: bool = True
         """If False, skip building and saving episode_<N>_debug.hdf5 to reduce
         per-frame overhead and shorten save time."""
 

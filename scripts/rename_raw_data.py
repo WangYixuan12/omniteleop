@@ -30,9 +30,9 @@ PATTERN = re.compile(r"^episode_(\d+)\.hdf5$")
 DEFAULT_SRC = Path("/home/yixuan/omniteleop/Dexmate/data/raw_data")
 DEFAULT_DST = Path("/home/yixuan/omniteleop/Dexmate/data/raw_data_renamed")
 
-TRAIN_RANGE = list(range(0, 51))           # 0..50 inclusive
-VAL_INDICES = [52, 54, 57, 59, 61]
-TEST_INDICES = [53, 55, 58, 60, 62]
+TRAIN_RANGE = [0] # list(range(0, 51))           # 0..50 inclusive
+VAL_INDICES = None # [52, 54, 57, 59, 61]
+TEST_INDICES = None # [53, 55, 58, 60, 62]
 
 
 def collect_episodes(directory: Path) -> dict[int, Path]:
@@ -48,9 +48,13 @@ def collect_episodes(directory: Path) -> dict[int, Path]:
 
 
 def build_split_plan(source_files: dict[int, Path], split_name: str,
-                     src_indices: list[int], require_all: bool,
+                     src_indices: list[int] | None, require_all: bool,
                      dst_dir: Path) -> list[tuple[Path, Path, int]]:
     """Return list of (src_path, dst_path, old_idx) sorted by source index."""
+    if src_indices is None:
+        print(f"  [{split_name}] no source indices configured (skipped)")
+        return []
+
     available = sorted(i for i in src_indices if i in source_files)
     missing = [i for i in src_indices if i not in source_files]
     if missing:
@@ -105,7 +109,7 @@ def main():
     print(f"Source: {args.src}")
     print(f"Found {len(source_files)} episode files in source.")
 
-    splits: list[tuple[str, list[int], bool]] = []
+    splits: list[tuple[str, list[int] | None, bool]] = []
     if args.train:
         splits.append(("train", TRAIN_RANGE, False))   # gaps allowed
     if args.val:

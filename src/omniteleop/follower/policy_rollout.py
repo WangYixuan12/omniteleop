@@ -17,15 +17,23 @@ ticks. By default ACT checkpoints are overridden to run with
 ``n_action_steps=1`` and ``temporal_ensemble_coeff=0.01``; pass ``None`` for
 those ACT override options to keep the checkpoint's saved queue dynamics.
 
+EEF actions go through the leader's IK pipeline verbatim (mirrors
+``vr_reader._solve_and_apply_arm_ik``): a single ``MotionManager.ik(type="pink")``
+call seeded from the chained last-commanded state (NOT observed joints),
+then ``ArmProcessor.limit_joint_step`` 10°/tick clamp and
+``ArmProcessor.apply_positions`` to commit. ``set_joint_pos`` to the arm
+matches ``vr_robot_controller`` (no ``wait_time``).
+
 Safety guards (applied to the **command actually being sent**):
 
-  1. Estop snapshot via robot.estop.get_status()
-  2. NaN/inf rejection
-  3. IK status check  (eef-action variants): solution / not is_collision,
-     then validate the 7-DOF right-arm target that will actually be commanded
-  4. WorkspaceChecker on the final commanded joint target
-  
-But no limit_joint_step() for 10-deg step limit here because the arm processor is not used.
+  1. Estop snapshot via robot.estop.get_status(); on release the IK chain
+     re-syncs to observed.
+  2. NaN/inf rejection.
+  3. IK status check (eef-action variants): solution / not is_collision /
+     within_limits. On reject the chain does not advance.
+  4. 10°/tick clamp via ``ArmProcessor.limit_joint_step`` on the raw IK
+     solution, then hardware joint-limit check on the post-clamp target.
+  5. WorkspaceChecker on the final commanded joint target.
 
 Run::
 
@@ -37,6 +45,7 @@ Run::
 from __future__ import annotations
 
 import pathlib
+import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -66,6 +75,7 @@ from omniteleop.common.vr_mode_const import (
     INIT_TORSO_JOINTS,
     SAFE_RIGHT_ARM_JOINTS,
 )
+from omniteleop.follower.component_processors import ArmProcessor
 from omniteleop.follower.robotiq import build_hande_command, send_activate
 from omniteleop.follower.workspace_check import WorkspaceChecker
 
@@ -90,6 +100,27 @@ def _gram_schmidt_6d_to_R(r6: np.ndarray) -> np.ndarray:
 def _mat_to_pos6d(M: np.ndarray) -> np.ndarray:
     """4x4 SE(3) → ``[tx, ty, tz, R[:,0], R[:,1]]`` (9-D)."""
     return np.concatenate([M[:3, 3], M[:3, 0], M[:3, 1]]).astype(np.float32)
+
+
+def _next_record_subdir(record_root: str | pathlib.Path) -> pathlib.Path:
+    """Reserve the next numeric rollout subdirectory under ``record_root``."""
+    root = pathlib.Path(record_root)
+    root.mkdir(parents=True, exist_ok=True)
+
+    existing_indices = (
+        int(path.name)
+        for path in root.iterdir()
+        if path.is_dir() and path.name.isdecimal()
+    )
+    next_idx = max(existing_indices, default=-1) + 1
+    while True:
+        candidate = root / f"{next_idx:01d}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            next_idx += 1
+            continue
+        return candidate
 
 
 # ── controller ───────────────────────────────────────────────────────────────
@@ -135,9 +166,9 @@ class PolicyRolloutController:
     ) -> None:
         self.node = Node(name="policy_rollout", namespace=namespace)
 
-        robot_info = RobotInfo()
-        self.has_torso = robot_info.has_torso
-        self.has_chassis = robot_info.has_chassis
+        self._robot_info = RobotInfo()
+        self.has_torso = self._robot_info.has_torso
+        self.has_chassis = self._robot_info.has_chassis
 
         from omniteleop import LIB_PATH
 
@@ -146,7 +177,7 @@ class PolicyRolloutController:
         )
         self.config = get_config(config_path)
         # Outer command-hold loop (must be high-frequency for set_joint_pos(wait_time=0)).
-        self.control_rate = self.config.get_rate("control_rate", 100)
+        self.control_rate = self.config.get_rate("control_rate", 300)
         self.feedback_rate = self.config.get_rate("feedback_rate", 50)
         # Inner policy/camera tick (matches training fps).
         self.policy_fps = int(policy_fps)
@@ -170,6 +201,14 @@ class PolicyRolloutController:
             logger.warning("WorkspaceChecker disabled.")
         self._fixed_motion_joint_limits: dict[str, tuple[float, float]] = {}
 
+        # IK-chain state. Holds the last safe_right we sent (= post-clamp IK
+        # output). Seeded from observed joints after homing and on estop
+        # release. Mirrors the leader's implicit chain through mm.right_arm.
+        # initialize_robot() writes it; _init_motion_manager() writes
+        # self._right_proc. Both run inside this __init__.
+        self._chained_right_arm_qpos: Optional[np.ndarray] = None
+        self._right_proc: Optional[ArmProcessor] = None
+
         # Hardware + policy.
         self.initialize_robot()
         self.initialize_policy(
@@ -182,14 +221,19 @@ class PolicyRolloutController:
             if record_dir is None:
                 tag = pathlib.Path(policy_path).parents[2].name
                 record_dir = f"/home/yixuan/Dexmate/deploy/{tag}"
-            self._recorder: Optional[EpisodeRecorder] = EpisodeRecorder(record_dir)
-            logger.info(f"Recording rollouts to {record_dir}")
+            rollout_record_dir = _next_record_subdir(record_dir)
+            self._recorder: Optional[EpisodeRecorder] = EpisodeRecorder(
+                str(rollout_record_dir)
+            )
+            logger.info(f"Recording rollouts to {rollout_record_dir}")
         else:
             self._recorder = None
 
-        self._last_obs_img_hwc: Optional[np.ndarray] = None
+        self._last_obs_left_rgb: Optional[np.ndarray] = None
+        self._last_obs_depth_u16: Optional[np.ndarray] = None
         self._last_obs_right_arm_qpos: Optional[np.ndarray] = None
         self._last_obs_eef_9d: Optional[np.ndarray] = None
+        self._last_obs_gripper = None  # np.float32; set in _build_observation
 
         self._mode = _Mode.HOMING
 
@@ -222,6 +266,8 @@ class PolicyRolloutController:
         )
         self._last_gripper_cmd = 0.0
         self._last_cmd_right = np.array(self.robot.right_arm.get_joint_pos())
+        # Initialise the IK chain at the observed home pose.
+        self._chained_right_arm_qpos = self._last_cmd_right.astype(np.float32)
         logger.success("Robot ready (home, gripper open).")
 
     def initialize_policy(
@@ -304,6 +350,7 @@ class PolicyRolloutController:
         else:
             self._motion_manager = None
             self._ik_solver = None
+            self._right_proc = None
 
         # Reset action queue at start.
         self._policy.reset()
@@ -329,7 +376,12 @@ class PolicyRolloutController:
             raise ValueError("LocalPinkIKSolver not available from MotionManager")
         self._cache_fixed_motion_joint_limits()
         self._motion_manager.set_joint_pos(self._motion_manager_state_dict())
-        logger.info("MotionManager + LocalPinkIKSolver initialised.")
+        # Right-arm processor: provides limit_joint_step (10°/tick clamp) and
+        # apply_positions, exactly as on the leader (vr_reader.py:377).
+        self._right_proc = ArmProcessor(
+            "right", self.config, self._motion_manager, self._robot_info, "vr"
+        )
+        logger.info("MotionManager + LocalPinkIKSolver + ArmProcessor initialised.")
 
     def _cache_fixed_motion_joint_limits(self) -> None:
         """Cache dexmotion limits only for fixed non-commanded model context."""
@@ -359,11 +411,22 @@ class PolicyRolloutController:
         eps = 1e-4
         return float(np.clip(value, lower + eps, upper - eps))
 
-    def _motion_manager_state_dict(self) -> dict[str, float]:
-        """Right-arm live state plus fixed non-commanded joints for FK/IK."""
+    def _motion_manager_state_dict(
+        self, right_arm: Optional[np.ndarray] = None
+    ) -> dict[str, float]:
+        """Right-arm state plus fixed non-commanded joints for FK/IK.
+
+        ``right_arm=None`` reads live observed joints (used for FK on the
+        policy's observation). Pass an explicit array (e.g. the chained
+        last-commanded joints) to seed MM before an IK call so
+        ``limit_joint_step`` clamps against last-commanded, matching the
+        leader's behaviour.
+        """
+        if right_arm is None:
+            right_arm = self.robot.right_arm.get_joint_pos()
         qd = {
             f"R_arm_j{i + 1}": float(q)
-            for i, q in enumerate(self.robot.right_arm.get_joint_pos())
+            for i, q in enumerate(right_arm)
         }
         qd.update(
             {
@@ -430,17 +493,36 @@ class PolicyRolloutController:
 
     # ── observation ───────────────────────────────────────────────────────────
 
-    def _read_camera_240x320_uint8(self) -> np.ndarray:
-        img_dict = self.robot.sensors.head_camera.get_obs(obs_keys=[self.camera_key])
+    def _read_head_camera(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Read head camera streams for policy input + HDF5 recording.
+
+        One ``get_obs()`` call covers all three streams: the ``camera_key``
+        image feeds the policy after resize, while ``left_rgb`` and
+        ``depth`` are kept at original resolution for the recorder
+        (mirrors ``vr_reader._handle_recording``: depth in metres →
+        uint16 millimetres).
+        """
+        keys = list({self.camera_key, "left_rgb", "depth"})
+        obs = self.robot.sensors.head_camera.get_obs(obs_keys=keys)
+
         # mdp_recorder.py:565 prefixes with "head_"; tolerate both shapes.
-        if self.camera_key in img_dict:
-            img = img_dict[self.camera_key]
-        else:
-            img = img_dict[f"head_{self.camera_key}"]
-        if img.dtype != np.uint8:
-            img = np.clip(img, 0, 255).astype(np.uint8)
+        def pick(key: str) -> np.ndarray:
+            return obs[key] if key in obs else obs[f"head_{key}"]
+
+        policy_raw = pick(self.camera_key)
+        if policy_raw.dtype != np.uint8:
+            policy_raw = np.clip(policy_raw, 0, 255).astype(np.uint8)
         # cv2.resize takes (W, H).
-        return cv2.resize(img, (self.image_w, self.image_h), interpolation=cv2.INTER_AREA)
+        policy_img = cv2.resize(
+            policy_raw, (self.image_w, self.image_h), interpolation=cv2.INTER_AREA
+        )
+
+        left_rgb = pick("left_rgb")
+        if left_rgb.dtype != np.uint8:
+            left_rgb = np.clip(left_rgb, 0, 255).astype(np.uint8)
+
+        depth_u16 = np.clip(pick("depth") * 1000, 0, 65535).astype(np.uint16)
+        return policy_img, left_rgb, depth_u16
 
     def _current_eef_pose(self) -> np.ndarray:
         """4x4 SE(3) of right_ee in robot base frame, via MotionManager FK."""
@@ -470,10 +552,13 @@ class PolicyRolloutController:
                 [right_arm, [self._last_gripper_cmd]]
             ).astype(np.float32)
 
-        img_hwc = self._read_camera_240x320_uint8()
-        self._last_obs_img_hwc = img_hwc
+        img_hwc, left_rgb, depth_u16 = self._read_head_camera()
+        self._last_obs_left_rgb = left_rgb
+        self._last_obs_depth_u16 = depth_u16
         self._last_obs_right_arm_qpos = right_arm.copy()
         self._last_obs_eef_9d = obs_eef_9d.astype(np.float32)
+        # Last element of observation.state (commanded gripper at obs build time).
+        self._last_obs_gripper = np.float32(self._last_gripper_cmd)
         # Mirror what LeRobotDataset.__getitem__ returns: CHW float32 in [0, 1].
         img_chw = (
             torch.from_numpy(img_hwc).permute(2, 0, 1).float() / 255.0
@@ -499,18 +584,24 @@ class PolicyRolloutController:
     def _policy_step(self) -> tuple[np.ndarray, dict]:
         """Run one policy tick: returns (absolute action, timing info)."""
         qlen_before = self._policy_action_queue_len()
-        t_obs_ns_wallclock = time.time_ns()
+        begin_build_obs_ns = time.time_ns()
         t_obs_start = time.monotonic()
         sample = self._build_observation()
         t_obs_end = time.monotonic()
         sample = self._pre(sample)
+        begin_inference_ns = time.time_ns()
         t_inf_start = time.monotonic()
         with torch.no_grad():
             a = self._policy.select_action(sample)
         t_inf_end = time.monotonic()
+        finish_inference_ns = time.time_ns()
         a_abs = self._post(a)
         info = {
-            "t_obs_ns_wallclock": t_obs_ns_wallclock,
+            # Legacy alias kept so readers that grep for t_obs_ns_wallclock still work.
+            "t_obs_ns_wallclock": begin_build_obs_ns,
+            "begin_build_obs_ns": begin_build_obs_ns,
+            "begin_inference_ns": begin_inference_ns,
+            "finish_inference_ns": finish_inference_ns,
             "t_obs_end": t_obs_end,
             "obs_build_ms": (t_obs_end - t_obs_start) * 1000.0,
             "inference_ms": (t_inf_end - t_inf_start) * 1000.0,
@@ -531,40 +622,54 @@ class PolicyRolloutController:
             joint_target = action[:7].astype(np.float32)
             return joint_target, gripper, "ok"
 
-        # EEF action: rebuild SE(3), run IK with status checks.
+        # EEF action — mirror vr_reader._solve_and_apply_arm_ik exactly.
         T = np.eye(4, dtype=np.float64)
         T[:3, :3] = _gram_schmidt_6d_to_R(action[3:9].astype(np.float64))
         T[:3, 3] = action[:3].astype(np.float64)
-        assert self._ik_solver is not None
         assert self._motion_manager is not None
-        self._motion_manager.set_joint_pos(self._motion_manager_state_dict())
+        assert self._right_proc is not None
+        assert self._chained_right_arm_qpos is not None
+
+        # Seed MM with the chained (last-commanded) right_arm so:
+        #   - the Pink IK warm-starts from there (matches leader),
+        #   - limit_joint_step clamps the raw IK output against it.
+        # mm.ik() does NOT commit its solution back into mm.right_arm, so the
+        # MM state stays at the chained value across the call.
+        self._motion_manager.set_joint_pos(
+            self._motion_manager_state_dict(right_arm=self._chained_right_arm_qpos)
+        )
         try:
-            solution, is_collision, within_limits = self._ik_solver.solve_ik(
-                target_pose_dict={"R_ee": T}
+            arm_solution, in_collision, within_limits = self._motion_manager.ik(
+                target_pose={"R_ee": T},
+                type="pink",
             )
         except Exception as e:  # solver internals can throw on degenerate inputs
             return None, gripper, f"ik_exception: {e}"
 
-        if not solution:
+        if not arm_solution:
             return None, gripper, "ik_no_solution"
-        if is_collision:
+        if in_collision:
             return None, gripper, "ik_collision"
+        if not within_limits:
+            return None, gripper, "ik_outside_limits"
 
         try:
-            joint_target = np.array(
-                [solution[f"R_arm_j{i + 1}"] for i in range(7)], dtype=np.float32
-            )
+            raw_right = [arm_solution[f"R_arm_j{i}"] for i in range(1, 8)]
         except KeyError as e:
             return None, gripper, f"ik_missing_joint:{e}"
 
+        # 10°/tick clamp against the chained state, then commit back into MM.
+        # apply_positions advances the leader's implicit chain (mm.right_arm
+        # is the source for next tick's limit_joint_step) — we also store it
+        # explicitly so the next IK call re-seeds MM from a known place.
+        safe_right = self._right_proc.limit_joint_step(raw_right)
+        self._right_proc.apply_positions(safe_right.tolist())
+        self._chained_right_arm_qpos = safe_right.astype(np.float32)
+
+        joint_target = safe_right.astype(np.float32)
         ok, why = self._check_right_arm_joint_target(joint_target)
         if not ok:
             return None, gripper, why
-        if not within_limits:
-            logger.debug(
-                "Ignoring IK within_limits=False because the commanded "
-                "7-DOF right arm target passed right-arm checks."
-            )
         return joint_target, gripper, "ok"
 
     def _action_eef_records(
@@ -683,6 +788,8 @@ class PolicyRolloutController:
     def run(self) -> None:
         import threading
 
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+
         self._feedback_running = True
         feedback_thread = threading.Thread(
             target=self._publish_joint_feedback, daemon=True, name="JointFeedback"
@@ -729,6 +836,16 @@ class PolicyRolloutController:
                 if self._mode == _Mode.PAUSED:
                     logger.info("Estop released; resuming.")
                     self._policy.reset()  # fresh queue after pause
+                    # Re-sync the IK chain to the observed arm pose — the
+                    # operator may have moved the arm while paused. Re-seed
+                    # mm.right_arm via apply_positions so the next
+                    # limit_joint_step clamps against the live state.
+                    if self._right_proc is not None:
+                        obs_right = np.array(
+                            self.robot.right_arm.get_joint_pos(), dtype=np.float32
+                        )
+                        self._chained_right_arm_qpos = obs_right
+                        self._right_proc.apply_positions(obs_right.tolist())
                     self._mode = _Mode.RUNNING
 
                 # ─── inner: policy at policy_fps ──────────────────────────────
@@ -764,8 +881,10 @@ class PolicyRolloutController:
                 command_target = joint_target
 
                 ok, why = self._check_safety(command_target)
+                publish_command_ns = 0
                 if ok:
                     self.robot.right_arm.set_joint_pos(command_target.tolist())
+                    publish_command_ns = time.time_ns()
                     self.robot.right_arm.send_ee_pass_through_message(
                         build_hande_command(gripper_target)
                     )
@@ -788,6 +907,7 @@ class PolicyRolloutController:
                         logger.warning(f"Safety rejected: {why}; holding last command.")
                     # Re-send last good joint target to keep the motor live.
                     self.robot.right_arm.set_joint_pos(self._last_cmd_right.tolist())
+                    publish_command_ns = time.time_ns()
                     if consecutive_rejects >= REJECT_LIMIT:
                         logger.error(
                             f"{consecutive_rejects} consecutive safety rejects — exiting."
@@ -814,24 +934,42 @@ class PolicyRolloutController:
                                 1.0 if cand_gripper >= self.gripper_threshold else 0.0
                             )
                             eef_4x4, eef_9d = self._action_eef_records(action, proposed_joint)
-                            obs_img = self._last_obs_img_hwc
+                            obs_left_rgb = self._last_obs_left_rgb
+                            obs_depth_u16 = self._last_obs_depth_u16
                             obs_qpos = self._last_obs_right_arm_qpos
                             obs_eef_9d = self._last_obs_eef_9d
+                            obs_gripper = self._last_obs_gripper
                             assert (
-                                obs_img is not None
+                                obs_left_rgb is not None
+                                and obs_depth_u16 is not None
                                 and obs_qpos is not None
                                 and obs_eef_9d is not None
+                                and obs_gripper is not None
                             )
                             self._recorder.record({
                                 "time": {
                                     "timestamp_ns": np.int64(step_info["t_obs_ns_wallclock"]),
+                                    "begin_build_observation": np.int64(
+                                        step_info["begin_build_obs_ns"]
+                                    ),
+                                    "begin_inference": np.int64(
+                                        step_info["begin_inference_ns"]
+                                    ),
+                                    "finish_inference": np.int64(
+                                        step_info["finish_inference_ns"]
+                                    ),
+                                    "publish_command": np.int64(publish_command_ns),
                                     "obs_flag": np.bool_(step_info["replan"]),
                                     "action_number": np.int32(chunk_idx),
                                 },
                                 "obs": {
                                     "joint": {"right_arm": obs_qpos},
                                     "eef_9d": {"right": obs_eef_9d},
-                                    "images": {"right_rgb": obs_img},
+                                    "gripper": {"right": obs_gripper},
+                                    "images": {
+                                        "left_rgb": obs_left_rgb,
+                                        "depth": obs_depth_u16,
+                                    },
                                 },
                                 "action": {
                                     "eef": {"right": eef_4x4},
@@ -888,8 +1026,8 @@ def main(
     workspace_check: bool = True,
     policy_fps: int = 15,
     gripper_threshold: float = 0.5,
-    act_n_action_steps: Optional[int] = 1,
-    act_temporal_ensemble_coeff: Optional[float] = 0.01,
+    act_n_action_steps: Optional[int] = 15,
+    act_temporal_ensemble_coeff: Optional[float] = None,
     record: bool = True,
     record_dir: Optional[str] = None,
 ) -> None:
@@ -913,8 +1051,9 @@ def main(
         act_temporal_ensemble_coeff: ACT-only checkpoint config override.
             Defaults to 0.01, matching the original ACT temporal ensemble value.
         record: Dump per-policy-tick frames to HDF5 for debug analysis.
-        record_dir: Override save directory; defaults to
-            ``/home/yixuan/Dexmate/deploy/name=<model-variant>`` derived from
+        record_dir: Override save root. Each rollout records under the next
+            numeric subdirectory (``0``, ``1``, ...). Defaults to
+            ``/home/yixuan/Dexmate/deploy/<model-variant>`` derived from
             ``policy_path``.
     """
     setup_logging(debug)

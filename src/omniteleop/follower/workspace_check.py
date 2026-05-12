@@ -26,7 +26,7 @@ from yixuan_utilities.kinematics_helper import KinHelper
 DEFAULT_RIGHT_BOUNDS: dict[str, tuple[float, float]] = {
     "x": (0.0, 0.75),
     "y": (-0.70, 0.20),
-    "z": (0.70, 1.10),
+    "z": (0.72, 1.10), # 0.72 is hitting the table
 }
 DEFAULT_RIGHT_LINK = "R_ee"
 DEFAULT_ROBOT_NAME = "vega_no_effector"
