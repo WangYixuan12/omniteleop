@@ -1,6 +1,6 @@
 """Plot every intermediate stage of a recorded VR teleop episode.
 
-Reads a main episode HDF5 (`episode_<N>.hdf5`) and an optional debug HDF5
+Reads a main episode HDF5 (`episode_<N>.hdf5`) and the matching debug HDF5
 (`episode_<N>_debug.hdf5`, produced by `DebugEpisodeRecorder` in vr_reader.py)
 and produces ~12 matplotlib figures plus a printed per-joint summary.
 
@@ -8,9 +8,7 @@ Stages visualised
 -----------------
 - Per-joint commanded vs actual (arms, head)
 - Raw IK output before rate-limiting (debug file)
-- Commanded EEF target — main `action/eef` plus debug `eef_used_by_ik`.
-  These must match: every EEF dataset is the robot-frame target used by IK,
-  independent of start mode.
+- Commanded EEF target — debug `target/eef_used_by_ik`.
 - Rate-limit clipping size and joint-tracking-error histograms
 - Loop period and timing breakdown (IK solve, publish)
 - Stage-equivalence: published payload vs rate-limited cmd (must be 0)
@@ -19,7 +17,8 @@ Stages visualised
 
 Usage::
     python scripts/vis_teleop_curves.py --hdf5 /path/episode_5.hdf5
-    python scripts/vis_teleop_curves.py --hdf5 ... --save-dir out/ --no-fk
+    python scripts/vis_teleop_curves.py --episode-id 5
+    python scripts/vis_teleop_curves.py --hdf5 ... --save-dir out/
 """
 
 from __future__ import annotations
@@ -29,6 +28,9 @@ import pathlib
 import warnings
 from typing import Optional
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from yixuan_utilities.hdf5_utils import load_dict_from_hdf5
@@ -49,8 +51,6 @@ def _load_main(path: str) -> dict:
         "cmd_left": _arr(data["action"]["joint"]["left_arm"]),
         "cmd_right": _arr(data["action"]["joint"]["right_arm"]),
         "cmd_head": _arr(data["action"]["joint"]["head"]),
-        "cmd_eef_left": _arr(data["action"]["eef"]["left"]),
-        "cmd_eef_right": _arr(data["action"]["eef"]["right"]),
         "grip_left": _arr(data["action"]["gripper"]["left"]),
         "grip_right": _arr(data["action"]["gripper"]["right"]),
         "vx": _arr(data["action"]["joint"]["chassis_vx"]),
@@ -85,8 +85,6 @@ def _load_debug(path: str) -> dict:
         "vr_to_robot_right": _arr(data["calib"]["vr_to_robot_right"]),
         "eef_used_by_ik_left": _arr(data["target"]["eef_used_by_ik"]["left"]),
         "eef_used_by_ik_right": _arr(data["target"]["eef_used_by_ik"]["right"]),
-        "eef_recorded_main_left": _arr(data["target"]["eef_recorded_main"]["left"]),
-        "eef_recorded_main_right": _arr(data["target"]["eef_recorded_main"]["right"]),
         "ik_raw_left": _arr(data["ik"]["left_arm_raw"]),
         "ik_raw_right": _arr(data["ik"]["right_arm_raw"]),
         "ik_success": _arr(data["ik"]["status"]["success"]),
@@ -164,37 +162,68 @@ def fig_head_joints(t: np.ndarray, cmd: np.ndarray, actual: np.ndarray, fig_id: 
     return fig
 
 
+def _local_extrema_indices(y: np.ndarray, min_prominence: float = 0.0) -> np.ndarray:
+    """Indices of strict interior local minima/maxima of ``y``.
+
+    Interior sign-changes of the first derivative; plateaus (zero derivative)
+    are skipped so flat segments don't generate spurious extrema. If
+    ``min_prominence > 0``, drop extrema whose y-value sits within that
+    threshold of the previously kept extremum (cheap clutter filter — not the
+    exact scipy ``peak_prominences`` definition).
+    """
+    if y.size < 3:
+        return np.empty(0, dtype=int)
+    dy = np.diff(y)
+    sign = np.sign(dy)
+    changes = np.where(np.diff(sign) != 0)[0] + 1
+    valid = (sign[changes - 1] != 0) & (sign[changes] != 0) & (sign[changes - 1] != sign[changes])
+    candidates = changes[valid]
+    if min_prominence <= 0 or len(candidates) == 0:
+        return candidates.astype(int)
+    keep: list[int] = []
+    last_y: Optional[float] = None
+    for c in candidates:
+        cv = float(y[c])
+        if last_y is None or abs(cv - last_y) >= min_prominence:
+            keep.append(int(c))
+            last_y = cv
+    return np.array(keep, dtype=int)
+
+
 def fig_eef_xyz(
     t: np.ndarray,
     target_used: np.ndarray,
-    target_main: np.ndarray,
     actual_eef: Optional[np.ndarray],
     side: str,
     fig_id: int,
     dt_s: Optional[float] = None,
+    *,
+    show_extrema_gaps: bool = False,
+    min_prominence_m: float = 0.02,
 ) -> plt.Figure:
-    """target_used / target_main: (N,4,4); actual_eef: (N,3) FK-derived."""
+    """target_used: (N,4,4); actual_eef: optional (N,3) FK-derived.
+
+    If ``show_extrema_gaps`` is True (and ``actual_eef`` is provided), drop a
+    dashed vertical at each local extremum of the target curve down to the
+    achieved value and annotate the gap in mm. Extrema below
+    ``min_prominence_m`` (relative to the previously kept extremum) are filtered
+    to keep dense traces readable.
+    """
     fig, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 6))
     labels = "xyz"
     for i in range(3):
         ax = axes[i]
-        ax.plot(t, target_used[:, i, 3], color="C0", lw=1.4, label="target (used_by_ik)")
-        ax.plot(
-            t,
-            target_main[:, i, 3],
-            color="gray",
-            lw=0.9,
-            ls=":",
-            label="target (main action/eef)",
-        )
-        if actual_eef is not None:
-            ax.plot(t, actual_eef[:, i], color="C3", lw=1.0, label="actual (FK)")
+        tgt = target_used[:, i, 3]
+        ax.plot(t, tgt, color="C0", lw=1.4, label="target (used_by_ik)")
+        act = actual_eef[:, i] if actual_eef is not None else None
+        if act is not None:
+            ax.plot(t, act, color="C3", lw=1.0, label="actual (FK)")
         ax.set_ylabel(f"{labels[i]} (m)", fontsize=9)
         ax.grid(alpha=0.3)
         if i == 0:
             ax.legend(loc="upper right", fontsize=8)
-        if dt_s is not None and actual_eef is not None:
-            lag_ms = estimate_lag_ms(target_used[:, i, 3], actual_eef[:, i], dt_s)
+        if dt_s is not None and act is not None:
+            lag_ms = estimate_lag_ms(tgt, act, dt_s)
             ax.text(
                 0.01,
                 0.95,
@@ -205,6 +234,23 @@ def fig_eef_xyz(
                 ha="left",
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.85),
             )
+        if show_extrema_gaps and act is not None:
+            extrema = _local_extrema_indices(tgt, min_prominence=min_prominence_m)
+            for k in extrema:
+                dv_mm = float(act[k] - tgt[k]) * 1000.0
+                ax.plot([t[k], t[k]], [tgt[k], act[k]], color="0.55", lw=0.7, ls="--")
+                ax.plot(t[k], tgt[k], "o", color="C0", ms=3)
+                ax.plot(t[k], act[k], "o", color="C3", ms=3)
+                ymax = max(tgt[k], act[k])
+                ax.annotate(
+                    f"Δ={dv_mm:+.1f} mm",
+                    xy=(t[k], ymax),
+                    xytext=(0, 6),
+                    textcoords="offset points",
+                    ha="center",
+                    fontsize=7,
+                    color="0.25",
+                )
     axes[-1].set_xlabel("t (s)")
     fig.suptitle(f"Fig {fig_id}: {side} arm EEF xyz", fontsize=11)
     fig.tight_layout()
@@ -229,7 +275,7 @@ def fig_chassis(
     vx: np.ndarray,
     vy: np.ndarray,
     wz: np.ndarray,
-    dbg: Optional[dict],
+    dbg: dict,
     fig_id: int,
 ) -> plt.Figure:
     fig, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 6))
@@ -238,34 +284,32 @@ def fig_chassis(
         ax.plot(t, cmd, color="C0", lw=1.2, label="cmd")
         ax.set_ylabel(lbl)
         ax.grid(alpha=0.3)
-    if dbg is not None:
-        # _thumbstick_to_chassis maps:
-        #   vx ← -left_thumbstick[1], vy ← -left_thumbstick[0],
-        #   wz ← -right_thumbstick[0]
-        ls = dbg["left_thumbstick"]
-        rs = dbg["right_thumbstick"]
-        raws = [-ls[:, 1], -ls[:, 0], -rs[:, 0]]
-        for ax, raw in zip(axes, raws, strict=False):
-            ax2 = ax.twinx()
-            ax2.plot(t, raw, color="lightgray", lw=0.8, label="raw stick")
-            ax2.set_ylabel("stick", color="gray", fontsize=8)
-            ax2.tick_params(axis="y", labelcolor="gray", labelsize=7)
+    # _thumbstick_to_chassis maps:
+    #   vx <- -left_thumbstick[1], vy <- -left_thumbstick[0],
+    #   wz <- -right_thumbstick[0]
+    ls = dbg["left_thumbstick"]
+    rs = dbg["right_thumbstick"]
+    raws = [-ls[:, 1], -ls[:, 0], -rs[:, 0]]
+    for ax, raw in zip(axes, raws, strict=False):
+        ax2 = ax.twinx()
+        ax2.plot(t, raw, color="lightgray", lw=0.8, label="raw stick")
+        ax2.set_ylabel("stick", color="gray", fontsize=8)
+        ax2.tick_params(axis="y", labelcolor="gray", labelsize=7)
     axes[-1].set_xlabel("t (s)")
     fig.suptitle(f"Fig {fig_id}: chassis velocity (cmd) + raw thumbstick", fontsize=11)
     fig.tight_layout()
     return fig
 
 
-def fig_loop_and_timing(t_ns: np.ndarray, dbg: Optional[dict], fig_id: int) -> plt.Figure:
+def fig_loop_and_timing(t_ns: np.ndarray, dbg: dict, fig_id: int) -> plt.Figure:
     """Combined: loop period + per-frame ik_solve / publish timings."""
     dt_ms = np.diff(t_ns).astype(np.float64) / 1e6
     fig, ax = plt.subplots(figsize=(10, 5))
     loop_x = np.arange(1, len(dt_ms) + 1)
     ax.plot(loop_x, dt_ms, lw=0.8, color="C0", label="loop period")
-    if dbg is not None:
-        x = np.arange(len(dbg["ik_solve_ms"]))
-        ax.plot(x, dbg["ik_solve_ms"], lw=0.8, color="C1", label="ik_solve_ms")
-        ax.plot(x, dbg["publish_ms"], lw=0.8, color="C2", label="publish_ms")
+    x = np.arange(len(dbg["ik_solve_ms"]))
+    ax.plot(x, dbg["ik_solve_ms"], lw=0.8, color="C1", label="ik_solve_ms")
+    ax.plot(x, dbg["publish_ms"], lw=0.8, color="C2", label="publish_ms")
     mean = float(np.mean(dt_ms)) if len(dt_ms) else float("nan")
     std = float(np.std(dt_ms)) if len(dt_ms) else float("nan")
     p95 = float(np.percentile(dt_ms, 95)) if len(dt_ms) else float("nan")
@@ -296,7 +340,7 @@ def fig_error_hist(
             valid = ~np.isnan(ik_raw[:, i])
             clip = cmd[valid, i] - ik_raw[valid, i]
             axes[i, 0].hist(clip, bins=60, color="C0")
-            axes[i, 0].set_title(f"{side}_j{i+1}  cmd − ik_raw (rate-limit clip)", fontsize=8)
+            axes[i, 0].set_title(f"{side}_j{i+1}  cmd - ik_raw (rate-limit clip)", fontsize=8)
         else:
             axes[i, 0].axis("off")
         err = actual[:, i] - cmd[:, i]
@@ -304,7 +348,7 @@ def fig_error_hist(
         rms = float(np.sqrt(np.mean(err**2)))
         peak = float(np.max(np.abs(err)))
         axes[i, 1].set_title(
-            f"{side}_j{i+1}  actual − cmd  RMS={rms:.4f}  peak={peak:.4f}",
+            f"{side}_j{i+1}  actual - cmd  RMS={rms:.4f}  peak={peak:.4f}",
             fontsize=8,
         )
     fig.suptitle(f"Fig {fig_id}: {side} arm error histograms", fontsize=11)
@@ -319,7 +363,7 @@ def fig_stage_eq(
     dbg: dict,
     fig_id: int,
 ) -> plt.Figure:
-    """Stage 5 == Stage 4: published payload − rate-limited cmd should be 0."""
+    """Stage 5 == Stage 4: published payload - rate-limited cmd should be 0."""
     fig, axes = plt.subplots(3, 1, sharex=True, figsize=(10, 7))
     axes[0].plot(np.max(np.abs(dbg["publish_left_arm_pos"] - cmd_left), axis=1), color="C0")
     axes[0].set_ylabel("max |Δ| left_arm")
@@ -330,7 +374,7 @@ def fig_stage_eq(
     for ax in axes:
         ax.grid(alpha=0.3)
     axes[-1].set_xlabel("frame index")
-    fig.suptitle(f"Fig {fig_id}: published payload − rate-limited cmd  (should be 0)")
+    fig.suptitle(f"Fig {fig_id}: published payload - rate-limited cmd  (should be 0)")
     fig.tight_layout()
     return fig
 
@@ -342,7 +386,7 @@ def compute_actual_eef(
     main: dict, robot_name: str = "vega_no_effector"
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return per-frame actual EEF positions (N,3) for left and right arm."""
-    from yixuan_utilities.kinematics_helper import KinHelper
+    from yixuan_utilities.kinematics_helper import KinHelper  # noqa: PLC0415
 
     kin = KinHelper(robot_name)
     name_to_idx = {j.name: i for i, j in enumerate(kin.sapien_robot.get_active_joints())}
@@ -454,26 +498,7 @@ def estimate_lag_ms(
     return lag_samples * dt_s * 1000.0
 
 
-def assert_eef_targets_match(main: dict, dbg: dict, atol: float = 1e-5) -> None:
-    """Require all EEF datasets to be the same robot-frame IK target."""
-    checks = [
-        ("left", main["cmd_eef_left"], dbg["eef_used_by_ik_left"]),
-        ("left", main["cmd_eef_left"], dbg["eef_recorded_main_left"]),
-        ("right", main["cmd_eef_right"], dbg["eef_used_by_ik_right"]),
-        ("right", main["cmd_eef_right"], dbg["eef_recorded_main_right"]),
-    ]
-    for side, main_eef, debug_eef in checks:
-        diff = np.abs(main_eef - debug_eef)
-        max_diff = float(np.nanmax(diff))
-        if max_diff > atol:
-            raise ValueError(
-                f"{side} EEF mismatch: main action/eef and debug EEF differ by "
-                f"max {max_diff:.6g}. Regenerate the episode with vr_reader.py so "
-                "all EEF datasets are the robot-frame targets used by IK."
-            )
-
-
-def print_summary(main: dict, dbg: Optional[dict]) -> None:
+def print_summary(main: dict, dbg: dict) -> None:
     ts_ns = main["ts_ns"]
     dt_ns = np.diff(ts_ns).astype(np.float64)
     dt_mean_s = float(np.mean(dt_ns)) / 1e9 if len(dt_ns) else 0.0
@@ -514,96 +539,114 @@ def print_summary(main: dict, dbg: Optional[dict]) -> None:
             f"p95 = {np.percentile(dt_ms, 95):.2f} ms"
         )
 
-    if dbg is not None:
-        print()
-        print("══════ IK status breakdown ══════")
-        reasons, counts = np.unique(dbg["ik_failure_reason"], return_counts=True)
-        for r, c in zip(reasons, counts, strict=False):
-            r_str = r.decode() if isinstance(r, (bytes, np.bytes_)) else str(r)
-            print(f"  {r_str:<30} {int(c)}")
+    print()
+    print("══════ IK status breakdown ══════")
+    reasons, counts = np.unique(dbg["ik_failure_reason"], return_counts=True)
+    for r, c in zip(reasons, counts, strict=False):
+        r_str = r.decode() if isinstance(r, (bytes, np.bytes_)) else str(r)
+        print(f"  {r_str:<30} {int(c)}")
 
-        print()
-        print("══════ Timing ══════")
-        for name, vals in [
-            ("ik_solve_ms", dbg["ik_solve_ms"]),
-            ("publish_ms", dbg["publish_ms"]),
-        ]:
-            v = vals[~np.isnan(vals)]
-            if len(v) == 0:
-                print(f"  {name}: all NaN")
-            else:
-                print(
-                    f"  {name}: mean={v.mean():.3f}, "
-                    f"p95={np.percentile(v, 95):.3f}, max={v.max():.3f}"
-                )
+    print()
+    print("══════ Timing ══════")
+    for name, vals in [
+        ("ik_solve_ms", dbg["ik_solve_ms"]),
+        ("publish_ms", dbg["publish_ms"]),
+    ]:
+        v = vals[~np.isnan(vals)]
+        if len(v) == 0:
+            print(f"  {name}: all NaN")
+        else:
+            print(
+                f"  {name}: mean={v.mean():.3f}, "
+                f"p95={np.percentile(v, 95):.3f}, max={v.max():.3f}"
+            )
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
 
 def _maybe_show_or_save(figs: dict, save_dir: Optional[str]) -> None:
-    if save_dir:
-        out = pathlib.Path(save_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        for name, fig in figs.items():
-            path = out / f"{name}.png"
-            fig.savefig(path, dpi=120, bbox_inches="tight")
-            print(f"saved {path}")
-    plt.show()
+    if save_dir is None:
+        raise ValueError("offline plotting requires --save-dir")
+
+    out = pathlib.Path(save_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    for name, fig in figs.items():
+        path = out / f"{name}.png"
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"saved {path}")
 
 
 def main_fn() -> None:
     parser = argparse.ArgumentParser()
-    episode_id = 3
+    _raw = "/home/yixuan/omniteleop/Dexmate/data/raw_data"
+    _dbg = "/home/yixuan/omniteleop/Dexmate/debug/debug_data"
+    _plots = "/home/yixuan/omniteleop/Dexmate/debug/plots"
+    parser.add_argument(
+        "--episode-id",
+        "--episode_id",
+        dest="episode_id",
+        type=int,
+        default=0,
+        help=(
+            "Episode index for default --hdf5, --debug, and --save-dir when those "
+            f"flags are omitted ({_raw}/episode_<id>.hdf5, …)."
+        ),
+    )
     parser.add_argument(
         "--hdf5",
-        default=f"/home/yixuan/omniteleop/Dexmate/data/raw_data/episode_{episode_id}.hdf5",
-        help="Path to main episode HDF5",
+        default=None,
+        help="Path to main episode HDF5 (default: raw_data/episode_<episode_id>.hdf5)",
     )
     parser.add_argument(
         "--debug",
-        default=f"/home/yixuan/omniteleop/Dexmate/debug/debug_data/episode_{episode_id}_debug.hdf5",
-        help="Path to debug HDF5 (auto-derived if omitted)",
+        default=None,
+        help="Path to debug HDF5 (default: debug_data/episode_<episode_id>_debug.hdf5)",
     )
     parser.add_argument(
         "--save-dir",
-        default=f"/home/yixuan/omniteleop/Dexmate/debug/plots/episode_{episode_id}/",
-        help="If set, save PNGs instead of plt.show()",
-    )
-    parser.add_argument(
-        "--no-fk",
-        action="store_true",
-        help="Skip KinHelper FK (faster, but no actual EEF curves)",
+        default=None,
+        help="If set, save PNGs instead of plt.show() (default: plots/episode_<episode_id>/)",
     )
     parser.add_argument("--robot-name", default="vega_no_effector")
     args = parser.parse_args()
+
+    eid = args.episode_id
+    if args.hdf5 is None:
+        args.hdf5 = f"{_raw}/episode_{eid}.hdf5"
+    if args.debug is None:
+        args.debug = f"{_dbg}/episode_{eid}_debug.hdf5"
+    if args.save_dir is None:
+        args.save_dir = f"{_plots}/episode_{eid}/"
 
     main_path = pathlib.Path(args.hdf5)
     if args.debug:
         debug_path = pathlib.Path(args.debug)
     else:
         if main_path.stem.endswith("_debug"):
-            warnings.warn("--hdf5 looks like a debug file; pass the main file instead.")
+            warnings.warn(
+                "--hdf5 looks like a debug file; pass the main file instead.",
+                stacklevel=2,
+            )
         debug_path = main_path.parent / f"{main_path.stem}_debug.hdf5"
 
     main = _load_main(str(main_path))
-    if debug_path.exists():
-        dbg = _load_debug(str(debug_path))
-        print(
-            f"loaded main ({main['ts_ns'].shape[0]} frames) + "
-            f"debug ({dbg['ts_ns'].shape[0]} frames)"
+    if not debug_path.exists():
+        raise FileNotFoundError(
+            f"Debug HDF5 is required because vr_reader.py logs EEF targets only "
+            f"under /target/eef_used_by_ik in the debug file: {debug_path}"
         )
-        if dbg["ts_ns"].shape[0] != main["ts_ns"].shape[0]:
-            warnings.warn(
-                f"frame count mismatch: main={main['ts_ns'].shape[0]} "
-                f"debug={dbg['ts_ns'].shape[0]}"
-            )
-        assert_eef_targets_match(main, dbg)
-    else:
-        dbg = None
-        print(
-            f"loaded main ({main['ts_ns'].shape[0]} frames); "
-            f"debug file not found at {debug_path}"
+    dbg = _load_debug(str(debug_path))
+    print(
+        f"loaded main ({main['ts_ns'].shape[0]} frames) + "
+        f"debug ({dbg['ts_ns'].shape[0]} frames)"
+    )
+    if dbg["ts_ns"].shape[0] != main["ts_ns"].shape[0]:
+        warnings.warn(
+            f"frame count mismatch: main={main['ts_ns'].shape[0]} "
+            f"debug={dbg['ts_ns'].shape[0]}",
+            stacklevel=2,
         )
 
     ts0 = main["ts_ns"][0]
@@ -616,7 +659,7 @@ def main_fn() -> None:
         t,
         main["cmd_left"],
         main["act_left"],
-        dbg["ik_raw_left"] if dbg else None,
+        dbg["ik_raw_left"],
         "L",
         1,
     )
@@ -624,37 +667,28 @@ def main_fn() -> None:
         t,
         main["cmd_right"],
         main["act_right"],
-        dbg["ik_raw_right"] if dbg else None,
+        dbg["ik_raw_right"],
         "R",
         2,
         dt_s=dt_mean_s,
     )
     figs["fig03_head"] = fig_head_joints(t, main["cmd_head"], main["act_head"], 3)
 
-    if not args.no_fk:
-        print("computing FK for actual EEF (this can take a few seconds) …")
-        actual_eef_l, actual_eef_r = compute_actual_eef(main, args.robot_name)
-    else:
-        actual_eef_l = actual_eef_r = None
+    print("computing FK for actual EEF (this can take a few seconds) …")
+    actual_eef_l, actual_eef_r = compute_actual_eef(main, args.robot_name)
 
-    target_used_l = dbg["eef_used_by_ik_left"] if dbg else main["cmd_eef_left"]
-    target_used_r = dbg["eef_used_by_ik_right"] if dbg else main["cmd_eef_right"]
-    target_main_l = main["cmd_eef_left"]
-    target_main_r = main["cmd_eef_right"]
-
-    figs["fig04_left_eef"] = fig_eef_xyz(t, target_used_l, target_main_l, actual_eef_l, "L", 4)
+    figs["fig04_left_eef"] = fig_eef_xyz(t, dbg["eef_used_by_ik_left"], actual_eef_l, "L", 4)
     figs["fig05_right_eef"] = fig_eef_xyz(
-        t, target_used_r, target_main_r, actual_eef_r, "R", 5, dt_s=dt_mean_s
+        t, dbg["eef_used_by_ik_right"], actual_eef_r, "R", 5, dt_s=dt_mean_s,
+        show_extrema_gaps=True,
     )
 
     figs["fig06_grippers"] = fig_grippers(t, main["grip_left"], main["grip_right"], 6)
     figs["fig07_chassis"] = fig_chassis(t, main["vx"], main["vy"], main["wz"], dbg, 7)
     figs["fig08_loop_and_timing"] = fig_loop_and_timing(main["ts_ns"], dbg, 8)
-
-    if dbg is not None:
-        figs["fig12_stage_eq"] = fig_stage_eq(
-            main["cmd_left"], main["cmd_right"], main["cmd_head"], dbg, 12
-        )
+    figs["fig12_stage_eq"] = fig_stage_eq(
+        main["cmd_left"], main["cmd_right"], main["cmd_head"], dbg, 12
+    )
 
     print_summary(main, dbg)
     _maybe_show_or_save(figs, args.save_dir)

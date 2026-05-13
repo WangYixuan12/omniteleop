@@ -48,7 +48,6 @@ Data flow::
         ├─ recording path  (only while recording in whole_body)
         │     main HDF5:
         │       action/joint/* = safe published commands
-        │       action/eef/* = EEF targets used by IK in the robot/world frame
         │       obs/joint/* = robot joint feedback sampled through Robot API
         │     debug HDF5:
         │       raw VR wrist poses, calibration matrices, EEF target used by IK,
@@ -127,6 +126,12 @@ from omniteleop.common.vr_mode_const import (
 
 StartMode = Literal["follow_hand", "fixed_pose"]
 from omniteleop.follower.component_processors import ArmProcessor
+from omniteleop.follower.robotiq import (
+    build_hande_status_request,
+    poll_gripper_status,
+    read_gripper_status_event,
+    response_token,
+)
 from omniteleop.follower.workspace_check import DEFAULT_RIGHT_BOUNDS
 from omniteleop.leader.communication.webxr_vr_reader import VRFrame, WebXRVRReader
 
@@ -412,6 +417,14 @@ class VRReader:
         self._last_ik_solve_ms: float = float("nan")
         self._last_publish_ms: float = float("nan")
 
+        # Gripper FC03 status cache. `_last_obs_grip_*` holds gPO/255 ∈ [0,1]
+        # (0 = fully open, 1 = fully closed); NaN until the first parseable reply.
+        # Tokens drive the nonblocking drain in read_gripper_status_event.
+        self._last_obs_grip_left: float = float("nan")
+        self._last_obs_grip_right: float = float("nan")
+        self._grip_token_left: object = None
+        self._grip_token_right: object = None
+
         # Reset interpolation state (set when entering "resetting" stage).
         # Reset is two-phase: phase 1 brings arms to SAFE_*_ARM_JOINTS, phase 2
         # brings everything (incl. arms) to INIT_*_JOINTS.
@@ -645,10 +658,8 @@ class VRReader:
     def _solve_and_apply_arm_ik(
         self, l_target: np.ndarray, r_target: np.ndarray
     ) -> tuple[list[float], list[float]]:
-        # Stash the actual IK target for the debug recorder. This is the
-        # canonical "what was passed to IK"; the main HDF5 mirrors this as
-        # `action/eef/*` so training sees robot/world-frame EEF actions
-        # independent of start_mode.
+        # Stash the canonical robot/world-frame EEF targets that were passed to
+        # IK. These are used only by the optional debug recorder.
         self._last_ik_target_left = l_target.astype(np.float32, copy=True)
         self._last_ik_target_right = r_target.astype(np.float32, copy=True)
 
@@ -727,6 +738,27 @@ class VRReader:
         )
         self._right_eef_oob = not in_bounds
         self._right_eef_xyz = np.asarray(eef_xyz, dtype=np.float32)
+
+    def _poll_gripper_status_step(self) -> None:
+        """Drain pending FC03 replies, then send next status requests.
+
+        Co-exists with the follower's FC16 writes on the shared EE pass-through
+        Zenoh topic; read_gripper_status_event filters by function_code=0x03
+        so write-ACKs are dropped. One-frame latency at publish_rate is fine —
+        actuation lag dominates anyway.
+        """
+        for side, arm in (
+            ("left", self._cam_robot.left_arm),
+            ("right", self._cam_robot.right_arm),
+        ):
+            last_tok = getattr(self, f"_grip_token_{side}")
+            new_tok, parsed, _ = read_gripper_status_event(
+                arm, last_tok, function_code=0x03
+            )
+            setattr(self, f"_grip_token_{side}", new_tok)
+            if parsed is not None:
+                setattr(self, f"_last_obs_grip_{side}", float(parsed["actual"]))
+            arm.send_ee_pass_through_message(build_hande_status_request(0x03))
 
     def _mark_ik_skipped(self, reason: str) -> None:
         """Reset IK telemetry to NaN/skipped when no IK call was made this frame."""
@@ -985,12 +1017,6 @@ class VRReader:
         if now_t > self._next_record_t:
             self._next_record_t = now_t + self._record_period_s
 
-        # Training actions and debug EEF targets must use the same frame:
-        # the robot/world-frame EEF poses that were passed to arm IK. Raw VR
-        # wrist poses stay under debug vr_raw/* and are not logged as EEF.
-        eef_left = self._last_ik_target_left.astype(np.float32, copy=True)
-        eef_right = self._last_ik_target_right.astype(np.float32, copy=True)
-
         # Sample observed joints once and FK them to the head camera link to
         # get world_t_cam (matches scripts/compute_extrinsics.py output).
         obs_torso = np.array(self._cam_robot.torso.get_joint_pos(), dtype=np.float32)
@@ -1015,10 +1041,6 @@ class VRReader:
         frame = {
             "timestamp_ns": np.int64(time.time_ns()),
             "action": {
-                "eef": {
-                    "left": eef_left,
-                    "right": eef_right,
-                },
                 "joint": {
                     "left_arm": np.array(left_pos, dtype=np.float32),
                     "right_arm": np.array(right_pos, dtype=np.float32),
@@ -1039,6 +1061,10 @@ class VRReader:
                     "head": obs_head,
                     "torso": obs_torso,
                 },
+                "gripper": {
+                    "left": np.float32(self._last_obs_grip_left),
+                    "right": np.float32(self._last_obs_grip_right),
+                },
                 "images": {
                     "left_rgb": self._last_imgs["left_rgb"],
                     "right_rgb": self._last_imgs["right_rgb"],
@@ -1052,6 +1078,11 @@ class VRReader:
 
         if not self.save_debug:
             return
+
+        # Debug keeps the robot/world-frame EEF poses that were passed to IK.
+        # Raw VR wrist poses stay under debug vr_raw/*.
+        eef_left = self._last_ik_target_left.astype(np.float32, copy=True)
+        eef_right = self._last_ik_target_right.astype(np.float32, copy=True)
 
         nan44 = np.full((4, 4), np.nan, dtype=np.float32)
         nan7 = np.full(7, np.nan, dtype=np.float32)
@@ -1097,10 +1128,6 @@ class VRReader:
             },
             "target": {
                 "eef_used_by_ik": {
-                    "left": eef_left,
-                    "right": eef_right,
-                },
-                "eef_recorded_main": {
                     "left": eef_left,
                     "right": eef_right,
                 },
@@ -1205,6 +1232,28 @@ class VRReader:
         )[0].copy()
         self._calib_stage = "static"
 
+        # Warm up gripper FC03 reads. Seeds the cache so obs.gripper is valid
+        # from frame 0, and surfaces a clear warning if EE pass-through is
+        # not enabled on the leader's Robot config.
+        for side, arm in (
+            ("left", self._cam_robot.left_arm),
+            ("right", self._cam_robot.right_arm),
+        ):
+            parsed = poll_gripper_status(arm, function_code=0x03, timeout_s=0.5)
+            if parsed is None:
+                logger.warning(
+                    f"{side} gripper FC03 warmup failed — obs.gripper.{side} "
+                    "will record NaN. Verify enable_ee_pass_through=True for "
+                    "the leader's Robot config."
+                )
+            else:
+                setattr(self, f"_last_obs_grip_{side}", float(parsed["actual"]))
+            setattr(
+                self,
+                f"_grip_token_{side}",
+                response_token(arm.get_ee_pass_through_response()),
+            )
+
         rate_limiter = RateLimiter(self.publish_rate)
         if self._debug_display:
             self._debug_display.start()
@@ -1228,6 +1277,8 @@ class VRReader:
                 vr_head = transforms["head"]
                 vr_l = transforms["left_wrist"]
                 vr_r = transforms["right_wrist"]
+
+                self._poll_gripper_status_step()
 
                 if self._calib_stage == "resetting":
                     head_pos, left_pos, right_pos = self._resetting_step(transforms)
