@@ -112,6 +112,12 @@ from omniteleop.common import get_config
 from omniteleop.common.debug_display import get_debug_display
 from omniteleop.common.log_utils import suppress_loguru_module
 from omniteleop.common.logging import setup_logging
+from omniteleop.common.recorder import (
+    EpisodeRecorder,
+    _progress_bar,
+    _recursive_np_stack,
+    _save_dict_with_progress,
+)
 from omniteleop.common.schemas import VRJointData
 from omniteleop.common.vis_utils import concat_img_h
 from omniteleop.common.vr_mode_const import (
@@ -123,18 +129,15 @@ from omniteleop.common.vr_mode_const import (
     SAFE_LEFT_ARM_JOINTS,
     SAFE_RIGHT_ARM_JOINTS,
 )
-
-StartMode = Literal["follow_hand", "fixed_pose"]
 from omniteleop.follower.component_processors import ArmProcessor
 from omniteleop.follower.robotiq import (
-    build_hande_status_request,
+    RobotiqStatusMonitor,
     poll_gripper_status,
-    read_gripper_status_event,
-    response_token,
 )
 from omniteleop.follower.workspace_check import DEFAULT_RIGHT_BOUNDS
 from omniteleop.leader.communication.webxr_vr_reader import VRFrame, WebXRVRReader
 
+StartMode = Literal["follow_hand", "fixed_pose"]
 workspace_check = True
 
 console = Console()
@@ -208,8 +211,6 @@ def make_frame_markers(scene: sapien.ActorBuilder, color: list[float]) -> list[s
 
 
 def update_frame_markers(markers: list[sapien.Entity], mat4: np.ndarray) -> None:
-    import sapien
-
     p, R = mat4[:3, 3], mat4[:3, :3]
     rot = Rotation.from_matrix(R)
     half = _AXIS_LEN / 2
@@ -222,15 +223,6 @@ def update_frame_markers(markers: list[sapien.Entity], mat4: np.ndarray) -> None
     markers[1].set_pose(pose(p + R[:, 0] * half, rot))
     markers[2].set_pose(pose(p + R[:, 1] * half, rot * _ROT_Z_P90))
     markers[3].set_pose(pose(p + R[:, 2] * half, rot * _ROT_Y_N90))
-
-
-from omniteleop.common.recorder import (
-    EpisodeRecorder,
-    _progress_bar,
-    _recursive_np_stack,
-    _save_dict_with_progress,
-)
-
 
 class DebugEpisodeRecorder:
     """Parallel recorder for the debug HDF5 (`episode_<N>_debug.hdf5`).
@@ -251,15 +243,18 @@ class DebugEpisodeRecorder:
         self._episode_id: int = 0
 
     def start(self, episode_id: int) -> None:
+        """Start a new debug episode."""
         self._frames = []
         self._episode_id = episode_id
         self.recording = True
         logger.info(f"DebugEpisodeRecorder: recording started (episode_{episode_id})")
 
     def record(self, frame: dict) -> None:
+        """Append one debug frame."""
         self._frames.append(frame)
 
     def stop(self) -> Optional[str]:
+        """Stop recording and save debug HDF5 in the background."""
         self.recording = False
         if not self._frames:
             logger.warning("DebugEpisodeRecorder: 0 frames — skipping save")
@@ -417,13 +412,16 @@ class VRReader:
         self._last_ik_solve_ms: float = float("nan")
         self._last_publish_ms: float = float("nan")
 
-        # Gripper FC03 status cache. `_last_obs_grip_*` holds gPO/255 ∈ [0,1]
-        # (0 = fully open, 1 = fully closed); NaN until the first parseable reply.
-        # Tokens drive the nonblocking drain in read_gripper_status_event.
+        # Gripper FC03 status cache. `_last_obs_grip_*` holds gPO/255 ∈ [0,1].
+        # Monitors queue FC03 replies separately from FC16 ACKs so recording
+        # never depends on dexcontrol's single latest-response slot.
         self._last_obs_grip_left: float = float("nan")
         self._last_obs_grip_right: float = float("nan")
-        self._grip_token_left: object = None
-        self._grip_token_right: object = None
+        self._grip_monitors: dict[str, RobotiqStatusMonitor] = {}
+        self._obs_grip_event_count_left: int = 0
+        self._obs_grip_event_count_right: int = 0
+        self._recorded_obs_grip_event_count_left: int = 0
+        self._recorded_obs_grip_event_count_right: int = 0
 
         # Reset interpolation state (set when entering "resetting" stage).
         # Reset is two-phase: phase 1 brings arms to SAFE_*_ARM_JOINTS, phase 2
@@ -489,8 +487,6 @@ class VRReader:
         )
 
     def _setup_sapien_viewer(self, urdf_path: Optional[str]) -> None:
-        import sapien
-
         scene = sapien.Scene()
         scene.add_ground(-0.1)
         scene.set_ambient_light([0.5, 0.5, 0.5])
@@ -740,25 +736,31 @@ class VRReader:
         self._right_eef_xyz = np.asarray(eef_xyz, dtype=np.float32)
 
     def _poll_gripper_status_step(self) -> None:
-        """Drain pending FC03 replies, then send next status requests.
+        """Drain queued FC03 replies, then send next status requests.
 
         Co-exists with the follower's FC16 writes on the shared EE pass-through
-        Zenoh topic; read_gripper_status_event filters by function_code=0x03
-        so write-ACKs are dropped. One-frame latency at publish_rate is fine —
-        actuation lag dominates anyway.
+        Zenoh topic. RobotiqStatusMonitor has its own subscriber and queues
+        FC03 replies so FC16 ACKs cannot overwrite statuses before this loop
+        reads them.
         """
-        for side, arm in (
-            ("left", self._cam_robot.left_arm),
-            ("right", self._cam_robot.right_arm),
-        ):
-            last_tok = getattr(self, f"_grip_token_{side}")
-            new_tok, parsed, _ = read_gripper_status_event(
-                arm, last_tok, function_code=0x03
-            )
-            setattr(self, f"_grip_token_{side}", new_tok)
-            if parsed is not None:
-                setattr(self, f"_last_obs_grip_{side}", float(parsed["actual"]))
-            arm.send_ee_pass_through_message(build_hande_status_request(0x03))
+        for side, monitor in self._grip_monitors.items():
+            events = monitor.drain_status_events()
+            if events:
+                latest = events[-1]
+                setattr(self, f"_last_obs_grip_{side}", float(latest["actual"]))
+                count = getattr(self, f"_obs_grip_event_count_{side}") + len(events)
+                setattr(self, f"_obs_grip_event_count_{side}", count)
+            monitor.expire_timeouts(max(0.5, 2.0 / self.publish_rate))
+            monitor.send_status_request()
+
+    def _recordable_obs_grip(self, side: str) -> np.float32:
+        """Return the latest gripper status only if it is fresh for this record."""
+        count = getattr(self, f"_obs_grip_event_count_{side}")
+        recorded_count = getattr(self, f"_recorded_obs_grip_event_count_{side}")
+        if count <= recorded_count:
+            return np.float32(np.nan)
+        setattr(self, f"_recorded_obs_grip_event_count_{side}", count)
+        return np.float32(getattr(self, f"_last_obs_grip_{side}"))
 
     def _mark_ik_skipped(self, reason: str) -> None:
         """Reset IK telemetry to NaN/skipped when no IK call was made this frame."""
@@ -828,7 +830,9 @@ class VRReader:
         return left_pos, right_pos, ik_l, ik_r
 
     def _resetting_step(self, transforms: VRFrame) -> tuple[list[float], list[float], list[float]]:
-        """Interpolate joints toward reset target; on phase 1 completion advance
+        """Interpolate joints toward reset target.
+
+        On phase 1 completion advance
         to phase 2 (INIT); on phase 2 completion compute new base transform.
         """
         self._reset_step_idx += 1
@@ -985,6 +989,8 @@ class VRReader:
             if self.save_debug:
                 self.debug_recorder.start(self.recorder.episode_id)
             self.recorder.start()
+            self._recorded_obs_grip_event_count_left = self._obs_grip_event_count_left
+            self._recorded_obs_grip_event_count_right = self._obs_grip_event_count_right
             self._next_record_t = 0.0  # anchor cadence to the first recorded frame
             console.print(
                 f"[bold green]Recording started at {self.record_rate:g} Hz "
@@ -1037,6 +1043,8 @@ class VRReader:
         extrinsic = self.kin.compute_fk_from_link_idx(obs_qpos, [self.head_eef_idx])[0].astype(
             np.float32
         )
+        obs_grip_left = self._recordable_obs_grip("left")
+        obs_grip_right = self._recordable_obs_grip("right")
 
         frame = {
             "timestamp_ns": np.int64(time.time_ns()),
@@ -1062,8 +1070,8 @@ class VRReader:
                     "torso": obs_torso,
                 },
                 "gripper": {
-                    "left": np.float32(self._last_obs_grip_left),
-                    "right": np.float32(self._last_obs_grip_right),
+                    "left": obs_grip_left,
+                    "right": obs_grip_right,
                 },
                 "images": {
                     "left_rgb": self._last_imgs["left_rgb"],
@@ -1248,11 +1256,16 @@ class VRReader:
                 )
             else:
                 setattr(self, f"_last_obs_grip_{side}", float(parsed["actual"]))
-            setattr(
-                self,
-                f"_grip_token_{side}",
-                response_token(arm.get_ee_pass_through_response()),
-            )
+        self._grip_monitors = {
+            "left": RobotiqStatusMonitor(
+                self._cam_robot.left_arm, side="left", function_code=0x03
+            ),
+            "right": RobotiqStatusMonitor(
+                self._cam_robot.right_arm, side="right", function_code=0x03
+            ),
+        }
+        for monitor in self._grip_monitors.values():
+            monitor.send_status_request()
 
         rate_limiter = RateLimiter(self.publish_rate)
         if self._debug_display:
@@ -1326,9 +1339,12 @@ class VRReader:
             if self.debug_recorder.recording:
                 self.debug_recorder.stop()
             for r in (self.recorder, self.debug_recorder):
-                if r._save_thread is not None and r._save_thread.is_alive():
+                save_thread = r._save_thread  # noqa: SLF001 - recorder exposes no join helper
+                if save_thread is not None and save_thread.is_alive():
                     logger.info(f"Waiting for {type(r).__name__} save to finish ...")
-                    r._save_thread.join()
+                    save_thread.join()
+            for monitor in self._grip_monitors.values():
+                monitor.close()
             if self._debug_display:
                 self._debug_display.stop()
             self.quest.close()

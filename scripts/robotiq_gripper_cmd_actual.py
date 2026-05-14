@@ -1,8 +1,8 @@
 """Standalone Robotiq Hand-E cmd-vs-actual logger.
 
 Drives one or both Hand-E grippers through a step sequence, polls the actual
-encoder position via FC03 over the existing dexcontrol EE pass-through reply
-channel, and writes a CSV plus PNG of cmd / actual plus latency summary per side.
+encoder position via FC03 over a queued EE pass-through response monitor, and
+writes a CSV plus PNG of cmd / actual plus latency summary per side.
 
 Modes:
   * stepped: traverse the requested step sequence once and send a gripper
@@ -11,16 +11,19 @@ Modes:
     gripper command on every tick, matching VRRobotController's whole-body
     control_rate by default.
 
-The collector uses two independent rates inside one thread:
+The collector uses a queued response demux:
   * Tick rate issues cmd writes and FC03 status requests; emits one "tick" row
-    per side per tick.
-  * Drain rate (~500 Hz) reads each side's response slot nonblockingly and
-    emits one "sample" row whenever a fresh, parseable FC03 reply lands.
+    per side per tick with separate send timestamps for the FC16 command (when
+    one is actually sent) and the FC03 request.
+  * Drain rate (~500 Hz) reads each side's queued monitor nonblockingly and
+    emits one "sample" row with read timestamps whenever a fresh, parseable
+    FC03 reply lands.
 
-This avoids the lossy snapshot-then-timeout pattern: every reply that did
-arrive is captured, regardless of which tick triggered it. The CSV's `kind`
-column distinguishes the two streams; sample rows carry only sample columns
-and tick rows carry only tick columns — no NaN-fill rows.
+This avoids the lossy single-slot response pattern: FC16 write ACKs are counted
+and discarded by the monitor while FC03 status replies are queued. The CSV's
+`kind` column distinguishes tick, sample, and timeout rows.
+The plot uses dots only, so it shows actual send/read events rather than
+interpolated curves.
 
 Hardware preconditions:
   * Robot config has `enable_ee_pass_through=True` for each requested arm.
@@ -50,12 +53,11 @@ from dexcontrol.robot import Robot
 
 from omniteleop.common import get_config
 from omniteleop.follower.robotiq import (
+    RobotiqStatusMonitor,
     build_hande_command,
-    build_hande_status_request,
     poll_gripper_status,
-    read_gripper_status_event,
-    response_token,
     send_activate,
+    send_ee_pass_through_with_timestamps,
 )
 
 DEFAULT_STEPS = (0.0, 1.0, 0.5, 1.0, 0.0)
@@ -75,9 +77,36 @@ CSV_FIELDS = [
     "kind",
     "tick_t_monotonic_s",
     "sample_t_monotonic_s",
+    "event_t_monotonic_s",
+    "event_wall_ns",
     "side",
+    "status_result",
+    "status_request_id",
     "cmd",
+    "cmd_sent",
+    "cmd_send_t_monotonic_s",
+    "cmd_send_monotonic_ns",
+    "cmd_send_wall_ns",
+    "cmd_hex",
     "cmd_at_sample",
+    "status_request_send_t_monotonic_s",
+    "status_request_send_monotonic_ns",
+    "status_request_send_wall_ns",
+    "status_request_hex",
+    "state_read_t_monotonic_s",
+    "state_read_monotonic_ns",
+    "state_read_wall_ns",
+    "status_timeout_t_monotonic_s",
+    "status_timeout_monotonic_ns",
+    "status_timeout_wall_ns",
+    "monitor_fc16_acks_discarded",
+    "monitor_invalid_discarded",
+    "monitor_other_status_discarded",
+    "monitor_missing_data_discarded",
+    "monitor_status_timeouts",
+    "monitor_unmatched_statuses",
+    "monitor_status_queue_overflow",
+    "monitor_pending_status_requests",
     "cmd_echo",
     "actual",
     "current_ma",
@@ -151,6 +180,12 @@ def parse_args() -> argparse.Namespace:
         help="Modbus function code for status read (3 or 4; default 3)",
     )
     p.add_argument(
+        "--status-timeout",
+        type=float,
+        default=0.2,
+        help="seconds before a sent FC03/FC04 request is marked timed out (default: 0.2)",
+    )
+    p.add_argument(
         "--out-dir",
         default="/home/yixuan/omniteleop/Dexmate/debug/plots/gripper",
         help="output directory (default: Dexmate/debug/plots/gripper)",
@@ -202,14 +237,72 @@ def warmup_check(arm: Arm, side: str, function_code: int, timeout_s: float = 0.5
     return True
 
 
-def make_tick_row(tick_elapsed: float, side: str, cmd: float) -> Dict:
+def _event_elapsed_s(event: Optional[Dict], t0_monotonic_ns: int) -> str | float:
+    if event is None:
+        return ""
+    return (int(event["send_monotonic_ns"]) - t0_monotonic_ns) / 1e9
+
+
+def _monitor_stat_fields(stats: Optional[Dict[str, int]]) -> Dict:
+    stats = stats or {}
     return {
+        "monitor_fc16_acks_discarded": stats.get("fc16_acks_discarded", ""),
+        "monitor_invalid_discarded": stats.get("invalid_discarded", ""),
+        "monitor_other_status_discarded": stats.get("other_status_discarded", ""),
+        "monitor_missing_data_discarded": stats.get("missing_data_discarded", ""),
+        "monitor_status_timeouts": stats.get("status_timeouts", ""),
+        "monitor_unmatched_statuses": stats.get("unmatched_statuses", ""),
+        "monitor_status_queue_overflow": stats.get("status_queue_overflow", ""),
+        "monitor_pending_status_requests": stats.get("pending_status_requests", ""),
+    }
+
+
+def make_tick_row(
+    tick_elapsed: float,
+    side: str,
+    cmd: float,
+    t0_monotonic_ns: int,
+    cmd_event: Optional[Dict] = None,
+    status_request_event: Optional[Dict] = None,
+    monitor_stats: Optional[Dict[str, int]] = None,
+) -> Dict:
+    event = cmd_event or status_request_event
+    row = {
         "kind": "tick",
         "tick_t_monotonic_s": tick_elapsed,
         "sample_t_monotonic_s": "",
+        "event_t_monotonic_s": _event_elapsed_s(event, t0_monotonic_ns),
+        "event_wall_ns": "" if event is None else event["send_wall_ns"],
         "side": side,
+        "status_result": "requested" if status_request_event is not None else "",
+        "status_request_id": (
+            "" if status_request_event is None else status_request_event["status_request_id"]
+        ),
         "cmd": cmd,
+        "cmd_sent": cmd_event is not None,
+        "cmd_send_t_monotonic_s": _event_elapsed_s(cmd_event, t0_monotonic_ns),
+        "cmd_send_monotonic_ns": "" if cmd_event is None else cmd_event["send_monotonic_ns"],
+        "cmd_send_wall_ns": "" if cmd_event is None else cmd_event["send_wall_ns"],
+        "cmd_hex": "" if cmd_event is None else cmd_event["message_hex"],
         "cmd_at_sample": "",
+        "status_request_send_t_monotonic_s": _event_elapsed_s(
+            status_request_event, t0_monotonic_ns
+        ),
+        "status_request_send_monotonic_ns": (
+            "" if status_request_event is None else status_request_event["send_monotonic_ns"]
+        ),
+        "status_request_send_wall_ns": (
+            "" if status_request_event is None else status_request_event["send_wall_ns"]
+        ),
+        "status_request_hex": (
+            "" if status_request_event is None else status_request_event["message_hex"]
+        ),
+        "state_read_t_monotonic_s": "",
+        "state_read_monotonic_ns": "",
+        "state_read_wall_ns": "",
+        "status_timeout_t_monotonic_s": "",
+        "status_timeout_monotonic_ns": "",
+        "status_timeout_wall_ns": "",
         "cmd_echo": "",
         "actual": "",
         "current_ma": "",
@@ -220,21 +313,54 @@ def make_tick_row(tick_elapsed: float, side: str, cmd: float) -> Dict:
         "response_timestamp_ns": "",
         "response_sequence": "",
     }
+    row.update(_monitor_stat_fields(monitor_stats))
+    return row
 
 
 def make_sample_row(
-    sample_elapsed: float,
     side: str,
     cmd_at_sample: Optional[float],
     parsed: Dict,
+    t0_monotonic_ns: int,
 ) -> Dict:
-    return {
+    read_monotonic_ns = parsed.get("read_monotonic_ns")
+    sample_elapsed = (
+        ""
+        if read_monotonic_ns in ("", None)
+        else (int(read_monotonic_ns) - t0_monotonic_ns) / 1e9
+    )
+    request_send_monotonic_ns = parsed.get("request_send_monotonic_ns")
+    request_elapsed = (
+        ""
+        if request_send_monotonic_ns in ("", None)
+        else (int(request_send_monotonic_ns) - t0_monotonic_ns) / 1e9
+    )
+    row = {
         "kind": "sample",
         "tick_t_monotonic_s": "",
         "sample_t_monotonic_s": sample_elapsed,
+        "event_t_monotonic_s": sample_elapsed,
+        "event_wall_ns": parsed.get("read_wall_ns", ""),
         "side": side,
+        "status_result": "ok",
+        "status_request_id": parsed.get("status_request_id", ""),
         "cmd": "",
+        "cmd_sent": "",
+        "cmd_send_t_monotonic_s": "",
+        "cmd_send_monotonic_ns": "",
+        "cmd_send_wall_ns": "",
+        "cmd_hex": "",
         "cmd_at_sample": "" if cmd_at_sample is None else cmd_at_sample,
+        "status_request_send_t_monotonic_s": request_elapsed,
+        "status_request_send_monotonic_ns": parsed.get("request_send_monotonic_ns", ""),
+        "status_request_send_wall_ns": parsed.get("request_send_wall_ns", ""),
+        "status_request_hex": parsed.get("status_request_hex", ""),
+        "state_read_t_monotonic_s": sample_elapsed,
+        "state_read_monotonic_ns": parsed.get("read_monotonic_ns", ""),
+        "state_read_wall_ns": parsed.get("read_wall_ns", ""),
+        "status_timeout_t_monotonic_s": "",
+        "status_timeout_monotonic_ns": "",
+        "status_timeout_wall_ns": "",
         "cmd_echo": parsed["cmd_echo"],
         "actual": parsed["actual"],
         "current_ma": parsed["current_ma"],
@@ -245,6 +371,56 @@ def make_sample_row(
         "response_timestamp_ns": parsed.get("response_timestamp_ns", ""),
         "response_sequence": parsed.get("response_sequence", ""),
     }
+    row.update(_monitor_stat_fields(None))
+    return row
+
+
+def make_timeout_row(
+    side: str,
+    timeout_event: Dict,
+    t0_monotonic_ns: int,
+    monitor_stats: Optional[Dict[str, int]] = None,
+) -> Dict:
+    timeout_elapsed = (int(timeout_event["timeout_monotonic_ns"]) - t0_monotonic_ns) / 1e9
+    request_elapsed = (int(timeout_event["send_monotonic_ns"]) - t0_monotonic_ns) / 1e9
+    row = {
+        "kind": "timeout",
+        "tick_t_monotonic_s": "",
+        "sample_t_monotonic_s": "",
+        "event_t_monotonic_s": timeout_elapsed,
+        "event_wall_ns": timeout_event["timeout_wall_ns"],
+        "side": side,
+        "status_result": "timeout",
+        "status_request_id": timeout_event["status_request_id"],
+        "cmd": "",
+        "cmd_sent": "",
+        "cmd_send_t_monotonic_s": "",
+        "cmd_send_monotonic_ns": "",
+        "cmd_send_wall_ns": "",
+        "cmd_hex": "",
+        "cmd_at_sample": "",
+        "status_request_send_t_monotonic_s": request_elapsed,
+        "status_request_send_monotonic_ns": timeout_event["send_monotonic_ns"],
+        "status_request_send_wall_ns": timeout_event["send_wall_ns"],
+        "status_request_hex": timeout_event["message_hex"],
+        "state_read_t_monotonic_s": "",
+        "state_read_monotonic_ns": "",
+        "state_read_wall_ns": "",
+        "status_timeout_t_monotonic_s": timeout_elapsed,
+        "status_timeout_monotonic_ns": timeout_event["timeout_monotonic_ns"],
+        "status_timeout_wall_ns": timeout_event["timeout_wall_ns"],
+        "cmd_echo": "",
+        "actual": "",
+        "current_ma": "",
+        "gSTA": "",
+        "gOBJ": "",
+        "gFLT": "",
+        "raw_hex": "",
+        "response_timestamp_ns": "",
+        "response_sequence": "",
+    }
+    row.update(_monitor_stat_fields(monitor_stats))
+    return row
 
 
 def write_csv(rows: List[Dict], path: Path) -> None:
@@ -258,7 +434,12 @@ def print_summary(rows: List[Dict], sides: List[str], duration_s: float, hold_s:
     settle_s = min(0.3, hold_s * 0.3)
     sample_rows = [r for r in rows if r["kind"] == "sample"]
     tick_rows = [r for r in rows if r["kind"] == "tick"]
-    print(f"Captured {len(tick_rows)} tick rows and {len(sample_rows)} sample rows.")
+    timeout_rows = [r for r in rows if r["kind"] == "timeout"]
+    cmd_rows = [r for r in tick_rows if r.get("cmd_sent")]
+    print(
+        f"Captured {len(cmd_rows)} command sends, {len(tick_rows)} status requests, "
+        f"{len(sample_rows)} state reads, and {len(timeout_rows)} status timeouts."
+    )
     for side in sides:
         side_samples = [r for r in sample_rows if r["side"] == side]
         if not side_samples:
@@ -299,6 +480,9 @@ def print_summary(rows: List[Dict], sides: List[str], duration_s: float, hold_s:
             print(f"  fault breakdown (gFLT): {dict(flt_counts)}")
         obj_counts = Counter(r["gOBJ"] for r in side_samples)
         print(f"  gOBJ histogram: {dict(obj_counts)}")
+        side_timeouts = [r for r in timeout_rows if r["side"] == side]
+        if side_timeouts:
+            print(f"  status timeouts: {len(side_timeouts)}")
 
 
 def classify_pre_motion(
@@ -404,7 +588,14 @@ def compute_latencies(
         for r in rows:
             if r["side"] != side:
                 continue
-            t = r["tick_t_monotonic_s"] if r["kind"] == "tick" else r["sample_t_monotonic_s"]
+            if r["kind"] == "tick":
+                if not r.get("cmd_sent"):
+                    continue
+                t = r.get("cmd_send_t_monotonic_s") or r["tick_t_monotonic_s"]
+            elif r["kind"] == "sample":
+                t = r["sample_t_monotonic_s"]
+            else:
+                continue
             side_rows.append((t, r))
         side_rows.sort(key=lambda x: x[0])
 
@@ -417,7 +608,8 @@ def compute_latencies(
                 if prev_cmd is not None and cmd != prev_cmd:
                     transitions.append(
                         {
-                            "t_send": r["tick_t_monotonic_s"],
+                            "t_send": r.get("cmd_send_t_monotonic_s")
+                            or r["tick_t_monotonic_s"],
                             "from": prev_cmd,
                             "to": cmd,
                             "actual_at_send": last_actual,
@@ -545,9 +737,13 @@ def compute_continuous_peak_latencies(
     """Find latency from cmd=1.0 ticks to the later actual maximum per cycle."""
     results: Dict[str, List[Dict]] = {side: [] for side in sides}
     for side in sides:
-        side_ticks = [r for r in rows if r["kind"] == "tick" and r["side"] == side]
+        side_ticks = [
+            r
+            for r in rows
+            if r["kind"] == "tick" and r["side"] == side and r.get("cmd_sent")
+        ]
         side_samples = [r for r in rows if r["kind"] == "sample" and r["side"] == side]
-        side_ticks.sort(key=lambda r: r["tick_t_monotonic_s"])
+        side_ticks.sort(key=lambda r: r.get("cmd_send_t_monotonic_s") or r["tick_t_monotonic_s"])
         side_samples.sort(key=lambda r: r["sample_t_monotonic_s"])
 
         cmd_peak_ticks: List[Dict] = []
@@ -561,9 +757,10 @@ def compute_continuous_peak_latencies(
             prev_cmd = cmd
 
         for i, tick in enumerate(cmd_peak_ticks):
-            t_send = tick["tick_t_monotonic_s"]
+            t_send = tick.get("cmd_send_t_monotonic_s") or tick["tick_t_monotonic_s"]
             t_next_peak = (
-                cmd_peak_ticks[i + 1]["tick_t_monotonic_s"]
+                cmd_peak_ticks[i + 1].get("cmd_send_t_monotonic_s")
+                or cmd_peak_ticks[i + 1]["tick_t_monotonic_s"]
                 if i + 1 < len(cmd_peak_ticks)
                 else float("inf")
             )
@@ -690,20 +887,49 @@ def plot_results(
     for ax, side in zip(axes, sides, strict=True):
         side_ticks = [r for r in rows if r["kind"] == "tick" and r["side"] == side]
         side_samples = [r for r in rows if r["kind"] == "sample" and r["side"] == side]
+        side_timeouts = [r for r in rows if r["kind"] == "timeout" and r["side"] == side]
+        side_cmds = [r for r in side_ticks if r.get("cmd_sent")]
 
-        if side_ticks:
-            tick_t = np.asarray([r["tick_t_monotonic_s"] for r in side_ticks])
-            cmd = np.asarray([r["cmd"] for r in side_ticks])
-            ax.step(tick_t, cmd, where="post", label="cmd", color="tab:blue", lw=1.5)
+        if side_cmds:
+            cmd_t = np.asarray(
+                [r.get("cmd_send_t_monotonic_s") or r["tick_t_monotonic_s"] for r in side_cmds]
+            )
+            cmd = np.asarray([r["cmd"] for r in side_cmds], dtype=float)
+            ax.plot(
+                cmd_t,
+                cmd,
+                linestyle="None",
+                marker=".",
+                label="cmd sent",
+                color="tab:blue",
+                ms=7,
+            )
 
         if side_samples:
-            sample_t = np.asarray([r["sample_t_monotonic_s"] for r in side_samples])
+            sample_t = np.asarray(
+                [
+                    r.get("state_read_t_monotonic_s") or r["sample_t_monotonic_s"]
+                    for r in side_samples
+                ]
+            )
             actual = np.asarray([r["actual"] for r in side_samples], dtype=float)
-            ax.plot(sample_t, actual, label="actual (gPO/255)", color="tab:red", lw=1)
+            ax.plot(
+                sample_t,
+                actual,
+                linestyle="None",
+                marker=".",
+                label="state read (gPO/255)",
+                color="tab:red",
+                ms=7,
+            )
 
         ax.set_ylim(-0.05, 1.05)
         ax.set_ylabel(f"{side} pos")
-        ax.set_title(f"{side} gripper " f"(ticks={len(side_ticks)}, samples={len(side_samples)})")
+        ax.set_title(
+            f"{side} gripper "
+            f"(cmds={len(side_cmds)}, status_requests={len(side_ticks)}, "
+            f"states={len(side_samples)}, timeouts={len(side_timeouts)})"
+        )
         ax.text(
             0.02,
             0.98,
@@ -763,6 +989,8 @@ def main() -> None:
 
     if args.function_code not in (0x03, 0x04):
         raise ValueError(f"--function-code must be 3 or 4; got {args.function_code:#x}")
+    if args.status_timeout <= 0:
+        raise ValueError("--status-timeout must be positive")
 
     out_dir = Path(args.out_dir).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -773,6 +1001,7 @@ def main() -> None:
     print("Initialising Robot()...")
     robot = Robot()
     arms: Dict[str, Arm] = {side: get_arm(robot, side) for side in sides}
+    monitors: Dict[str, RobotiqStatusMonitor] = {}
 
     rows: List[Dict] = []
     interrupted = {"flag": False}
@@ -791,6 +1020,10 @@ def main() -> None:
         print("Warming up status poll...")
         for side, arm in arms.items():
             warmup_check(arm, side, args.function_code)
+        monitors = {
+            side: RobotiqStatusMonitor(arm, side=side, function_code=args.function_code)
+            for side, arm in arms.items()
+        }
 
         mode_detail = (
             f"ramp_steps={len(steps)}, cycle={len(steps) * period_s:.2f}s"
@@ -799,16 +1032,15 @@ def main() -> None:
         )
         print(
             f"Logging for {args.duration:.1f} s with tick {args.rate:.1f} Hz "
-            f"and ~{1.0/DRAIN_PERIOD_S:.0f} Hz drain "
+            f"and queued FC03 demux (~{1.0/DRAIN_PERIOD_S:.0f} Hz drain, "
+            f"timeout={args.status_timeout:.3f}s) "
             f"(mode={args.mode}, {mode_detail}) → {csv_path}"
         )
 
         # Persistent per-side state.
         last_cmd: Dict[str, Optional[float]] = {side: None for side in sides}
-        last_token: Dict[str, object] = {
-            side: response_token(arm.get_ee_pass_through_response()) for side, arm in arms.items()
-        }
 
+        t0_monotonic_ns = time.monotonic_ns()
         t0 = time.monotonic()
         next_tick = t0
         tick_index = 0
@@ -820,21 +1052,24 @@ def main() -> None:
             if elapsed >= args.duration:
                 break
 
-            # 1. Drain replies (per side, nonblocking).
-            for side, arm in arms.items():
-                new_tok, parsed, _advanced = read_gripper_status_event(
-                    arm,
-                    last_token[side],
-                    function_code=args.function_code,
-                )
-                last_token[side] = new_tok
-                if parsed is not None:
+            # 1. Drain queued status replies and explicit timeouts.
+            for side, monitor in monitors.items():
+                for parsed in monitor.drain_status_events():
                     rows.append(
                         make_sample_row(
-                            sample_elapsed=time.monotonic() - t0,
                             side=side,
                             cmd_at_sample=last_cmd[side],
                             parsed=parsed,
+                            t0_monotonic_ns=t0_monotonic_ns,
+                        )
+                    )
+                for timeout_event in monitor.expire_timeouts(args.status_timeout):
+                    rows.append(
+                        make_timeout_row(
+                            side=side,
+                            timeout_event=timeout_event,
+                            t0_monotonic_ns=t0_monotonic_ns,
+                            monitor_stats=monitor.stats(),
                         )
                     )
 
@@ -845,11 +1080,25 @@ def main() -> None:
                 else:
                     cmd = step_for_time(elapsed, steps, args.hold)
                 for side, arm in arms.items():
+                    monitor = monitors[side]
+                    cmd_event = None
                     if args.mode == "continuous" or cmd != last_cmd[side]:
-                        arm.send_ee_pass_through_message(build_hande_command(cmd))
+                        cmd_event = send_ee_pass_through_with_timestamps(
+                            arm, build_hande_command(cmd)
+                        )
                         last_cmd[side] = cmd
-                    arm.send_ee_pass_through_message(build_hande_status_request(args.function_code))
-                    rows.append(make_tick_row(tick_elapsed=elapsed, side=side, cmd=cmd))
+                    status_request_event = monitor.send_status_request()
+                    rows.append(
+                        make_tick_row(
+                            tick_elapsed=elapsed,
+                            side=side,
+                            cmd=cmd,
+                            t0_monotonic_ns=t0_monotonic_ns,
+                            cmd_event=cmd_event,
+                            status_request_event=status_request_event,
+                            monitor_stats=monitor.stats(),
+                        )
+                    )
                 next_tick += period_s
                 tick_index += 1
                 if next_tick <= time.monotonic():
@@ -866,12 +1115,50 @@ def main() -> None:
         if overruns:
             print(f"NOTE: {overruns} tick overruns (consider lowering --rate).")
     finally:
+        if monitors:
+            final_t0_monotonic_ns = (
+                t0_monotonic_ns if "t0_monotonic_ns" in locals() else time.monotonic_ns()
+            )
+            for side, monitor in monitors.items():
+                for parsed in monitor.drain_status_events():
+                    rows.append(
+                        make_sample_row(
+                            side=side,
+                            cmd_at_sample=last_cmd.get(side) if "last_cmd" in locals() else None,
+                            parsed=parsed,
+                            t0_monotonic_ns=final_t0_monotonic_ns,
+                        )
+                    )
+                for timeout_event in monitor.expire_timeouts(0.0):
+                    rows.append(
+                        make_timeout_row(
+                            side=side,
+                            timeout_event=timeout_event,
+                            t0_monotonic_ns=final_t0_monotonic_ns,
+                            monitor_stats=monitor.stats(),
+                        )
+                    )
+        monitor_stats_by_side = {
+            side: monitor.stats() for side, monitor in monitors.items()
+        }
         if rows:
             print(f"Captured {len(rows)} rows; writing CSV...")
             write_csv(rows, csv_path)
             print(f"Wrote {csv_path}")
             print()
             print_summary(rows, sides, args.duration, args.hold)
+            if monitor_stats_by_side:
+                print("Demux counters:")
+                for side, stats in monitor_stats_by_side.items():
+                    print(
+                        f"  {side}: requests={stats.get('status_requests', 0)}, "
+                        f"states={stats.get('statuses_received', 0)}, "
+                        f"timeouts={stats.get('status_timeouts', 0)}, "
+                        f"fc16_acks={stats.get('fc16_acks_discarded', 0)}, "
+                        f"invalid={stats.get('invalid_discarded', 0)}, "
+                        f"overflow={stats.get('status_queue_overflow', 0)}, "
+                        f"pending={stats.get('pending_status_requests', 0)}"
+                    )
             latencies = compute_latencies(rows, sides)
             peak_latencies = compute_continuous_peak_latencies(rows, sides)
             if args.mode == "continuous":
@@ -891,6 +1178,8 @@ def main() -> None:
                 print(f"Wrote {png_path}")
         else:
             print("No rows captured; nothing to write.")
+        for monitor in monitors.values():
+            monitor.close()
         try:
             print("Shutting down robot...")
             robot.shutdown()
