@@ -37,6 +37,7 @@ import tyro
 from dexbot_utils import RobotInfo
 from dexcomm import Node, RateLimiter
 from dexcomm.codecs import DictDataCodec
+from dexcontrol.exceptions import ServiceUnavailableError
 from dexcontrol.robot import Robot
 from loguru import logger
 
@@ -44,6 +45,7 @@ from omniteleop import LIB_PATH
 from omniteleop.common import get_config
 from omniteleop.common.debug_display import get_debug_display
 from omniteleop.common.logging import setup_logging
+from omniteleop.common.recorder import FollowerEpisodeRecorder
 from omniteleop.common.schemas import VRJointData
 from omniteleop.common.vr_mode_const import (
     INIT_HEAD_JOINTS,
@@ -54,7 +56,6 @@ from omniteleop.common.vr_mode_const import (
     SAFE_RIGHT_ARM_JOINTS,
 )
 from omniteleop.follower.robotiq import build_hande_command, send_activate
-from omniteleop.follower.workspace_check import WorkspaceChecker
 
 workspace_check = True
 
@@ -74,6 +75,7 @@ class VRRobotController:
         debug: bool = False,
         config_name: Optional[str] = None,
         workspace_check: bool = workspace_check,
+        follower_save_dir: str = "/home/dexmate/yixuan/Dexmate/data/follower",
     ) -> None:
         self.node = Node(name="vr_robot_controller", namespace=namespace)
 
@@ -116,10 +118,20 @@ class VRRobotController:
         self._latest: Optional[VRJointData] = None
         self._mode = _Mode.STOP
 
-        self._workspace_checker = WorkspaceChecker() if workspace_check else None
-        self._last_workspace_warn_t = 0.0
-        if self._workspace_checker is None:
+        if workspace_check:
+            from omniteleop.follower.workspace_check import WorkspaceChecker
+            self._workspace_checker = WorkspaceChecker()
+        else:
+            self._workspace_checker = None
             logger.warning("Right-arm workspace check disabled.")
+        self._last_workspace_warn_t = 0.0
+
+        # Per-100Hz-tick recorder. Episode_id is leader-driven via
+        # VRJointData.episode_id (-1 idle, >=0 active). All rows include
+        # vr_publish_ns = vr.timestamp_ns so the offline alignment script can
+        # join with the leader-side HDF5 by exact match.
+        self._follower_recorder = FollowerEpisodeRecorder(save_dir=follower_save_dir)
+        self._prev_episode_id: int = -1
 
         self.initialize()
 
@@ -216,6 +228,112 @@ class VRRobotController:
         # print("=" * 60)
         logger.info("Robot at home position.")
 
+    # ── Follower-side recorder helpers ─────────────────────────────────────────
+
+    def _handle_episode_boundary(self, episode_id: int) -> None:
+        """Watch `VRJointData.episode_id` and start/stop the follower recorder.
+
+        Transitions:
+            -1 → N        : start a fresh episode.
+            N → -1        : stop current; nothing started.
+            N → M (M != N): stop current, start M (handles missed -1 frames).
+        """
+        if episode_id == self._prev_episode_id:
+            return
+        if self._follower_recorder.recording:
+            path = self._follower_recorder.stop()
+            logger.info(f"FollowerEpisodeRecorder: stopped → {path}")
+        if episode_id >= 0:
+            self._follower_recorder.start(episode_id)
+        self._prev_episode_id = episode_id
+
+    @staticmethod
+    def _sample_joint_state(component) -> tuple[np.ndarray, int]:
+        """Atomic (pos, timestamp_ns) snapshot from a dexcontrol joint
+        component; uses `_get_state` so pos and timestamp_ns come from the same
+        state message. Returns (zeros, -1) if the state cache is still empty.
+        """
+        try:
+            state = component._get_state()
+        except ServiceUnavailableError:
+            return np.zeros(0, dtype=np.float32), -1
+        return np.asarray(state["pos"], dtype=np.float32), int(state["timestamp_ns"])
+
+    def _record_follower_tick(
+        self,
+        vr: VRJointData,
+        t_apply_ns: int,
+        head_target: list[float],
+        left_arm_target: list[float],
+        right_arm_target: list[float],
+        right_arm_applied: bool,
+    ) -> None:
+        """Build and push one per-tick row to the follower recorder.
+
+        All `*_ns` fields are int64 in **dexmate** clock (the same clock as
+        `time.time_ns()` on this machine); the only lambda-clock field is
+        `vr_publish_ns`, copied verbatim from the inbound VRJointData. Offline
+        alignment applies the dexmate→lambda offset (see `/meta/clock/...` in
+        the leader-side HDF5) only to dexmate-tagged fields.
+        """
+        r_arm_pos, r_arm_ts = self._sample_joint_state(self.robot.right_arm)
+        l_arm_pos, l_arm_ts = self._sample_joint_state(self.robot.left_arm)
+        head_pos, head_ts = self._sample_joint_state(self.robot.head)
+        if self.has_torso:
+            torso_pos, torso_ts = self._sample_joint_state(self.robot.torso)
+        else:
+            torso_pos, torso_ts = np.zeros(3, dtype=np.float32), -1
+
+        # Fixed-shape applied/* fields so HDF5 stacking is uniform across rows.
+        left_applied = (
+            np.asarray(left_arm_target, dtype=np.float32)
+            if len(left_arm_target) == 7
+            else np.zeros(7, dtype=np.float32)
+        )
+        right_target = (
+            np.asarray(right_arm_target, dtype=np.float32)
+            if len(right_arm_target) == 7
+            else np.zeros(7, dtype=np.float32)
+        )
+        head_applied = (
+            np.asarray(head_target, dtype=np.float32)
+            if len(head_target) == 3
+            else np.zeros(3, dtype=np.float32)
+        )
+
+        row = {
+            "t_apply_ns": np.int64(t_apply_ns),
+            "vr_publish_ns": np.int64(vr.timestamp_ns),
+            "calib_stage": np.bytes_(vr.calib_stage),
+            "applied": {
+                "joint": {
+                    "right_arm": right_target,
+                    "left_arm": left_applied,
+                    "head": head_applied,
+                },
+                "gripper": {
+                    "right": np.float32(vr.right_gripper),
+                    "left": np.float32(vr.left_gripper),
+                },
+                "right_arm_applied": np.bool_(right_arm_applied),
+            },
+            "obs": {
+                "joint": {
+                    "right_arm": r_arm_pos,
+                    "left_arm": l_arm_pos,
+                    "head": head_pos,
+                    "torso": torso_pos,
+                },
+                "joint_ts": {
+                    "right_arm": np.int64(r_arm_ts),
+                    "left_arm": np.int64(l_arm_ts),
+                    "head": np.int64(head_ts),
+                    "torso": np.int64(torso_ts),
+                },
+            },
+        }
+        self._follower_recorder.record(row)
+
     # ── Joint feedback ─────────────────────────────────────────────────────────
 
     def _publish_joint_feedback(self) -> None:
@@ -262,6 +380,10 @@ class VRRobotController:
                     rate.sleep()
                     continue
 
+                # Leader-driven episode boundary. Start/stop the follower
+                # recorder on -1 ↔ N transitions in VRJointData.episode_id.
+                self._handle_episode_boundary(vr.episode_id)
+
                 # ── Estop ─────────────────────────────────────────────────────
                 if vr.estop:
                     if self._mode != _Mode.STOP:
@@ -288,6 +410,14 @@ class VRRobotController:
                     # self.robot.estop.deactivate()
                     # self.robot.head.set_mode("enable")
                     self._mode = _Mode.RUNNING
+
+                # Stamp once, immediately before the first set_joint_pos of
+                # this iteration. All commands below execute synchronously
+                # within a few hundred µs, so a single stamp captures the
+                # apply moment with adequate precision for ms-level latency
+                # analysis.
+                t_apply_ns = time.time_ns()
+                right_arm_applied = False
 
                 # ── Head ──────────────────────────────────────────────────────
                 head_target = (
@@ -326,6 +456,7 @@ class VRRobotController:
                             )
                         if in_bounds:
                             self.robot.right_arm.set_joint_pos(vr.right_arm_pos)
+                            right_arm_applied = True
                             right_arm_error = np.abs(
                                 np.array(vr.right_arm_pos) - self.robot.right_arm.get_joint_pos()
                             )
@@ -385,6 +516,16 @@ class VRRobotController:
                         safety_flags={"estop": vr.estop},
                     )
 
+                if self._follower_recorder.recording:
+                    self._record_follower_tick(
+                        vr=vr,
+                        t_apply_ns=t_apply_ns,
+                        head_target=list(head_target) if head_target else [],
+                        left_arm_target=list(left_arm_target) if left_arm_target else [],
+                        right_arm_target=list(vr.right_arm_pos) if vr.right_arm_pos else [],
+                        right_arm_applied=right_arm_applied,
+                    )
+
                 rate.sleep()
 
         except KeyboardInterrupt:
@@ -392,6 +533,14 @@ class VRRobotController:
         finally:
             self._feedback_running = False
             feedback_thread.join(timeout=2.0)
+            if self._follower_recorder.recording:
+                self._follower_recorder.stop()
+            if (
+                self._follower_recorder._save_thread is not None
+                and self._follower_recorder._save_thread.is_alive()
+            ):
+                logger.info("Waiting for FollowerEpisodeRecorder save to finish ...")
+                self._follower_recorder._save_thread.join()
             self.cleanup()
 
     def cleanup(self) -> None:
@@ -411,6 +560,7 @@ def main(
     debug: bool = False,
     config_name: Optional[str] = None,
     workspace_check: bool = workspace_check,
+    follower_save_dir: str = "/home/dexmate/yixuan/Dexmate/data/follower",
 ) -> None:
     """Follower robot controller for VR teleoperation.
 
@@ -420,6 +570,10 @@ def main(
     Args:
         workspace_check: Gate right-arm commands on the configured Cartesian
             workspace bounds. Pass --workspace-check to enable.
+        follower_save_dir: Directory for per-100Hz follower recordings
+            (``episode_<N>_follower.hdf5``). On Dexmate, default lives under
+            the shared mount that maps to ``/home/yixuan/Dexmate/...`` on
+            Lambda; the alignment script reads from the Lambda view directly.
     """
     setup_logging(debug)
     ctrl = VRRobotController(
@@ -427,6 +581,7 @@ def main(
         debug=debug,
         config_name=config_name,
         workspace_check=workspace_check,
+        follower_save_dir=follower_save_dir,
     )
     ctrl.run()
 

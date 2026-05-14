@@ -26,9 +26,11 @@ pip install omniteleop
 ## Data collection
 
 1. check network on lambda, dexmate
-2. ssh dexmate, conda activate dexmate
-3. run '(dexmate) dextop node start' and 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera' in tmux
-4. ssh lambda
+2. ssh dexmate, conda activate yixuan_yifan
+3. run '(yixuan_yifan) dextop node start' and 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera' in tmux
+  1. cd ~/yixuan/omniteleop_yifan
+  2. '(yixuan_yifan) python src/omniteleop/follower/vr_robot_[controller.py](http://controller.py) --no-workspace-check' # save on mounting disk  /home/dexmate/yixuan/Dexmate
+4. ssh lambda, conda activate dexmate
 5. run
   (dexmate) python src/omniteleop/follower/vr_robot_controller.py # workspace_check = True, joint positions in vr_mode_const, head_mode and left_arm_mode in src/omniteleop/configs/vega_1_f5d6.yaml  
     (dexmate) python src/omniteleop/leader/vr_reader.py # start-mode=fixed_pose

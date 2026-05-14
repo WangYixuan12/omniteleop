@@ -113,9 +113,15 @@ class EpisodeRecorder:
         """Record a frame (VRJointData as dict)."""
         self._frames.append(frame)
 
-    def stop(self) -> Optional[str]:
+    def stop(self, extra: Optional[dict] = None) -> Optional[str]:
         """Stop recording; spawn background thread to save HDF5. Returns the
         target path immediately (file is written asynchronously).
+
+        Args:
+            extra: Optional nested dict-of-ndarrays merged at the top level of
+                the saved file before stacked frames. Used for session metadata
+                (e.g., NTP offsets, clock-source map) that doesn't fit a
+                per-frame shape.
         """
         self.recording = False
         if not self._frames:
@@ -128,14 +134,19 @@ class EpisodeRecorder:
         self.saving = True
         self.save_progress = 0.0
         self._save_thread = threading.Thread(
-            target=self._save_worker, args=(frames, str(path)), daemon=True
+            target=self._save_worker, args=(frames, str(path), extra), daemon=True
         )
         self._save_thread.start()
         return str(path)
 
-    def _save_worker(self, frames: list[dict], path: str) -> None:
+    def _save_worker(self, frames: list[dict], path: str, extra: Optional[dict] = None) -> None:
         try:
             data = _recursive_np_stack(frames)
+            if extra:
+                for k, v in extra.items():
+                    if k in data:
+                        raise ValueError(f"extra key {k!r} collides with frame data")
+                    data[k] = v
 
             def on_progress(p: float) -> None:
                 self.save_progress = p
@@ -149,4 +160,70 @@ class EpisodeRecorder:
 
     def num_frames(self) -> int:
         """Return number of frames recorded so far"""
+        return len(self._frames)
+
+
+class FollowerEpisodeRecorder:
+    """Per-tick recorder used by `vr_robot_controller` to log apply/obs timing.
+
+    Unlike `EpisodeRecorder`, the episode_id is assigned externally by the
+    leader (via VRJointData.episode_id) so leader and follower files share IDs.
+    Files are saved as ``episode_<N>_follower.hdf5``.
+    """
+
+    def __init__(self, save_dir: str) -> None:
+        self._save_dir = pathlib.Path(save_dir)
+        self._save_dir.mkdir(parents=True, exist_ok=True)
+        self._frames: list[dict] = []
+        self.recording = False
+        self.saving = False
+        self.save_progress: float = 0.0
+        self._save_thread: Optional[threading.Thread] = None
+        self._episode_id: int = -1
+
+    def start(self, episode_id: int) -> None:
+        self._frames = []
+        self._episode_id = episode_id
+        self.recording = True
+        logger.info(f"FollowerEpisodeRecorder: recording started (episode_{episode_id})")
+
+    def record(self, frame: dict) -> None:
+        self._frames.append(frame)
+
+    def stop(self, extra: Optional[dict] = None) -> Optional[str]:
+        self.recording = False
+        if not self._frames:
+            logger.warning("FollowerEpisodeRecorder: 0 frames — skipping save")
+            return None
+        path = self._save_dir / f"episode_{self._episode_id}_follower.hdf5"
+        frames = self._frames
+        self._frames = []
+        self.saving = True
+        self.save_progress = 0.0
+        self._save_thread = threading.Thread(
+            target=self._save_worker, args=(frames, str(path), extra), daemon=True
+        )
+        self._save_thread.start()
+        return str(path)
+
+    def _save_worker(self, frames: list[dict], path: str, extra: Optional[dict] = None) -> None:
+        try:
+            data = _recursive_np_stack(frames)
+            if extra:
+                for k, v in extra.items():
+                    if k in data:
+                        raise ValueError(f"extra key {k!r} collides with frame data")
+                    data[k] = v
+
+            def on_progress(p: float) -> None:
+                self.save_progress = p
+
+            _save_dict_with_progress(data, path, on_progress)
+            logger.info(f"FollowerEpisodeRecorder: {len(frames)} frames → {path}")
+        except Exception:
+            logger.exception("FollowerEpisodeRecorder: save failed")
+        finally:
+            self.saving = False
+
+    def num_frames(self) -> int:
         return len(self._frames)

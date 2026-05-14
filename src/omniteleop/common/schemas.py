@@ -78,3 +78,7 @@ class VRJointData:
     recalibrate: bool = False
     # Calibration stage: A=head, B=arms preview, C=live teleop
     calib_stage: str = "A"
+    # Episode boundary signal for follower-side recording. -1 = not recording;
+    # >=0 = active leader episode id. Follower's FollowerEpisodeRecorder starts
+    # on -1 → N transition and stops on N → -1 (or N → M).
+    episode_id: int = -1

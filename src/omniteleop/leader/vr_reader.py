@@ -94,6 +94,7 @@ from dataclasses import asdict
 from typing import Any, Literal, Optional
 
 import cv2
+import json
 import numpy as np
 import sapien
 import tyro
@@ -309,7 +310,7 @@ class VRReader:
         debug: bool = False,
         visualize: bool = False,
         urdf_path: Optional[str] = None,
-        save_dir: str = "/home/yixuan/omniteleop/Dexmate/data/raw_data",
+        save_dir: str = "/home/yixuan/omniteleop/Dexmate/data/leader",
         debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/debug_data",
         start_mode: StartMode = "follow_hand",
         save_debug: bool = True,
@@ -397,6 +398,10 @@ class VRReader:
         self.recorder = EpisodeRecorder(save_dir)
         self.debug_recorder = DebugEpisodeRecorder(debug_save_dir)
         self._last_imgs: dict[str, np.ndarray] = {}
+        # Per-channel camera capture timestamps (dexmate clock, int64 ns; -1
+        # sentinel). Set together with `_last_imgs` each loop iter from
+        # `get_obs(include_timestamp=True)`; read by `_handle_recording`.
+        self._last_img_ts: dict[str, int] = {}
         self._last_depth_u16: Optional[np.ndarray] = None
         self._prev_a: bool = False
         self._prev_b: bool = False
@@ -419,11 +424,24 @@ class VRReader:
 
         # Gripper FC03 status cache. `_last_obs_grip_*` holds gPO/255 ∈ [0,1]
         # (0 = fully open, 1 = fully closed); NaN until the first parseable reply.
+        # `_last_obs_grip_*_ts` holds the FC03 reply's `response_timestamp_ns`
+        # (dexmate clock) — int64 ns; -1 sentinel for "no reply yet / upstream
+        # didn't attach a timestamp".
         # Tokens drive the nonblocking drain in read_gripper_status_event.
         self._last_obs_grip_left: float = float("nan")
         self._last_obs_grip_right: float = float("nan")
+        self._last_obs_grip_left_ts: int = -1
+        self._last_obs_grip_right_ts: int = -1
+        self._grip_ts_logged_left: bool = False
+        self._grip_ts_logged_right: bool = False
         self._grip_token_left: object = None
         self._grip_token_right: object = None
+
+        # Lambda↔Dexmate NTP offset log. Each entry is (query_lambda_ns,
+        # offset_ns, rtt_ns) where offset = dexmate − lambda; convert dexmate
+        # timestamps to lambda clock by subtracting offset_ns. Persisted under
+        # /meta/clock/query_results when the episode is saved.
+        self._clock_query_log: list[tuple[int, int, int]] = []
 
         # Reset interpolation state (set when entering "resetting" stage).
         # Reset is two-phase: phase 1 brings arms to SAFE_*_ARM_JOINTS, phase 2
@@ -544,7 +562,105 @@ class VRReader:
         wz = -dz(right_thumbstick[0]) * self.stick_max_wz
         return vx, vy, wz
 
+    # ── Timestamp / clock helpers ──────────────────────────────────────────────
+
+    def _do_clock_query(self, sample_count: int = 30) -> None:
+        """Query the on-robot NTP service and append the result to the log.
+
+        `Robot.query_ntp` returns offset/rtt as floats in **seconds** where
+        offset = server (dexmate) − client (lambda). We convert to int64 ns and
+        store `(t_query_lambda_ns, offset_ns, rtt_ns)`. To map a dexmate-clock
+        nanosecond timestamp to lambda clock offline, subtract `offset_ns`.
+        """
+        t_query = time.time_ns()
+        try:
+            result = self._cam_robot.query_ntp(sample_count=sample_count)
+        except Exception as e:
+            logger.warning(f"query_ntp() failed: {e}; recording offset=0, rtt=0")
+            result = {"success": False, "offset": 0.0, "rtt": 0.0}
+        if not result.get("success"):
+            logger.warning(
+                "query_ntp() reported no replies; storing offset=0, rtt=0. "
+                "Offline alignment will treat dexmate/lambda as same clock."
+            )
+        offset_ns = int(round(float(result.get("offset", 0.0)) * 1e9))
+        rtt_ns = int(round(float(result.get("rtt", 0.0)) * 1e9))
+        self._clock_query_log.append((int(t_query), int(offset_ns), int(rtt_ns)))
+        logger.info(
+            f"NTP query: offset = {offset_ns / 1e6:+.3f} ms, "
+            f"rtt = {rtt_ns / 1e6:.3f} ms (dexmate − lambda)."
+        )
+
+    def _build_session_meta(self) -> dict:
+        """Build the `/meta/clock/...` subtree merged into the episode HDF5."""
+        source_map = {
+            "obs/joint/right_arm": "dexmate",
+            "obs/joint/left_arm": "dexmate",
+            "obs/joint/head": "dexmate",
+            "obs/joint/torso": "dexmate",
+            "obs/gripper/right": "dexmate",
+            "obs/gripper/left": "dexmate",
+            "obs/images/left_rgb": "dexmate",
+            "obs/images/right_rgb": "dexmate",
+            "obs/images/depth": "dexmate",
+            "action/publish_ns": "lambda",
+            "timestamp_ns": "lambda",
+        }
+        if self._clock_query_log:
+            query_arr = np.asarray(self._clock_query_log, dtype=np.int64)
+        else:
+            query_arr = np.zeros((0, 3), dtype=np.int64)
+        return {
+            "meta": {
+                "clock": {
+                    "source_per_channel": np.array(
+                        json.dumps(source_map).encode("utf-8")
+                    ),
+                    "query_results": query_arr,
+                },
+            },
+        }
+
+    def _sample_joint_state(self, component) -> tuple[np.ndarray, int]:
+        """Atomic (pos, timestamp_ns) snapshot from a dexcontrol joint
+        component. One `_get_state()` call so pos and ts come from the same
+        state dict — no race between `get_joint_pos()` + `get_timestamp_ns()`.
+
+        `_get_state()` raises `ServiceUnavailableError` if the component has no
+        state yet; let it propagate — a joint channel going silent mid-recording
+        is a hard fault, not something to paper over with an empty array.
+        """
+        state = component._get_state()
+        return np.asarray(state["pos"], dtype=np.float32), int(state["timestamp_ns"])
+
     # ── Camera polling ─────────────────────────────────────────────────────────
+
+    def _unpack_camera_obs(
+        self, cam_obs: dict[str, Any]
+    ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+        """Split `head_camera.get_obs(include_timestamp=True)` into images + ts.
+
+        Each per-stream value is the dexcomm-decoded payload dict — for Zenoh:
+        `{'data': ndarray, 'timestamp_ns': int, 'sequence': int, ...}`; for RTC:
+        `{'data': ndarray, 'timestamp': None}`. `timestamp_ns` is dexsensor's
+        frame-encode time in the dexmate clock domain (matches what
+        `_build_session_meta` declares for `obs/images/*`); -1 sentinel when a
+        stream carries no payload timestamp (RTC). Raises if a stream returned
+        no data — the camera not streaming is a hard error, not something to
+        paper over with a placeholder.
+        """
+        imgs: dict[str, np.ndarray] = {}
+        img_ts: dict[str, int] = {}
+        for key in ("left_rgb", "right_rgb", "depth"):
+            val = cam_obs.get(key)
+            if not isinstance(val, dict) or "data" not in val:
+                raise ValueError(
+                    f"head_camera stream {key!r} returned {type(val).__name__}, "
+                    "expected a decoded payload dict — camera not streaming?"
+                )
+            imgs[key] = val["data"]
+            img_ts[key] = int(val.get("timestamp_ns", -1))
+        return imgs, img_ts
 
     def _camera_poll(self) -> None:
         vis_imgs = []
@@ -746,6 +862,10 @@ class VRReader:
         Zenoh topic; read_gripper_status_event filters by function_code=0x03
         so write-ACKs are dropped. One-frame latency at publish_rate is fine —
         actuation lag dominates anyway.
+
+        Also caches `parsed["response_timestamp_ns"]` (dexmate clock, int64 ns;
+        -1 if upstream didn't attach a timestamp) so `_handle_recording` can
+        write `/timestamps/obs/gripper/{side}` per frame.
         """
         for side, arm in (
             ("left", self._cam_robot.left_arm),
@@ -758,6 +878,19 @@ class VRReader:
             setattr(self, f"_grip_token_{side}", new_tok)
             if parsed is not None:
                 setattr(self, f"_last_obs_grip_{side}", float(parsed["actual"]))
+                resp_ts = parsed.get("response_timestamp_ns")
+                setattr(
+                    self,
+                    f"_last_obs_grip_{side}_ts",
+                    int(resp_ts) if resp_ts is not None else -1,
+                )
+                if not getattr(self, f"_grip_ts_logged_{side}"):
+                    setattr(self, f"_grip_ts_logged_{side}", True)
+                    logger.info(
+                        f"gripper {side}: first FC03 reply, response_timestamp_ns="
+                        f"{resp_ts}, lambda time.time_ns()={time.time_ns()} "
+                        f"(delta = {(resp_ts - time.time_ns()) / 1e6 if resp_ts else float('nan'):+.2f} ms)"
+                    )
             arm.send_ee_pass_through_message(build_hande_status_request(0x03))
 
     def _mark_ik_skipped(self, reason: str) -> None:
@@ -970,6 +1103,7 @@ class VRReader:
         vx: float,
         vy: float,
         wz: float,
+        t_publish_ns: int,
     ) -> None:
         a_now = transforms["right_a_button"]
         b_now = transforms["right_b_button"]
@@ -985,13 +1119,14 @@ class VRReader:
             if self.save_debug:
                 self.debug_recorder.start(self.recorder.episode_id)
             self.recorder.start()
+            self._do_clock_query()  # fresh NTP offset for this episode
             self._next_record_t = 0.0  # anchor cadence to the first recorded frame
             console.print(
                 f"[bold green]Recording started at {self.record_rate:g} Hz "
                 "(press B to stop)[/]"
             )
         if b_now and not self._prev_b and self.recorder.recording:
-            path = self.recorder.stop()
+            path = self.recorder.stop(extra=self._build_session_meta())
             console.print(f"[bold yellow]Saving in background → {path}[/]")
             if self.save_debug:
                 debug_path = self.debug_recorder.stop()
@@ -1019,10 +1154,13 @@ class VRReader:
 
         # Sample observed joints once and FK them to the head camera link to
         # get world_t_cam (matches scripts/compute_extrinsics.py output).
-        obs_torso = np.array(self._cam_robot.torso.get_joint_pos(), dtype=np.float32)
-        obs_left_arm = np.array(self._cam_robot.left_arm.get_joint_pos(), dtype=np.float32)
-        obs_right_arm = np.array(self._cam_robot.right_arm.get_joint_pos(), dtype=np.float32)
-        obs_head = np.array(self._cam_robot.head.get_joint_pos(), dtype=np.float32)
+        # Use `_sample_joint_state` so each (pos, timestamp_ns) pair comes from
+        # the same protobuf — avoids the race between separate get_joint_pos()
+        # and get_timestamp_ns() calls. Timestamps are dexmate clock, int64 ns.
+        obs_torso, ts_torso = self._sample_joint_state(self._cam_robot.torso)
+        obs_left_arm, ts_left_arm = self._sample_joint_state(self._cam_robot.left_arm)
+        obs_right_arm, ts_right_arm = self._sample_joint_state(self._cam_robot.right_arm)
+        obs_head, ts_head = self._sample_joint_state(self._cam_robot.head)
         obs_qpos = np.zeros(self.kin.sapien_robot.dof, dtype=np.float64)
         for i, n in enumerate(_TORSO_JOINTS):
             if n in self.joint_name_to_idx:
@@ -1037,6 +1175,13 @@ class VRReader:
         extrinsic = self.kin.compute_fk_from_link_idx(obs_qpos, [self.head_eef_idx])[0].astype(
             np.float32
         )
+
+        # Per-channel capture timestamps for offline temporal alignment. All
+        # int64 ns with -1 sentinel for missing. Clock domain per channel is
+        # recorded once at session level under /meta/clock/source_per_channel.
+        ts_left_rgb = self._last_img_ts.get("left_rgb", -1)
+        ts_right_rgb = self._last_img_ts.get("right_rgb", -1)
+        ts_depth = self._last_img_ts.get("depth", -1)
 
         frame = {
             "timestamp_ns": np.int64(time.time_ns()),
@@ -1071,6 +1216,28 @@ class VRReader:
                     "depth": self._last_depth_u16,
                     "intrinsic": ZED_K.astype(np.float32),
                     "extrinsic": extrinsic,
+                },
+            },
+            "timestamps": {
+                "obs": {
+                    "joint": {
+                        "left_arm": np.int64(ts_left_arm),
+                        "right_arm": np.int64(ts_right_arm),
+                        "head": np.int64(ts_head),
+                        "torso": np.int64(ts_torso),
+                    },
+                    "gripper": {
+                        "left": np.int64(self._last_obs_grip_left_ts),
+                        "right": np.int64(self._last_obs_grip_right_ts),
+                    },
+                    "images": {
+                        "left_rgb": np.int64(ts_left_rgb),
+                        "right_rgb": np.int64(ts_right_rgb),
+                        "depth": np.int64(ts_depth),
+                    },
+                },
+                "action": {
+                    "publish_ns": np.int64(t_publish_ns),
                 },
             },
         }
@@ -1173,10 +1340,16 @@ class VRReader:
         chassis_vx: float,
         chassis_vy: float,
         chassis_wz: float,
+        t_publish_ns: int,
     ) -> None:
         estop = self._calib_stage in ("static", "head")
+        # `episode_id` is the cross-node boundary signal: follower starts its
+        # per-tick recorder on -1 → N transition, stops on N → -1. While the
+        # leader is recording, this is `self.recorder.episode_id` (the active
+        # id; `EpisodeRecorder.stop()` increments only after the file is named).
+        episode_id = self.recorder.episode_id if self.recorder.recording else -1
         data = VRJointData(
-            timestamp_ns=time.time_ns(),
+            timestamp_ns=t_publish_ns,
             head_pos=head_pos,
             left_arm_pos=left_arm_pos,
             right_arm_pos=right_arm_pos,
@@ -1187,6 +1360,7 @@ class VRReader:
             chassis_wz=chassis_wz,
             estop=estop,
             calib_stage=self._calib_stage,
+            episode_id=episode_id,
         )
         # logger.info(f"left_arm: {left_arm_pos}")
         t0 = time.perf_counter()
@@ -1254,6 +1428,11 @@ class VRReader:
                 response_token(arm.get_ee_pass_through_response()),
             )
 
+        # Session-level NTP offset (lambda↔dexmate). Stored verbatim under
+        # /meta/clock/query_results in each episode HDF5. Re-queried at every
+        # episode start so the alignment script can interpolate drift.
+        self._do_clock_query()
+
         rate_limiter = RateLimiter(self.publish_rate)
         if self._debug_display:
             self._debug_display.start()
@@ -1267,11 +1446,14 @@ class VRReader:
                     rate_limiter.sleep()
                     continue
 
-                imgs = self._cam_robot.sensors.head_camera.get_obs(
-                    obs_keys=["left_rgb", "right_rgb", "depth"]
+                cam_obs = self._cam_robot.sensors.head_camera.get_obs(
+                    obs_keys=["left_rgb", "right_rgb", "depth"],
+                    include_timestamp=True,
                 )
-                self._last_imgs = imgs
-                self._last_depth_u16 = np.clip(imgs["depth"] * 1000, 0, 65535).astype(np.uint16)
+                self._last_imgs, self._last_img_ts = self._unpack_camera_obs(cam_obs)
+                self._last_depth_u16 = np.clip(
+                    self._last_imgs["depth"] * 1000, 0, 65535
+                ).astype(np.uint16)
                 if step % 4 == 0:
                     self._camera_poll()
                 vr_head = transforms["head"]
@@ -1292,6 +1474,10 @@ class VRReader:
                 chassis_vx, chassis_vy, chassis_wz = self._thumbstick_to_chassis(transforms)
 
                 self._handle_stage_transition(transforms)
+                # One shared wall-clock stamp so `/timestamps/action/publish_ns`
+                # (HDF5) and `VRJointData.timestamp_ns` (Zenoh) match exactly;
+                # offline alignment joins on this value.
+                t_publish_ns = time.time_ns()
                 self._handle_recording(
                     transforms,
                     vr_l,
@@ -1302,9 +1488,17 @@ class VRReader:
                     chassis_vx,
                     chassis_vy,
                     chassis_wz,
+                    t_publish_ns,
                 )
                 self._publish(
-                    head_pos, left_pos, right_pos, transforms, chassis_vx, chassis_vy, chassis_wz
+                    head_pos,
+                    left_pos,
+                    right_pos,
+                    transforms,
+                    chassis_vx,
+                    chassis_vy,
+                    chassis_wz,
+                    t_publish_ns,
                 )
 
                 if left_pos and self._debug_display:
@@ -1322,7 +1516,7 @@ class VRReader:
         finally:
             self.running = False
             if self.recorder.recording:
-                self.recorder.stop()
+                self.recorder.stop(extra=self._build_session_meta())
             if self.debug_recorder.recording:
                 self.debug_recorder.stop()
             for r in (self.recorder, self.debug_recorder):
@@ -1389,7 +1583,7 @@ def main() -> None:
         urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"  # noqa
         """Path to robot URDF for Sapien visualizer (required if --visualize)"""
 
-        save_dir: str = "/home/yixuan/omniteleop/Dexmate/data/raw_data"
+        save_dir: str = "/home/yixuan/omniteleop/Dexmate/data/leader"
         """Directory to save episode_<N>.hdf5 files (A=start, B=stop)"""
 
         debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/debug_data"

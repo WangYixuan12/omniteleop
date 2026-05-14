@@ -30,7 +30,7 @@ PATTERN = re.compile(r"^episode_(\d+)\.hdf5$")
 DEFAULT_SRC = Path("/home/yixuan/omniteleop/Dexmate/data/raw_data")
 DEFAULT_DST = Path("/home/yixuan/omniteleop/Dexmate/data/raw_data_renamed")
 
-TRAIN_RANGE = [0] # list(range(0, 51))           # 0..50 inclusive
+TRAIN_RANGE = [2] # list(range(0, 51))           # 0..50 inclusive
 VAL_INDICES = None # [52, 54, 57, 59, 61]
 TEST_INDICES = None # [53, 55, 58, 60, 62]
 

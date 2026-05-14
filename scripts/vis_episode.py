@@ -1,6 +1,6 @@
 """Visualise a recorded VR teleoperation episode in rerun.
 
-Logs RGB-D, the colored point cloud, robot meshes, EEF and camera frames
+Logs RGB-D, the colored point cloud, robot meshes, and camera frames
 under a single ``frame`` timeline so the rerun viewer's scrubber doubles as
 prev/next/jump navigation.
 
@@ -93,7 +93,7 @@ def main() -> None:
     parser.add_argument(
         "--hdf5",
         type=str,
-        default="/media/yixuan/portable_ssd/Dexmate/data/raw_data/episode_7.hdf5",
+        default="/media/yixuan/portable_ssd/Dexmate/data/raw_data/episode_1.hdf5",
         help="Path to episode HDF5 file",
     )
     parser.add_argument(
@@ -112,9 +112,6 @@ def main() -> None:
     obs_left_arm = np.array(data["obs"]["joint"]["left_arm"])  # (N,7)
     obs_right_arm = np.array(data["obs"]["joint"]["right_arm"])  # (N,7)
     obs_head = np.array(data["obs"]["joint"]["head"])  # (N,3)
-
-    eef_left = np.array(data["action"]["eef"]["left"])  # (N,4,4)
-    eef_right = np.array(data["action"]["eef"]["right"])  # (N,4,4)
 
     N = left_rgb.shape[0]
     H, W = left_rgb.shape[1], left_rgb.shape[2]
@@ -207,16 +204,6 @@ def main() -> None:
                     vertex_positions=np.asarray(mesh.vertices, dtype=np.float32),
                     triangle_indices=np.asarray(mesh.faces, dtype=np.uint32),
                 ),
-            )
-
-        # ── EEF frames (skip frames where IK was bypassed → NaN) ────────────
-        for name, mat in (("world/eef/left", eef_left[idx]), ("world/eef/right", eef_right[idx])):
-            if not np.all(np.isfinite(mat)):
-                rr.log(name, rr.Clear(recursive=True))
-                continue
-            rr.log(
-                name,
-                rr.Transform3D(translation=mat[:3, 3], mat3x3=mat[:3, :3]),
             )
 
 
