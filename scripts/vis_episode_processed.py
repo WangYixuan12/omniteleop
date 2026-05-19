@@ -32,10 +32,15 @@ What this shows (matches the README "What ``vis_episode_processed.py`` shows" bl
 A small per-frame divergence is expected (controller tracking lag); large
 divergence indicates a port-time or controller bug.
 
-Camera pose/intrinsics are NOT read from the parquet (this script predates
-the extrinsic/intrinsic columns and still uses the static fallback): hardcoded
-ZED intrinsics + FK on ``zed_depth_frame`` using
-``INIT_TORSO_JOINTS / INIT_LEFT_ARM_JOINTS / INIT_HEAD_JOINTS``.
+Camera calibration (per-frame extrinsic and intrinsic) is read from the
+sidecar at ``<variant_root>/debug/calib/episode_<idx>.npz``:
+
+- ``"extrinsic"`` : ``(T, 4, 4)`` float32 — camera-in-world SE(3) pose.
+- ``"intrinsic"`` : ``(T, 3, 3)`` float32 — already rescaled to the stored
+  ``resize_h × resize_w`` frame; use directly without further scaling.
+
+The porter (``port_dexmate_hdf5.py``) writes this sidecar alongside the
+depth sidecar.
 
 Depth: NOT in the parquet (would be auto-picked-up as a VISUAL policy input).
 Read instead from the sidecar at
@@ -72,7 +77,6 @@ from omniteleop.common.vr_mode_const import (
 
 _ROBOT_NAME = "vega_no_effector"
 _RIGHT_ARM_EEF_LINK = "R_ee"
-_CAM_LINK = "zed_depth_frame"
 _TORSO_JOINTS = ("torso_j1", "torso_j2", "torso_j3")
 _HEAD_JOINTS = ("head_j1", "head_j2", "head_j3")
 _LEFT_ARM_JOINTS = tuple(f"L_arm_j{i}" for i in range(1, 8))
@@ -171,7 +175,6 @@ class _Kin:
     def __init__(self) -> None:
         self.kin = KinHelper(_ROBOT_NAME)
         self.eef_idx = self.kin.link_name_to_idx[_RIGHT_ARM_EEF_LINK]
-        self.cam_idx = self.kin.link_name_to_idx[_CAM_LINK]
         active = self.kin.sapien_robot.get_active_joints()
         self.name_to_idx = {j.name: i for i, j in enumerate(active)}
         self.dof = self.kin.sapien_robot.dof
@@ -400,6 +403,28 @@ def main() -> None:
     if depth_stack.dtype != np.uint16:
         raise ValueError(f"depth sidecar dtype {depth_stack.dtype}, expected uint16")
 
+    # Calibration sidecar: per-frame extrinsic (T, 4, 4) and intrinsic (T, 3, 3).
+    # Intrinsic is already rescaled to the stored resize_h × resize_w frame.
+    calib_sidecar = (
+        eef_root / "debug" / "calib" / f"episode_{args.episode_index:06d}.npz"
+    )
+    if not calib_sidecar.exists():
+        raise FileNotFoundError(
+            f"calib sidecar missing: {calib_sidecar}. Re-run port_dexmate_hdf5.py "
+            "with --overwrite to regenerate."
+        )
+    with np.load(calib_sidecar) as data:
+        extrinsic_stack = data["extrinsic"].astype(np.float64)   # (T, 4, 4) world_T_cam
+        intrinsic_stack = data["intrinsic"].astype(np.float64)   # (T, 3, 3)
+    if extrinsic_stack.shape[0] != N:
+        raise ValueError(
+            f"calib sidecar extrinsic frame count {extrinsic_stack.shape[0]} != {N}"
+        )
+    if intrinsic_stack.shape[0] != N:
+        raise ValueError(
+            f"calib sidecar intrinsic frame count {intrinsic_stack.shape[0]} != {N}"
+        )
+
     if state_joint.shape[1] != 8:
         raise ValueError(
             f"--urdf_joint_motion_dir observation.state: expected (N, 8), got {state_joint.shape}"
@@ -428,35 +453,18 @@ def main() -> None:
         f"(dt = {dt_s*1000:.1f} ms, fps = {1.0/dt_s:.1f} Hz)"
     )
 
-    # ── Camera intrinsics ────────────────────────────────────────────────────
-    # Hardcoded ZED calibration is for the *raw* 600×960 HDF5 frame (verified
-    # against the stored /obs/images/intrinsic). The porter resizes to 240×320,
-    # so we rescale fx,cx by W/RAW_W and fy,cy by H/RAW_H. Without this the
-    # unprojected point cloud is ~3× too narrow and drifts away from the
-    # robot mesh in world space.
-    RAW_H, RAW_W = 600, 960
+    # ── RGB dimensions (constant across frames) ──────────────────────────────
     sample_rgb = _rgb_to_hwc(dataset_eef[0]["observation.images.left_rgb"])
     H, W = sample_rgb.shape[:2]
-    sx, sy = W / RAW_W, H / RAW_H
-    fx = (770.1868 / 2.0) * sx
-    fy = (770.1868 / 2.0) * sy
-    cx = (990.2711 / 2.0) * sx
-    cy = (637.7721 / 2.0) * sy
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-    K32 = K.astype(np.float32)
-    print(f"episode {args.episode_index}: {N} frames  |  rgb: {H}x{W}  |  K rescaled by ({sx:.3f}, {sy:.3f})")
+    print(f"episode {args.episode_index}: {N} frames  |  rgb: {H}x{W}  |  calib from sidecar")
 
-    # ── FK for static camera pose and per-frame robot meshes ─────────────────
+    # ── FK for per-frame robot meshes ─────────────────────────────────────────
+    # Camera pose and intrinsics now come from the calib sidecar (per-frame).
     kin = _Kin()
     robot_mesh_gen = RobotMeshGenerator(_ROBOT_NAME)
     torso_init = np.asarray(INIT_TORSO_JOINTS, dtype=np.float64)
     l_arm_init = np.asarray(INIT_LEFT_ARM_JOINTS, dtype=np.float64)
     head_init  = np.asarray(INIT_HEAD_JOINTS,  dtype=np.float64)
-
-    # Camera lives on the torso/head chain (both held at INIT_*) → constant.
-    world_t_cam = kin.fk_link(
-        kin.cam_idx, torso_init, l_arm_init, state_joint[0, :7].astype(np.float64), head_init
-    )
 
     # ── rerun setup ──────────────────────────────────────────────────────────
     rr.init("vis_episode_processed", spawn=True)
@@ -514,16 +522,8 @@ def main() -> None:
         static=True,
     )
 
-    rr.log(
-        "world/camera",
-        rr.Transform3D(translation=world_t_cam[:3, 3], mat3x3=world_t_cam[:3, :3]),
-        static=True,
-    )
-    rr.log(
-        "world/camera",
-        rr.Pinhole(image_from_camera=K32, width=W, height=H),
-        static=True,
-    )
+    # Camera transform and pinhole are logged per-frame in the loop below
+    # because the extrinsic/intrinsic can change each frame.
 
     # ── Per-frame loop ───────────────────────────────────────────────────────
     # Sequence (idx) timeline; playback rate is set by ``TimePanel(fps=...)``
@@ -538,6 +538,19 @@ def main() -> None:
             continue
 
         frame = dataset_eef[idx]
+
+        # Per-frame camera pose and intrinsics from calib sidecar.
+        world_t_cam = extrinsic_stack[idx]          # (4, 4) world_T_cam
+        K = intrinsic_stack[idx]                     # (3, 3) already at stored resolution
+        K32 = K.astype(np.float32)
+        rr.log(
+            "world/camera",
+            rr.Transform3D(translation=world_t_cam[:3, 3], mat3x3=world_t_cam[:3, :3]),
+        )
+        rr.log(
+            "world/camera",
+            rr.Pinhole(image_from_camera=K32, width=W, height=H),
+        )
 
         # Future-trail markers + current pose frames.
         rr.log(
@@ -561,7 +574,7 @@ def main() -> None:
             ),
         )
 
-        # RGB from parquet; depth from sidecar (camera pose set statically above).
+        # RGB from parquet; depth from sidecar.
         rgb = _rgb_to_hwc(frame["observation.images.left_rgb"])
         depth_mm = depth_stack[idx]
         rr.log("world/camera/rgb", rr.Image(rgb))

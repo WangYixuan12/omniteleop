@@ -9,37 +9,60 @@ combo.
 
 Two-rate loop:
 
-  outer ──── 100 Hz (control_rate from config) ─── safety + send
-  inner ────  15 Hz  (matches training fps)      ─── policy.select_action
+  outer ──── 300 Hz (control_rate from config) ─── send held command
+  inner ────  15 Hz  (matches training fps)      ─── policy + safety + decode
 
 The inner tick is gated on ``round(control_rate / policy_fps)`` outer
-ticks. By default ACT checkpoints are overridden to run with
-``n_action_steps=1`` and ``temporal_ensemble_coeff=0.01``; pass ``None`` for
-those ACT override options to keep the checkpoint's saved queue dynamics.
+ticks. By default ACT checkpoints keep their saved queue/ensemble dynamics;
+pass ACT override options only when you want to change the checkpoint config
+at deploy time.
 
-EEF actions go through the leader's IK pipeline verbatim (mirrors
-``vr_reader._solve_and_apply_arm_ik``): a single ``MotionManager.ik(type="pink")``
-call seeded from the chained last-commanded state (NOT observed joints),
-then ``ArmProcessor.limit_joint_step`` 10°/tick clamp and
-``ArmProcessor.apply_positions`` to commit. ``set_joint_pos`` to the arm
-matches ``vr_robot_controller`` (no ``wait_time``).
+Both joint- and EEF-action variants share the same decode/safety pipeline
+in ``_action_to_joint_target`` — for EEF actions the raw 7-DOF target comes
+from ``MotionManager.ik(type="pink")`` (seeded from the chained
+last-commanded state, mirroring ``vr_reader._solve_and_apply_arm_ik``); for
+joint actions it comes straight from ``action[:7]``. Both then go through
+``ArmProcessor.limit_joint_step`` (10°/tick clamp against the chained
+state) → ``_check_right_arm_joint_target`` → ``_check_safety`` before
+``ArmProcessor.apply_positions`` commits the new chained pose.
+``set_joint_pos`` to the arm matches ``vr_robot_controller`` (no
+``wait_time``).
 
-Safety guards (applied to the **command actually being sent**):
+Safety guards (all run inside ``_action_to_joint_target``; the IK chain
+``mm.right_arm`` / ``_chained_right_arm_qpos`` advances only after every
+guard passes, so a rejected tick leaves the chain anchored to the last
+safe pose for next tick's clamp):
 
-  1. Estop snapshot via robot.estop.get_status(); on release the IK chain
-     re-syncs to observed.
-  2. NaN/inf rejection.
-  3. IK status check (eef-action variants): solution / not is_collision /
-     within_limits. On reject the chain does not advance.
-  4. 10°/tick clamp via ``ArmProcessor.limit_joint_step`` on the raw IK
-     solution, then hardware joint-limit check on the post-clamp target.
-  5. WorkspaceChecker on the final commanded joint target.
+  1. Estop snapshot via robot.estop.get_status() (outer loop); on release
+     the IK chain re-syncs to observed.
+  2. IK status check (EEF-action variants): solution / not is_collision /
+     within_limits.
+  3. ``ArmProcessor.limit_joint_step`` — 10°/tick clamp on the raw 7-DOF
+     target (IK output for EEF actions, ``action[:7]`` for joint actions).
+  4. ``_check_right_arm_joint_target`` — shape, NaN/inf, hardware joint
+     limits on the post-clamp target.
+  5. ``_check_safety`` — NaN/inf and ``WorkspaceChecker`` (Cartesian EEF
+     bounds with head/torso held at ``INIT_*``) on the post-clamp target.
+
+Any rejection bumps ``consecutive_rejects``; the loop exits when it hits
+``REJECT_LIMIT``.
 
 Run::
 
-    PYTHONPATH=/home/yixuan/lerobot_yifan/src \\
+    # New repo (lerobot_original) + new model layout under ~/Dexmate/model/.
+    PYTHONPATH=/home/yixuan/lerobot_original/src \\
     python -m omniteleop.follower.policy_rollout \\
-        --policy-path /home/yixuan/omniteleop/Dexmate/model/dp/dp_abs_eef_eef/checkpoints/025000/pretrained_model
+        --policy-path /home/yixuan/Dexmate/model/act/dexmate_eef_eef/checkpoints/200000/pretrained_model
+
+    # Diffusion variant:
+    PYTHONPATH=/home/yixuan/lerobot_original/src \\
+    python -m omniteleop.follower.policy_rollout \\
+        --policy-path /home/yixuan/Dexmate/model/dp/dexmate_eef_eef/checkpoints/050000/pretrained_model
+
+    # Relative-action ACT (chunk-anchor pinning engages automatically):
+    PYTHONPATH=/home/yixuan/lerobot_original/src \\
+    python -m omniteleop.follower.policy_rollout \\
+        --policy-path /home/yixuan/Dexmate/model/act/dexmate_eef_eef_relative/checkpoints/050000/pretrained_model
 """
 
 from __future__ import annotations
@@ -82,6 +105,7 @@ from omniteleop.follower.workspace_check import WorkspaceChecker
 # LeRobot policy stack
 from lerobot.configs import PreTrainedConfig
 from lerobot.policies import get_policy_class, make_pre_post_processors
+from lerobot.processor import RelativeActionsProcessorStep
 
 
 # ── small math helpers (mirror port_dexmate_hdf5.py) ──────────────────────────
@@ -143,7 +167,10 @@ class _Variant:
     state_is_eef: bool  # True if state_dim == 10
     action_is_eef: bool  # True if action_dim == 10
     uses_relative: bool
-    relative_mode: Optional[str]
+    # Action-side last-dim indices that stay absolute when relative mode is on
+    # (lerobot_original: PreTrainedConfig.relative_exclude_dims["action"]). None
+    # when the policy was trained without relative actions.
+    relative_exclude_action_dims: Optional[list[int]]
 
 
 class PolicyRolloutController:
@@ -156,11 +183,11 @@ class PolicyRolloutController:
         workspace_check: bool = True,
         policy_fps: int = 15,
         gripper_threshold: float = 0.5,
-        camera_key: str = "right_rgb",
+        camera_key: str = "left_rgb",
         image_h: int = 240,
         image_w: int = 320,
-        act_n_action_steps: Optional[int] = 1,
-        act_temporal_ensemble_coeff: Optional[float] = 0.01,
+        act_n_action_steps: Optional[int] = None,
+        act_temporal_ensemble_coeff: Optional[float] = None,
         record: bool = True,
         record_dir: Optional[str] = None,
     ) -> None:
@@ -273,8 +300,8 @@ class PolicyRolloutController:
     def initialize_policy(
         self,
         policy_path: str,
-        act_n_action_steps: Optional[int] = 1,
-        act_temporal_ensemble_coeff: Optional[float] = 0.01,
+        act_n_action_steps: Optional[int] = None,
+        act_temporal_ensemble_coeff: Optional[float] = None,
     ) -> None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self._device = device
@@ -319,14 +346,31 @@ class PolicyRolloutController:
         out_feats = self._policy.config.output_features
         state_dim = int(in_feats[OBS_STATE].shape[0])
         action_dim = int(out_feats[ACTION].shape[0])
+        rel_exclude_map = getattr(pcfg, "relative_exclude_dims", None) or {}
+        rel_exclude_action = (
+            list(rel_exclude_map.get("action", [])) if isinstance(rel_exclude_map, dict) else None
+        )
         self.variant = _Variant(
             state_dim=state_dim,
             action_dim=action_dim,
             state_is_eef=(state_dim == 10),
             action_is_eef=(action_dim == 10),
             uses_relative=bool(getattr(pcfg, "use_relative_actions", False)),
-            relative_mode=getattr(pcfg, "relative_action_mode", None),
+            relative_exclude_action_dims=rel_exclude_action,
         )
+
+        # Locate the RelativeActionsProcessorStep so the control loop can pin its
+        # cached state to the chunk anchor between in-chunk pops (see _policy_step).
+        # Without this, post() would compute `a_t_abs = a_t_rel + s_t` instead of
+        # `a_t_rel + s_replan`, causing action drift across the chunk.
+        self._relative_step = next(
+            (s for s in self._pre.steps if isinstance(s, RelativeActionsProcessorStep)),
+            None,
+        )
+        self._chunk_anchor_active = (
+            self._relative_step is not None and self._relative_step.enabled
+        )
+        self._chunk_ref_state: Optional[torch.Tensor] = None
 
         # Print chunking like infer_dexmate.py for sanity.
         chunk = getattr(pcfg, "chunk_size", None) or getattr(pcfg, "horizon", None)
@@ -336,21 +380,20 @@ class PolicyRolloutController:
         logger.info(
             f"Policy: type={pcfg.type} state_dim={state_dim} action_dim={action_dim} "
             f"chunk/horizon={chunk} n_action_steps={n_act} n_obs_steps={n_obs} "
-            f"relative={self.variant.uses_relative} mode={self.variant.relative_mode}"
+            f"relative={self.variant.uses_relative} "
+            f"relative_exclude_action_dims={self.variant.relative_exclude_action_dims} "
+            f"chunk_anchor_active={self._chunk_anchor_active}"
         )
         logger.info(
             f"Loop rates: control={self.control_rate}Hz, policy={self.policy_fps}Hz "
             f"(policy fires every {self._policy_period_ticks} control ticks)"
         )
 
-        # MotionManager + IK: required if EITHER state OR action is in EEF space
-        # (state_is_eef → FK in obs build; action_is_eef → IK in action decode).
-        if self.variant.state_is_eef or self.variant.action_is_eef:
-            self._init_motion_manager()
-        else:
-            self._motion_manager = None
-            self._ik_solver = None
-            self._right_proc = None
+        # MotionManager + IK + ArmProcessor: always initialised because every
+        # variant runs ArmProcessor.limit_joint_step (10°/tick clamp) and the
+        # workspace + joint-limit safety gates before sending. EEF state/action
+        # variants additionally use IK (action decode) and FK (obs build).
+        self._init_motion_manager()
 
         # Reset action queue at start.
         self._policy.reset()
@@ -588,7 +631,15 @@ class PolicyRolloutController:
         t_obs_start = time.monotonic()
         sample = self._build_observation()
         t_obs_end = time.monotonic()
-        sample = self._pre(sample)
+
+        sample = self._pre(sample)  # writes _last_state = current obs state
+
+        # In-chunk pop: restore the chunk anchor so post() adds the same state
+        # the model used during the relative subtraction at replan time.
+        if self._chunk_anchor_active and qlen_before > 0:
+            assert self._relative_step is not None  # implied by _chunk_anchor_active
+            self._relative_step.set_cached_state(self._chunk_ref_state)
+
         begin_inference_ns = time.time_ns()
         t_inf_start = time.monotonic()
         with torch.no_grad():
@@ -596,6 +647,16 @@ class PolicyRolloutController:
         t_inf_end = time.monotonic()
         finish_inference_ns = time.time_ns()
         a_abs = self._post(a)
+
+        # On replan, snapshot the (just-set) cache as the chunk anchor for
+        # subsequent in-chunk pops in this chunk.
+        if self._chunk_anchor_active and qlen_before == 0:
+            assert self._relative_step is not None
+            cached = self._relative_step.get_cached_state()
+            self._chunk_ref_state = (
+                cached.detach().clone() if cached is not None else None
+            )
+
         info = {
             # Legacy alias kept so readers that grep for t_obs_ns_wallclock still work.
             "t_obs_ns_wallclock": begin_build_obs_ns,
@@ -615,61 +676,79 @@ class PolicyRolloutController:
     ) -> tuple[Optional[np.ndarray], float, str]:
         """Convert policy output to (joint_target_7, gripper, reason).
 
-        Returns (None, _, reason) if IK fails — caller freezes on this tick.
+        Both branches (joint and EEF actions) go through the same safety
+        pipeline: seed MM with the chained (last-commanded) state → produce a
+        raw 7-DOF target (IK for EEF, action[:7] for joint) →
+        ``limit_joint_step`` (10°/tick clamp against the chained state) →
+        ``_check_right_arm_joint_target`` (hardware joint limits) →
+        ``_check_safety`` (NaN + Cartesian workspace). The IK chain
+        (``mm.right_arm`` / ``_chained_right_arm_qpos``) is committed only
+        after every guard passes, so a rejected tick leaves the chain anchored
+        to the last safe pose for next tick's clamp.
+
+        Returns (None, _, reason) on any rejection — caller exits or freezes
+        on this tick.
         """
         gripper = float(action[-1])
-        if not self.variant.action_is_eef:
-            joint_target = action[:7].astype(np.float32)
-            return joint_target, gripper, "ok"
-
-        # EEF action — mirror vr_reader._solve_and_apply_arm_ik exactly.
-        T = np.eye(4, dtype=np.float64)
-        T[:3, :3] = _gram_schmidt_6d_to_R(action[3:9].astype(np.float64))
-        T[:3, 3] = action[:3].astype(np.float64)
         assert self._motion_manager is not None
         assert self._right_proc is not None
         assert self._chained_right_arm_qpos is not None
 
         # Seed MM with the chained (last-commanded) right_arm so:
-        #   - the Pink IK warm-starts from there (matches leader),
-        #   - limit_joint_step clamps the raw IK output against it.
+        #   - (EEF only) the Pink IK warm-starts from there (matches leader),
+        #   - limit_joint_step clamps the raw target against it.
         # mm.ik() does NOT commit its solution back into mm.right_arm, so the
         # MM state stays at the chained value across the call.
         self._motion_manager.set_joint_pos(
             self._motion_manager_state_dict(right_arm=self._chained_right_arm_qpos)
         )
-        try:
-            arm_solution, in_collision, within_limits = self._motion_manager.ik(
-                target_pose={"R_ee": T},
-                type="pink",
-            )
-        except Exception as e:  # solver internals can throw on degenerate inputs
-            return None, gripper, f"ik_exception: {e}"
 
-        if not arm_solution:
-            return None, gripper, "ik_no_solution"
-        if in_collision:
-            return None, gripper, "ik_collision"
-        if not within_limits:
-            return None, gripper, "ik_outside_limits"
+        if self.variant.action_is_eef:
+            # EEF action — mirror vr_reader._solve_and_apply_arm_ik exactly.
+            T = np.eye(4, dtype=np.float64)
+            T[:3, :3] = _gram_schmidt_6d_to_R(action[3:9].astype(np.float64))
+            T[:3, 3] = action[:3].astype(np.float64)
+            try:
+                arm_solution, in_collision, within_limits = self._motion_manager.ik(
+                    target_pose={"R_ee": T},
+                    type="pink",
+                )
+            except Exception as e:  # solver internals can throw on degenerate inputs
+                return None, gripper, f"ik_exception: {e}"
 
-        try:
-            raw_right = [arm_solution[f"R_arm_j{i}"] for i in range(1, 8)]
-        except KeyError as e:
-            return None, gripper, f"ik_missing_joint:{e}"
+            if not arm_solution:
+                return None, gripper, "ik_no_solution"
+            if in_collision:
+                return None, gripper, "ik_collision"
+            if not within_limits:
+                return None, gripper, "ik_outside_limits"
 
-        # 10°/tick clamp against the chained state, then commit back into MM.
-        # apply_positions advances the leader's implicit chain (mm.right_arm
-        # is the source for next tick's limit_joint_step) — we also store it
-        # explicitly so the next IK call re-seeds MM from a known place.
+            try:
+                raw_right = [arm_solution[f"R_arm_j{i}"] for i in range(1, 8)]
+            except KeyError as e:
+                return None, gripper, f"ik_missing_joint:{e}"
+        else:
+            # Joint action — raw target straight from the policy.
+            raw_right = action[:7].astype(np.float64).tolist()
+
+        # 10°/tick clamp against the chained state.
         safe_right = self._right_proc.limit_joint_step(raw_right)
-        self._right_proc.apply_positions(safe_right.tolist())
-        self._chained_right_arm_qpos = safe_right.astype(np.float32)
-
         joint_target = safe_right.astype(np.float32)
+
+        # Validate the post-clamp target before committing the chain.
         ok, why = self._check_right_arm_joint_target(joint_target)
         if not ok:
             return None, gripper, why
+        ok, why = self._check_safety(joint_target)
+        if not ok:
+            return None, gripper, why
+
+        # Commit chain (mm.right_arm advances → next tick's limit_joint_step
+        # clamps against this value; _chained_right_arm_qpos mirrors it so the
+        # next IK call re-seeds MM from a known place).
+        self._right_proc.apply_positions(safe_right.tolist())
+        self._chained_right_arm_qpos = safe_right.astype(np.float32)
+
         return joint_target, gripper, "ok"
 
     def _action_eef_records(
@@ -815,7 +894,7 @@ class PolicyRolloutController:
         joint_target = self._last_cmd_right.copy()
         gripper_target = self._last_gripper_cmd
         consecutive_rejects = 0
-        REJECT_LIMIT = 30  # ~0.3 s at 100 Hz
+        REJECT_LIMIT = 1
         chunk_idx = -1
         last_replan_log_t = 0.0
         if self._recorder is not None:
@@ -836,6 +915,9 @@ class PolicyRolloutController:
                 if self._mode == _Mode.PAUSED:
                     logger.info("Estop released; resuming.")
                     self._policy.reset()  # fresh queue after pause
+                    # Drop the stale chunk anchor; the next tick will replan
+                    # and capture a new one from the post-resume observation.
+                    self._chunk_ref_state = None
                     # Re-sync the IK chain to the observed arm pose — the
                     # operator may have moved the arm while paused. Re-seed
                     # mm.right_arm via apply_positions so the next
@@ -865,7 +947,7 @@ class PolicyRolloutController:
                     cand_target, cand_gripper, reason = self._action_to_joint_target(action)
                     if cand_target is None:
                         consecutive_rejects += 1
-                        logger.warning(f"Action decode rejected: {reason}")
+                        logger.warning(f"Action rejected: {reason}")
                         if consecutive_rejects >= REJECT_LIMIT:
                             logger.error(
                                 f"{consecutive_rejects} consecutive rejects — exiting."
@@ -876,43 +958,27 @@ class PolicyRolloutController:
                         gripper_target = (
                             1.0 if cand_gripper >= self.gripper_threshold else 0.0
                         )
+                        consecutive_rejects = 0
 
-                # ─── outer: safety → send ────────────────────────────────────
+                # ─── outer: send (all safety guards ran in _action_to_joint_target) ─
                 command_target = joint_target
-
-                ok, why = self._check_safety(command_target)
-                publish_command_ns = 0
-                if ok:
-                    self.robot.right_arm.set_joint_pos(command_target.tolist())
-                    publish_command_ns = time.time_ns()
-                    self.robot.right_arm.send_ee_pass_through_message(
-                        build_hande_command(gripper_target)
-                    )
-                    t_send = time.monotonic()
-                    if step_info is not None and step_info["replan"]:
-                        if t_send - last_replan_log_t > 0.95:
-                            last_replan_log_t = t_send
-                            obs_to_send_ms = (t_send - step_info["t_obs_end"]) * 1000.0
-                            logger.info(
-                                f"chunk replan: obs_build={step_info['obs_build_ms']:.1f}ms "
-                                f"inference={step_info['inference_ms']:.1f}ms "
-                                f"obs→send={obs_to_send_ms:.1f}ms"
-                            )
-                    self._last_cmd_right = command_target
-                    self._last_gripper_cmd = gripper_target
-                    consecutive_rejects = 0
-                else:
-                    consecutive_rejects += 1
-                    if consecutive_rejects % 20 == 1:
-                        logger.warning(f"Safety rejected: {why}; holding last command.")
-                    # Re-send last good joint target to keep the motor live.
-                    self.robot.right_arm.set_joint_pos(self._last_cmd_right.tolist())
-                    publish_command_ns = time.time_ns()
-                    if consecutive_rejects >= REJECT_LIMIT:
-                        logger.error(
-                            f"{consecutive_rejects} consecutive safety rejects — exiting."
+                self.robot.right_arm.set_joint_pos(command_target.tolist())
+                publish_command_ns = time.time_ns()
+                self.robot.right_arm.send_ee_pass_through_message(
+                    build_hande_command(gripper_target)
+                )
+                t_send = time.monotonic()
+                if step_info is not None and step_info["replan"]:
+                    if t_send - last_replan_log_t > 0.95:
+                        last_replan_log_t = t_send
+                        obs_to_send_ms = (t_send - step_info["t_obs_end"]) * 1000.0
+                        logger.info(
+                            f"chunk replan: obs_build={step_info['obs_build_ms']:.1f}ms "
+                            f"inference={step_info['inference_ms']:.1f}ms "
+                            f"obs→send={obs_to_send_ms:.1f}ms"
                         )
-                        break
+                self._last_cmd_right = command_target
+                self._last_gripper_cmd = gripper_target
 
                 # ─── record (per inner policy tick) ──────────────────────────
                 if step_info is not None and action is not None:
@@ -1026,7 +1092,7 @@ def main(
     workspace_check: bool = True,
     policy_fps: int = 15,
     gripper_threshold: float = 0.5,
-    act_n_action_steps: Optional[int] = 15,
+    act_n_action_steps: Optional[int] = None,
     act_temporal_ensemble_coeff: Optional[float] = None,
     record: bool = True,
     record_dir: Optional[str] = None,
@@ -1047,9 +1113,9 @@ def main(
         gripper_threshold: Binarise the policy's gripper output at this value
             (matches the dataset's binarisation in port_dexmate_hdf5.py).
         act_n_action_steps: ACT-only checkpoint config override. Defaults to
-            1 so temporal ensembling can query the policy on every policy tick.
+            None, preserving the checkpoint value.
         act_temporal_ensemble_coeff: ACT-only checkpoint config override.
-            Defaults to 0.01, matching the original ACT temporal ensemble value.
+            Defaults to None, preserving the checkpoint value.
         record: Dump per-policy-tick frames to HDF5 for debug analysis.
         record_dir: Override save root. Each rollout records under the next
             numeric subdirectory (``0``, ``1``, ...). Defaults to

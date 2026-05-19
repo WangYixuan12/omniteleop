@@ -553,7 +553,7 @@ def has_reached_target(
 def compute_latencies(
     rows: List[Dict],
     sides: List[str],
-    motion_thresh: float = 0.02,
+    motion_thresh: float = 0.005,
     echo_tol: float = 1.5 / 255.0,
     pre_motion_window_s: float = PRE_MOTION_WINDOW_S,
     settled_tol: float = SETTLED_TOL,

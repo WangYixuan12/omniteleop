@@ -98,6 +98,7 @@ import numpy as np
 import sapien
 import tyro
 from dexbot_utils import RobotInfo
+from dexbot_utils.configs.components.sensors.cameras import CameraConfig
 from dexcomm import Node, RateLimiter
 from dexcomm.codecs import DictDataCodec
 from dexcontrol.core.config import get_robot_config
@@ -139,6 +140,32 @@ from omniteleop.leader.communication.webxr_vr_reader import VRFrame, WebXRVRRead
 
 StartMode = Literal["follow_hand", "fixed_pose"]
 workspace_check = True
+
+CameraStream = Literal[
+    "head_left_rgb",
+    "head_right_rgb",
+    "head_depth",
+    "left_wrist_rgb",
+    "right_wrist_rgb",
+    "wrist_depth",
+]
+_DEFAULT_CAMERAS: list[CameraStream] = ["head_left_rgb", "head_depth", "left_wrist_rgb"]
+# Stream id → (camera namespace prefix, head_camera obs_key for that stream)
+_HEAD_STREAM_TO_OBS_KEY: dict[CameraStream, str] = {
+    "head_left_rgb": "left_rgb",
+    "head_right_rgb": "right_rgb",
+    "head_depth": "depth",
+}
+# Stream id → which half of the side-by-side stereo frame to use.
+# dexsensor's usb_camera driver publishes the raw 2*W x H ZED-M output as one
+# topic; we slice it here. wrist_depth is intentionally absent — depth would
+# require running the ZED SDK, which dexsensor's usb_camera driver does not do.
+_WRIST_STREAM_TO_HALF: dict[CameraStream, str] = {
+    "left_wrist_rgb": "left_rgb",
+    "right_wrist_rgb": "right_rgb",
+}
+_WRIST_SENSOR_ID = "wrist_zedm"
+_WRIST_TOPIC = f"sensors/{_WRIST_SENSOR_ID}/rgb"
 
 console = Console()
 
@@ -309,6 +336,7 @@ class VRReader:
         start_mode: StartMode = "follow_hand",
         save_debug: bool = True,
         workspace_check: bool = workspace_check,
+        cameras: Optional[list[CameraStream]] = None,
     ) -> None:
         self.stick_max_vx = stick_max_vx
         self.stick_max_vy = stick_max_vy
@@ -351,12 +379,62 @@ class VRReader:
             ssl_keyfile="/home/yixuan/omniteleop/tests/key.pem",
         )
 
-        # Camera polling via Robot API
+        # Camera selection. Both head_camera (ZED-X Mini, GMSL) and wrist_zedm
+        # (ZED-M, USB) come from dexsensor via the dexcontrol Robot API.
+        # head_camera runs the ZED SDK inside dexsensor → rectified L/R + depth.
+        # wrist_zedm uses dexsensor's raw V4L2 usb_camera driver → a single
+        # 2W*H side-by-side BGR frame, which we slice in the loop. No depth
+        # is available for wrist this way; wrist_depth in --cameras is rejected.
+        selected = cameras if cameras else _DEFAULT_CAMERAS
+        if not selected:
+            raise ValueError("`cameras` must select at least one stream.")
+        if "wrist_depth" in selected:
+            raise ValueError(
+                "wrist_depth is not supported: dexsensor's usb_camera driver "
+                "does not run the ZED SDK, so no depth is computed for the USB "
+                "ZED-M. Remove wrist_depth from --cameras."
+            )
+        self.cameras: list[CameraStream] = list(selected)
+        self._head_keys: list[str] = [
+            _HEAD_STREAM_TO_OBS_KEY[c]
+            for c in self.cameras
+            if c in _HEAD_STREAM_TO_OBS_KEY
+        ]
+        self._wrist_halves: list[str] = [
+            _WRIST_STREAM_TO_HALF[c]
+            for c in self.cameras
+            if c in _WRIST_STREAM_TO_HALF
+        ]
+        self._wrist_enabled: bool = bool(self._wrist_halves)
+        logger.info(
+            f"Cameras selected: {self.cameras}  "
+            f"(head_keys={self._head_keys}, wrist_halves={self._wrist_halves})"
+        )
 
+        # Camera polling via Robot API — also provides arm/torso/head joint
+        # feedback used by gripper monitors and recording, so we always
+        # construct it. Sensors are only enabled when actually selected.
         configs = get_robot_config()
-        configs.sensors["head_camera"].enabled = True
+        configs.sensors["head_camera"].enabled = bool(self._head_keys)
+        if self._wrist_enabled and _WRIST_SENSOR_ID not in configs.sensors:
+            # Variant has no wrist_zedm; inject a USB CameraConfig pointing at
+            # the dexsensor topic for it. dexsensor must be launched with
+            # `--sensor wrist_zedm` for this subscriber to receive frames.
+            configs.sensors[_WRIST_SENSOR_ID] = CameraConfig(
+                name=_WRIST_SENSOR_ID,
+                topic=_WRIST_TOPIC,
+                rtc_channel=f"{_WRIST_TOPIC}_rtc",
+            )
+        if _WRIST_SENSOR_ID in configs.sensors:
+            configs.sensors[_WRIST_SENSOR_ID].enabled = self._wrist_enabled
         self._cam_robot = _Robot(configs=configs)
-        logger.info("Camera streaming started")
+        if self._head_keys:
+            logger.info(f"Head camera streaming started (keys={self._head_keys})")
+        if self._wrist_enabled:
+            logger.info(
+                f"Wrist camera streaming started (halves={self._wrist_halves}) "
+                f"— requires `dexsensor launch --sensor {_WRIST_SENSOR_ID}`"
+            )
 
         # KinHelper (head IK only)
         logger.info(f"Loading KinHelper for '{robot_name}' ...")
@@ -391,8 +469,12 @@ class VRReader:
         # Recording
         self.recorder = EpisodeRecorder(save_dir)
         self.debug_recorder = DebugEpisodeRecorder(debug_save_dir)
-        self._last_imgs: dict[str, np.ndarray] = {}
-        self._last_depth_u16: Optional[np.ndarray] = None
+        # Per-camera caches. Keys match canonical obs names (left_rgb /
+        # right_rgb / depth) — head_* and wrist_* are kept in separate dicts
+        # because they originate from different sources (Robot API vs Zenoh).
+        self._last_head_imgs: dict[str, np.ndarray] = {}
+        self._last_head_depth_u16: Optional[np.ndarray] = None
+        self._last_wrist_imgs: dict[str, np.ndarray] = {}
         self._prev_a: bool = False
         self._prev_b: bool = False
         self._prev_x: bool = False
@@ -542,22 +624,60 @@ class VRReader:
 
     # ── Camera polling ─────────────────────────────────────────────────────────
 
-    def _camera_poll(self) -> None:
-        vis_imgs = []
-        for key in ("left_rgb", "right_rgb"):
-            img = self._last_imgs[key]
-            small = cv2.resize(img[:, :, ::-1], (320, 180))
-            vis_imgs.append(small)
-        depth = self._last_imgs["depth"]
-        finite = depth[np.isfinite(depth) & (depth > 0)]
-        if len(finite) == 0:
-            normalized = np.zeros(depth.shape[:2], dtype=np.uint8)
+    def _all_selected_streams_ready(self) -> bool:
+        """All selected streams have at least one frame cached.
+
+        Recording requires every selected stream to be present so the saved
+        HDF5 has consistent keys across frames.
+        """
+        for stream in self.cameras:
+            if stream == "head_left_rgb" and "left_rgb" not in self._last_head_imgs:
+                return False
+            if stream == "head_right_rgb" and "right_rgb" not in self._last_head_imgs:
+                return False
+            if stream == "head_depth" and self._last_head_depth_u16 is None:
+                return False
+            if stream == "left_wrist_rgb" and "left_rgb" not in self._last_wrist_imgs:
+                return False
+            if stream == "right_wrist_rgb" and "right_rgb" not in self._last_wrist_imgs:
+                return False
+        return True
+
+    def _render_tile(self, stream: CameraStream) -> Optional[np.ndarray]:
+        """Render one 320×180 preview tile for the given selected stream.
+
+        Returns None if no frame for this stream is available yet (subscriber
+        hasn't received anything, or head poll returned no key).
+        """
+        if stream in _HEAD_STREAM_TO_OBS_KEY:
+            key = _HEAD_STREAM_TO_OBS_KEY[stream]
+            img = self._last_head_imgs.get(key)
         else:
-            mn, mx = finite.min(), np.percentile(finite, 95)
-            normalized = np.clip((depth - mn) / (mx - mn + 1e-6) * 255, 0, 255).astype(np.uint8)
-        colored = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
-        colored = cv2.resize(colored, (320, 180))
-        vis_imgs.append(colored)
+            key = _WRIST_STREAM_TO_HALF[stream]
+            img = self._last_wrist_imgs.get(key)
+        if img is None:
+            return None
+
+        if key == "depth":
+            finite = img[np.isfinite(img) & (img > 0)]
+            if len(finite) == 0:
+                normalized = np.zeros(img.shape[:2], dtype=np.uint8)
+            else:
+                mn, mx = finite.min(), np.percentile(finite, 95)
+                normalized = np.clip((img - mn) / (mx - mn + 1e-6) * 255, 0, 255).astype(np.uint8)
+            colored = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+            return cv2.resize(colored, (320, 180))
+        # Both head_camera and dexsensor usb_camera publish RGB. cv2 wants BGR.
+        return cv2.resize(img[:, :, ::-1], (320, 180))
+
+    def _camera_poll(self) -> None:
+        vis_imgs: list[np.ndarray] = []
+        for stream in self.cameras:
+            tile = self._render_tile(stream)
+            if tile is not None:
+                vis_imgs.append(tile)
+        if not vis_imgs:
+            return
 
         vis_img = concat_img_h(vis_imgs)
         episode_id: int = self.recorder.episode_id
@@ -1008,7 +1128,7 @@ class VRReader:
 
         if not self.recorder.recording or self._calib_stage != "whole_body":
             return
-        if not self._last_imgs or self._last_depth_u16 is None:
+        if not self._all_selected_streams_ready():
             return
 
         # Throttle to record_rate so saved HDF5 has a consistent FPS independent
@@ -1046,6 +1166,25 @@ class VRReader:
         obs_grip_left = self._recordable_obs_grip("left")
         obs_grip_right = self._recordable_obs_grip("right")
 
+        images: dict[str, np.ndarray] = {}
+        for stream in self.cameras:
+            if stream == "head_left_rgb":
+                images["head_left_rgb"] = self._last_head_imgs["left_rgb"]
+            elif stream == "head_right_rgb":
+                images["head_right_rgb"] = self._last_head_imgs["right_rgb"]
+            elif stream == "head_depth":
+                assert self._last_head_depth_u16 is not None
+                images["head_depth"] = self._last_head_depth_u16
+            elif stream == "left_wrist_rgb":
+                images["left_wrist_rgb"] = self._last_wrist_imgs["left_rgb"]
+            elif stream == "right_wrist_rgb":
+                images["right_wrist_rgb"] = self._last_wrist_imgs["right_rgb"]
+        # intrinsic/extrinsic are head_camera-specific — only emit when head
+        # is being recorded. Wrist intrinsics not yet plumbed.
+        if self._head_keys:
+            images["intrinsic"] = ZED_K.astype(np.float32)
+            images["extrinsic"] = extrinsic
+
         frame = {
             "timestamp_ns": np.int64(time.time_ns()),
             "action": {
@@ -1073,13 +1212,7 @@ class VRReader:
                     "left": obs_grip_left,
                     "right": obs_grip_right,
                 },
-                "images": {
-                    "left_rgb": self._last_imgs["left_rgb"],
-                    "right_rgb": self._last_imgs["right_rgb"],
-                    "depth": self._last_depth_u16,
-                    "intrinsic": ZED_K.astype(np.float32),
-                    "extrinsic": extrinsic,
-                },
+                "images": images,
             },
         }
         self.recorder.record(frame)
@@ -1280,11 +1413,30 @@ class VRReader:
                     rate_limiter.sleep()
                     continue
 
-                imgs = self._cam_robot.sensors.head_camera.get_obs(
-                    obs_keys=["left_rgb", "right_rgb", "depth"]
-                )
-                self._last_imgs = imgs
-                self._last_depth_u16 = np.clip(imgs["depth"] * 1000, 0, 65535).astype(np.uint16)
+                if self._head_keys:
+                    head_imgs = self._cam_robot.sensors.head_camera.get_obs(
+                        obs_keys=self._head_keys
+                    )
+                    self._last_head_imgs = head_imgs
+                    if "depth" in head_imgs:
+                        self._last_head_depth_u16 = np.clip(
+                            head_imgs["depth"] * 1000, 0, 65535
+                        ).astype(np.uint16)
+                if self._wrist_enabled:
+                    # dexsensor usb_camera publishes the raw ZED-M output as
+                    # one (H, 2W, 3) RGB frame; slice into the eyes we need.
+                    wrist_frame = self._cam_robot.sensors.wrist_zedm.get_obs()
+                    if wrist_frame is not None:
+                        half_w = wrist_frame.shape[1] // 2
+                        for half in self._wrist_halves:
+                            if half == "left_rgb":
+                                self._last_wrist_imgs["left_rgb"] = wrist_frame[
+                                    :, :half_w, :
+                                ]
+                            elif half == "right_rgb":
+                                self._last_wrist_imgs["right_rgb"] = wrist_frame[
+                                    :, half_w:, :
+                                ]
                 if step % 4 == 0:
                     self._camera_poll()
                 vr_head = transforms["head"]
@@ -1405,10 +1557,10 @@ def main() -> None:
         urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"  # noqa
         """Path to robot URDF for Sapien visualizer (required if --visualize)"""
 
-        save_dir: str = "/home/yixuan/omniteleop/Dexmate/data/raw_data"
+        save_dir: str = "/home/yixuan/Dexmate/data/raw_data_2"
         """Directory to save episode_<N>.hdf5 files (A=start, B=stop)"""
 
-        debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/debug_data"
+        debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/raw_data_2"
         """Directory to save episode_<N>_debug.hdf5 files"""
 
         start_mode: StartMode = "fixed_pose"
@@ -1418,7 +1570,7 @@ def main() -> None:
         configuration; user trigger-advances out of whole_body_alignment to
         lock the per-arm calibration."""
 
-        save_debug: bool = True
+        save_debug: bool = False
         """If False, skip building and saving episode_<N>_debug.hdf5 to reduce
         per-frame overhead and shorten save time."""
 
@@ -1426,6 +1578,16 @@ def main() -> None:
         """Compute right-arm EEF FK each frame and overlay 'WARNING: out of
         workspace' on the headset view when the commanded EEF leaves the
         configured Cartesian bounds. Pass --workspace-check to enable."""
+
+        cameras: list[CameraStream] = dataclasses.field(
+            default_factory=lambda: list(_DEFAULT_CAMERAS)
+        )
+        """Camera streams to read and record. Choose any subset of:
+        head_left_rgb, head_right_rgb, head_depth, left_wrist_rgb,
+        right_wrist_rgb. Default: head_left_rgb head_depth left_wrist_rgb.
+        Wrist streams require `dexsensor launch --sensor wrist_zedm` to be
+        running. wrist_depth is rejected — dexsensor's usb_camera driver
+        does not run the ZED SDK and cannot compute depth from USB ZED-M."""
 
     args = tyro.cli(Args)
 
@@ -1449,6 +1611,7 @@ def main() -> None:
         start_mode=args.start_mode,
         save_debug=args.save_debug,
         workspace_check=args.workspace_check,
+        cameras=args.cameras,
     )
     reader.run()
 

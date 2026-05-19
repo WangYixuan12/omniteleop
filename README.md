@@ -27,9 +27,17 @@ pip install omniteleop
 
 1. check network on lambda, dexmate
 2. ssh dexmate, conda activate dexmate
-3. run '(dexmate) dextop node start' and 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera' in tmux
-4. ssh lambda
-5. run
+3. run '(dexmate) dextop node start' and 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera' and 'dexsensor launch -c ~/.dexmate/sensors/default.toml --sensor wrist_zedm' in tmux
+
+3.1 test wrist camera via  ZED SDK (do not run dexsensor): 
+
+```python
+python /home/dexmate/yixuan/omniteleop/tests/test_wrist_zedm_depth.py --duration 5 --save-dir /home/dexmate/yixuan/Dexmate
+```
+
+  
+4. ssh lambda  
+5. run  
   (dexmate) python src/omniteleop/follower/vr_robot_controller.py # workspace_check = True, joint positions in vr_mode_const, head_mode and left_arm_mode in src/omniteleop/configs/vega_1_f5d6.yaml  
     (dexmate) python src/omniteleop/leader/vr_reader.py # start-mode=fixed_pose
 
@@ -52,8 +60,9 @@ fixed_pose mode:
 1. Move to new position
 2. Y (initialize hand, track head)
 3. A-Trigger (track hand)-Manip-B-X
-4. Repeat 2-3
-# if you forgot position last time, run scripts/save_first_rgb_print_fps.py
+4. Reset
+5. Repeat 2-3
+# if you forgot position last time, run scripts/save_rgb_print_fps.py
 ```
 
 - scripts/vis_episode.py (Optional)
@@ -113,18 +122,21 @@ Run infer_dexmate.py before deploy.
 ## Deploy
 
 ```bash
-python -m omniteleop.follower.policy_rollout --policy-path /home/yixuan/omniteleop/Dexmate/model/act/act_abs_joint_eef/checkpoints/400000/pretrained_model
-# act_n_action_steps=1, act_temporal_ensemble_coeff=0.01 for ACT eval
+python -m omniteleop.follower.policy_rollout \
+      --policy-path /home/yixuan/Dexmate/model/dp/dexmate_eef_eef_abs/checkpoints/last/pretrained_model \
+      --record_dir /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef/last
+# ACT deploy uses checkpoint n_action_steps and temporal_ensemble_coeff by default.
+# use the training stats baked into the checkpoint
 ```
 
 ```bash
-python /home/yixuan/Dexmate/deploy/dump_subset.py --input_path /home/yixuan/Dexmate/deploy/act_abs_eef_eef/episode_0.hdf5
-# visualize in csv
+python scripts/vis_eef_curves.py \
+        --gt /home/yixuan/Dexmate/data/raw_data_renamed/test/episode_0.hdf5 \
+        --infer /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef/last/0/episode_0.hdf5
 ```
 
 ```bash
 python /home/yixuan/omniteleop/scripts/vis_episode_online.py # rerun, transmission latency plot under debug/
-python /home/yixuan/omniteleop/scripts/vis_eef_curves.py
 ```
 
 ## Misc
