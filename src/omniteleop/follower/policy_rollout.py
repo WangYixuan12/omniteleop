@@ -875,7 +875,7 @@ class PolicyRolloutController:
         # (matches vr_robot_controller.py).
         if self._workspace_checker is not None:
             in_bounds, eef_xyz = self._workspace_checker.is_in_workspace(
-                right_arm=command_target.tolist(),
+                arm_joints=command_target.tolist(),
                 head=list(INIT_HEAD_JOINTS),
                 torso=list(INIT_TORSO_JOINTS),
             )

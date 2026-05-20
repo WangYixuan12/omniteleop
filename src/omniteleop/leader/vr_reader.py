@@ -127,15 +127,15 @@ from omniteleop.common.vr_mode_const import (
     INIT_LEFT_ARM_JOINTS,
     INIT_RIGHT_ARM_JOINTS,
     INIT_TORSO_JOINTS,
-    SAFE_LEFT_ARM_JOINTS,
-    SAFE_RIGHT_ARM_JOINTS,
+    # SAFE_LEFT_ARM_JOINTS,  # unused: arms → SAFE skipped on Y-press
+    # SAFE_RIGHT_ARM_JOINTS,
 )
 from omniteleop.follower.component_processors import ArmProcessor
 from omniteleop.follower.robotiq import (
     RobotiqStatusMonitor,
     poll_gripper_status,
 )
-from omniteleop.follower.workspace_check import DEFAULT_RIGHT_BOUNDS
+from omniteleop.follower.workspace_check import DEFAULT_LEFT_BOUNDS, DEFAULT_RIGHT_BOUNDS
 from omniteleop.leader.communication.webxr_vr_reader import VRFrame, WebXRVRReader
 
 StartMode = Literal["follow_hand", "fixed_pose"]
@@ -462,7 +462,9 @@ class VRReader:
 
         self._trigger_start: Optional[float] = None
 
-        # Right-arm EEF workspace status — set per frame, read by _camera_poll.
+        # Per-arm EEF workspace status — set per frame, read by _camera_poll.
+        self._left_eef_oob: bool = False
+        self._left_eef_xyz: np.ndarray = np.full(3, np.nan, dtype=np.float32)
         self._right_eef_oob: bool = False
         self._right_eef_xyz: np.ndarray = np.full(3, np.nan, dtype=np.float32)
 
@@ -479,6 +481,9 @@ class VRReader:
         self._prev_b: bool = False
         self._prev_x: bool = False
         self._prev_y: bool = False
+        # Stage counter saved per recorded frame: 0 when recording starts,
+        # +1 on every A-press during recording (B stops as before).
+        self._stage: int = 0
 
         # IK / timing telemetry — populated by _solve_and_apply_arm_ik (or
         # set to NaN/skip-reason on every bypass path) and read by
@@ -706,7 +711,7 @@ class VRReader:
             thickness=2,
             color=(0, 255, 255),
         )
-        if self.recorder.recording and self._last_ik_in_collision:
+        if self._last_ik_in_collision:
             cv2.putText(
                 vis_img,
                 "Left/Right Arm Self-collision!",
@@ -716,12 +721,23 @@ class VRReader:
                 thickness=2,
                 color=(0, 0, 255),
             )
+        if self._left_eef_oob:
+            xyz = self._left_eef_xyz
+            cv2.putText(
+                vis_img,
+                f"WARNING: L out of workspace xyz=[{xyz[0]:+.2f},{xyz[1]:+.2f},{xyz[2]:+.2f}]",
+                (10, 100),
+                fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                fontScale=1,
+                thickness=2,
+                color=(0, 0, 255),
+            )
         if self._right_eef_oob:
             xyz = self._right_eef_xyz
             cv2.putText(
                 vis_img,
-                f"WARNING: out of workspace xyz=[{xyz[0]:+.2f},{xyz[1]:+.2f},{xyz[2]:+.2f}]",
-                (10, 100),
+                f"WARNING: R out of workspace xyz=[{xyz[0]:+.2f},{xyz[1]:+.2f},{xyz[2]:+.2f}]",
+                (10, 135),
                 fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                 fontScale=1,
                 thickness=2,
@@ -824,6 +840,36 @@ class VRReader:
         for i, n in enumerate(self.right_proc.joint_names):
             self.current_qpos[self.joint_name_to_idx[n]] = safe_right[i]
         return safe_left.tolist(), safe_right.tolist()
+
+    def _update_left_eef_workspace_status(self, left_pos: list[float]) -> None:
+        """FK the commanded left-arm joints and check against workspace bounds.
+
+        Mirrors the gate in vr_robot_controller — when this flag is True the
+        follower will freeze the left arm, so the headset overlay matches.
+        """
+        if not left_pos or self._calib_stage not in (
+            "resetting",
+            "whole_body",
+            "whole_body_alignment",
+        ):
+            self._left_eef_oob = False
+            self._left_eef_xyz = np.full(3, np.nan, dtype=np.float32)
+            return
+        eef_xyz = self.kin.compute_fk_from_link_idx(
+            self.current_qpos, [self.left_arm_eef_idx]
+        )[0][:3, 3]
+        bx, by, bz = (
+            DEFAULT_LEFT_BOUNDS["x"],
+            DEFAULT_LEFT_BOUNDS["y"],
+            DEFAULT_LEFT_BOUNDS["z"],
+        )
+        in_bounds = (
+            bx[0] <= eef_xyz[0] <= bx[1]
+            and by[0] <= eef_xyz[1] <= by[1]
+            and bz[0] <= eef_xyz[2] <= bz[1]
+        )
+        self._left_eef_oob = not in_bounds
+        self._left_eef_xyz = np.asarray(eef_xyz, dtype=np.float32)
 
     def _update_right_eef_workspace_status(self, right_pos: list[float]) -> None:
         """FK the commanded right-arm joints and check against workspace bounds.
@@ -1032,10 +1078,13 @@ class VRReader:
             # Phase 1: arms → SAFE (torso/head stay put). Phase 2 (all → INIT)
             # is queued by _resetting_step when phase 1 completes.
             target = self.current_qpos.copy()
-            for i, n in enumerate(self.left_proc.joint_names):
-                target[self.joint_name_to_idx[n]] = SAFE_LEFT_ARM_JOINTS[i]
-            for i, n in enumerate(self.right_proc.joint_names):
-                target[self.joint_name_to_idx[n]] = SAFE_RIGHT_ARM_JOINTS[i]
+            # NOTE: skip arms → SAFE on Y-press. Leaving the arm targets at the
+            # current pose makes phase 1 a no-op for the arms (it completes in one
+            # step), so the reset goes straight to phase 2 (→ INIT).
+            # for i, n in enumerate(self.left_proc.joint_names):
+            #     target[self.joint_name_to_idx[n]] = SAFE_LEFT_ARM_JOINTS[i]
+            # for i, n in enumerate(self.right_proc.joint_names):
+            #     target[self.joint_name_to_idx[n]] = SAFE_RIGHT_ARM_JOINTS[i]
             self._reset_start_qpos = self.current_qpos.copy()
             self._reset_target_qpos = target
             max_dist = float(np.max(np.abs(target - self.current_qpos)))
@@ -1109,13 +1158,17 @@ class VRReader:
             if self.save_debug:
                 self.debug_recorder.start(self.recorder.episode_id)
             self.recorder.start()
+            self._stage = 0
             self._recorded_obs_grip_event_count_left = self._obs_grip_event_count_left
             self._recorded_obs_grip_event_count_right = self._obs_grip_event_count_right
             self._next_record_t = 0.0  # anchor cadence to the first recorded frame
             console.print(
                 f"[bold green]Recording started at {self.record_rate:g} Hz "
-                "(press B to stop)[/]"
+                "(stage 0, press A to advance stage, B to stop)[/]"
             )
+        elif a_now and not self._prev_a and self.recorder.recording:
+            self._stage += 1
+            console.print(f"[bold cyan]Stage → {self._stage}[/]")
         if b_now and not self._prev_b and self.recorder.recording:
             path = self.recorder.stop()
             console.print(f"[bold yellow]Saving in background → {path}[/]")
@@ -1187,6 +1240,7 @@ class VRReader:
 
         frame = {
             "timestamp_ns": np.int64(time.time_ns()),
+            "stage": np.int64(self._stage),
             "action": {
                 "joint": {
                     "left_arm": np.array(left_pos, dtype=np.float32),
@@ -1453,6 +1507,7 @@ class VRReader:
                     head_pos = self._head_ik_step(vr_head)
                     left_pos, right_pos, ik_l, ik_r = self._arm_ik_step(vr_l, vr_r)
                 if self._workspace_check_enabled:
+                    self._update_left_eef_workspace_status(left_pos)
                     self._update_right_eef_workspace_status(right_pos)
                 chassis_vx, chassis_vy, chassis_wz = self._thumbstick_to_chassis(transforms)
 
@@ -1570,7 +1625,7 @@ def main() -> None:
         configuration; user trigger-advances out of whole_body_alignment to
         lock the per-arm calibration."""
 
-        save_debug: bool = False
+        save_debug: bool = True
         """If False, skip building and saving episode_<N>_debug.hdf5 to reduce
         per-frame overhead and shorten save time."""
 

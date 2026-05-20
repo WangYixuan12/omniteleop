@@ -54,7 +54,11 @@ from omniteleop.common.vr_mode_const import (
     SAFE_RIGHT_ARM_JOINTS,
 )
 from omniteleop.follower.robotiq import build_hande_command, send_activate
-from omniteleop.follower.workspace_check import WorkspaceChecker
+from omniteleop.follower.workspace_check import (
+    DEFAULT_LEFT_BOUNDS,
+    DEFAULT_LEFT_LINK,
+    WorkspaceChecker,
+)
 
 workspace_check = True
 
@@ -116,10 +120,19 @@ class VRRobotController:
         self._latest: Optional[VRJointData] = None
         self._mode = _Mode.STOP
 
-        self._workspace_checker = WorkspaceChecker() if workspace_check else None
-        self._last_workspace_warn_t = 0.0
-        if self._workspace_checker is None:
-            logger.warning("Right-arm workspace check disabled.")
+        if workspace_check:
+            self._right_workspace_checker = WorkspaceChecker()
+            self._left_workspace_checker = WorkspaceChecker(
+                arm_link=DEFAULT_LEFT_LINK,
+                arm_joint_names=tuple(f"L_arm_j{i}" for i in range(1, 8)),
+                bounds=DEFAULT_LEFT_BOUNDS,
+            )
+        else:
+            self._right_workspace_checker = None
+            self._left_workspace_checker = None
+            logger.warning("Arm workspace check disabled (both arms).")
+        self._last_left_workspace_warn_t = 0.0
+        self._last_right_workspace_warn_t = 0.0
 
         self.initialize()
 
@@ -304,23 +317,44 @@ class VRRobotController:
                 )
                 if vr.calib_stage in ("resetting", "whole_body", "whole_body_alignment"):
                     if left_arm_target:
-                        self.robot.left_arm.set_joint_pos(left_arm_target)
-                        left_arm_error = np.abs(
-                            np.array(left_arm_target) - self.robot.left_arm.get_joint_pos()
-                        )
-                        if np.any(left_arm_error > 0.3):
-                            logger.info(f"Commanded left arm pos: {left_arm_target}")
-                            logger.info(
-                                f"Current left arm pos: {self.robot.left_arm.get_joint_pos()}"
+                        in_bounds = True
+                        eef_xyz = None
+                        if self._left_workspace_checker is not None:
+                            head_for_fk = head_target if head_target else list(INIT_HEAD_JOINTS)
+                            in_bounds, eef_xyz = self._left_workspace_checker.is_in_workspace(
+                                arm_joints=left_arm_target,
+                                head=head_for_fk,
+                                torso=list(INIT_TORSO_JOINTS),
                             )
-                            logger.warning(f"Warning: Large left arm error: {left_arm_error}")
+                        if in_bounds:
+                            self.robot.left_arm.set_joint_pos(left_arm_target)
+                            left_arm_error = np.abs(
+                                np.array(left_arm_target) - self.robot.left_arm.get_joint_pos()
+                            )
+                            if np.any(left_arm_error > 0.3):
+                                logger.info(f"Commanded left arm pos: {left_arm_target}")
+                                logger.info(
+                                    f"Current left arm pos: {self.robot.left_arm.get_joint_pos()}"
+                                )
+                                logger.warning(f"Warning: Large left arm error: {left_arm_error}")
+                        else:
+                            now = time.monotonic()
+                            if now - self._last_left_workspace_warn_t > 0.5:
+                                self._last_left_workspace_warn_t = now
+                                bounds = self._left_workspace_checker.bounds
+                                logger.warning(
+                                    f"Left EEF out of workspace: "
+                                    f"xyz={eef_xyz.round(3).tolist()} "
+                                    f"(bounds x{bounds['x']}, y{bounds['y']}, "
+                                    f"z{bounds['z']}) — freezing left arm."
+                                )
                     if vr.right_arm_pos:
                         in_bounds = True
                         eef_xyz = None
-                        if self._workspace_checker is not None:
+                        if self._right_workspace_checker is not None:
                             head_for_fk = head_target if head_target else list(INIT_HEAD_JOINTS)
-                            in_bounds, eef_xyz = self._workspace_checker.is_in_workspace(
-                                right_arm=vr.right_arm_pos,
+                            in_bounds, eef_xyz = self._right_workspace_checker.is_in_workspace(
+                                arm_joints=vr.right_arm_pos,
                                 head=head_for_fk,
                                 torso=list(INIT_TORSO_JOINTS),
                             )
@@ -339,9 +373,9 @@ class VRRobotController:
                                 )
                         else:
                             now = time.monotonic()
-                            if now - self._last_workspace_warn_t > 0.5:
-                                self._last_workspace_warn_t = now
-                                bounds = self._workspace_checker.bounds
+                            if now - self._last_right_workspace_warn_t > 0.5:
+                                self._last_right_workspace_warn_t = now
+                                bounds = self._right_workspace_checker.bounds
                                 logger.warning(
                                     f"Right EEF out of workspace: "
                                     f"xyz={eef_xyz.round(3).tolist()} "
@@ -418,8 +452,8 @@ def main(
     the robot hardware directly.
 
     Args:
-        workspace_check: Gate right-arm commands on the configured Cartesian
-            workspace bounds. Pass --workspace-check to enable.
+        workspace_check: Gate both arms' commands on their configured Cartesian
+            workspace bounds (left mirrors right). Pass --workspace-check to enable.
     """
     setup_logging(debug)
     ctrl = VRRobotController(

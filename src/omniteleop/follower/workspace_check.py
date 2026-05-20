@@ -28,7 +28,17 @@ DEFAULT_RIGHT_BOUNDS: dict[str, tuple[float, float]] = {
     "y": (-0.70, 0.20),
     "z": (0.72, 1.10), # 0.72 is hitting the table
 }
+# Left bounds are the right bounds mirrored across the robot's sagittal plane:
+# the y-interval (-0.70, 0.20) reflects to (-0.20, 0.70); x and z are shared
+# (same table, same reach envelope). VERIFY EMPIRICALLY by driving the left EEF
+# to each corner, the way DEFAULT_RIGHT_BOUNDS was originally mapped.
+DEFAULT_LEFT_BOUNDS: dict[str, tuple[float, float]] = {
+    "x": (0.0, 0.75),
+    "y": (-0.20, 0.70),
+    "z": (0.72, 1.10),  # 0.72 is hitting the table
+}
 DEFAULT_RIGHT_LINK = "R_ee"
+DEFAULT_LEFT_LINK = "L_ee"
 DEFAULT_ROBOT_NAME = "vega_no_effector"
 
 _DEFAULT_TORSO = [math.pi / 2.0, math.pi, math.pi / 8.0]
@@ -80,14 +90,18 @@ class WorkspaceChecker:
 
     def compute_eef_xyz(
         self,
-        right_arm: Sequence[float],
+        arm_joints: Sequence[float],
         head: Sequence[float],
         torso: Sequence[float],
     ) -> np.ndarray:
-        """Run FK on (torso, right_arm, head) and return EEF xyz in robot base frame."""
-        if len(right_arm) != len(self._arm_qidx):
+        """Run FK on (torso, arm_joints, head) and return EEF xyz in robot base frame.
+
+        ``arm_joints`` are the 7 joints of whichever arm this checker was built
+        for (``arm_joint_names`` / ``arm_link`` in __init__).
+        """
+        if len(arm_joints) != len(self._arm_qidx):
             raise ValueError(
-                f"right_arm has {len(right_arm)} joints, expected {len(self._arm_qidx)}"
+                f"arm_joints has {len(arm_joints)} joints, expected {len(self._arm_qidx)}"
             )
         if len(head) != len(self._head_qidx):
             raise ValueError(
@@ -100,7 +114,7 @@ class WorkspaceChecker:
 
         for q, v in zip(self._torso_qidx, torso, strict=True):
             self._qpos[q] = v
-        for q, v in zip(self._arm_qidx, right_arm, strict=True):
+        for q, v in zip(self._arm_qidx, arm_joints, strict=True):
             self._qpos[q] = v
         for q, v in zip(self._head_qidx, head, strict=True):
             self._qpos[q] = v
@@ -110,12 +124,12 @@ class WorkspaceChecker:
 
     def is_in_workspace(
         self,
-        right_arm: Sequence[float],
+        arm_joints: Sequence[float],
         head: Sequence[float],
         torso: Sequence[float],
     ) -> tuple[bool, np.ndarray]:
         """Return (in_bounds, xyz). Bounds are inclusive on both sides."""
-        xyz = self.compute_eef_xyz(right_arm, head, torso)
+        xyz = self.compute_eef_xyz(arm_joints, head, torso)
         in_bounds = (
             self.bounds["x"][0] <= xyz[0] <= self.bounds["x"][1]
             and self.bounds["y"][0] <= xyz[1] <= self.bounds["y"][1]
@@ -153,7 +167,7 @@ def main() -> None:
 
     checker = WorkspaceChecker(robot_name=args.robot_name, arm_link=args.right_link)
     in_bounds, xyz = checker.is_in_workspace(
-        right_arm=right_arm, head=head, torso=torso
+        arm_joints=right_arm, head=head, torso=torso
     )
 
     print(f"xyz: [{xyz[0]:+.6f}, {xyz[1]:+.6f}, {xyz[2]:+.6f}]")

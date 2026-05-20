@@ -33,7 +33,7 @@ python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending c
 
 1. check network on lambda, dexmate
 2. ssh dexmate, conda activate dexmate
-3. run '(dexmate) dextop node start' and 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera' and 'dexsensor launch -c ~/.dexmate/sensors/default.toml --sensor wrist_zedm' in tmux
+3. run '(dexmate) dextop node start' 'dexsensor launch -c ~/.dexmate/sensors/default.toml --sensor wrist_zedm' and then 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera'  in tmux
 
 3.1 test wrist camera via  ZED SDK (do not run dexsensor): 
 
@@ -68,6 +68,9 @@ fixed_pose mode:
 4. Reset
 5. Repeat 2-3
 # if you forgot position last time, run scripts/save_rgb_print_fps.py
+
+before shutdown:
+python -m omniteleop.follower.safearm_shutdown # reposition arm so that they fall onto table
 ```
 
 - scripts/vis_episode.py (Optional)

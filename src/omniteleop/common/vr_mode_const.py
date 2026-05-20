@@ -4,15 +4,8 @@ INIT_HEAD_JOINTS = [-np.pi / 8.0, 0.0, 0.0]
 INIT_TORSO_JOINTS = [np.pi / 2.0, np.pi, np.pi / 8.0]
 SAFE_LEFT_ARM_JOINTS = [np.pi / 3.0, 0.0, 0.0, -np.pi * 2.0 / 3.0, 0.0, 0.0, 0.0]
 SAFE_RIGHT_ARM_JOINTS = [-np.pi / 3.0, 0.0, 0.0, -np.pi * 2.0 / 3.0, 0.0, 0.0, 0.0]
-INIT_LEFT_ARM_JOINTS = [
-    1.4998975,
-    0.19498293,
-    -0.21315183,
-    -1.3266282,
-    0.49401367,
-    -1.3039546,
-    0.67662925
-]
+INIT_LEFT_ARM_JOINTS = [ 1.6959364 ,  0.21902311, -0.35161752, -1.5194558 ,  0.6528282 ,
+       -1.2291011 ,  0.72751427]
 INIT_RIGHT_ARM_JOINTS = [
     -1.6348639,
     0.05716477,

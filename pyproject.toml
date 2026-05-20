@@ -60,6 +60,7 @@ omni-vr = "omniteleop.leader.vr_reader:main"
 omni-cmd = "omniteleop.follower.command_processor:main"
 omni-robot = "omniteleop.follower.robot_controller:main"
 omni-vr-robot = "omniteleop.follower.vr_robot_controller:main"
+omni-safearm-shutdown = "omniteleop.follower.safearm_shutdown:main"
 omni-telemetry = "omniteleop.tools.telemetry_viewer:main"
 omni-recorder = "omniteleop.record.mdp_recorder:main"
 
