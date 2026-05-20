@@ -23,6 +23,12 @@ pip install omniteleop
 - [ZED camera](https://www.stereolabs.com/docs) 
   - [Depth sensing](https://www.stereolabs.com/docs/depth-sensing)
 
+## Latency
+
+```python
+python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending cmd in different curves
+```
+
 ## Data collection
 
 1. check network on lambda, dexmate
@@ -35,9 +41,8 @@ pip install omniteleop
 python /home/dexmate/yixuan/omniteleop/tests/test_wrist_zedm_depth.py --duration 5 --save-dir /home/dexmate/yixuan/Dexmate
 ```
 
-  
-4. ssh lambda  
-5. run  
+1. ssh lambda
+2. run
   (dexmate) python src/omniteleop/follower/vr_robot_controller.py # workspace_check = True, joint positions in vr_mode_const, head_mode and left_arm_mode in src/omniteleop/configs/vega_1_f5d6.yaml  
     (dexmate) python src/omniteleop/leader/vr_reader.py # start-mode=fixed_pose
 
@@ -123,16 +128,16 @@ Run infer_dexmate.py before deploy.
 
 ```bash
 python -m omniteleop.follower.policy_rollout \
-      --policy-path /home/yixuan/Dexmate/model/dp/dexmate_eef_eef_abs/checkpoints/last/pretrained_model \
-      --record_dir /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef/last
+      --policy-path /home/yixuan/Dexmate/model/dp/dexmate_eef_eef_relative/checkpoints/last/pretrained_model \
+      --record_dir /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef_relative/last
 # ACT deploy uses checkpoint n_action_steps and temporal_ensemble_coeff by default.
 # use the training stats baked into the checkpoint
 ```
 
 ```bash
-python scripts/vis_eef_curves.py \
+python scripts/vis_deploy.py \
         --gt /home/yixuan/Dexmate/data/raw_data_renamed/test/episode_0.hdf5 \
-        --infer /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef/last/0/episode_0.hdf5
+        --infer /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef/last/2/episode_0.hdf5
 ```
 
 ```bash

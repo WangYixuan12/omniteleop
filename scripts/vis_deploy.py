@@ -147,6 +147,38 @@ def load_infer_pos(infer_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]
     return act[:, :3], obs[:, :3], grip
 
 
+def export_infer_csv(infer_path: str, out_dir: Path) -> None:
+    """Write ``/action`` and ``/obs`` EEF arrays (9D + gripper) to two CSVs in ``out_dir``.
+
+    Each CSV has 10 columns: the 9D EEF pose followed by the matching gripper
+    scalar (``/action/gripper/right`` for the action file, ``/obs/gripper/right``
+    for the obs file). File names are ``{stem}_eef_action.csv`` and
+    ``{stem}_eef_obs.csv`` where ``stem`` is the INFER file stem (e.g.
+    ``episode_0``).
+    """
+    with h5py.File(infer_path, "r") as f:
+        act = np.array(f["/action/eef_9d/right"], dtype=np.float32)
+        obs = np.array(f["/obs/eef_9d/right"], dtype=np.float32)
+        act_grip = np.array(f["/action/gripper/right"], dtype=np.float32)
+        obs_grip = np.array(f["/obs/gripper/right"], dtype=np.float32)
+    stem = Path(infer_path).stem
+    header = ",".join([*(f"d{i}" for i in range(9)), "gripper"])
+    for arr, grip, suffix, eef_key, grip_key in (
+        (act, act_grip, "eef_action", "/action/eef_9d/right", "/action/gripper/right"),
+        (obs, obs_grip, "eef_obs", "/obs/eef_9d/right", "/obs/gripper/right"),
+    ):
+        if arr.ndim != 2 or arr.shape[1] != 9:
+            raise ValueError(f"{eef_key} shape: expected (T, 9), got {arr.shape}")
+        if grip.ndim != 1 or grip.shape[0] != arr.shape[0]:
+            raise ValueError(
+                f"{grip_key} shape: expected ({arr.shape[0]},), got {grip.shape}"
+            )
+        out = np.concatenate([arr, grip[:, None]], axis=1)
+        out_path = out_dir / f"{stem}_{suffix}.csv"
+        np.savetxt(out_path, out, delimiter=",", header=header, comments="")
+        print(f"saved {out_path}")
+
+
 def contig_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     """Return ``[(start, end_exclusive), ...]`` for contiguous True runs in ``mask``."""
     if mask.size == 0:
@@ -182,6 +214,8 @@ def main() -> None:
     out_dir = Path(args.out) if args.out is not None else Path(args.infer).resolve().parent
     if not out_dir.is_dir():
         raise ValueError(f"--out is not an existing directory: {out_dir}")
+
+    export_infer_csv(args.infer, out_dir)
 
     kin = _Kin()
     gt_obs_pos = compute_gt_pos(args.gt, kin)

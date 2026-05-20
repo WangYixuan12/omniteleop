@@ -99,7 +99,12 @@ from omniteleop.common.vr_mode_const import (
     SAFE_RIGHT_ARM_JOINTS,
 )
 from omniteleop.follower.component_processors import ArmProcessor
-from omniteleop.follower.robotiq import build_hande_command, send_activate
+from omniteleop.follower.robotiq import (
+    RobotiqStatusMonitor,
+    build_hande_command,
+    poll_gripper_status,
+    send_activate,
+)
 from omniteleop.follower.workspace_check import WorkspaceChecker
 
 # LeRobot policy stack
@@ -295,7 +300,34 @@ class PolicyRolloutController:
         self._last_cmd_right = np.array(self.robot.right_arm.get_joint_pos())
         # Initialise the IK chain at the observed home pose.
         self._chained_right_arm_qpos = self._last_cmd_right.astype(np.float32)
-        logger.success("Robot ready (home, gripper open).")
+
+        # Robotiq Hand-E achieved-position sensor. Training-time
+        # observation.state[9] is the raw float `gPO/255` (range ≈ [0.012, 0.655]
+        # on this hardware), NOT the binary command. Feeding the binary command
+        # at inference normalizes to ≈ +2.07 under MIN_MAX (way outside training
+        # range) and destabilizes diffusion policies in particular. Mirror the
+        # leader's pattern (vr_reader.py:1383, :1392): synchronous warmup poll
+        # to seed the cache, then RobotiqStatusMonitor for async sampling. The
+        # monitor's subscriber filters FC16 ACKs from FC03 status replies, so
+        # it coexists with our outbound gripper writes on the same topic.
+        warm = poll_gripper_status(
+            self.robot.right_arm, function_code=0x03, timeout_s=0.5
+        )
+        if warm is None:
+            logger.warning(
+                "Gripper FC03 warmup failed — falling back to 0.0 until the "
+                "monitor catches up. Verify enable_ee_pass_through=True."
+            )
+            self._last_obs_grip_right = 0.0
+        else:
+            self._last_obs_grip_right = float(warm["actual"])
+        self._grip_monitor = RobotiqStatusMonitor(
+            self.robot.right_arm, side="right", function_code=0x03
+        )
+        self._grip_monitor.send_status_request()
+        logger.success(
+            f"Robot ready (home, gripper open, achieved={self._last_obs_grip_right:.3f})."
+        )
 
     def initialize_policy(
         self,
@@ -577,14 +609,33 @@ class PolicyRolloutController:
         )
         return fk["R_ee"].np  # type: ignore[attr-defined]
 
+    def _poll_gripper_status_step(self) -> None:
+        """Drain queued FC03 replies and send the next status request.
+
+        Mirrors ``vr_reader._poll_gripper_status_step``. Called once per policy
+        tick so ``self._last_obs_grip_right`` is refreshed at ~policy_fps,
+        which matches the leader's 15 Hz cadence during recording.
+        """
+        events = self._grip_monitor.drain_status_events()
+        if events:
+            self._last_obs_grip_right = float(events[-1]["actual"])
+        self._grip_monitor.expire_timeouts(0.5)
+        self._grip_monitor.send_status_request()
+
     def _build_observation(self) -> dict:
         """Construct an unbatched dataset-style sample for ``self._pre()``."""
+        # Refresh achieved gripper before reading state — training-time
+        # observation.state[9] is the raw FC03 ``actual`` value, not the binary
+        # command, so we must mirror what port_dexmate_hdf5.py recorded.
+        self._poll_gripper_status_step()
+        gripper_obs = self._last_obs_grip_right
+
         right_arm = np.asarray(self.robot.right_arm.get_joint_pos(), dtype=np.float32)
         if self.variant.state_is_eef:
             T_ee = self._current_eef_pose()
             obs_eef_9d = _mat_to_pos6d(T_ee)
             state = np.concatenate(
-                [obs_eef_9d, [self._last_gripper_cmd]]
+                [obs_eef_9d, [gripper_obs]]
             ).astype(np.float32)
         else:
             if self._motion_manager is not None:
@@ -592,7 +643,7 @@ class PolicyRolloutController:
             else:
                 obs_eef_9d = np.full(9, np.nan, dtype=np.float32)
             state = np.concatenate(
-                [right_arm, [self._last_gripper_cmd]]
+                [right_arm, [gripper_obs]]
             ).astype(np.float32)
 
         img_hwc, left_rgb, depth_u16 = self._read_head_camera()
@@ -600,8 +651,8 @@ class PolicyRolloutController:
         self._last_obs_depth_u16 = depth_u16
         self._last_obs_right_arm_qpos = right_arm.copy()
         self._last_obs_eef_9d = obs_eef_9d.astype(np.float32)
-        # Last element of observation.state (commanded gripper at obs build time).
-        self._last_obs_gripper = np.float32(self._last_gripper_cmd)
+        # Last element of observation.state (achieved gripper at obs build time).
+        self._last_obs_gripper = np.float32(gripper_obs)
         # Mirror what LeRobotDataset.__getitem__ returns: CHW float32 in [0, 1].
         img_chw = (
             torch.from_numpy(img_hwc).permute(2, 0, 1).float() / 255.0
@@ -1069,6 +1120,12 @@ class PolicyRolloutController:
                     logger.warning(f"Recorder still saving at exit: {path}")
                 else:
                     logger.info(f"Recorded rollout → {path}")
+        monitor = getattr(self, "_grip_monitor", None)
+        if monitor is not None:
+            try:
+                monitor.close()
+            except Exception as e:
+                logger.warning(f"grip_monitor.close() raised: {e}")
         if hasattr(self, "robot") and self.robot is not None:
             try:
                 self.robot.shutdown()
