@@ -481,9 +481,11 @@ class VRReader:
         self._prev_b: bool = False
         self._prev_x: bool = False
         self._prev_y: bool = False
-        # Stage counter saved per recorded frame: 0 when recording starts,
-        # +1 on every A-press during recording (B stops as before).
-        self._stage: int = 0
+        # Left-arm freeze toggle: A-press during recording flips it. While set,
+        # the left arm holds the pose captured at freeze time. Transient state —
+        # never written to the recorded HDF5.
+        self._left_arm_frozen: bool = False
+        self._frozen_left_pos: Optional[list[float]] = None
 
         # IK / timing telemetry — populated by _solve_and_apply_arm_ik (or
         # set to NaN/skip-reason on every bypass path) and read by
@@ -525,11 +527,17 @@ class VRReader:
         self._curr_left_target: np.ndarray = np.eye(4)
         self._curr_right_target: np.ndarray = np.eye(4)
 
-        # Per-arm calibration for fixed_pose mode: target = T @ vr_wrist.
-        # Recomputed each frame in whole_body_alignment, locked on trigger
-        # advance to whole_body.
+        # Per-arm calibration for fixed_pose mode. Position and orientation are
+        # locked separately so controller tilt at lock time does not skew
+        # subsequent Cartesian translation.
         self._vr_to_robot_left: Optional[np.ndarray] = None
         self._vr_to_robot_right: Optional[np.ndarray] = None
+        self._fixed_left_robot0: Optional[np.ndarray] = None
+        self._fixed_right_robot0: Optional[np.ndarray] = None
+        self._fixed_left_vr_pos0: Optional[np.ndarray] = None
+        self._fixed_right_vr_pos0: Optional[np.ndarray] = None
+        self._fixed_left_vr_rot0: Optional[np.ndarray] = None
+        self._fixed_right_vr_rot0: Optional[np.ndarray] = None
 
         self.visualize = visualize
         if visualize:
@@ -940,6 +948,26 @@ class VRReader:
         self._last_ik_failure_reason = reason
         self._last_ik_solve_ms = float("nan")
 
+    def _clear_fixed_pose_calibration(self) -> None:
+        self._vr_to_robot_left = None
+        self._vr_to_robot_right = None
+        self._fixed_left_robot0 = None
+        self._fixed_right_robot0 = None
+        self._fixed_left_vr_pos0 = None
+        self._fixed_right_vr_pos0 = None
+        self._fixed_left_vr_rot0 = None
+        self._fixed_right_vr_rot0 = None
+
+    def _has_fixed_pose_calibration(self) -> bool:
+        return (
+            self._fixed_left_robot0 is not None
+            and self._fixed_right_robot0 is not None
+            and self._fixed_left_vr_pos0 is not None
+            and self._fixed_right_vr_pos0 is not None
+            and self._fixed_left_vr_rot0 is not None
+            and self._fixed_right_vr_rot0 is not None
+        )
+
     def _arm_ik_step(
         self, vr_l: np.ndarray, vr_r: np.ndarray
     ) -> tuple[list[float], list[float], Optional[np.ndarray], Optional[np.ndarray]]:
@@ -964,17 +992,9 @@ class VRReader:
         self, vr_l: np.ndarray, vr_r: np.ndarray
     ) -> tuple[list[float], list[float], Optional[np.ndarray], Optional[np.ndarray]]:
         if self._calib_stage == "whole_body_alignment":
-            # Arm is held at FIXED (set by resetting). Recompute per-arm
-            # calibration each frame so it reflects the user's current hand
-            # pose; locked when the user trigger-advances to whole_body.
-            left_fk = self.kin.compute_fk_from_link_idx(self.current_qpos, [self.left_arm_eef_idx])[
-                0
-            ]
-            right_fk = self.kin.compute_fk_from_link_idx(
-                self.current_qpos, [self.right_arm_eef_idx]
-            )[0]
-            self._vr_to_robot_left = left_fk @ np.linalg.inv(vr_l)
-            self._vr_to_robot_right = right_fk @ np.linalg.inv(vr_r)
+            # Arm is held at FIXED (set by resetting). Recompute per-arm lock
+            # state each frame so it reflects the user's current hand pose;
+            # locked when the user trigger-advances to whole_body.
             safe_left = self.left_proc.limit_joint_step(list(INIT_LEFT_ARM_JOINTS))
             safe_right = self.right_proc.limit_joint_step(list(INIT_RIGHT_ARM_JOINTS))
             self.left_proc.apply_positions(safe_left)
@@ -983,15 +1003,52 @@ class VRReader:
                 self.current_qpos[self.joint_name_to_idx[n]] = safe_left[i]
             for i, n in enumerate(self.right_proc.joint_names):
                 self.current_qpos[self.joint_name_to_idx[n]] = safe_right[i]
+            left_fk = self.kin.compute_fk_from_link_idx(
+                self.current_qpos, [self.left_arm_eef_idx]
+            )[0]
+            right_fk = self.kin.compute_fk_from_link_idx(
+                self.current_qpos, [self.right_arm_eef_idx]
+            )[0]
+            self._fixed_left_robot0 = left_fk.copy()
+            self._fixed_right_robot0 = right_fk.copy()
+            self._fixed_left_vr_pos0 = vr_l[:3, 3].copy()
+            self._fixed_right_vr_pos0 = vr_r[:3, 3].copy()
+            self._fixed_left_vr_rot0 = vr_l[:3, :3].copy()
+            self._fixed_right_vr_rot0 = vr_r[:3, :3].copy()
+            # Kept for debug/backward compatibility; live fixed_pose tracking
+            # uses the split lock state above.
+            self._vr_to_robot_left = left_fk @ np.linalg.inv(vr_l)
+            self._vr_to_robot_right = right_fk @ np.linalg.inv(vr_r)
             self._mark_ik_skipped("skipped_alignment_fixed")
             return safe_left.tolist(), safe_right.tolist(), left_fk, right_fk
 
-        # whole_body: use locked per-arm calibration
-        if self._vr_to_robot_left is None or self._vr_to_robot_right is None:
+        # whole_body: use locked per-arm calibration. Translation follows the
+        # VR position delta in the calibrated VR/base frame; rotation follows
+        # relative controller orientation.
+        if not self._has_fixed_pose_calibration():
             self._mark_ik_skipped("skipped_no_calibration")
             return [], [], None, None
-        ik_l = self._vr_to_robot_left @ vr_l
-        ik_r = self._vr_to_robot_right @ vr_r
+        assert self._fixed_left_robot0 is not None
+        assert self._fixed_right_robot0 is not None
+        assert self._fixed_left_vr_pos0 is not None
+        assert self._fixed_right_vr_pos0 is not None
+        assert self._fixed_left_vr_rot0 is not None
+        assert self._fixed_right_vr_rot0 is not None
+        robot_base_r_vr_base = self._robot_base_t_vr_base[:3, :3]
+        ik_l = self._fixed_left_robot0.copy()
+        ik_r = self._fixed_right_robot0.copy()
+        ik_l[:3, 3] = self._fixed_left_robot0[:3, 3] + robot_base_r_vr_base @ (
+            vr_l[:3, 3] - self._fixed_left_vr_pos0
+        )
+        ik_r[:3, 3] = self._fixed_right_robot0[:3, 3] + robot_base_r_vr_base @ (
+            vr_r[:3, 3] - self._fixed_right_vr_pos0
+        )
+        ik_l[:3, :3] = (
+            self._fixed_left_robot0[:3, :3] @ self._fixed_left_vr_rot0.T @ vr_l[:3, :3]
+        )
+        ik_r[:3, :3] = (
+            self._fixed_right_robot0[:3, :3] @ self._fixed_right_vr_rot0.T @ vr_r[:3, :3]
+        )
         left_pos, right_pos = self._solve_and_apply_arm_ik(ik_l, ik_r)
         return left_pos, right_pos, ik_l, ik_r
 
@@ -1070,8 +1127,7 @@ class VRReader:
 
         if x_now and not self._prev_x:
             self._calib_stage = "static"
-            self._vr_to_robot_left = None
-            self._vr_to_robot_right = None
+            self._clear_fixed_pose_calibration()
             console.rule("[bold red]Stage reset → static (left X)")
 
         if y_now and not self._prev_y:
@@ -1092,6 +1148,7 @@ class VRReader:
             self._reset_step_idx = 0
             self._reset_phase = 1
             self._calib_stage = "resetting"
+            self._clear_fixed_pose_calibration()
             console.rule("[bold cyan]Resetting to safe pose… (left Y)")
 
         self._prev_x = x_now
@@ -1110,6 +1167,7 @@ class VRReader:
                 )
                 return
             self._calib_stage = "whole_body_alignment"
+            self._clear_fixed_pose_calibration()
             self._curr_left_target = self.kin.compute_fk_from_link_idx(
                 self.current_qpos, [self.left_arm_eef_idx]
             )[0].copy()
@@ -1124,13 +1182,39 @@ class VRReader:
             else:
                 console.rule("[bold cyan]Stage whole_body_alignment — approaching arm targets…")
         elif self._calib_stage == "whole_body_alignment" and self.start_mode == "fixed_pose":
-            if self._vr_to_robot_left is None or self._vr_to_robot_right is None:
+            if not self._has_fixed_pose_calibration():
                 console.print(
                     "[bold red]fixed_pose: calibration not yet computed — wait one frame[/]"
                 )
                 return
             self._calib_stage = "whole_body"
             console.rule("[bold green]Calibration locked → whole_body")
+
+    def _toggle_left_arm_freeze(self) -> None:
+        """A-press during recording: freeze the left arm at its current pose, or
+        release it. Freeze state is transient and never written to the HDF5."""
+        self._left_arm_frozen = not self._left_arm_frozen
+        if self._left_arm_frozen:
+            self._frozen_left_pos = [
+                float(self.current_qpos[self.joint_name_to_idx[n]])
+                for n in self.left_proc.joint_names
+            ]
+            console.print("[bold cyan]Left arm frozen — press A to release[/]")
+        else:
+            self._frozen_left_pos = None
+            console.print("[bold cyan]Left arm released — tracking resumed[/]")
+
+    def _pin_left_arm(self, left_joints: list[float]) -> None:
+        """Hold the leader's left-arm tracking state at ``left_joints``.
+
+        Pinning the processor and current_qpos (not just the published value)
+        keeps the command static while frozen and lets limit_joint_step ramp
+        smoothly when the arm is released — the follower applies commands with
+        no step limit, so the smoothing must happen here.
+        """
+        self.left_proc.apply_positions(np.asarray(left_joints, dtype=float))
+        for i, n in enumerate(self.left_proc.joint_names):
+            self.current_qpos[self.joint_name_to_idx[n]] = left_joints[i]
 
     def _handle_recording(
         self,
@@ -1143,7 +1227,7 @@ class VRReader:
         vx: float,
         vy: float,
         wz: float,
-    ) -> None:
+    ) -> list[float]:
         a_now = transforms["right_a_button"]
         b_now = transforms["right_b_button"]
 
@@ -1158,31 +1242,43 @@ class VRReader:
             if self.save_debug:
                 self.debug_recorder.start(self.recorder.episode_id)
             self.recorder.start()
-            self._stage = 0
+            self._left_arm_frozen = False
+            self._frozen_left_pos = None
             self._recorded_obs_grip_event_count_left = self._obs_grip_event_count_left
             self._recorded_obs_grip_event_count_right = self._obs_grip_event_count_right
             self._next_record_t = 0.0  # anchor cadence to the first recorded frame
             console.print(
                 f"[bold green]Recording started at {self.record_rate:g} Hz "
-                "(stage 0, press A to advance stage, B to stop)[/]"
+                "(press A to freeze/release left arm, B to stop)[/]"
             )
         elif a_now and not self._prev_a and self.recorder.recording:
-            self._stage += 1
-            console.print(f"[bold cyan]Stage → {self._stage}[/]")
+            self._toggle_left_arm_freeze()
         if b_now and not self._prev_b and self.recorder.recording:
             path = self.recorder.stop()
             console.print(f"[bold yellow]Saving in background → {path}[/]")
             if self.save_debug:
                 debug_path = self.debug_recorder.stop()
                 console.print(f"[bold yellow]Debug saving in background → {debug_path}[/]")
+            self._left_arm_frozen = False
+            self._frozen_left_pos = None
 
         self._prev_a = a_now
         self._prev_b = b_now
 
+        # While frozen, hold the left arm at the captured pose for both the
+        # published command and the recorded action.
+        if (
+            self.recorder.recording
+            and self._left_arm_frozen
+            and self._frozen_left_pos is not None
+        ):
+            self._pin_left_arm(self._frozen_left_pos)
+            left_pos = list(self._frozen_left_pos)
+
         if not self.recorder.recording or self._calib_stage != "whole_body":
-            return
+            return left_pos
         if not self._all_selected_streams_ready():
-            return
+            return left_pos
 
         # Throttle to record_rate so saved HDF5 has a consistent FPS independent
         # of publish_rate. Cadence is locked to ideal timestamps; if the loop
@@ -1191,7 +1287,7 @@ class VRReader:
         if self._next_record_t == 0.0:
             self._next_record_t = now_t
         if now_t < self._next_record_t:
-            return
+            return left_pos
         self._next_record_t += self._record_period_s
         if now_t > self._next_record_t:
             self._next_record_t = now_t + self._record_period_s
@@ -1240,7 +1336,6 @@ class VRReader:
 
         frame = {
             "timestamp_ns": np.int64(time.time_ns()),
-            "stage": np.int64(self._stage),
             "action": {
                 "joint": {
                     "left_arm": np.array(left_pos, dtype=np.float32),
@@ -1272,7 +1367,7 @@ class VRReader:
         self.recorder.record(frame)
 
         if not self.save_debug:
-            return
+            return left_pos
 
         # Debug keeps the robot/world-frame EEF poses that were passed to IK.
         # Raw VR wrist poses stay under debug vr_raw/*.
@@ -1358,6 +1453,7 @@ class VRReader:
             },
         }
         self.debug_recorder.record(debug_frame)
+        return left_pos
 
     def _publish(
         self,
@@ -1481,16 +1577,29 @@ class VRReader:
                     # one (H, 2W, 3) RGB frame; slice into the eyes we need.
                     wrist_frame = self._cam_robot.sensors.wrist_zedm.get_obs()
                     if wrist_frame is not None:
+                        if (
+                            wrist_frame.ndim != 3
+                            or wrist_frame.shape[2] != 3
+                            or wrist_frame.shape[1] % 2 != 0
+                        ):
+                            raise ValueError(
+                                f"Unexpected wrist frame shape {wrist_frame.shape}; "
+                                "expected (H, 2W, 3) side-by-side stereo RGB."
+                            )
                         half_w = wrist_frame.shape[1] // 2
+                        # .copy() each half: get_obs() hands back a reused capture
+                        # buffer the driver overwrites in place, so a bare view
+                        # tears in the live preview and corrupts recorded frames
+                        # (which are only np.stack-copied at save time).
                         for half in self._wrist_halves:
                             if half == "left_rgb":
                                 self._last_wrist_imgs["left_rgb"] = wrist_frame[
                                     :, :half_w, :
-                                ]
+                                ].copy()
                             elif half == "right_rgb":
                                 self._last_wrist_imgs["right_rgb"] = wrist_frame[
                                     :, half_w:, :
-                                ]
+                                ].copy()
                 if step % 4 == 0:
                     self._camera_poll()
                 vr_head = transforms["head"]
@@ -1512,7 +1621,7 @@ class VRReader:
                 chassis_vx, chassis_vy, chassis_wz = self._thumbstick_to_chassis(transforms)
 
                 self._handle_stage_transition(transforms)
-                self._handle_recording(
+                left_pos = self._handle_recording(
                     transforms,
                     vr_l,
                     vr_r,
@@ -1612,10 +1721,10 @@ def main() -> None:
         urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"  # noqa
         """Path to robot URDF for Sapien visualizer (required if --visualize)"""
 
-        save_dir: str = "/home/yixuan/Dexmate/data/raw_data_2"
+        save_dir: str = "/home/yixuan/Dexmate/data/raw_data"
         """Directory to save episode_<N>.hdf5 files (A=start, B=stop)"""
 
-        debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/raw_data_2"
+        debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/raw_data"
         """Directory to save episode_<N>_debug.hdf5 files"""
 
         start_mode: StartMode = "fixed_pose"
@@ -1625,7 +1734,7 @@ def main() -> None:
         configuration; user trigger-advances out of whole_body_alignment to
         lock the per-arm calibration."""
 
-        save_debug: bool = True
+        save_debug: bool = False
         """If False, skip building and saving episode_<N>_debug.hdf5 to reduce
         per-frame overhead and shorten save time."""
 

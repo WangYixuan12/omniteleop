@@ -11,7 +11,7 @@ Targets the ``raw_data_2`` HDF5 layout::
     obs/gripper/{left, right}
     action/joint/{left_arm, right_arm, head, chassis_*}
     action/gripper/{left, right}
-    stage, timestamp_ns
+    timestamp_ns  (legacy episodes may also carry a top-level ``stage``)
 
 EEF frames are no longer stored in the episode, so they are recovered via
 forward kinematics from the observed arm joints (``L_ee`` / ``R_ee`` links).
@@ -20,6 +20,11 @@ Usage::
 
     python scripts/vis_episode.py --hdf5 data/episode_0.hdf5
     python scripts/vis_episode.py --hdf5 data/episode_0.hdf5 --voxel 0.01
+    python scripts/vis_episode.py --hdf5 data/episode_0.hdf5 --save out.rrd
+
+Robot link geometry is logged once as static and animated per-frame with a
+Transform3D, rather than re-sending full meshes each frame -- this keeps the
+recording (and viewer memory) ~20x smaller with no visual change.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ import argparse
 
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 import torch
 from yixuan_utilities.hdf5_utils import load_dict_from_hdf5
 from yixuan_utilities.kinematics_helper import KinHelper
@@ -105,11 +111,19 @@ def main() -> None:
     parser.add_argument(
         "--hdf5",
         type=str,
-        default="/home/yixuan/Dexmate/data/raw_data_2/episode_3.hdf5",
+        default="/home/yixuan/Dexmate/data/raw_data/episode_7.hdf5",
         help="Path to episode HDF5 file",
     )
     parser.add_argument(
         "--voxel", type=float, default=0.008, help="Voxel size for PCD downsample (m)"
+    )
+    parser.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        help="If set, stream to this .rrd file headlessly instead of spawning a "
+        "viewer (useful over SSH: generate on the server, open later with "
+        "`rerun FILE.rrd`). Default: spawn the viewer (single-script workflow).",
     )
     args = parser.parse_args()
 
@@ -126,12 +140,13 @@ def main() -> None:
     obs_right_arm = np.array(data["obs"]["joint"]["right_arm"])  # (N,7)
     obs_head = np.array(data["obs"]["joint"]["head"])  # (N,3)
 
-    # ── scalar streams (gripper may be NaN, stage is an int label) ───────────
+    # ── scalar streams (gripper may be NaN) ──────────────────────────────────
     obs_grip_left = np.array(data["obs"]["gripper"]["left"])  # (N,)
     obs_grip_right = np.array(data["obs"]["gripper"]["right"])  # (N,)
     act_grip_left = np.array(data["action"]["gripper"]["left"])  # (N,)
     act_grip_right = np.array(data["action"]["gripper"]["right"])  # (N,)
-    stage = np.array(data["stage"])  # (N,)
+    # "stage" was dropped from recordings; keep showing it for legacy episodes.
+    stage = np.array(data["stage"]) if "stage" in data else None  # (N,) or None
 
     N = head_rgb.shape[0]
     H, W = head_rgb.shape[1], head_rgb.shape[2]
@@ -191,8 +206,56 @@ def main() -> None:
     robot_mesh_gen = RobotMeshGenerator("vega_no_effector")
 
     # ── rerun ────────────────────────────────────────────────────────────────
-    rr.init("vis_episode", spawn=True)
+    rr.init("vis_episode", spawn=args.save is None)
+    if args.save is not None:
+        rr.save(args.save)
+        print(f"Streaming to {args.save} (headless; no viewer spawned)")
+
+    # ── default layout: wrist RGB, world PCD, head RGB, grippers, stage ──────
+    # Entity paths below mirror where the streams are logged further down; an
+    # explicit blueprint also stops the viewer falling back to a stale auto
+    # layout that reported "Entity not found in view" for the wrist image.
+    blueprint = rrb.Blueprint(
+        rrb.Horizontal(
+            rrb.Spatial3DView(origin="/world", name="world pointcloud"),
+            rrb.Vertical(
+                rrb.Spatial2DView(origin="/image/left_wrist_rgb", name="left_wrist_rgb"),
+                rrb.Spatial2DView(origin="/world/camera/rgb", name="head_left_rgb"),
+                rrb.TimeSeriesView(
+                    name="gripper (obs)",
+                    contents=["/plot/gripper/obs_left", "/plot/gripper/obs_right"],
+                ),
+            ),
+            column_shares=[2, 1],
+        ),
+        collapse_panels=True,
+    )
+    rr.send_blueprint(blueprint, make_active=True, make_default=True)
+
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+
+    # ── distinct colors per gripper series (otherwise rerun auto-picks green for both)
+    rr.log("plot/gripper/obs_left", rr.SeriesLines(colors=[230, 25, 75], names="obs_left"), static=True)
+    rr.log("plot/gripper/obs_right", rr.SeriesLines(colors=[0, 130, 200], names="obs_right"), static=True)
+    rr.log("plot/gripper/act_left", rr.SeriesLines(colors=[245, 130, 48], names="act_left"), static=True)
+    rr.log("plot/gripper/act_right", rr.SeriesLines(colors=[60, 180, 75], names="act_right"), static=True)
+
+    # ── robot link geometry: log ONCE as static, then animate per-frame via
+    #    Transform3D in the loop below. Re-logging full Mesh3D every frame costs
+    #    ~42 MB/frame here (39 links, 1.85M verts ≈ 28 GB over a 664-frame
+    #    episode); static geometry collapses that to a one-time cost. Pixel
+    #    identical — verified 0 m vertex diff vs compute_robot_meshes.
+    robot_link_names = list(robot_mesh_gen.meshes.keys())
+    for name in robot_link_names:
+        m = robot_mesh_gen.meshes[name]
+        rr.log(
+            f"world/robot/{name}",
+            rr.Mesh3D(
+                vertex_positions=np.asarray(m.vertices, dtype=np.float32),
+                triangle_indices=np.asarray(m.faces, dtype=np.uint32),
+            ),
+            static=True,
+        )
 
     for idx in range(N):
         rr.set_time("frame", sequence=idx)
@@ -219,7 +282,7 @@ def main() -> None:
         pts, cols = voxel_downsample(pts, cols, args.voxel)
         rr.log("world/pcd", rr.Points3D(pts, colors=cols, radii=0.003))
 
-        # ── robot meshes (already in world frame from compute_robot_meshes) ──
+        # ── robot pose: per-frame transforms only (geometry is static above) ──
         joints_vals = (
             [0.0] * len(_WHEEL_NAMES)
             + obs_torso[idx].tolist()
@@ -228,16 +291,17 @@ def main() -> None:
             + obs_head[idx].tolist()
         )
         joint_names = _WHEEL_NAMES + _OBS_NAMES
-        joints_arr = np.array(joints_vals)
-        joints_arr = robot_mesh_gen.convert_to_sapien_joint_order(joints_arr, joint_names)
-        meshes = robot_mesh_gen.compute_robot_meshes(joints_arr)
-        for i, mesh in enumerate(meshes):
+        qpos = robot_mesh_gen.convert_to_sapien_joint_order(
+            np.array(joints_vals), joint_names
+        )
+        link_tf = robot_mesh_gen.compute_fk_from_link_names(
+            qpos, robot_link_names, in_obj_frame=True
+        )
+        for name in robot_link_names:
+            tf = link_tf[name]
             rr.log(
-                f"world/robot/link_{i}",
-                rr.Mesh3D(
-                    vertex_positions=np.asarray(mesh.vertices, dtype=np.float32),
-                    triangle_indices=np.asarray(mesh.faces, dtype=np.uint32),
-                ),
+                f"world/robot/{name}",
+                rr.Transform3D(translation=tf[:3, 3], mat3x3=tf[:3, :3]),
             )
 
         # ── EEF frames (FK from observed arm joints) ────────────────────────
@@ -247,12 +311,11 @@ def main() -> None:
                 continue
             rr.log(name, rr.Transform3D(translation=mat[:3, 3], mat3x3=mat[:3, :3]))
 
-        # ── scalar plots: gripper (obs vs action) and stage label ───────────
+        # ── scalar plots: gripper (obs vs action) ───────────────────────────
         rr.log("plot/gripper/obs_left", rr.Scalars(float(obs_grip_left[idx])))
         rr.log("plot/gripper/obs_right", rr.Scalars(float(obs_grip_right[idx])))
         rr.log("plot/gripper/act_left", rr.Scalars(float(act_grip_left[idx])))
         rr.log("plot/gripper/act_right", rr.Scalars(float(act_grip_right[idx])))
-        rr.log("plot/stage", rr.Scalars(float(stage[idx])))
 
 
 if __name__ == "__main__":

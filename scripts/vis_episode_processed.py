@@ -4,30 +4,34 @@ Sibling to ``scripts/vis_episode_online.py`` — same rendering structure, but
 sourced entirely from processed parquet variants produced by
 ``examples/port_datasets/port_dexmate_hdf5.py`` (no raw HDF5 input).
 
-Two variants of the same source episode are loaded in lockstep:
+Two variants of the same source episode are loaded in lockstep. Both are now
+BIMANUAL — each vector is the LEFT arm's block followed by the RIGHT arm's block:
 
 - ``--marker_and_plot_dir`` (the ``dexmate_eef_eef`` variant root):
-    * ``observation.state`` (N, 10) — FK on the OBSERVED arm joints (pos6d +
-      raw gripper); the EEF pose the robot actually reached.
-    * ``action`` (N, 10) — FK on the COMMANDED arm joints (pos6d + binary
-      gripper); identical to the joint_eef action by construction.
-    * Camera scene: ``observation.images.left_rgb`` + depth sidecar drive
-      the rerun RGB / depth / point-cloud panels.
+    * ``observation.state`` (N, 20) — per arm: FK on the OBSERVED arm joints
+      (pos6d + raw gripper); the EEF pose the robot actually reached. Left =
+      ``[0:10]``, Right = ``[10:20]``; each block = ``[tx,ty,tz, R6(6), grip]``.
+    * ``action`` (N, 20) — per arm: FK on the COMMANDED arm joints (pos6d +
+      binary gripper); the FK image of the dexmate_joint_joint action.
+    * Camera scene: ``observation.images.head_rgb`` + depth sidecar drive the
+      head RGB / depth / point-cloud panels; ``observation.images.wrist_rgb``
+      drives a plain 2D wrist panel (no calibration/depth for the wrist).
 
-- ``--urdf_joint_motion_dir`` (the ``dexmate_joint_eef`` variant root):
-    * ``observation.state`` (N, 8) — right-arm joints + raw gripper;
-      ``state[:7]`` drives the URDF mesh visualization.
+- ``--urdf_joint_motion_dir`` (the ``dexmate_joint_joint`` variant root):
+    * ``observation.state`` (N, 16) — per arm: 7 joints + raw gripper. The left
+      arm ``[0:7]`` and right arm ``[8:15]`` drive both URDF arms.
 
-What this shows (matches the README "What ``vis_episode_processed.py`` shows" block):
+What this shows:
 
-- **EEF position** — red markers = ``action``[:3]; blue markers =
-  ``observation.state``[:3] (eef variant).
-- **Robot URDF** — pose follows ``observation.state`` from the joint_eef
-  variant (``state[:7]`` feeds right-arm joints, the rest pinned at INIT_*).
-- **Gripper** — red curve = ``action`` gripper (binary commanded); blue
-  curve = ``observation.state`` gripper (raw observed).
-- **Matplotlib EEF xyz** — red = ``action``, blue = ``observation.state``;
-  per-axis cross-correlation lag (positive = state lags action) annotated.
+- **EEF position** — per arm, red markers = ``action`` pos; blue markers =
+  ``observation.state`` pos (eef variant).
+- **Robot URDF** — pose follows ``observation.state`` from the joint_joint
+  variant (left arm ``[0:7]`` + right arm ``[8:15]``; torso/head pinned INIT_*).
+- **Gripper** — two plots (left, right). In each: red = ``action`` gripper
+  (binary commanded); blue = ``observation.state`` gripper (raw observed).
+  Left gripper = dim 9, right gripper = dim 19.
+- **Matplotlib EEF xyz** — per arm (left + right), red = ``action``, blue =
+  ``observation.state``; per-axis cross-correlation lag annotated.
 
 A small per-frame divergence is expected (controller tracking lag); large
 divergence indicates a port-time or controller bug.
@@ -51,7 +55,7 @@ Usage::
 
     python scripts/vis_episode_processed.py \\
         --marker_and_plot_dir /home/yixuan/omniteleop/Dexmate/data/processed_data/train/dexmate_eef_eef \\
-        --urdf_joint_motion_dir /home/yixuan/omniteleop/Dexmate/data/processed_data/train/dexmate_joint_eef \\
+        --urdf_joint_motion_dir /home/yixuan/omniteleop/Dexmate/data/processed_data/train/dexmate_joint_joint \\
         --episode_index 0
 """
 
@@ -89,6 +93,13 @@ _OBS_NAMES = (
 
 _COLOR_ACTION = (255, 0, 0)   # red  — ``action`` markers + binary gripper
 _COLOR_STATE  = (0, 80, 255)  # blue — ``observation.state`` markers + raw gripper
+
+# Bimanual layout (LEFT block then RIGHT). EEF blocks are 10-D
+# [tx,ty,tz, R6(6), gripper]; joint blocks are 8-D [7 joints, gripper].
+_ARM_SIDES = ("left", "right")
+_EEF_BASE = {"left": 0, "right": 10}             # start col of each 10-D eef block
+_EEF_GRIP_IDX = {"left": 9, "right": 19}         # gripper col within state_eef / action
+_JOINT_ARM_SLICE = {"left": slice(0, 7), "right": slice(8, 15)}  # 7 arm joints per side
 
 _GRIPPER_Y_MIN = -0.2
 _GRIPPER_Y_MAX = 1.1
@@ -282,6 +293,7 @@ def _build_eef_xyz_figs(
     action_xyz: np.ndarray,
     state_xyz: np.ndarray,
     dt_s: float,
+    prefix: str = "",
 ) -> list[plt.Figure]:
     """Three figures (one per axis) comparing ``action`` vs ``observation.state``.
 
@@ -313,7 +325,7 @@ def _build_eef_xyz_figs(
         ax.set_xlabel("t (s)")
         ax.set_ylabel(f"eef_{axis_name} (m)")
         ax.set_title(
-            f"EEF {axis_name}"
+            f"{prefix}EEF {axis_name}"
         )
         ax.legend(loc="upper right", fontsize=8)
         ax.grid(alpha=0.3)
@@ -337,7 +349,7 @@ def main() -> None:
         "--urdf_joint_motion_dir",
         type=str,
         required=True,
-        help="Path to the dexmate_joint_eef variant root. Provides "
+        help="Path to the dexmate_joint_joint variant root. Provides "
              "observation.state (joint) so state[:7] drives the URDF mesh "
              "right-arm pose.",
     )
@@ -345,7 +357,25 @@ def main() -> None:
     parser.add_argument(
         "--voxel", type=float, default=0.008, help="Voxel size for PCD downsample (m)."
     )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Log every Nth frame (>=1). Robot mesh geometry is logged once "
+        "regardless; this trims the per-frame image/depth/pointcloud cost, "
+        "which dominates memory after the mesh fix.",
+    )
+    parser.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        help="If set, stream to this .rrd file headlessly instead of spawning a "
+        "viewer (useful over SSH: generate on the server, open later with "
+        "`rerun FILE.rrd`). Default: spawn the viewer (single-script workflow).",
+    )
     args = parser.parse_args()
+    if args.stride < 1:
+        raise ValueError(f"--stride must be >= 1, got {args.stride}")
 
     eef_root   = Path(args.marker_and_plot_dir)
     joint_root = Path(args.urdf_joint_motion_dir)
@@ -379,9 +409,9 @@ def main() -> None:
         )
 
     # Pre-collect numeric trails so future-trail markers are O(1) per frame.
-    state_eef   = np.stack([dataset_eef[i]["observation.state"].numpy()   for i in range(N)])  # (N, 10)
-    action      = np.stack([dataset_eef[i]["action"].numpy()              for i in range(N)])  # (N, 10)
-    state_joint = np.stack([dataset_joint[i]["observation.state"].numpy() for i in range(N)])  # (N, 8)
+    state_eef   = np.stack([dataset_eef[i]["observation.state"].numpy()   for i in range(N)])  # (N, 20)
+    action      = np.stack([dataset_eef[i]["action"].numpy()              for i in range(N)])  # (N, 20)
+    state_joint = np.stack([dataset_joint[i]["observation.state"].numpy() for i in range(N)])  # (N, 16)
 
     # Depth sidecar (NOT in the parquet — see docstring). Read from
     # marker_and_plot_dir; both variants write the same sidecar content per
@@ -425,21 +455,27 @@ def main() -> None:
             f"calib sidecar intrinsic frame count {intrinsic_stack.shape[0]} != {N}"
         )
 
-    if state_joint.shape[1] != 8:
+    if state_joint.shape[1] != 16:
         raise ValueError(
-            f"--urdf_joint_motion_dir observation.state: expected (N, 8), got {state_joint.shape}"
+            f"--urdf_joint_motion_dir observation.state: expected bimanual (N, 16), got {state_joint.shape}"
         )
-    if state_eef.shape[1] != 10:
+    if state_eef.shape[1] != 20:
         raise ValueError(
-            f"--marker_and_plot_dir observation.state: expected (N, 10), got {state_eef.shape}"
+            f"--marker_and_plot_dir observation.state: expected bimanual (N, 20), got {state_eef.shape}"
         )
-    if action.shape[1] != 10:
+    if action.shape[1] != 20:
         raise ValueError(
-            f"--marker_and_plot_dir action: expected (N, 10), got {action.shape}"
+            f"--marker_and_plot_dir action: expected bimanual (N, 20), got {action.shape}"
+        )
+    if "observation.images.wrist_rgb" not in dataset_eef.meta.features:
+        raise ValueError(
+            "--marker_and_plot_dir is missing observation.images.wrist_rgb; "
+            "re-port with the bimanual port_dexmate_hdf5.py (stores head + wrist)."
         )
 
-    action_pos    = action[:, :3]
-    state_eef_pos = state_eef[:, :3]
+    # Per-arm EEF position trails (LEFT block then RIGHT), keyed by side.
+    action_pos    = {side: action[:, _EEF_BASE[side]:_EEF_BASE[side] + 3]   for side in _ARM_SIDES}
+    state_eef_pos = {side: state_eef[:, _EEF_BASE[side]:_EEF_BASE[side] + 3] for side in _ARM_SIDES}
 
     # ── EEF xyz figures: action vs observation.state with lag ────────────────
     # Built before the rerun loop so they pop up immediately. ``plt.show()`` at
@@ -447,14 +483,18 @@ def main() -> None:
     # rerun viewer is a separate process and is unaffected.
     dt_s = 1.0 / float(dataset_eef.fps) if dataset_eef.fps else 1.0 / 30.0
     t_s = np.arange(N, dtype=np.float64) * dt_s
-    eef_figs = _build_eef_xyz_figs(t_s, action_pos, state_eef_pos, dt_s)
+    eef_figs: list[plt.Figure] = []
+    for side in _ARM_SIDES:
+        eef_figs += _build_eef_xyz_figs(
+            t_s, action_pos[side], state_eef_pos[side], dt_s, prefix=f"{side} "
+        )
     print(
-        f"built {len(eef_figs)} EEF xyz figures "
+        f"built {len(eef_figs)} EEF xyz figures (left+right) "
         f"(dt = {dt_s*1000:.1f} ms, fps = {1.0/dt_s:.1f} Hz)"
     )
 
     # ── RGB dimensions (constant across frames) ──────────────────────────────
-    sample_rgb = _rgb_to_hwc(dataset_eef[0]["observation.images.left_rgb"])
+    sample_rgb = _rgb_to_hwc(dataset_eef[0]["observation.images.head_rgb"])
     H, W = sample_rgb.shape[:2]
     print(f"episode {args.episode_index}: {N} frames  |  rgb: {H}x{W}  |  calib from sidecar")
 
@@ -467,41 +507,45 @@ def main() -> None:
     head_init  = np.asarray(INIT_HEAD_JOINTS,  dtype=np.float64)
 
     # ── rerun setup ──────────────────────────────────────────────────────────
-    rr.init("vis_episode_processed", spawn=True)
+    rr.init("vis_episode_processed", spawn=args.save is None)
+    if args.save is not None:
+        rr.save(args.save)
+        print(f"Streaming to {args.save} (headless; no viewer spawned)")
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
 
-    # Explicit layout: default auto-views are disabled once we send a blueprint,
-    # so we must include a 2D view for ``world/camera/rgb`` (and depth) in
-    # addition to the 3D world and the gripper time series.
+    # Explicit layout (auto-views are disabled once a blueprint is sent). Default
+    # panels: 3D world (pointcloud + robot + both-arm EEF markers), head RGB/depth
+    # (pinhole, under world/camera), wrist RGB (plain 2D, no calib/depth), and the
+    # left + right gripper time series.
     lookback = max(400, min(N, 5000))
     lookahead = min(80, max(1, N // 50 + 5))
+
+    def _gripper_view(origin: str, name: str) -> rrb.TimeSeriesView:
+        return rrb.TimeSeriesView(
+            origin=origin,
+            name=name,
+            axis_y=rrb.ScalarAxis(range=(_GRIPPER_Y_MIN, _GRIPPER_Y_MAX), zoom_lock=True),
+            time_ranges=[
+                rrb.VisibleTimeRange(
+                    "frame",
+                    start=rrb.TimeRangeBoundary.cursor_relative(seq=-lookback),
+                    end=rrb.TimeRangeBoundary.cursor_relative(seq=lookahead),
+                )
+            ],
+        )
+
     rr.send_blueprint(
         rrb.Blueprint(
             rrb.Vertical(
                 rrb.Horizontal(
-                    rrb.Spatial3DView(origin="world", name="World"),
-                    rrb.Spatial2DView(
-                        origin="world/camera",
-                        name="Camera (RGB / depth)",
-                    ),
-                    column_shares=[2.0, 1.4],
+                    rrb.Spatial3DView(origin="world", name="World (pointcloud + robot)"),
+                    rrb.Spatial2DView(origin="world/camera", name="Head RGB / depth"),
+                    rrb.Spatial2DView(origin="wrist", name="Wrist RGB"),
+                    column_shares=[2.0, 1.3, 1.3],
                 ),
-                rrb.TimeSeriesView(
-                    origin="plots/gripper",
-                    name="Gripper",
-                    axis_y=rrb.ScalarAxis(
-                        range=(_GRIPPER_Y_MIN, _GRIPPER_Y_MAX),
-                        zoom_lock=True,
-                    ),
-                    time_ranges=[
-                        rrb.VisibleTimeRange(
-                            "frame",
-                            start=rrb.TimeRangeBoundary.cursor_relative(
-                                seq=-lookback
-                            ),
-                            end=rrb.TimeRangeBoundary.cursor_relative(seq=lookahead),
-                        )
-                    ],
+                rrb.Horizontal(
+                    _gripper_view("plots/gripper_left", "Left gripper"),
+                    _gripper_view("plots/gripper_right", "Right gripper"),
                 ),
                 row_shares=[2.2, 1.0],
             ),
@@ -509,26 +553,45 @@ def main() -> None:
         )
     )
 
-    # Two named gripper series sharing one plot entity.
-    #   action[9]              (red)  — binarized commanded gripper
-    #   observation.state[9]   (blue) — raw obs gripper /obs/gripper/right
-    rr.log(
-        "plots/gripper",
-        rr.SeriesLines(
-            colors=[_COLOR_ACTION, _COLOR_STATE],
-            names=["action", "observation.state"],
-            widths=[2.0, 2.0],
-        ),
-        static=True,
-    )
+    # One gripper plot per arm; each shares two named series:
+    #   action[grip]            (red)  — binarized commanded gripper
+    #   observation.state[grip] (blue) — raw obs gripper /obs/gripper/{side}
+    # Left gripper = dim 9, right gripper = dim 19.
+    for side in _ARM_SIDES:
+        rr.log(
+            f"plots/gripper_{side}",
+            rr.SeriesLines(
+                colors=[_COLOR_ACTION, _COLOR_STATE],
+                names=[f"{side} action", f"{side} observation.state"],
+                widths=[2.0, 2.0],
+            ),
+            static=True,
+        )
 
     # Camera transform and pinhole are logged per-frame in the loop below
     # because the extrinsic/intrinsic can change each frame.
 
+    # ── robot link geometry: log ONCE as static, then animate per-frame via
+    #    Transform3D in the loop below. Re-logging full Mesh3D every frame costs
+    #    ~42 MB/frame (39 links, 1.85M verts); static geometry collapses that to
+    #    a one-time cost. Pixel identical — verified 0 m vertex diff.
+    robot_link_names = list(robot_mesh_gen.meshes.keys())
+    for name in robot_link_names:
+        m = robot_mesh_gen.meshes[name]
+        rr.log(
+            f"world/robot/{name}",
+            rr.Mesh3D(
+                vertex_positions=np.asarray(m.vertices, dtype=np.float32),
+                triangle_indices=np.asarray(m.faces, dtype=np.uint32),
+            ),
+            static=True,
+        )
+
     # ── Per-frame loop ───────────────────────────────────────────────────────
     # Sequence (idx) timeline; playback rate is set by ``TimePanel(fps=...)``
-    # above so the viewer advances at ``_PLAYBACK_FPS`` at 1× speed.
-    for idx in range(N + 1):
+    # above so the viewer advances at ``_PLAYBACK_FPS`` at 1× speed. The trailing
+    # ``[N]`` index drives the end-of-episode marker clear regardless of stride.
+    for idx in list(range(0, N, args.stride)) + [N]:
         rr.set_time("frame", sequence=idx)
 
         if idx == N:
@@ -552,42 +615,55 @@ def main() -> None:
             rr.Pinhole(image_from_camera=K32, width=W, height=H),
         )
 
-        # Future-trail markers + current pose frames.
-        rr.log(
-            "world/action/marker",
-            rr.Points3D(action_pos[idx:], colors=[_COLOR_ACTION], radii=0.006),
-        )
-        rr.log(
-            "world/action/frame",
-            rr.Transform3D(
-                translation=action_pos[idx], mat3x3=gram_schmidt_6d_to_R(action[idx, 3:9])
-            ),
-        )
-        rr.log(
-            "world/state/marker",
-            rr.Points3D(state_eef_pos[idx:], colors=[_COLOR_STATE], radii=0.006),
-        )
-        rr.log(
-            "world/state/frame",
-            rr.Transform3D(
-                translation=state_eef_pos[idx], mat3x3=gram_schmidt_6d_to_R(state_eef[idx, 3:9])
-            ),
-        )
+        # Future-trail markers + current pose frames, per arm (action red, state blue).
+        # rot6 sits at cols base+3:base+9 within each arm's 10-D block.
+        for side in _ARM_SIDES:
+            b = _EEF_BASE[side]
+            rr.log(
+                f"world/action/{side}/marker",
+                rr.Points3D(action_pos[side][idx:], colors=[_COLOR_ACTION], radii=0.006),
+            )
+            rr.log(
+                f"world/action/{side}/frame",
+                rr.Transform3D(
+                    translation=action_pos[side][idx],
+                    mat3x3=gram_schmidt_6d_to_R(action[idx, b + 3:b + 9]),
+                ),
+            )
+            rr.log(
+                f"world/state/{side}/marker",
+                rr.Points3D(state_eef_pos[side][idx:], colors=[_COLOR_STATE], radii=0.006),
+            )
+            rr.log(
+                f"world/state/{side}/frame",
+                rr.Transform3D(
+                    translation=state_eef_pos[side][idx],
+                    mat3x3=gram_schmidt_6d_to_R(state_eef[idx, b + 3:b + 9]),
+                ),
+            )
 
-        # RGB from parquet; depth from sidecar.
-        rgb = _rgb_to_hwc(frame["observation.images.left_rgb"])
+        # Head RGB from parquet; depth from sidecar (both under world/camera).
+        rgb = _rgb_to_hwc(frame["observation.images.head_rgb"])
         depth_mm = depth_stack[idx]
         rr.log("world/camera/rgb", rr.Image(rgb))
         rr.log("world/camera/depth", rr.DepthImage(depth_mm, meter=1000.0))
 
-        # Project current observation.state EEF position onto the camera image.
-        uv_state, uv_valid = project_world_to_pixel(
-            state_eef_pos[idx : idx + 1], K, world_t_cam
-        )
-        if uv_valid[0]:
+        # Wrist RGB: plain 2D panel (no calibration/depth for the wrist camera).
+        wrist_rgb = _rgb_to_hwc(frame["observation.images.wrist_rgb"])
+        rr.log("wrist/rgb", rr.Image(wrist_rgb))
+
+        # Project each arm's observation.state EEF position onto the head image.
+        uv_pts = []
+        for side in _ARM_SIDES:
+            uv, uv_valid = project_world_to_pixel(
+                state_eef_pos[side][idx : idx + 1], K, world_t_cam
+            )
+            if uv_valid[0]:
+                uv_pts.append(uv[0])
+        if uv_pts:
             rr.log(
                 "world/camera/eef_state_2d",
-                rr.Points2D(uv_state, colors=[_COLOR_STATE], radii=2.0),
+                rr.Points2D(np.asarray(uv_pts, dtype=np.float32), colors=[_COLOR_STATE], radii=2.0),
             )
         else:
             rr.log("world/camera/eef_state_2d", rr.Clear(recursive=False))
@@ -599,34 +675,37 @@ def main() -> None:
         pts, cols = voxel_downsample(pts, cols, args.voxel)
         rr.log("world/pcd", rr.Points3D(pts, colors=cols, radii=0.003))
 
-        # Robot mesh: right arm from state_joint[:7] (dexmate_joint_eef variant),
-        # rest pinned at INIT_*. Matches the README "Robot URDF: pose follows
-        # observation.state (dexmate_joint_eef)" bullet.
+        # Robot pose: BOTH arms from the dexmate_joint_joint variant (left arm
+        # state_joint[0:7], right arm state_joint[8:15]); torso/head pinned INIT_*.
+        # Geometry is static (logged once above); here we emit only per-link transforms.
         joint_vals = (
             [0.0] * len(_WHEEL_NAMES)
             + list(INIT_TORSO_JOINTS)
-            + list(INIT_LEFT_ARM_JOINTS)
-            + state_joint[idx, :7].tolist()
+            + state_joint[idx, _JOINT_ARM_SLICE["left"]].tolist()
+            + state_joint[idx, _JOINT_ARM_SLICE["right"]].tolist()
             + list(INIT_HEAD_JOINTS)
         )
         joint_names = _WHEEL_NAMES + _OBS_NAMES
-        joints_arr = robot_mesh_gen.convert_to_sapien_joint_order(
+        qpos = robot_mesh_gen.convert_to_sapien_joint_order(
             np.array(joint_vals), joint_names
         )
-        for i, mesh in enumerate(robot_mesh_gen.compute_robot_meshes(joints_arr)):
+        link_tf = robot_mesh_gen.compute_fk_from_link_names(
+            qpos, robot_link_names, in_obj_frame=True
+        )
+        for name in robot_link_names:
+            tf = link_tf[name]
             rr.log(
-                f"world/robot/link_{i}",
-                rr.Mesh3D(
-                    vertex_positions=np.asarray(mesh.vertices, dtype=np.float32),
-                    triangle_indices=np.asarray(mesh.faces, dtype=np.uint32),
-                ),
+                f"world/robot/{name}",
+                rr.Transform3D(translation=tf[:3, 3], mat3x3=tf[:3, :3]),
             )
 
-        # Gripper scalars: [action[9], state_eef[9]] → matches SeriesLines order.
-        rr.log(
-            "plots/gripper",
-            rr.Scalars([float(action[idx, 9]), float(state_eef[idx, 9])]),
-        )
+        # Gripper scalars per arm: [action[grip], state_eef[grip]] → SeriesLines order.
+        for side in _ARM_SIDES:
+            g = _EEF_GRIP_IDX[side]
+            rr.log(
+                f"plots/gripper_{side}",
+                rr.Scalars([float(action[idx, g]), float(state_eef[idx, g])]),
+            )
 
     # Block on the matplotlib windows so the user can inspect the EEF curves
     # while the rerun viewer (separate process) continues running.

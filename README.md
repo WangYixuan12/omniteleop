@@ -38,10 +38,10 @@ python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending c
 3.1 test wrist camera via  ZED SDK (do not run dexsensor): 
 
 ```python
-python /home/dexmate/yixuan/omniteleop/tests/test_wrist_zedm_depth.py --duration 5 --save-dir /home/dexmate/yixuan/Dexmate
+python /home/dexmate/yixuan/omniteleop/tests/test_wrist_zedm_depth.py --duration 10 --save-dir /home/dexmate/yixuan/Dexmate
 ```
 
-1. ssh lambda
+1. ssh lambda, conda activate dexmate
 2. run
   (dexmate) python src/omniteleop/follower/vr_robot_controller.py # workspace_check = True, joint positions in vr_mode_const, head_mode and left_arm_mode in src/omniteleop/configs/vega_1_f5d6.yaml  
     (dexmate) python src/omniteleop/leader/vr_reader.py # start-mode=fixed_pose
@@ -69,14 +69,19 @@ fixed_pose mode:
 5. Repeat 2-3
 # if you forgot position last time, run scripts/save_rgb_print_fps.py
 
+python examples/advanced_examples/admittance_control.py # manual adjustment
+
 before shutdown:
 python -m omniteleop.follower.safearm_shutdown # reposition arm so that they fall onto table
+
+visualize:
+python /home/yixuan/omniteleop/scripts/vis_episode.py
 ```
 
 - scripts/vis_episode.py (Optional)
 
 ```bash
-1. scripts/rename_raw_data.py  # revise train/val/test range
+1. python /home/yixuan/omniteleop/scripts/rename_raw_data.py # revise train/val/test range
 ```
 
 ```bash
