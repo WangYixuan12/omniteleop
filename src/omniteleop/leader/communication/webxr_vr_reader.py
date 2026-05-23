@@ -266,7 +266,18 @@ class WebXRVRReader:
 
         async def serve_html(request: aiohttp.web.Request) -> aiohttp.web.FileResponse:
             html_path = os.path.abspath(_HTML_PATH)
-            return aiohttp.web.FileResponse(html_path)
+            # No Cache-Control => the Quest browser caches vr_client.html
+            # heuristically and serves a stale copy after we edit it (e.g. the
+            # camera-quad geometry), so restarting vr_reader.py appears to do
+            # nothing. Forbid caching so every page load re-fetches the latest.
+            return aiohttp.web.FileResponse(
+                html_path,
+                headers={
+                    "Cache-Control": "no-cache, no-store, must-revalidate",
+                    "Pragma": "no-cache",
+                    "Expires": "0",
+                },
+            )
 
         app.router.add_get("/", serve_html)
         return app

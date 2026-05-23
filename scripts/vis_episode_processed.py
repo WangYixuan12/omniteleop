@@ -25,6 +25,11 @@ What this shows:
 
 - **EEF position** — per arm, red markers = ``action`` pos; blue markers =
   ``observation.state`` pos (eef variant).
+- **Position condition** — per frame, orange/green markers on the head RGB
+  panel show the selected 6-D ``observation.environment_state`` chunk:
+  before XYZ and after XYZ. Selection uses ``observation.pos_condition_mask``
+  exactly like training (``[1, 0]`` -> ``environment_state[:6]``,
+  ``[0, 1]`` -> ``environment_state[6:12]``).
 - **Robot URDF** — pose follows ``observation.state`` from the joint_joint
   variant (left arm ``[0:7]`` + right arm ``[8:15]``; torso/head pinned INIT_*).
 - **Gripper** — two plots (left, right). In each: red = ``action`` gripper
@@ -93,6 +98,12 @@ _OBS_NAMES = (
 
 _COLOR_ACTION = (255, 0, 0)   # red  — ``action`` markers + binary gripper
 _COLOR_STATE  = (0, 80, 255)  # blue — ``observation.state`` markers + raw gripper
+_COLOR_CONDITION_BEFORE = (255, 180, 0)  # orange — selected condition before XYZ
+_COLOR_CONDITION_AFTER = (0, 220, 120)   # green  — selected condition after XYZ
+_COLOR_CONDITION_LINE = (255, 255, 255)  # white  — before->after condition vector
+
+_OBS_ENV_STATE_KEY = "observation.environment_state"
+_OBS_POS_CONDITION_MASK_KEY = "observation.pos_condition_mask"
 
 # Bimanual layout (LEFT block then RIGHT). EEF blocks are 10-D
 # [tx,ty,tz, R6(6), gripper]; joint blocks are 8-D [7 joints, gripper].
@@ -137,6 +148,64 @@ def project_world_to_pixel(
     u = K[0, 0] * pts_cam[:, 0] / z_safe + K[0, 2]
     v = K[1, 1] * pts_cam[:, 1] / z_safe + K[1, 2]
     return np.stack([u, v], axis=-1).astype(np.float32), valid
+
+
+def select_position_conditions(
+    env_state: np.ndarray,
+    pos_condition_mask: np.ndarray | None,
+    *,
+    condition_dim: int = 6,
+) -> np.ndarray:
+    """Select per-frame position condition with the same slot logic as training."""
+    if condition_dim <= 0:
+        raise ValueError(f"condition_dim must be positive, got {condition_dim}")
+
+    env = np.asarray(env_state, dtype=np.float32)
+    if env.ndim != 2:
+        raise ValueError(
+            f"{_OBS_ENV_STATE_KEY} must be 2-D (T, D), got shape {env.shape}"
+        )
+    if not np.all(np.isfinite(env)):
+        raise ValueError(f"{_OBS_ENV_STATE_KEY} must contain only finite values")
+
+    frame_count, env_dim = env.shape
+    if env_dim == condition_dim:
+        return env.copy()
+    if env_dim % condition_dim != 0:
+        raise ValueError(
+            f"{_OBS_ENV_STATE_KEY} last dimension must be {condition_dim} or a "
+            f"multiple of it, got shape {env.shape}"
+        )
+    if pos_condition_mask is None:
+        raise ValueError(
+            f"{_OBS_POS_CONDITION_MASK_KEY} is required to select a {condition_dim}-D "
+            f"condition from {_OBS_ENV_STATE_KEY} shape {env.shape}"
+        )
+
+    object_count = env_dim // condition_dim
+    mask = np.asarray(pos_condition_mask, dtype=np.float32)
+    if mask.shape != (frame_count, object_count):
+        raise ValueError(
+            f"{_OBS_POS_CONDITION_MASK_KEY} shape must be {(frame_count, object_count)} "
+            f"to match {_OBS_ENV_STATE_KEY} shape {env.shape}, got {mask.shape}"
+        )
+    if not np.all(np.isfinite(mask)):
+        raise ValueError(
+            f"{_OBS_POS_CONDITION_MASK_KEY} must contain finite one-hot values"
+        )
+
+    is_binary = np.isclose(mask, 0.0, atol=1e-4, rtol=0) | np.isclose(
+        mask, 1.0, atol=1e-4, rtol=0
+    )
+    if not np.all(is_binary) or not np.allclose(
+        mask.sum(axis=-1), 1.0, atol=1e-4, rtol=0
+    ):
+        raise ValueError(
+            f"{_OBS_POS_CONDITION_MASK_KEY} must be one-hot along the last dimension"
+        )
+
+    env_blocks = env.reshape(frame_count, object_count, condition_dim)
+    return np.sum(env_blocks * mask[:, :, None], axis=1, dtype=np.float32)
 
 
 def unproject_depth(
@@ -412,6 +481,26 @@ def main() -> None:
     state_eef   = np.stack([dataset_eef[i]["observation.state"].numpy()   for i in range(N)])  # (N, 20)
     action      = np.stack([dataset_eef[i]["action"].numpy()              for i in range(N)])  # (N, 20)
     state_joint = np.stack([dataset_joint[i]["observation.state"].numpy() for i in range(N)])  # (N, 16)
+    missing_position_features = [
+        key for key in (_OBS_ENV_STATE_KEY, _OBS_POS_CONDITION_MASK_KEY)
+        if key not in dataset_eef.meta.features
+    ]
+    if missing_position_features:
+        raise ValueError(
+            "--marker_and_plot_dir is missing position-conditioning feature(s): "
+            f"{missing_position_features}. Re-port with --positions-dir so the viewer "
+            "can overlay the selected 6-D position condition on the head RGB."
+        )
+    env_state = np.stack([dataset_eef[i][_OBS_ENV_STATE_KEY].numpy() for i in range(N)])
+    pos_condition_mask = np.stack([
+        dataset_eef[i][_OBS_POS_CONDITION_MASK_KEY].numpy() for i in range(N)
+    ])
+    position_condition = select_position_conditions(env_state, pos_condition_mask)  # (N, 6)
+    if position_condition.shape != (N, 6):
+        raise ValueError(
+            f"selected position condition must have shape {(N, 6)}, got "
+            f"{position_condition.shape}"
+        )
 
     # Depth sidecar (NOT in the parquet — see docstring). Read from
     # marker_and_plot_dir; both variants write the same sidecar content per
@@ -492,6 +581,15 @@ def main() -> None:
         f"built {len(eef_figs)} EEF xyz figures (left+right) "
         f"(dt = {dt_s*1000:.1f} ms, fps = {1.0/dt_s:.1f} Hz)"
     )
+    object_count = env_state.shape[1] // 6
+    mask_switches = (
+        np.flatnonzero(np.diff(np.argmax(pos_condition_mask, axis=1)) != 0) + 1
+    )
+    print(
+        f"position condition: env_state {env_state.shape[1]}D over "
+        f"{object_count} object slots -> selected 6D; mask switches at frames "
+        f"{mask_switches.tolist()}"
+    )
 
     # ── RGB dimensions (constant across frames) ──────────────────────────────
     sample_rgb = _rgb_to_hwc(dataset_eef[0]["observation.images.head_rgb"])
@@ -500,11 +598,7 @@ def main() -> None:
 
     # ── FK for per-frame robot meshes ─────────────────────────────────────────
     # Camera pose and intrinsics now come from the calib sidecar (per-frame).
-    kin = _Kin()
     robot_mesh_gen = RobotMeshGenerator(_ROBOT_NAME)
-    torso_init = np.asarray(INIT_TORSO_JOINTS, dtype=np.float64)
-    l_arm_init = np.asarray(INIT_LEFT_ARM_JOINTS, dtype=np.float64)
-    head_init  = np.asarray(INIT_HEAD_JOINTS,  dtype=np.float64)
 
     # ── rerun setup ──────────────────────────────────────────────────────────
     rr.init("vis_episode_processed", spawn=args.save is None)
@@ -598,6 +692,8 @@ def main() -> None:
             rr.log("world/action", rr.Clear(recursive=True))
             rr.log("world/state",  rr.Clear(recursive=True))
             rr.log("world/camera/eef_state_2d", rr.Clear(recursive=False))
+            rr.log("world/camera/position_condition_2d", rr.Clear(recursive=False))
+            rr.log("world/camera/position_condition_vector_2d", rr.Clear(recursive=False))
             continue
 
         frame = dataset_eef[idx]
@@ -667,6 +763,42 @@ def main() -> None:
             )
         else:
             rr.log("world/camera/eef_state_2d", rr.Clear(recursive=False))
+
+        # Project the selected 6-D position condition onto the head image:
+        # [before_xyz, after_xyz], chosen per-frame by observation.pos_condition_mask.
+        condition_xyz = position_condition[idx].reshape(2, 3)
+        condition_uv, condition_valid = project_world_to_pixel(
+            condition_xyz, K, world_t_cam
+        )
+        valid_condition_idx = np.flatnonzero(condition_valid)
+        if len(valid_condition_idx) > 0:
+            condition_colors = np.asarray(
+                [_COLOR_CONDITION_BEFORE, _COLOR_CONDITION_AFTER], dtype=np.uint8
+            )[valid_condition_idx]
+            rr.log(
+                "world/camera/position_condition_2d",
+                rr.Points2D(
+                    condition_uv[valid_condition_idx],
+                    colors=condition_colors,
+                    radii=np.full(len(valid_condition_idx), 3.0, dtype=np.float32),
+                ),
+            )
+        else:
+            rr.log("world/camera/position_condition_2d", rr.Clear(recursive=False))
+        if np.all(condition_valid):
+            rr.log(
+                "world/camera/position_condition_vector_2d",
+                rr.LineStrips2D(
+                    [condition_uv.astype(np.float32)],
+                    colors=[_COLOR_CONDITION_LINE],
+                    radii=1.5,
+                ),
+            )
+        else:
+            rr.log(
+                "world/camera/position_condition_vector_2d",
+                rr.Clear(recursive=False),
+            )
 
         # Point cloud (manual unproject + voxel downsample).
         depth_m = depth_mm.astype(np.float32) / 1000.0

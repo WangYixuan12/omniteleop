@@ -52,6 +52,7 @@ let xrProg  = null;
 let quadBuf = null;
 let idxBuf  = null;
 let camTex      = {};  // key → WebGLTexture
+let camAspect   = {};  // key → image width/height, sizes the quad so any tile-count renders undistorted
 let camDecoding = {};  // key → bool, true while an Image decode is in-flight
 let camPending  = {};  // key → latest b64jpeg waiting to be decoded
 let loc         = {};  // cached GL attribute/uniform locations
@@ -117,6 +118,7 @@ function _decodeCamTex(key, b64jpeg) {
     }
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
     gl.bindTexture(gl.TEXTURE_2D, null);
+    camAspect[key] = (img.naturalWidth || img.width) / (img.naturalHeight || img.height);  // drives the quad width in renderCameras
     // immediately decode the latest pending frame if one arrived while we were busy
     const next = camPending[key];
     if (next) { delete camPending[key]; _decodeCamTex(key, next); }
@@ -174,7 +176,13 @@ function renderCameras(pose) {
     gl.viewport(vp.x, vp.y, vp.width, vp.height);
     const proj = view.projectionMatrix;
     // Use identity view → positions are in eye space (y=0 = eye height, -z = forward)
-    if (camTex.img)  drawQuad(proj, _eyeView, 0.0, -0.3, -1.2, 1.35, 0.27, camTex.img);
+    // Panel height is fixed; width follows the received image's aspect ratio
+    // (camAspect, captured in _decodeCamTex) so vr_reader._camera_poll can change
+    // the preview (depth tile, RGB tiles, montage width) without re-stretching
+    // here. Falls back to 16:9 for the first frame before any decode lands.
+    const camPanelH = 0.27;
+    const camPanelW = camPanelH * (camAspect.img || (16 / 9));
+    if (camTex.img)  drawQuad(proj, _eyeView, 0.0, -0.3, -1.2, camPanelW, camPanelH, camTex.img);
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }

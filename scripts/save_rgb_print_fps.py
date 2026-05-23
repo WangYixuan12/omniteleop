@@ -1,4 +1,4 @@
-"""Save the first left_rgb frame of every HDF5 episode as a PNG.
+"""Save the first head_left_rgb frame of every HDF5 episode as a PNG.
 
 Usage::
 
@@ -52,16 +52,16 @@ def main() -> None:
             print(f"[SKIP] {path.name}: {e}")
             skipped.append((path.name, str(e)))
             continue
-        left_rgb = np.array(data["obs"]["images"]["left_rgb"])
-        if left_rgb.ndim != 4 or left_rgb.shape[0] == 0:
+        head_left_rgb = np.array(data["obs"]["images"]["head_left_rgb"])
+        if head_left_rgb.ndim != 4 or head_left_rgb.shape[0] == 0:
             raise ValueError(
-                f"{path.name}: expected left_rgb of shape (N,H,W,3), got {left_rgb.shape}"
+                f"{path.name}: expected head_left_rgb of shape (N,H,W,3), got {head_left_rgb.shape}"
             )
-        first = left_rgb[0].astype(np.uint8)
+        first = head_left_rgb[0].astype(np.uint8)
         out_path = args.dst / f"{path.stem}.png"
         Image.fromarray(first).save(out_path)
 
-        last = left_rgb[-1].astype(np.uint8)
+        last = head_left_rgb[-1].astype(np.uint8)
         out_path_last = args.dst_last / f"{path.stem}.png"
         Image.fromarray(last).save(out_path_last)
 

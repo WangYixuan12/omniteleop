@@ -46,6 +46,8 @@ Data flow::
         │     thumbsticks → chassis_vx/chassis_vy/chassis_wz
         │     index triggers → left_gripper/right_gripper
         ├─ recording path  (only while recording in whole_body)
+        │     A starts an episode, B stops it; while recording, the left/right
+        │     grip (hand) triggers toggle freeze/track for that arm.
         │     main HDF5:
         │       action/joint/* = safe published commands
         │       obs/joint/* = robot joint feedback sampled through Robot API
@@ -62,9 +64,9 @@ Data flow::
 
 Calibration stages
 ------------------
-static              Initial — hold right index trigger ≥ 1 s → head.
+static              Initial — hold right_hand_trigger ≥ 1 s → head.
 head                Head tracks VR headset.
-                    Hold right index trigger ≥ 1 s → whole_body_alignment.
+                    Hold right_hand_trigger ≥ 1 s → whole_body_alignment.
 whole_body_alignment  Arms interpolate toward current controller positions.
                     Auto-advances to whole_body when both distances < 0.02 m.
 whole_body          Live tracking with self-collision avoidance.
@@ -86,6 +88,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import os
 import pathlib
 import threading
 import time
@@ -98,11 +101,13 @@ import numpy as np
 import sapien
 import tyro
 from dexbot_utils import RobotInfo
-from dexbot_utils.configs.components.sensors.cameras import CameraConfig
+from dexbot_utils.configs.components.sensors.cameras import ZedXCameraConfig
 from dexcomm import Node, RateLimiter
 from dexcomm.codecs import DictDataCodec
 from dexcontrol.core.config import get_robot_config
 from dexcontrol.robot import Robot as _Robot
+from dexcontrol.utils.constants import COMM_CFG_PATH_ENV_VAR, ROBOT_NAME_ENV_VAR
+from dexcontrol.utils.os_utils import resolve_key_name
 from dexmotion.motion_manager import MotionManager
 from loguru import logger
 from rich.console import Console
@@ -156,16 +161,17 @@ _HEAD_STREAM_TO_OBS_KEY: dict[CameraStream, str] = {
     "head_right_rgb": "right_rgb",
     "head_depth": "depth",
 }
-# Stream id → which half of the side-by-side stereo frame to use.
-# dexsensor's usb_camera driver publishes the raw 2*W x H ZED-M output as one
-# topic; we slice it here. wrist_depth is intentionally absent — depth would
-# require running the ZED SDK, which dexsensor's usb_camera driver does not do.
-_WRIST_STREAM_TO_HALF: dict[CameraStream, str] = {
+# Stream id → ZED per-eye obs key (mirrors _HEAD_STREAM_TO_OBS_KEY). The wrist
+# ZED-M is published by a ZED-SDK publisher (see tests/test_wrist_zedm_depth.py)
+# to sensors/wrist_zedm/{left_rgb,right_rgb} — the same multi-stream layout as
+# head_camera — so we consume it via ZedCameraSensor.get_obs (no slicing). This
+# replaces dexsensor's raw V4L2 usb_camera driver, whose partial-frame grabs
+# produced torn frames. wrist_depth is intentionally absent — RGB-only here.
+_WRIST_STREAM_TO_OBS_KEY: dict[CameraStream, str] = {
     "left_wrist_rgb": "left_rgb",
     "right_wrist_rgb": "right_rgb",
 }
 _WRIST_SENSOR_ID = "wrist_zedm"
-_WRIST_TOPIC = f"sensors/{_WRIST_SENSOR_ID}/rgb"
 
 console = Console()
 
@@ -200,6 +206,7 @@ _TORSO_JOINTS = ["torso_j1", "torso_j2", "torso_j3"]
 
 _INTERP_ALPHA = 0.1  # approach interpolation step per frame
 _RESET_SPEED = 1.0  # rad/s — joint speed during Y-press reset
+_HAND_TRIGGER_PRESS = 0.7  # grip (hand) trigger value counted as a press
 
 # ── Sapien visualisation helpers ───────────────────────────────────────────────
 
@@ -380,19 +387,19 @@ class VRReader:
         )
 
         # Camera selection. Both head_camera (ZED-X Mini, GMSL) and wrist_zedm
-        # (ZED-M, USB) come from dexsensor via the dexcontrol Robot API.
-        # head_camera runs the ZED SDK inside dexsensor → rectified L/R + depth.
-        # wrist_zedm uses dexsensor's raw V4L2 usb_camera driver → a single
-        # 2W*H side-by-side BGR frame, which we slice in the loop. No depth
-        # is available for wrist this way; wrist_depth in --cameras is rejected.
+        # (ZED-M, USB) come through the dexcontrol Robot API as multi-stream ZED
+        # cameras. head_camera runs the ZED SDK in dexsensor → rectified L/R +
+        # depth. wrist_zedm is published by a standalone ZED-SDK publisher (see
+        # tests/test_wrist_zedm_depth.py) on the same left_rgb/right_rgb topics,
+        # so we consume it identically. RGB-only here; wrist_depth is rejected.
         selected = cameras if cameras else _DEFAULT_CAMERAS
         if not selected:
             raise ValueError("`cameras` must select at least one stream.")
         if "wrist_depth" in selected:
             raise ValueError(
-                "wrist_depth is not supported: dexsensor's usb_camera driver "
-                "does not run the ZED SDK, so no depth is computed for the USB "
-                "ZED-M. Remove wrist_depth from --cameras."
+                "wrist_depth is not supported: the wrist ZedXCameraConfig is "
+                "configured RGB-only (enable_depth=False). Remove wrist_depth "
+                "from --cameras."
             )
         self.cameras: list[CameraStream] = list(selected)
         self._head_keys: list[str] = [
@@ -400,15 +407,20 @@ class VRReader:
             for c in self.cameras
             if c in _HEAD_STREAM_TO_OBS_KEY
         ]
-        self._wrist_halves: list[str] = [
-            _WRIST_STREAM_TO_HALF[c]
+        self._wrist_keys: list[str] = [
+            _WRIST_STREAM_TO_OBS_KEY[c]
             for c in self.cameras
-            if c in _WRIST_STREAM_TO_HALF
+            if c in _WRIST_STREAM_TO_OBS_KEY
         ]
-        self._wrist_enabled: bool = bool(self._wrist_halves)
+        self._wrist_enabled: bool = bool(self._wrist_keys)
         logger.info(
             f"Cameras selected: {self.cameras}  "
-            f"(head_keys={self._head_keys}, wrist_halves={self._wrist_halves})"
+            f"(head_keys={self._head_keys}, wrist_keys={self._wrist_keys})"
+        )
+        logger.info(
+            "DexControl comm: "
+            f"{ROBOT_NAME_ENV_VAR}={os.getenv(ROBOT_NAME_ENV_VAR)!r}, "
+            f"{COMM_CFG_PATH_ENV_VAR}={os.getenv(COMM_CFG_PATH_ENV_VAR)!r}"
         )
 
         # Camera polling via Robot API — also provides arm/torso/head joint
@@ -417,13 +429,16 @@ class VRReader:
         configs = get_robot_config()
         configs.sensors["head_camera"].enabled = bool(self._head_keys)
         if self._wrist_enabled and _WRIST_SENSOR_ID not in configs.sensors:
-            # Variant has no wrist_zedm; inject a USB CameraConfig pointing at
-            # the dexsensor topic for it. dexsensor must be launched with
-            # `--sensor wrist_zedm` for this subscriber to receive frames.
-            configs.sensors[_WRIST_SENSOR_ID] = CameraConfig(
+            # Variant has no wrist_zedm; inject a multi-stream ZED config mirroring
+            # head_camera (dispatches to ZedCameraSensor). RGB-only:
+            # enable_depth=False, so no depth subscriber is created. Topics derive
+            # from the name → sensors/wrist_zedm/{left_rgb,right_rgb}. A ZED-SDK
+            # publisher must be running on those topics for this subscriber to
+            # receive frames (see tests/test_wrist_zedm_depth.py).
+            configs.sensors[_WRIST_SENSOR_ID] = ZedXCameraConfig(
                 name=_WRIST_SENSOR_ID,
-                topic=_WRIST_TOPIC,
-                rtc_channel=f"{_WRIST_TOPIC}_rtc",
+                enable_rgb=True,
+                enable_depth=False,
             )
         if _WRIST_SENSOR_ID in configs.sensors:
             configs.sensors[_WRIST_SENSOR_ID].enabled = self._wrist_enabled
@@ -432,8 +447,14 @@ class VRReader:
             logger.info(f"Head camera streaming started (keys={self._head_keys})")
         if self._wrist_enabled:
             logger.info(
-                f"Wrist camera streaming started (halves={self._wrist_halves}) "
-                f"— requires `dexsensor launch --sensor {_WRIST_SENSOR_ID}`"
+                f"Wrist camera streaming started (keys={self._wrist_keys}) "
+                f"— requires a ZED-SDK publisher on sensors/{_WRIST_SENSOR_ID}/*"
+            )
+            logger.info(
+                "Wrist camera expects Zenoh keys: "
+                f"left={resolve_key_name(f'sensors/{_WRIST_SENSOR_ID}/left_rgb')!r}, "
+                f"right={resolve_key_name(f'sensors/{_WRIST_SENSOR_ID}/right_rgb')!r}, "
+                f"info={resolve_key_name(f'sensors/{_WRIST_SENSOR_ID}/info')!r}"
             )
 
         # KinHelper (head IK only)
@@ -477,15 +498,23 @@ class VRReader:
         self._last_head_imgs: dict[str, np.ndarray] = {}
         self._last_head_depth_u16: Optional[np.ndarray] = None
         self._last_wrist_imgs: dict[str, np.ndarray] = {}
+        self._wrist_first_frame_logged = False
+        self._last_wrist_missing_warn_t = 0.0
         self._prev_a: bool = False
         self._prev_b: bool = False
         self._prev_x: bool = False
         self._prev_y: bool = False
-        # Left-arm freeze toggle: A-press during recording flips it. While set,
-        # the left arm holds the pose captured at freeze time. Transient state —
+        # Per-arm freeze toggle: during recording, squeezing a controller's hand
+        # (grip) trigger flips that arm between frozen and tracking. While set,
+        # the arm holds the pose captured at freeze time. Transient state —
         # never written to the recorded HDF5.
         self._left_arm_frozen: bool = False
         self._frozen_left_pos: Optional[list[float]] = None
+        self._right_arm_frozen: bool = False
+        self._frozen_right_pos: Optional[list[float]] = None
+        # Rising-edge state for the hand (grip) triggers used as freeze toggles.
+        self._prev_left_hand_trigger: bool = False
+        self._prev_right_hand_trigger: bool = False
 
         # IK / timing telemetry — populated by _solve_and_apply_arm_ik (or
         # set to NaN/skip-reason on every bypass path) and read by
@@ -610,7 +639,7 @@ class VRReader:
     # ── Per-frame helpers ──────────────────────────────────────────────────────
 
     def _trigger_held(self, transforms: VRFrame, duration: float = 1.0) -> bool:
-        """True once right index trigger continuously held for `duration` s."""
+        """True once right hand (grip) trigger continuously held for `duration` s."""
         val = transforms["right_hand_trigger"]
         now = time.perf_counter()
         if val > 0.7:
@@ -656,8 +685,22 @@ class VRReader:
                 return False
         return True
 
+    def _warn_missing_wrist_streams(self) -> None:
+        now = time.monotonic()
+        if now - self._last_wrist_missing_warn_t < 10.0:
+            return
+        self._last_wrist_missing_warn_t = now
+        logger.warning(
+            "No wrist_zedm frames received yet. vr_reader is listening with "
+            f"{COMM_CFG_PATH_ENV_VAR}={os.getenv(COMM_CFG_PATH_ENV_VAR)!r}, "
+            f"{ROBOT_NAME_ENV_VAR}={os.getenv(ROBOT_NAME_ENV_VAR)!r}. "
+            "The wrist publisher must log the same resolved keys: "
+            f"{resolve_key_name(f'sensors/{_WRIST_SENSOR_ID}/left_rgb')!r}, "
+            f"{resolve_key_name(f'sensors/{_WRIST_SENSOR_ID}/right_rgb')!r}."
+        )
+
     def _render_tile(self, stream: CameraStream) -> Optional[np.ndarray]:
-        """Render one 320×180 preview tile for the given selected stream.
+        """Render one 320x180 preview tile for the given selected stream.
 
         Returns None if no frame for this stream is available yet (subscriber
         hasn't received anything, or head poll returned no key).
@@ -666,7 +709,7 @@ class VRReader:
             key = _HEAD_STREAM_TO_OBS_KEY[stream]
             img = self._last_head_imgs.get(key)
         else:
-            key = _WRIST_STREAM_TO_HALF[stream]
+            key = _WRIST_STREAM_TO_OBS_KEY[stream]
             img = self._last_wrist_imgs.get(key)
         if img is None:
             return None
@@ -684,15 +727,23 @@ class VRReader:
         return cv2.resize(img[:, :, ::-1], (320, 180))
 
     def _camera_poll(self) -> None:
+        # See-through preview shows the RGB streams (head + wrist), not depth —
+        # depth is recorded but excluded here. Tiles are concatenated side-by-side
+        # (320x180 each); the WebXR client sizes its quad from the received image
+        # aspect, so the montage width is free to vary. All selected cameras are
+        # still recorded (see _grab_images_for_record) — this only controls the
+        # preview. The warning fontScale stays small so text fits one 320px tile.
         vis_imgs: list[np.ndarray] = []
         for stream in self.cameras:
+            if stream == "head_depth":
+                continue
             tile = self._render_tile(stream)
             if tile is not None:
                 vis_imgs.append(tile)
         if not vis_imgs:
             return
-
         vis_img = concat_img_h(vis_imgs)
+
         episode_id: int = self.recorder.episode_id
         text: str = f"Episode: {episode_id}"
         if self.recorder.recording:
@@ -701,21 +752,24 @@ class VRReader:
             text += f", Saving {_progress_bar(self.recorder.save_progress)}"
         elif self.debug_recorder.saving:
             text += f", Saving debug {_progress_bar(self.debug_recorder.save_progress)}"
+        # Episode/Stage use a larger font than the warnings below — they're the
+        # at-a-glance status. fontScale=0.6 fits the recording line across the
+        # head+wrist montage (~640px); it may clip if only one tile is present.
         cv2.putText(
             vis_img,
             text,
-            (10, 30),
+            (8, 22),
             fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-            fontScale=1,
+            fontScale=0.6,
             thickness=2,
             color=(255, 255, 255),
         )
         cv2.putText(
             vis_img,
             f"Stage: {self._calib_stage}",
-            (10, vis_img.shape[0] - 15),
+            (8, vis_img.shape[0] - 8),
             fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-            fontScale=1,
+            fontScale=0.6,
             thickness=2,
             color=(0, 255, 255),
         )
@@ -723,10 +777,10 @@ class VRReader:
             cv2.putText(
                 vis_img,
                 "Left/Right Arm Self-collision!",
-                (10, 65),
+                (8, 34),
                 fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                fontScale=1,
-                thickness=2,
+                fontScale=0.4,
+                thickness=1,
                 color=(0, 0, 255),
             )
         if self._left_eef_oob:
@@ -734,10 +788,10 @@ class VRReader:
             cv2.putText(
                 vis_img,
                 f"WARNING: L out of workspace xyz=[{xyz[0]:+.2f},{xyz[1]:+.2f},{xyz[2]:+.2f}]",
-                (10, 100),
+                (8, 52),
                 fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                fontScale=1,
-                thickness=2,
+                fontScale=0.4,
+                thickness=1,
                 color=(0, 0, 255),
             )
         if self._right_eef_oob:
@@ -745,10 +799,10 @@ class VRReader:
             cv2.putText(
                 vis_img,
                 f"WARNING: R out of workspace xyz=[{xyz[0]:+.2f},{xyz[1]:+.2f},{xyz[2]:+.2f}]",
-                (10, 135),
+                (8, 70),
                 fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                fontScale=1,
-                thickness=2,
+                fontScale=0.4,
+                thickness=1,
                 color=(0, 0, 255),
             )
         _, buf = cv2.imencode(".jpg", vis_img, [cv2.IMWRITE_JPEG_QUALITY, 60])
@@ -1190,19 +1244,80 @@ class VRReader:
             self._calib_stage = "whole_body"
             console.rule("[bold green]Calibration locked → whole_body")
 
-    def _toggle_left_arm_freeze(self) -> None:
-        """A-press during recording: freeze the left arm at its current pose, or
-        release it. Freeze state is transient and never written to the HDF5."""
-        self._left_arm_frozen = not self._left_arm_frozen
-        if self._left_arm_frozen:
-            self._frozen_left_pos = [
-                float(self.current_qpos[self.joint_name_to_idx[n]])
-                for n in self.left_proc.joint_names
-            ]
-            console.print("[bold cyan]Left arm frozen — press A to release[/]")
-        else:
-            self._frozen_left_pos = None
-            console.print("[bold cyan]Left arm released — tracking resumed[/]")
+    def _freeze_left_arm(self) -> None:
+        """Capture the current left-arm pose and hold it (left grip press)."""
+        self._left_arm_frozen = True
+        self._frozen_left_pos = [
+            float(self.current_qpos[self.joint_name_to_idx[n]])
+            for n in self.left_proc.joint_names
+        ]
+        console.print("[bold cyan]Left arm frozen — squeeze left grip to release[/]")
+
+    def _freeze_right_arm(self) -> None:
+        """Capture the current right-arm pose and hold it (right grip press)."""
+        self._right_arm_frozen = True
+        self._frozen_right_pos = [
+            float(self.current_qpos[self.joint_name_to_idx[n]])
+            for n in self.right_proc.joint_names
+        ]
+        console.print("[bold cyan]Right arm frozen — squeeze right grip to release[/]")
+
+    def _release_left_arm_freeze(self, vr_l: np.ndarray) -> list[float]:
+        """Release the left-arm freeze without teleporting.
+
+        ``_arm_ik_step`` has already run this frame against the *stale*
+        calibration, so we (1) pin the held pose for this final frame, then
+        (2) in fixed_pose mode re-anchor the calibration to the held EEF and
+        the current controller pose. Next frame resumes tracking with ~zero
+        delta. Returns the held joints to publish/record this frame.
+        """
+        assert self._frozen_left_pos is not None
+        held = list(self._frozen_left_pos)
+        self._pin_left_arm(held)  # current_qpos[left] ← held, overriding stale IK
+        if self.start_mode == "fixed_pose":
+            self._reanchor_left_arm(vr_l)
+        self._left_arm_frozen = False
+        self._frozen_left_pos = None
+        console.print("[bold cyan]Left arm released — tracking resumed[/]")
+        return held
+
+    def _release_right_arm_freeze(self, vr_r: np.ndarray) -> list[float]:
+        """Release the right-arm freeze without teleporting (mirror of left)."""
+        assert self._frozen_right_pos is not None
+        held = list(self._frozen_right_pos)
+        self._pin_right_arm(held)  # current_qpos[right] ← held, overriding stale IK
+        if self.start_mode == "fixed_pose":
+            self._reanchor_right_arm(vr_r)
+        self._right_arm_frozen = False
+        self._frozen_right_pos = None
+        console.print("[bold cyan]Right arm released — tracking resumed[/]")
+        return held
+
+    def _reanchor_left_arm(self, vr_l: np.ndarray) -> None:
+        """Re-anchor fixed_pose calibration so the current left controller pose
+        maps to the currently held left EEF (zero delta).
+
+        Mirrors the per-arm anchor capture done at the whole_body_alignment
+        lock. Must be called after :meth:`_pin_left_arm`, so the FK below
+        reflects the held pose rather than the stale IK solution.
+        """
+        left_fk = self.kin.compute_fk_from_link_idx(
+            self.current_qpos, [self.left_arm_eef_idx]
+        )[0]
+        self._fixed_left_robot0 = left_fk.copy()
+        self._fixed_left_vr_pos0 = vr_l[:3, 3].copy()
+        self._fixed_left_vr_rot0 = vr_l[:3, :3].copy()
+        self._vr_to_robot_left = left_fk @ np.linalg.inv(vr_l)  # debug parity
+
+    def _reanchor_right_arm(self, vr_r: np.ndarray) -> None:
+        """Re-anchor fixed_pose calibration for the right arm (mirror of left)."""
+        right_fk = self.kin.compute_fk_from_link_idx(
+            self.current_qpos, [self.right_arm_eef_idx]
+        )[0]
+        self._fixed_right_robot0 = right_fk.copy()
+        self._fixed_right_vr_pos0 = vr_r[:3, 3].copy()
+        self._fixed_right_vr_rot0 = vr_r[:3, :3].copy()
+        self._vr_to_robot_right = right_fk @ np.linalg.inv(vr_r)  # debug parity
 
     def _pin_left_arm(self, left_joints: list[float]) -> None:
         """Hold the leader's left-arm tracking state at ``left_joints``.
@@ -1216,6 +1331,17 @@ class VRReader:
         for i, n in enumerate(self.left_proc.joint_names):
             self.current_qpos[self.joint_name_to_idx[n]] = left_joints[i]
 
+    def _pin_right_arm(self, right_joints: list[float]) -> None:
+        """Hold the leader's right-arm tracking state at ``right_joints``.
+
+        Mirror of :meth:`_pin_left_arm` — pins both the processor and
+        current_qpos so the command stays static while frozen and ramps
+        smoothly on release.
+        """
+        self.right_proc.apply_positions(np.asarray(right_joints, dtype=float))
+        for i, n in enumerate(self.right_proc.joint_names):
+            self.current_qpos[self.joint_name_to_idx[n]] = right_joints[i]
+
     def _handle_recording(
         self,
         transforms: VRFrame,
@@ -1227,9 +1353,11 @@ class VRReader:
         vx: float,
         vy: float,
         wz: float,
-    ) -> list[float]:
+    ) -> tuple[list[float], list[float]]:
         a_now = transforms["right_a_button"]
         b_now = transforms["right_b_button"]
+        left_grip_now = transforms["left_hand_trigger"] > _HAND_TRIGGER_PRESS
+        right_grip_now = transforms["right_hand_trigger"] > _HAND_TRIGGER_PRESS
 
         if (
             a_now
@@ -1244,28 +1372,49 @@ class VRReader:
             self.recorder.start()
             self._left_arm_frozen = False
             self._frozen_left_pos = None
+            self._right_arm_frozen = False
+            self._frozen_right_pos = None
             self._recorded_obs_grip_event_count_left = self._obs_grip_event_count_left
             self._recorded_obs_grip_event_count_right = self._obs_grip_event_count_right
             self._next_record_t = 0.0  # anchor cadence to the first recorded frame
             console.print(
                 f"[bold green]Recording started at {self.record_rate:g} Hz "
-                "(press A to freeze/release left arm, B to stop)[/]"
+                "(squeeze left/right grip to freeze/release that arm, B to stop)[/]"
             )
-        elif a_now and not self._prev_a and self.recorder.recording:
-            self._toggle_left_arm_freeze()
+        # Grip (hand) triggers toggle per-arm freeze while recording. Releasing
+        # re-anchors the calibration (fixed_pose) so tracking resumes from the
+        # held pose instead of teleporting to wherever the hand drifted.
+        if self.recorder.recording:
+            if left_grip_now and not self._prev_left_hand_trigger:
+                if self._left_arm_frozen:
+                    left_pos = self._release_left_arm_freeze(vr_l)
+                else:
+                    self._freeze_left_arm()
+            if right_grip_now and not self._prev_right_hand_trigger:
+                if self._right_arm_frozen:
+                    right_pos = self._release_right_arm_freeze(vr_r)
+                else:
+                    self._freeze_right_arm()
         if b_now and not self._prev_b and self.recorder.recording:
             path = self.recorder.stop()
             console.print(f"[bold yellow]Saving in background → {path}[/]")
             if self.save_debug:
                 debug_path = self.debug_recorder.stop()
                 console.print(f"[bold yellow]Debug saving in background → {debug_path}[/]")
-            self._left_arm_frozen = False
-            self._frozen_left_pos = None
+            # Stopping mid-freeze must release through the re-anchoring path —
+            # tracking continues in whole_body after stop, so simply clearing
+            # the flags would teleport the held arm to the current hand pose.
+            if self._left_arm_frozen:
+                left_pos = self._release_left_arm_freeze(vr_l)
+            if self._right_arm_frozen:
+                right_pos = self._release_right_arm_freeze(vr_r)
 
         self._prev_a = a_now
         self._prev_b = b_now
+        self._prev_left_hand_trigger = left_grip_now
+        self._prev_right_hand_trigger = right_grip_now
 
-        # While frozen, hold the left arm at the captured pose for both the
+        # While frozen, hold each arm at its captured pose for both the
         # published command and the recorded action.
         if (
             self.recorder.recording
@@ -1274,11 +1423,18 @@ class VRReader:
         ):
             self._pin_left_arm(self._frozen_left_pos)
             left_pos = list(self._frozen_left_pos)
+        if (
+            self.recorder.recording
+            and self._right_arm_frozen
+            and self._frozen_right_pos is not None
+        ):
+            self._pin_right_arm(self._frozen_right_pos)
+            right_pos = list(self._frozen_right_pos)
 
         if not self.recorder.recording or self._calib_stage != "whole_body":
-            return left_pos
+            return left_pos, right_pos
         if not self._all_selected_streams_ready():
-            return left_pos
+            return left_pos, right_pos
 
         # Throttle to record_rate so saved HDF5 has a consistent FPS independent
         # of publish_rate. Cadence is locked to ideal timestamps; if the loop
@@ -1287,7 +1443,7 @@ class VRReader:
         if self._next_record_t == 0.0:
             self._next_record_t = now_t
         if now_t < self._next_record_t:
-            return left_pos
+            return left_pos, right_pos
         self._next_record_t += self._record_period_s
         if now_t > self._next_record_t:
             self._next_record_t = now_t + self._record_period_s
@@ -1367,7 +1523,7 @@ class VRReader:
         self.recorder.record(frame)
 
         if not self.save_debug:
-            return left_pos
+            return left_pos, right_pos
 
         # Debug keeps the robot/world-frame EEF poses that were passed to IK.
         # Raw VR wrist poses stay under debug vr_raw/*.
@@ -1453,7 +1609,7 @@ class VRReader:
             },
         }
         self.debug_recorder.record(debug_frame)
-        return left_pos
+        return left_pos, right_pos
 
     def _publish(
         self,
@@ -1573,33 +1729,30 @@ class VRReader:
                             head_imgs["depth"] * 1000, 0, 65535
                         ).astype(np.uint16)
                 if self._wrist_enabled:
-                    # dexsensor usb_camera publishes the raw ZED-M output as
-                    # one (H, 2W, 3) RGB frame; slice into the eyes we need.
-                    wrist_frame = self._cam_robot.sensors.wrist_zedm.get_obs()
-                    if wrist_frame is not None:
-                        if (
-                            wrist_frame.ndim != 3
-                            or wrist_frame.shape[2] != 3
-                            or wrist_frame.shape[1] % 2 != 0
-                        ):
-                            raise ValueError(
-                                f"Unexpected wrist frame shape {wrist_frame.shape}; "
-                                "expected (H, 2W, 3) side-by-side stereo RGB."
-                            )
-                        half_w = wrist_frame.shape[1] // 2
-                        # .copy() each half: get_obs() hands back a reused capture
-                        # buffer the driver overwrites in place, so a bare view
-                        # tears in the live preview and corrupts recorded frames
-                        # (which are only np.stack-copied at save time).
-                        for half in self._wrist_halves:
-                            if half == "left_rgb":
-                                self._last_wrist_imgs["left_rgb"] = wrist_frame[
-                                    :, :half_w, :
-                                ].copy()
-                            elif half == "right_rgb":
-                                self._last_wrist_imgs["right_rgb"] = wrist_frame[
-                                    :, half_w:, :
-                                ].copy()
+                    # ZED-SDK publisher delivers per-eye rectified frames on
+                    # sensors/wrist_zedm/{left_rgb,right_rgb} — the same
+                    # multi-stream contract as head_camera, so consume it the same
+                    # way (no slicing). ZedCameraSensor.get_obs returns freshly
+                    # decoded arrays, so no .copy() is needed (cf. head above).
+                    # Cache only streams that have a frame so
+                    # _all_selected_streams_ready and the recorder never see None.
+                    wrist_imgs = self._cam_robot.sensors.wrist_zedm.get_obs(
+                        obs_keys=self._wrist_keys
+                    )
+                    received_wrist_keys: list[str] = []
+                    for k, v in wrist_imgs.items():
+                        if v is not None:
+                            self._last_wrist_imgs[k] = v
+                            received_wrist_keys.append(k)
+                    if received_wrist_keys and not self._wrist_first_frame_logged:
+                        shapes = {
+                            k: tuple(self._last_wrist_imgs[k].shape)
+                            for k in received_wrist_keys
+                        }
+                        logger.info(f"Received first wrist_zedm frame(s): {shapes}")
+                        self._wrist_first_frame_logged = True
+                    elif not self._last_wrist_imgs:
+                        self._warn_missing_wrist_streams()
                 if step % 4 == 0:
                     self._camera_poll()
                 vr_head = transforms["head"]
@@ -1621,7 +1774,7 @@ class VRReader:
                 chassis_vx, chassis_vy, chassis_wz = self._thumbstick_to_chassis(transforms)
 
                 self._handle_stage_transition(transforms)
-                left_pos = self._handle_recording(
+                left_pos, right_pos = self._handle_recording(
                     transforms,
                     vr_l,
                     vr_r,
@@ -1715,13 +1868,13 @@ def main() -> None:
         debug: bool = False
         """Print calculated arm joint positions to terminal"""
 
-        visualize: bool = True
+        visualize: bool = False
         """Open Sapien viewer to visualize IK in real time"""
 
         urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"  # noqa
         """Path to robot URDF for Sapien visualizer (required if --visualize)"""
 
-        save_dir: str = "/home/yixuan/Dexmate/data/raw_data"
+        save_dir: str = "/home/yixuan/Dexmate/data/raw_data_openlid"
         """Directory to save episode_<N>.hdf5 files (A=start, B=stop)"""
 
         debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/raw_data"
@@ -1749,9 +1902,10 @@ def main() -> None:
         """Camera streams to read and record. Choose any subset of:
         head_left_rgb, head_right_rgb, head_depth, left_wrist_rgb,
         right_wrist_rgb. Default: head_left_rgb head_depth left_wrist_rgb.
-        Wrist streams require `dexsensor launch --sensor wrist_zedm` to be
-        running. wrist_depth is rejected — dexsensor's usb_camera driver
-        does not run the ZED SDK and cannot compute depth from USB ZED-M."""
+        Wrist streams require a ZED-SDK publisher running on
+        sensors/wrist_zedm/{left_rgb,right_rgb} (see
+        tests/test_wrist_zedm_depth.py). wrist_depth is rejected — the wrist
+        is configured RGB-only (enable_depth=False)."""
 
     args = tyro.cli(Args)
 

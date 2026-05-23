@@ -30,9 +30,9 @@ PATTERN = re.compile(r"^episode_(\d+)\.hdf5$")
 DEFAULT_SRC = Path("/home/yixuan/omniteleop/Dexmate/data/raw_data")
 DEFAULT_DST = Path("/home/yixuan/omniteleop/Dexmate/data/raw_data_renamed")
 
-TRAIN_RANGE = [7] # list(range(12,81))
-VAL_INDICES = None
-TEST_INDICES = None
+TRAIN_RANGE = list(range(0,110))
+VAL_INDICES = [113]
+TEST_INDICES = [115]
 
 
 def collect_episodes(directory: Path) -> dict[int, Path]:
