@@ -114,6 +114,7 @@ from omniteleop.follower.workspace_check import (
 from lerobot.configs import PreTrainedConfig
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.processor import RelativeActionsProcessorStep
+from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_POS_CONDITION_MASK
 
 # Wrist ZED-M sensor id + obs key (mirrors vr_reader._WRIST_SENSOR_ID and the
 # left-eye obs key it consumes from sensors/wrist_zedm/left_rgb).
@@ -127,6 +128,16 @@ HEAD_CROP_TOP = 220
 HEAD_CROP_BOTTOM = 600
 HEAD_CROP_LEFT = 150
 HEAD_CROP_RIGHT = 800
+
+# Full-resolution head ZED intrinsics used by the teleop recorder and visualizers.
+ZED_K = np.array(
+    [
+        [770.1868 / 2.0, 0.0, 990.2711 / 2.0],
+        [0.0, 770.1868 / 2.0, 637.7721 / 2.0],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float32,
+)
 
 
 # ── small math helpers (mirror port_dexmate_hdf5.py) ──────────────────────────
@@ -223,6 +234,7 @@ class PolicyRolloutController:
         act_temporal_ensemble_coeff: Optional[float] = None,
         record: bool = True,
         record_dir: Optional[str] = None,
+        positions_npz: Optional[str] = None,
     ) -> None:
         self.node = Node(name="policy_rollout", namespace=namespace)
 
@@ -252,6 +264,10 @@ class PolicyRolloutController:
         # model actually needs it). The full policy is loaded in
         # initialize_policy(); image HxW is taken from the head feature shape.
         self._policy_path = policy_path
+        # Path to the precomputed changed-object positions npz (SceneDiff env-state
+        # conditioning). Loaded in initialize_policy() only when the policy declares
+        # observation.environment_state; ignored otherwise.
+        self._positions_npz = positions_npz
         self._detect_camera_inputs(policy_path)
 
         # Joint feedback publisher.
@@ -287,6 +303,8 @@ class PolicyRolloutController:
         self._chained_right_arm_qpos: Optional[np.ndarray] = None
         self._left_proc: Optional[ArmProcessor] = None
         self._right_proc: Optional[ArmProcessor] = None
+        self._head_camera_intrinsic: Optional[np.ndarray] = None
+        self._head_camera_extrinsic: Optional[np.ndarray] = None
 
         # Hardware + policy.
         self.initialize_robot()
@@ -297,6 +315,7 @@ class PolicyRolloutController:
         )
 
         if record:
+            self._cache_head_camera_calibration()
             if record_dir is None:
                 tag = pathlib.Path(policy_path).parents[2].name
                 record_dir = f"/home/yixuan/Dexmate/deploy/{tag}"
@@ -571,8 +590,112 @@ class PolicyRolloutController:
         # variants additionally use IK (action decode) and FK (obs build).
         self._init_motion_manager()
 
+        # Position conditioning (SceneDiff env-state). Enabled only when the policy
+        # declares observation.environment_state. We load the precomputed per-object
+        # before/after positions here — BEFORE the control loop — and freeze (raise)
+        # if they are missing/invalid, so the arms never move on bad conditioning.
+        # The per-frame slot-selection mask is driven online by the model's auxiliary
+        # stage head (see _policy_step).
+        self._env_state_enabled = OBS_ENV_STATE in self._policy.config.input_features
+        self._stage_num_classes = int(
+            getattr(self._policy.config, "stage_prediction_num_classes", 2)
+        )
+        self._current_stage = 0
+        self._env_state_vec: Optional[np.ndarray] = None
+        self._active_position_condition: Optional[dict] = None
+        if self._env_state_enabled:
+            self._load_position_conditions()
+            stage_head = getattr(self._policy.config, "stage_prediction_enabled", False)
+            logger.info(
+                "Position conditioning active: feeding "
+                f"observation.environment_state ({self._env_state_vec.shape[0]}-D) + "
+                "observation.pos_condition_mask."
+            )
+            if stage_head and (
+                self._act_stage_prediction_supported()
+                or callable(getattr(self._policy, "predict_stage", None))
+            ):
+                logger.info(
+                    "Stage mask auto-switches via the model's stage head "
+                    f"({self._stage_num_classes} classes)."
+                )
+            else:
+                logger.warning(
+                    "No usable stage head (stage_prediction_enabled=%s); "
+                    "pos_condition_mask stays fixed on object 0.",
+                    stage_head,
+                )
+        else:
+            if self._positions_npz is not None:
+                logger.warning(
+                    "--positions_npz was given but the policy declares no "
+                    "observation.environment_state; ignoring it."
+                )
+            logger.info("Position conditioning inactive (no env-state feature).")
+
         # Reset action queue at start.
         self._policy.reset()
+
+    def _load_position_conditions(self) -> None:
+        """Load precomputed changed-object positions into a constant env-state vector.
+
+        Reads the ``episode_<N>.npz`` produced offline by
+        ``scene_diff/scripts/extract_object_positions.py`` (driven by
+        ``run_img_with_depth.sh``), validates it the same way the porter's
+        ``load_episode_positions`` does — ``before_xyz``/``after_xyz`` each shape
+        ``(M, 3)`` and all-finite, ``M`` == the policy's object count (stage classes) —
+        and builds the flat slot-major ``(M*6,)`` vector ``[obj_i: before(3), after(3)]``.
+        The saved diffusion preprocessor collapses that vector to the active object's
+        6-D slot using ``observation.pos_condition_mask`` before the model.
+
+        Raises (aborting before any arm motion) when the file is missing or malformed.
+        That IS the quality gate: ``extract_object_positions.py`` only writes an npz for
+        episodes that passed the object-count / valid-pixel checks, so a missing npz
+        means the offline detection failed for this scene.
+        """
+        if self._positions_npz is None:
+            raise ValueError(
+                "policy declares observation.environment_state but --positions_npz was "
+                "not provided; pass the episode_<N>.npz produced offline by "
+                "scene_diff/scripts/extract_object_positions.py (run_img_with_depth.sh)"
+            )
+        path = pathlib.Path(self._positions_npz)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"--positions_npz not found: {path} (run run_img_with_depth.sh for this "
+                "scene first; a missing file means the SceneDiff detection gate failed)"
+            )
+        m = self._stage_num_classes
+        with np.load(path, allow_pickle=True) as data:
+            missing = [k for k in ("before_xyz", "after_xyz") if k not in data.files]
+            if missing:
+                raise ValueError(
+                    f"{path}: missing keys {missing} (available: {list(data.files)})"
+                )
+            before_xyz = np.asarray(data["before_xyz"], dtype=np.float32)
+            after_xyz = np.asarray(data["after_xyz"], dtype=np.float32)
+
+        for name, arr in (("before_xyz", before_xyz), ("after_xyz", after_xyz)):
+            if arr.shape != (m, 3):
+                raise ValueError(
+                    f"{path}: {name} shape {tuple(arr.shape)} != ({m}, 3); M must match "
+                    f"the policy's object count / stage classes ({m})"
+                )
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"{path}: {name} contains non-finite values")
+
+        # Flat slot-major layout [obj_i: before(3), after(3)] — identical to the porter's
+        # build_env_state_vector so the saved PositionConditionProcessorStep collapses it.
+        self._env_state_vec = (
+            np.concatenate([before_xyz, after_xyz], axis=1).reshape(-1).astype(np.float32)
+        )
+        logger.success(f"Loaded position conditioning ({m} object(s)) from {path}")
+        for i in range(m):
+            b, a = before_xyz[i], after_xyz[i]
+            logger.info(
+                f"  obj{i}: before=[{b[0]:.3f}, {b[1]:.3f}, {b[2]:.3f}]  "
+                f"after=[{a[0]:.3f}, {a[1]:.3f}, {a[2]:.3f}]"
+            )
 
     def _init_motion_manager(self) -> None:
         qpos_dict = self._motion_manager_state_dict()
@@ -602,6 +725,26 @@ class PolicyRolloutController:
             "right", self.config, self._motion_manager, self._robot_info, "vr"
         )
         logger.info("MotionManager + LocalPinkIKSolver + ArmProcessors initialised.")
+
+    def _cache_head_camera_calibration(self) -> None:
+        """Cache head-camera calibration once before rollout recording starts."""
+        self._head_camera_intrinsic = ZED_K.copy()
+        self._head_camera_extrinsic = self._compute_head_camera_extrinsic()
+        xyz = self._head_camera_extrinsic[:3, 3]
+        logger.info(
+            "Cached rollout head-camera calibration: "
+            f"xyz=[{xyz[0]:.3f}, {xyz[1]:.3f}, {xyz[2]:.3f}]"
+        )
+
+    def _compute_head_camera_extrinsic(self) -> np.ndarray:
+        """Compute ``world_T_head_camera`` from the fixed rollout home posture."""
+        assert self._motion_manager is not None
+        self._motion_manager.set_joint_pos(self._motion_manager_state_dict())
+        fk = self._motion_manager.fk(
+            frame_names=["zed_depth_frame"],
+            qpos=self._motion_manager.get_joint_pos(),
+        )
+        return np.asarray(fk["zed_depth_frame"].np, dtype=np.float32)  # type: ignore[attr-defined]
 
     def _cache_fixed_motion_joint_limits(self) -> None:
         """Cache dexmotion limits only for fixed non-commanded model context.
@@ -881,7 +1024,113 @@ class PolicyRolloutController:
         self._last_obs_gripper_left = np.float32(grip_left)
         self._last_obs_gripper_right = np.float32(grip_right)
 
+        # Position conditioning: attach the constant per-episode env-state vector plus the
+        # current one-hot stage mask. The saved preprocessor
+        # (PositionConditionProcessorStep) collapses the (M*6,) vector to the active
+        # object's 6-D [before, after] slot using this mask, then normalizes it.
+        if self._env_state_enabled and self._env_state_vec is not None:
+            sample[OBS_ENV_STATE] = torch.from_numpy(self._env_state_vec)
+            self._write_stage_mask(sample)
+
         return sample
+
+    def _write_stage_mask(self, sample: dict) -> None:
+        """Write the current one-hot stage mask into an unprocessed observation."""
+        mask = np.zeros((self._stage_num_classes,), dtype=np.float32)
+        mask[self._current_stage] = 1.0
+        sample[OBS_POS_CONDITION_MASK] = torch.from_numpy(mask)
+
+    def _set_current_stage(self, stage: int) -> None:
+        """Update the active position-condition stage after validation."""
+        new_stage = int(stage)
+        if not 0 <= new_stage < self._stage_num_classes:
+            raise ValueError(
+                f"predicted stage {new_stage} outside [0, {self._stage_num_classes})"
+            )
+        if new_stage != self._current_stage:
+            logger.info(f"Position-condition stage {self._current_stage} -> {new_stage}")
+            self._current_stage = new_stage
+
+    def _policy_is_act(self) -> bool:
+        """Return whether the loaded policy is an ACT policy."""
+        cfg_type = getattr(getattr(self._policy, "config", None), "type", None)
+        return getattr(self._policy, "name", None) == "act" or cfg_type == "act"
+
+    def _act_stage_prediction_supported(self) -> bool:
+        """Return whether ACT stage logits can be read from the policy model."""
+        if not self._policy_is_act():
+            return False
+        if not getattr(self._policy.config, "stage_prediction_enabled", False):
+            return False
+        return callable(getattr(getattr(self, "_policy", None), "model", None))
+
+    def _predict_act_stage_from_batch(self, batch: dict) -> Optional[int]:
+        """Predict current ACT stage from a preprocessed current observation.
+
+        ACT trains ``stage_logits[:, i]`` against the mask at action offset ``i``.
+        For selecting the env-state slot used by this replan's action chunk, the
+        correct timestamp is offset 0: the current observation / first action.
+        """
+        if not self._act_stage_prediction_supported():
+            return None
+
+        model_batch = dict(batch)
+        image_features = list(getattr(self._policy.config, "image_features", []) or [])
+        if image_features:
+            model_batch[OBS_IMAGES] = [model_batch[key] for key in image_features]
+
+        eval_fn = getattr(self._policy, "eval", None)
+        if callable(eval_fn):
+            eval_fn()
+        with torch.no_grad():
+            output = self._policy.model(model_batch)
+
+        if not isinstance(output, tuple) or len(output) < 3:
+            return None
+        stage_logits = output[2]
+        if stage_logits is None:
+            return None
+        if stage_logits.ndim != 3:
+            raise ValueError(
+                "ACT stage logits must have shape (B, n_action_steps, classes), "
+                f"got {tuple(stage_logits.shape)}"
+            )
+        if stage_logits.shape[-1] != self._stage_num_classes:
+            raise ValueError(
+                "ACT stage logits class dimension must match "
+                f"stage_prediction_num_classes={self._stage_num_classes}, "
+                f"got {tuple(stage_logits.shape)}"
+            )
+        return int(stage_logits[:, 0].argmax(dim=-1).reshape(-1)[0].item())
+
+    def _position_condition_record(self, raw_sample: dict) -> Optional[dict]:
+        """Return the position-condition stage/mask/6-D slot used by this sample."""
+        if (
+            not self._env_state_enabled
+            or self._env_state_vec is None
+            or OBS_POS_CONDITION_MASK not in raw_sample
+        ):
+            return None
+
+        mask_value = raw_sample[OBS_POS_CONDITION_MASK]
+        if isinstance(mask_value, torch.Tensor):
+            mask = mask_value.detach().cpu().numpy()
+        else:
+            mask = np.asarray(mask_value)
+        mask = np.asarray(mask, dtype=np.float32).reshape(-1)
+        if mask.shape != (self._stage_num_classes,):
+            raise ValueError(
+                f"position-condition mask shape {tuple(mask.shape)} != "
+                f"({self._stage_num_classes},)"
+            )
+
+        stage = int(mask.argmax())
+        env_state = self._env_state_vec.reshape(self._stage_num_classes, 6)
+        return {
+            "stage": np.int32(stage),
+            "mask": mask.copy(),
+            "condition_6d": env_state[stage].astype(np.float32, copy=True),
+        }
 
     # ── policy step ──────────────────────────────────────────────────────────
 
@@ -900,10 +1149,31 @@ class PolicyRolloutController:
         qlen_before = self._policy_action_queue_len()
         begin_build_obs_ns = time.time_ns()
         t_obs_start = time.monotonic()
-        sample = self._build_observation()
+        raw_sample = self._build_observation()
         t_obs_end = time.monotonic()
 
-        sample = self._pre(sample)  # writes _last_state = current obs state
+        sample = self._pre(dict(raw_sample))  # writes _last_state = current obs state
+
+        # At replan time, ACT's auxiliary head predicts the stage for the current
+        # observation at logits offset 0. Use that stage for THIS action chunk's
+        # env-state slot before select_action() runs. The head does not consume
+        # observation.environment_state, so the initial mask used for this probe
+        # cannot leak the answer into the prediction.
+        if self._env_state_enabled and qlen_before <= 0:
+            stage = self._predict_act_stage_from_batch(sample)
+            if stage is not None:
+                self._set_current_stage(stage)
+                self._write_stage_mask(raw_sample)
+                sample = self._pre(dict(raw_sample))
+
+        sample_position_condition = self._position_condition_record(raw_sample)
+        if qlen_before <= 0:
+            self._active_position_condition = sample_position_condition
+        position_condition = getattr(
+            self, "_active_position_condition", sample_position_condition
+        )
+        if position_condition is None:
+            position_condition = sample_position_condition
 
         # In-chunk pop: restore the chunk anchor so post() adds the same state
         # the model used during the relative subtraction at replan time.
@@ -928,6 +1198,20 @@ class PolicyRolloutController:
                 cached.detach().clone() if cached is not None else None
             )
 
+        # Fallback for policy classes whose stage API depends on internal queues
+        # populated by select_action() (e.g. DiffusionPolicy). ACT is handled above
+        # so its current replan chunk is conditioned at the correct timestamp.
+        predict_stage = getattr(self._policy, "predict_stage", None)
+        if (
+            self._env_state_enabled
+            and callable(predict_stage)
+            and not self._act_stage_prediction_supported()
+            and qlen_before <= 0
+        ):
+            stage = predict_stage()
+            if stage is not None:
+                self._set_current_stage(int(stage.reshape(-1)[0].item()))
+
         info = {
             # Legacy alias kept so readers that grep for t_obs_ns_wallclock still work.
             "t_obs_ns_wallclock": begin_build_obs_ns,
@@ -940,6 +1224,8 @@ class PolicyRolloutController:
             # qlen_before == 0 (or -1 on unknown impl) → this call ran the model.
             "replan": qlen_before <= 0,
         }
+        if position_condition is not None:
+            info["position_condition"] = position_condition
         return a_abs.squeeze(0).detach().cpu().numpy(), info
 
     # ── action decode + safety ─────────────────────────────────────────────────
@@ -1206,6 +1492,8 @@ class PolicyRolloutController:
             return
 
         self._mode = _Mode.RUNNING
+        self._current_stage = 0  # every rollout starts on object 0 (matches training)
+        self._active_position_condition = None
         rate = RateLimiter(self.control_rate)
         logger.info(f"Control loop at {self.control_rate} Hz")
 
@@ -1239,6 +1527,7 @@ class PolicyRolloutController:
                     # Drop the stale chunk anchor; the next tick will replan
                     # and capture a new one from the post-resume observation.
                     self._chunk_ref_state = None
+                    self._active_position_condition = None
                     # Re-sync both IK chains to the observed arm poses — the
                     # operator may have moved an arm while paused. Re-seed
                     # mm.{left,right}_arm via apply_positions so the next
@@ -1411,6 +1700,31 @@ class PolicyRolloutController:
         if self._use_wrist:
             assert self._last_obs_wrist_rgb is not None
             images["left_wrist_rgb"] = self._last_obs_wrist_rgb
+        if (
+            self._head_camera_intrinsic is not None
+            and self._head_camera_extrinsic is not None
+        ):
+            images["intrinsic"] = self._head_camera_intrinsic
+            images["extrinsic"] = self._head_camera_extrinsic
+
+        obs = {
+            "joint": {
+                "left_arm": obs_qpos_left,
+                "right_arm": obs_qpos_right,
+            },
+            "eef_9d": {"left": obs_eef9_left, "right": obs_eef9_right},
+            "gripper": {"left": obs_grip_left, "right": obs_grip_right},
+            "images": images,
+        }
+        position_condition = step_info.get("position_condition")
+        if position_condition is not None:
+            obs["position_condition"] = {
+                "stage": np.int32(position_condition["stage"]),
+                "mask": np.asarray(position_condition["mask"], dtype=np.float32),
+                "condition_6d": np.asarray(
+                    position_condition["condition_6d"], dtype=np.float32
+                ),
+            }
 
         self._recorder.record(  # type: ignore[union-attr]
             {
@@ -1425,15 +1739,7 @@ class PolicyRolloutController:
                     "obs_flag": np.bool_(step_info["replan"]),
                     "action_number": np.int32(chunk_idx),
                 },
-                "obs": {
-                    "joint": {
-                        "left_arm": obs_qpos_left,
-                        "right_arm": obs_qpos_right,
-                    },
-                    "eef_9d": {"left": obs_eef9_left, "right": obs_eef9_right},
-                    "gripper": {"left": obs_grip_left, "right": obs_grip_right},
-                    "images": images,
-                },
+                "obs": obs,
                 "action": {
                     "eef": {"left": eef4_left, "right": eef4_right},
                     "eef_9d": {"left": eef9_left, "right": eef9_right},
@@ -1489,6 +1795,7 @@ def main(
     act_temporal_ensemble_coeff: Optional[float] = None,
     record: bool = True,
     record_dir: Optional[str] = None,
+    positions_npz: Optional[str] = None,
 ) -> None:
     """Run live bimanual policy rollout on a Dexmate robot.
 
@@ -1516,6 +1823,11 @@ def main(
             numeric subdirectory (``0``, ``1``, ...). Defaults to
             ``/home/yixuan/Dexmate/deploy/<model-variant>`` derived from
             ``policy_path``.
+        positions_npz: Path to the precomputed changed-object positions
+            ``episode_<N>.npz`` (from scene_diff/scripts/extract_object_positions.py,
+            driven by run_img_with_depth.sh). REQUIRED when the policy declares
+            ``observation.environment_state``: loaded before the control loop and fed as
+            env-state conditioning. Ignored for non-position-conditioned policies.
     """
     setup_logging(debug)
     ctrl = PolicyRolloutController(
@@ -1530,6 +1842,7 @@ def main(
         act_temporal_ensemble_coeff=act_temporal_ensemble_coeff,
         record=record,
         record_dir=record_dir,
+        positions_npz=positions_npz,
     )
     ctrl.run()
 

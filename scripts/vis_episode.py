@@ -22,18 +22,25 @@ Two episode layouts are supported via ``--deploy``:
 * ``--deploy`` (policy rollout, written by ``follower/policy_rollout.py``)::
 
       time/{begin_build_observation, begin_inference, finish_inference, publish_command, ...}
-      obs/images/{head_left_rgb, head_depth, left_wrist_rgb}   (no intrinsic/extrinsic)
+      obs/images/{head_left_rgb, head_depth, left_wrist_rgb, intrinsic, extrinsic}
       obs/joint/{left_arm, right_arm}
       obs/eef_9d/{left, right}
       obs/gripper/{left, right}
+      obs/position_condition/{stage, mask, condition_6d}  (optional)
       action/eef_9d/{left, right}
       action/gripper/{left, right}
 
   EEF markers are read directly for both arms: obs = ``obs/eef_9d/{left,right}``
   (blue), action = ``action/eef_9d/{left,right}`` (red).
-  Torso/head joints aren't recorded, so they're held at ``INIT_*``
-  for robot-mesh / camera-extrinsic FK, and ZED intrinsics fall back to the
-  hardcoded values. A ``debug/latency.png`` is written from the ``time`` group.
+  Position-conditioned rollouts also show the selected stage/mask and the
+  active 6-D [before_xyz, after_xyz] condition as text plus 3D before/after
+  markers and a 2D overlay projected onto ``head_left_rgb``.
+  Torso/head joints aren't recorded, so they're held at ``INIT_*`` for
+  robot-mesh FK. The saved ``obs/images/{intrinsic, extrinsic}`` calibration is
+  required in this mode -- the script errors out rather than falling back to
+  hardcoded ZED intrinsics / FK camera extrinsics (a single shared matrix is
+  broadcast over frames). A ``debug/latency.png`` is written from the ``time``
+  group.
 
 EEF markers represent the *future* trajectory from each frame onwards (obs blue,
 action red), so the point cloud shrinks one point at a time from the start as
@@ -95,6 +102,12 @@ _OBS_NAMES = [
 _OBS_COLOR = (0, 80, 255)
 _ACTION_COLOR = (255, 0, 0)
 
+# Deploy position-condition markers (3D world + 2D head RGB overlay).
+_POS_COND_COLOR_BEFORE = (0, 200, 255)
+_POS_COND_COLOR_AFTER = (255, 225, 25)
+_POS_COND_RADIUS_3D = 0.015
+_POS_COND_RADIUS_2D = 2.5
+
 
 def gram_schmidt_6d_to_R(r6: np.ndarray) -> np.ndarray:
     """Recover (3, 3) rotation from Zhou et al. 6-D representation."""
@@ -119,6 +132,27 @@ def unproject_depth(
     pts_cam = np.stack([x, y, z, np.ones_like(z)], axis=-1)
     pts_world = (world_t_cam @ pts_cam.T).T[:, :3]
     return pts_world.astype(np.float32), mask
+
+
+def project_world_to_pixel(
+    pts_world: np.ndarray, K: np.ndarray, world_t_cam: np.ndarray, z_min: float = 0.01
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project (N, 3) world points into pixel coords using the same convention
+    as ``unproject_depth`` (camera frame: +x right, +y down, +z forward).
+
+    Returns ``(uv, valid)`` where ``uv`` is (N, 2) float32 pixel coords and
+    ``valid`` is a boolean mask of points in front of the camera.
+    """
+    pts = np.asarray(pts_world, dtype=np.float64).reshape(-1, 3)
+    cam_t_world = np.linalg.inv(world_t_cam)
+    pts_homog = np.concatenate([pts, np.ones((pts.shape[0], 1))], axis=1)
+    pts_cam = (cam_t_world @ pts_homog.T).T[:, :3]
+    z = pts_cam[:, 2]
+    valid = z > z_min
+    z_safe = np.where(valid, z, 1.0)
+    u = K[0, 0] * pts_cam[:, 0] / z_safe + K[0, 2]
+    v = K[1, 1] * pts_cam[:, 1] / z_safe + K[1, 2]
+    return np.stack([u, v], axis=-1).astype(np.float32), valid
 
 
 def voxel_downsample(
@@ -212,8 +246,10 @@ def report_pipeline_latencies(time_group: dict, hdf5_path: str) -> None:
 
 
 def eef9_to_pos_R(eef9: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Split an ``(N, 9)`` eef stream into positions ``(N, 3)`` and rotations
-    ``(N, 3, 3)``; non-finite rows yield NaN pose so the renderer can skip them."""
+    """Split an ``(N, 9)`` eef stream into positions and rotations.
+
+    Non-finite rows yield NaN pose so the renderer can skip them.
+    """
     if eef9.ndim != 2 or eef9.shape[1] != 9:
         raise ValueError(f"expected (N, 9) eef_9d stream, got shape {eef9.shape}")
     N = eef9.shape[0]
@@ -223,6 +259,56 @@ def eef9_to_pos_R(eef9: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if np.all(np.isfinite(eef9[i])):
             Rm[i] = gram_schmidt_6d_to_R(eef9[i, 3:9])
     return pos, Rm
+
+
+def load_deploy_position_condition(
+    obs_group: dict, num_frames: int
+) -> dict[str, np.ndarray] | None:
+    """Read optional deploy position-condition arrays from an episode obs group."""
+    if "position_condition" not in obs_group:
+        return None
+    group = obs_group["position_condition"]
+    missing = [key for key in ("stage", "mask", "condition_6d") if key not in group]
+    if missing:
+        raise KeyError(
+            f"obs/position_condition missing {missing}; have {list(group)}"
+        )
+
+    stage = np.asarray(group["stage"], dtype=np.int32).reshape(-1)
+    mask = np.asarray(group["mask"], dtype=np.float32)
+    condition_6d = np.asarray(group["condition_6d"], dtype=np.float32)
+    if stage.shape != (num_frames,):
+        raise ValueError(
+            f"obs/position_condition/stage shape {stage.shape} != ({num_frames},)"
+        )
+    if mask.ndim != 2 or mask.shape[0] != num_frames:
+        raise ValueError(
+            "obs/position_condition/mask must have shape (N, M), "
+            f"got {mask.shape} for N={num_frames}"
+        )
+    if condition_6d.shape != (num_frames, 6):
+        raise ValueError(
+            "obs/position_condition/condition_6d must have shape (N, 6), "
+            f"got {condition_6d.shape}"
+        )
+    return {"stage": stage, "mask": mask, "condition_6d": condition_6d}
+
+
+def format_position_condition_frame(
+    stage: np.integer | int, mask: np.ndarray, condition_6d: np.ndarray
+) -> str:
+    """Format one frame's selected position condition for a rerun text view."""
+    cond = np.asarray(condition_6d, dtype=np.float32).reshape(6)
+    mask_arr = np.asarray(mask, dtype=np.float32).reshape(-1)
+    before = ", ".join(f"{v:.3f}" for v in cond[:3])
+    after = ", ".join(f"{v:.3f}" for v in cond[3:])
+    mask_text = ", ".join(f"{v:.3f}" for v in mask_arr)
+    return (
+        f"stage: {int(stage)}\n"
+        f"mask: [{mask_text}]\n"
+        f"before: [{before}]\n"
+        f"after: [{after}]"
+    )
 
 
 def main() -> None:
@@ -239,7 +325,8 @@ def main() -> None:
         help="Read a policy-rollout episode (follower/policy_rollout.py layout) "
         "instead of a teleop recording: EEF markers come from "
         "obs/action eef_9d/{left,right}, torso/head joints are held at INIT_*, "
-        "ZED intrinsics fall back to hardcoded, and a debug/latency.png is written.",
+        "saved obs/images/{intrinsic,extrinsic} are required (no hardcoded/FK "
+        "fallback), and a debug/latency.png is written.",
     )
     parser.add_argument(
         "--voxel", type=float, default=0.008, help="Voxel size for PCD downsample (m)"
@@ -307,20 +394,35 @@ def main() -> None:
     obs_grip_right = np.array(data["obs"]["gripper"]["right"])  # (N,)
     act_grip_left = np.array(data["action"]["gripper"]["left"])  # (N,)
     act_grip_right = np.array(data["action"]["gripper"]["right"])  # (N,)
-    # "stage" was dropped from recordings; keep showing it for legacy episodes.
-    stage = np.array(data["stage"]) if "stage" in data else None  # (N,) or None
+    position_condition = (
+        load_deploy_position_condition(data["obs"], N) if args.deploy else None
+    )
 
     wrist_note = f"  |  wrist: {wrist_rgb.shape[1:3]}" if wrist_rgb is not None else "  |  no wrist"
     print(
         f"Episode ({'deploy' if args.deploy else 'teleop'}): {N} frames  |  "
         f"head image: {H}x{W}{wrist_note}"
     )
+    if position_condition is not None:
+        print("Position condition: plotting obs/position_condition stage/mask/condition_6d")
 
-    # ── intrinsics: prefer per-episode if recorded, else hardcoded ZED ───────
+    # ── intrinsics: deploy requires the saved matrix (no fallback); teleop
+    #    falls back to hardcoded ZED when absent. ──────────────────────────────
     if "intrinsic" in img_group:
-        K_all = np.array(img_group["intrinsic"]).astype(np.float64)
-        if K_all.ndim == 2:  # single shared matrix → broadcast over frames
+        K_all = np.array(img_group["intrinsic"], dtype=np.float64)
+        if K_all.shape == (3, 3):  # single shared matrix → broadcast over frames
             K_all = np.repeat(K_all[None], N, axis=0)
+        if K_all.shape != (N, 3, 3):
+            raise ValueError(
+                f"obs/images/intrinsic shape {K_all.shape} is not (3, 3) or ({N}, 3, 3)"
+            )
+        print(f"Using saved obs/images/intrinsic {K_all.shape}")
+    elif args.deploy:
+        raise KeyError(
+            f"obs/images/intrinsic missing in --deploy episode {args.hdf5!r}; "
+            "refusing to fall back to hardcoded ZED intrinsics "
+            f"(obs/images has: {list(img_group)})"
+        )
     else:
         fx = fy = 770.1868 / 2.0
         cx = 990.2711 / 2.0
@@ -359,10 +461,23 @@ def main() -> None:
                     Rm[k, idx] = M[:3, :3]
         return pos, Rm
 
-    # ── extrinsics: prefer saved, else FK from the (obs / INIT) joints ───────
+    # ── extrinsics: deploy requires the saved matrix (no FK fallback); teleop
+    #    falls back to per-frame FK from the (obs / INIT) joints when absent. ──
     if "extrinsic" in img_group:
-        extrinsics = np.array(img_group["extrinsic"]).astype(np.float64)
-        print("Using saved obs/images/extrinsic")
+        extrinsics = np.array(img_group["extrinsic"], dtype=np.float64)
+        if extrinsics.shape == (4, 4):  # single shared pose → broadcast over frames
+            extrinsics = np.repeat(extrinsics[None], N, axis=0)
+        if extrinsics.shape != (N, 4, 4):
+            raise ValueError(
+                f"obs/images/extrinsic shape {extrinsics.shape} is not (4, 4) or ({N}, 4, 4)"
+            )
+        print(f"Using saved obs/images/extrinsic {extrinsics.shape}")
+    elif args.deploy:
+        raise KeyError(
+            f"obs/images/extrinsic missing in --deploy episode {args.hdf5!r}; "
+            "refusing to fall back to FK camera extrinsics "
+            f"(obs/images has: {list(img_group)})"
+        )
     else:
         print("No saved extrinsic — computing per-frame FK ...")
         extrinsics = np.zeros((N, 4, 4), dtype=np.float64)
@@ -417,12 +532,27 @@ def main() -> None:
     # Entity paths below mirror where the streams are logged further down; an
     # explicit blueprint also stops the viewer falling back to a stale auto
     # layout that reported "Entity not found in view" for the wrist image.
+    # In --deploy mode the depth stream clutters the views (a translucent layer
+    # over head_left_rgb and a backprojected point cloud competing with the
+    # colored /world/pcd in 3D), so hide /world/camera/depth by default in both.
+    # It stays in the blueprint and can be toggled back on from the viewer.
+    depth_override = (
+        {"/world/camera/depth": rrb.EntityBehavior(visible=False)} if args.deploy else None
+    )
+
     side_panels: list = []
     if wrist_rgb is not None:
         side_panels.append(
             rrb.Spatial2DView(origin="/image/left_wrist_rgb", name="left_wrist_rgb")
         )
-    side_panels.append(rrb.Spatial2DView(origin="/world/camera/rgb", name="head_left_rgb"))
+    # Head RGB 2D view must root at the pinhole entity (/world/camera), not the
+    # Image child (/world/camera/rgb), so Points2D overlays logged as siblings
+    # of rgb (e.g. position_condition_2d) appear on top of the image.
+    side_panels.append(
+        rrb.Spatial2DView(
+            origin="/world/camera", name="head_left_rgb", overrides=depth_override
+        )
+    )
     side_panels.append(
         rrb.TimeSeriesView(
             name="gripper (obs + action)",
@@ -434,9 +564,24 @@ def main() -> None:
             ],
         )
     )
+    if position_condition is not None:
+        side_panels.append(
+            rrb.TextLogView(
+                origin="/text/position_condition", name="position_condition"
+            )
+        )
+        side_panels.append(
+            rrb.TimeSeriesView(
+                name="position condition stage",
+                contents=["/plot/position_condition/stage"],
+                visible=False,
+            )
+        )
     blueprint = rrb.Blueprint(
         rrb.Horizontal(
-            rrb.Spatial3DView(origin="/world", name="world pointcloud"),
+            rrb.Spatial3DView(
+                origin="/world", name="world pointcloud", overrides=depth_override
+            ),
             rrb.Vertical(*side_panels),
             column_shares=[2, 1],
         ),
@@ -447,10 +592,32 @@ def main() -> None:
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
 
     # ── distinct colors per gripper series (otherwise rerun auto-picks green for both)
-    rr.log("plot/gripper/obs_left", rr.SeriesLines(colors=[230, 25, 75], names="obs_left"), static=True)
-    rr.log("plot/gripper/obs_right", rr.SeriesLines(colors=[0, 130, 200], names="obs_right"), static=True)
-    rr.log("plot/gripper/act_left", rr.SeriesLines(colors=[245, 130, 48], names="act_left"), static=True)
-    rr.log("plot/gripper/act_right", rr.SeriesLines(colors=[60, 180, 75], names="act_right"), static=True)
+    rr.log(
+        "plot/gripper/obs_left",
+        rr.SeriesLines(colors=[230, 25, 75], names="obs_left"),
+        static=True,
+    )
+    rr.log(
+        "plot/gripper/obs_right",
+        rr.SeriesLines(colors=[0, 130, 200], names="obs_right"),
+        static=True,
+    )
+    rr.log(
+        "plot/gripper/act_left",
+        rr.SeriesLines(colors=[245, 130, 48], names="act_left"),
+        static=True,
+    )
+    rr.log(
+        "plot/gripper/act_right",
+        rr.SeriesLines(colors=[60, 180, 75], names="act_right"),
+        static=True,
+    )
+    if position_condition is not None:
+        rr.log(
+            "plot/position_condition/stage",
+            rr.SeriesLines(colors=[255, 225, 25], names="stage"),
+            static=True,
+        )
 
     # ── robot link geometry: log ONCE as static, then animate per-frame via
     #    Transform3D in the loop below. Re-logging full Mesh3D every frame costs
@@ -532,6 +699,77 @@ def main() -> None:
         rr.log("plot/gripper/obs_right", rr.Scalars(float(obs_grip_right[idx])))
         rr.log("plot/gripper/act_left", rr.Scalars(float(act_grip_left[idx])))
         rr.log("plot/gripper/act_right", rr.Scalars(float(act_grip_right[idx])))
+
+        # ── optional deploy position condition: selected [before, after] ─────
+        if position_condition is not None:
+            pc_stage = position_condition["stage"][idx]
+            pc_mask = position_condition["mask"][idx]
+            pc6 = position_condition["condition_6d"][idx]
+            before = pc6[:3].astype(np.float32)
+            after = pc6[3:].astype(np.float32)
+            if np.all(np.isfinite(pc6)):
+                rr.log(
+                    "world/position_condition/before",
+                    rr.Points3D(
+                        before[None], colors=[_POS_COND_COLOR_BEFORE], radii=_POS_COND_RADIUS_3D
+                    ),
+                )
+                rr.log(
+                    "world/position_condition/after",
+                    rr.Points3D(
+                        after[None], colors=[_POS_COND_COLOR_AFTER], radii=_POS_COND_RADIUS_3D
+                    ),
+                )
+                rr.log(
+                    "world/position_condition/delta",
+                    rr.LineStrips3D(
+                        [np.stack([before, after])], colors=[_POS_COND_COLOR_AFTER]
+                    ),
+                )
+
+                condition_uv, condition_valid = project_world_to_pixel(
+                    np.stack([before, after]), K, world_t_cam
+                )
+                valid_idx = np.flatnonzero(condition_valid)
+                if len(valid_idx) > 0:
+                    condition_colors = np.asarray(
+                        [_POS_COND_COLOR_BEFORE, _POS_COND_COLOR_AFTER], dtype=np.uint8
+                    )[valid_idx]
+                    rr.log(
+                        "world/camera/position_condition_2d",
+                        rr.Points2D(
+                            condition_uv[valid_idx],
+                            colors=condition_colors,
+                            radii=np.full(len(valid_idx), _POS_COND_RADIUS_2D, dtype=np.float32),
+                        ),
+                    )
+                else:
+                    rr.log("world/camera/position_condition_2d", rr.Clear(recursive=False))
+                if np.all(condition_valid):
+                    rr.log(
+                        "world/camera/position_condition_vector_2d",
+                        rr.LineStrips2D(
+                            [condition_uv.astype(np.float32)],
+                            colors=[_POS_COND_COLOR_AFTER],
+                            radii=1.5,
+                        ),
+                    )
+                else:
+                    rr.log(
+                        "world/camera/position_condition_vector_2d",
+                        rr.Clear(recursive=False),
+                    )
+            else:
+                rr.log("world/position_condition", rr.Clear(recursive=True))
+                rr.log("world/camera/position_condition_2d", rr.Clear(recursive=False))
+                rr.log(
+                    "world/camera/position_condition_vector_2d", rr.Clear(recursive=False)
+                )
+            rr.log("plot/position_condition/stage", rr.Scalars(float(pc_stage)))
+            rr.log(
+                "text/position_condition",
+                rr.TextLog(format_position_condition_frame(pc_stage, pc_mask, pc6)),
+            )
 
 
 if __name__ == "__main__":

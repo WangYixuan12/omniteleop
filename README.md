@@ -31,7 +31,7 @@ python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending c
 
 ## Data collection
 
-1. sshfs yixuan@128.59.19.217:/home/yixuan/omniteleop /home/dexmate/yixuan/omniteleop_yifan
+1. sshfs [yixuan@128.59.19.217](mailto:yixuan@128.59.19.217):/home/yixuan/omniteleop /home/dexmate/yixuan/omniteleop_yifan
 2. ssh dexmate, conda activate dexmate
 3. run '(dexmate) dextop node start' '(yixuan) python /home/dexmate/yixuan/omniteleop_yifan/tests/test_wrist_zedm_[depth.py](http://depth.py)
   ' and then 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera'  in tmux
@@ -138,10 +138,15 @@ Run infer_dexmate.py before deploy.
 
 ```bash
 python -m omniteleop.follower.policy_rollout \
-      --policy-path /home/yixuan/Dexmate/model/act/dexmate_eef_eef_abs_head_nopos_20_10/checkpoints/150000/pretrained_model \
-      --record_dir /home/yixuan/Dexmate/deploy/act/dexmate_eef_eef_abs_head_nopos_20_10/150000
+      --policy-path /home/yixuan/Dexmate/model/act/dexmate_eef_eef_abs_2cam_pos_20_10/checkpoints/last/pretrained_model \
+      --record_dir /home/yixuan/Dexmate/deploy/act/dexmate_eef_eef_abs_2cam_pos_20_10/last
 # ACT deploy uses checkpoint n_action_steps and temporal_ensemble_coeff by default.
 # use the training stats baked into the checkpoint
+
+python -m omniteleop.follower.policy_rollout \
+    --policy-path /home/yixuan/Dexmate/model/dp/dexmate_eef_eef_abs_2cam_pos_16_8/checkpoints/last/pretrained_model\
+    --record-dir /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef_abs_2cam_pos_16_8/last \
+    --positions-npz /home/yixuan/Dexmate/deploy/pos_condition/0/episode_0.npz
 ```
 
 ```bash
@@ -151,7 +156,7 @@ python scripts/vis_deploy.py \
 ```
 
 ```bash
-python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixuan/Dexmate/deploy/act/dexmate_eef_eef_abs_head_nopos_20_10/150000/0/episode_0.hdf5
+python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixuan/Dexmate/deploy/act/dexmate_eef_eef_abs_2cam_pos_20_10/last/2/episode_0.hdf5
 # rerun, transmission latency plot under debug/
 ```
 
