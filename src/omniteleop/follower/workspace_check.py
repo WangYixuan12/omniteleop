@@ -35,7 +35,7 @@ DEFAULT_RIGHT_BOUNDS: dict[str, tuple[float, float]] = {
 DEFAULT_LEFT_BOUNDS: dict[str, tuple[float, float]] = {
     "x": (0.0, 0.75),
     "y": (-0.20, 0.70),
-    "z": (0.72, 1.10),  # 0.72 is hitting the table
+    "z": (0.72, 1.20),  # 0.72 is hitting the table
 }
 DEFAULT_RIGHT_LINK = "R_ee"
 DEFAULT_LEFT_LINK = "L_ee"
