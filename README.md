@@ -44,8 +44,9 @@ python /home/dexmate/yixuan/omniteleop/tests/test_wrist_zedm_depth.py --duration
 
 1. ssh lambda, conda activate dexmate
 2. run
-  (dexmate) python src/omniteleop/follower/vr_robot_controller.py # workspace_check = True, joint positions in vr_mode_const, head_mode and left_arm_mode in src/omniteleop/configs/vega_1_f5d6.yaml  
-    (dexmate) python src/omniteleop/leader/vr_reader.py # start-mode=fixed_pose
+  (dexmate) python src/omniteleop/follower/vr_robot_controller.py # workspace_check = True, joint positions in vr_mode_const, head_mode and left_arm_mode in src/omniteleop/configs/vega_1_f5d6.yaml
+3. (dexmate) python src/omniteleop/leader/vr_reader.py --manual_reposition /home/yixuan/Dexmate/data/raw_data/episode_0.hdf5
+4. (dexmate) python src/omniteleop/leader/vr_reader.py # start-mode=fixed_pose
 
 > debug /target/eef_used_by_ik/right: IK input
 > /action/joint/right_arm: IK output + step clamping
@@ -144,9 +145,9 @@ python -m omniteleop.follower.policy_rollout \
 # use the training stats baked into the checkpoint
 
 python -m omniteleop.follower.policy_rollout \
-    --policy-path /home/yixuan/Dexmate/model/dp/dexmate_eef_eef_abs_2cam_pos_16_8/checkpoints/last/pretrained_model\
-    --record-dir /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef_abs_2cam_pos_16_8/last \
-    --positions-npz /home/yixuan/Dexmate/deploy/pos_condition/0/episode_0.npz
+    --policy-path /home/yixuan/Dexmate/model/dp/dexmate_eef_eef_abs_film/checkpoints/160000/pretrained_model \
+    --record-dir /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef_abs_film/160000 \
+    --positions-npz /home/yixuan/Dexmate/deploy/pos_condition/2/episode_0.npz
 ```
 
 ```bash

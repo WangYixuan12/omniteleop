@@ -344,6 +344,7 @@ class VRReader:
         save_debug: bool = True,
         workspace_check: bool = workspace_check,
         cameras: Optional[list[CameraStream]] = None,
+        manual_reposition: Optional[str] = None,
     ) -> None:
         self.stick_max_vx = stick_max_vx
         self.stick_max_vy = stick_max_vy
@@ -568,6 +569,19 @@ class VRReader:
         self._fixed_left_vr_rot0: Optional[np.ndarray] = None
         self._fixed_right_vr_rot0: Optional[np.ndarray] = None
 
+        # Manual-reposition reference: the first recorded head_left_rgb frame of
+        # another episode, ghost-blended onto the live head tile so the operator
+        # can physically align the scene/robot to match it before recording.
+        self._reposition_tile: Optional[np.ndarray] = None
+        if manual_reposition is not None:
+            self._reposition_tile = self._load_reposition_tile(manual_reposition)
+            if "head_left_rgb" not in self.cameras:
+                logger.warning(
+                    "--manual_reposition is set but 'head_left_rgb' is not in "
+                    f"--cameras ({self.cameras}); the reference overlay needs the "
+                    "live head_left_rgb tile to blend onto and will not appear."
+                )
+
         self.visualize = visualize
         if visualize:
             self._setup_sapien_viewer(urdf_path)
@@ -699,6 +713,49 @@ class VRReader:
             f"{resolve_key_name(f'sensors/{_WRIST_SENSOR_ID}/right_rgb')!r}."
         )
 
+    @staticmethod
+    def _load_reposition_tile(path: str) -> np.ndarray:
+        """Load obs/images/head_left_rgb[0] from an episode HDF5 as a preview tile.
+
+        Returns a 320x180 BGR uint8 image matching the head_left_rgb tile from
+        :meth:`_render_tile` (so it can be ghost-blended onto the live tile).
+        Raises ValueError on any missing/malformed input — never returns dummy
+        data.
+        """
+        import h5py
+
+        p = pathlib.Path(path)
+        if not p.is_file():
+            raise ValueError(f"--manual_reposition file not found: {path}")
+        with h5py.File(str(p), "r") as f:
+            img_group = f.get("obs/images")
+            if img_group is None:
+                raise ValueError(f"{path}: missing 'obs/images' group")
+            # Accept the legacy 'left_rgb' key too (cf. scripts/vis_episode.py).
+            key = (
+                "head_left_rgb"
+                if "head_left_rgb" in img_group
+                else ("left_rgb" if "left_rgb" in img_group else None)
+            )
+            if key is None:
+                raise ValueError(
+                    f"{path}: obs/images has no 'head_left_rgb' (or legacy "
+                    f"'left_rgb'); found {list(img_group)}"
+                )
+            dset = img_group[key]
+            if dset.ndim != 4 or dset.shape[0] < 1 or dset.shape[-1] != 3:
+                raise ValueError(
+                    f"{path}: obs/images/{key} shape {tuple(dset.shape)} is not "
+                    "(N>=1, H, W, 3)"
+                )
+            rgb = np.asarray(dset[0]).astype(np.uint8)  # (H, W, 3), RGB
+        logger.info(
+            f"Manual-reposition reference loaded: {path} obs/images/{key}[0] "
+            f"shape={rgb.shape}"
+        )
+        # Match _render_tile head output: RGB→BGR, resized to 320x180.
+        return cv2.resize(rgb[:, :, ::-1], (320, 180))
+
     def _render_tile(self, stream: CameraStream) -> Optional[np.ndarray]:
         """Render one 320x180 preview tile for the given selected stream.
 
@@ -738,8 +795,22 @@ class VRReader:
             if stream == "head_depth":
                 continue
             tile = self._render_tile(stream)
-            if tile is not None:
-                vis_imgs.append(tile)
+            if tile is None:
+                continue
+            # Ghost-blend the manual-reposition reference onto the live head tile
+            # so the operator can align the real scene to match it.
+            if stream == "head_left_rgb" and self._reposition_tile is not None:
+                tile = cv2.addWeighted(tile, 0.5, self._reposition_tile, 0.5, 0.0)
+                cv2.putText(
+                    tile,
+                    "reposition ref",
+                    (8, tile.shape[0] - 8),
+                    fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                    fontScale=0.4,
+                    thickness=1,
+                    color=(0, 255, 0),
+                )
+            vis_imgs.append(tile)
         if not vis_imgs:
             return
         vis_img = concat_img_h(vis_imgs)
@@ -908,11 +979,16 @@ class VRReader:
 
         Mirrors the gate in vr_robot_controller — when this flag is True the
         follower will freeze the left arm, so the headset overlay matches.
+
+        Skipped while the left arm is frozen: the held command is static and the
+        robot will not move regardless of where the controller drifts, so an OOB
+        warning against the live IK solution would be spurious.
         """
-        if not left_pos or self._calib_stage not in (
-            "resetting",
-            "whole_body",
-            "whole_body_alignment",
+        if (
+            not left_pos
+            or self._left_arm_frozen
+            or self._calib_stage
+            not in ("resetting", "whole_body", "whole_body_alignment")
         ):
             self._left_eef_oob = False
             self._left_eef_xyz = np.full(3, np.nan, dtype=np.float32)
@@ -938,11 +1014,16 @@ class VRReader:
 
         Mirrors the gate in vr_robot_controller — when this flag is True the
         follower will freeze the right arm, so the headset overlay matches.
+
+        Skipped while the right arm is frozen: the held command is static and the
+        robot will not move regardless of where the controller drifts, so an OOB
+        warning against the live IK solution would be spurious.
         """
-        if not right_pos or self._calib_stage not in (
-            "resetting",
-            "whole_body",
-            "whole_body_alignment",
+        if (
+            not right_pos
+            or self._right_arm_frozen
+            or self._calib_stage
+            not in ("resetting", "whole_body", "whole_body_alignment")
         ):
             self._right_eef_oob = False
             self._right_eef_xyz = np.full(3, np.nan, dtype=np.float32)
@@ -1874,7 +1955,7 @@ def main() -> None:
         urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"  # noqa
         """Path to robot URDF for Sapien visualizer (required if --visualize)"""
 
-        save_dir: str = "/home/yixuan/Dexmate/data/raw_data_openlid"
+        save_dir: str = "/home/yixuan/Dexmate/data/raw_data_tmp"
         """Directory to save episode_<N>.hdf5 files (A=start, B=stop)"""
 
         debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/raw_data"
@@ -1907,6 +1988,12 @@ def main() -> None:
         tests/test_wrist_zedm_depth.py). wrist_depth is rejected — the wrist
         is configured RGB-only (enable_depth=False)."""
 
+        manual_reposition: Optional[str] = None
+        """Path to an episode_<N>.hdf5. When set, obs/images/head_left_rgb[0]
+        from that episode is ghost-blended (~50%) onto the live head_left_rgb
+        see-through tile so you can physically reposition the scene/robot to
+        match the recorded start state. Requires 'head_left_rgb' in --cameras."""
+
     args = tyro.cli(Args)
 
     reader = VRReader(
@@ -1930,6 +2017,7 @@ def main() -> None:
         save_debug=args.save_debug,
         workspace_check=args.workspace_check,
         cameras=args.cameras,
+        manual_reposition=args.manual_reposition,
     )
     reader.run()
 
