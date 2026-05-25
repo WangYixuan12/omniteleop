@@ -144,10 +144,10 @@ python -m omniteleop.follower.policy_rollout \
 # ACT deploy uses checkpoint n_action_steps and temporal_ensemble_coeff by default.
 # use the training stats baked into the checkpoint
 
-python -m omniteleop.follower.policy_rollout \
-    --policy-path /home/yixuan/Dexmate/model/dp/dexmate_eef_eef_abs_film/checkpoints/160000/pretrained_model \
-    --record-dir /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef_abs_film/160000 \
-    --positions-npz /home/yixuan/Dexmate/deploy/pos_condition/2/episode_0.npz
+python -m omniteleop.follower.live_scenediff_rollout \
+    --policy-path /home/yixuan/Dexmate/model/dp/dexmate_eef_eef_abs_film_pos_16_8/checkpoints/200000/pretrained_model \
+    --prompt-before-capture
+# [--record-dir]
 ```
 
 ```bash
@@ -157,7 +157,7 @@ python scripts/vis_deploy.py \
 ```
 
 ```bash
-python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixuan/Dexmate/deploy/act/dexmate_eef_eef_abs_2cam_pos_20_10/last/2/episode_0.hdf5
+python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef_abs_2cam_film_16_8/200000/9/episode_0.hdf5
 # rerun, transmission latency plot under debug/
 ```
 

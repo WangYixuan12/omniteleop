@@ -270,6 +270,27 @@ class PolicyRolloutController:
         self._positions_npz = positions_npz
         self._detect_camera_inputs(policy_path)
 
+        # Resolve record_dir early — before initialize_robot() / _before_policy_init() —
+        # so subclasses (e.g. live_scenediff_rollout) can read self._record_dir in their
+        # hook to decide where to put SceneDiff outputs.
+        # Mirror the model tree under deploy/ by replacing the model root prefix:
+        #   .../Dexmate/model/dp/name/checkpoints/200000/pretrained_model
+        #       → /home/yixuan/Dexmate/deploy/dp/name/checkpoints/200000/
+        if record and record_dir is None:
+            p = pathlib.Path(policy_path)
+            _model_root = pathlib.Path("/home/yixuan/Dexmate/model")
+            _deploy_root = pathlib.Path("/home/yixuan/Dexmate/deploy")
+            try:
+                record_dir = str(_deploy_root / p.parent.relative_to(_model_root))
+            except ValueError:
+                raise ValueError(
+                    f"Cannot auto-derive record_dir: policy_path is not under "
+                    f"{_model_root}. Pass --record-dir explicitly."
+                ) from None
+        self._record_dir: Optional[pathlib.Path] = (
+            pathlib.Path(record_dir) if record_dir is not None else None
+        )
+
         # Joint feedback publisher.
         joint_topic = self.config.get_topic("robot_joints")
         self.joint_pub = self.node.create_publisher(
@@ -308,6 +329,13 @@ class PolicyRolloutController:
 
         # Hardware + policy.
         self.initialize_robot()
+        # Hook for subclasses to populate self._positions_npz AFTER the robot is homed
+        # (head/torso at INIT, camera streaming) but BEFORE initialize_policy() loads
+        # the policy and the env-state conditioning. Live SceneDiff conditioning
+        # overrides this to capture a head frame at the exact rollout start viewpoint
+        # and run detection while the GPU is still free of the policy. Default no-op,
+        # so the standard rollout path is unchanged.
+        self._before_policy_init()
         self.initialize_policy(
             policy_path,
             act_n_action_steps=act_n_action_steps,
@@ -316,10 +344,8 @@ class PolicyRolloutController:
 
         if record:
             self._cache_head_camera_calibration()
-            if record_dir is None:
-                tag = pathlib.Path(policy_path).parents[2].name
-                record_dir = f"/home/yixuan/Dexmate/deploy/{tag}"
-            rollout_record_dir = _next_record_subdir(record_dir)
+            # self._record_dir was resolved above (before initialize_robot).
+            rollout_record_dir = _next_record_subdir(self._record_dir)  # type: ignore[arg-type]
             self._recorder: Optional[EpisodeRecorder] = EpisodeRecorder(
                 str(rollout_record_dir)
             )
@@ -466,6 +492,15 @@ class PolicyRolloutController:
             f"left={self._last_obs_grip_left:.3f} "
             f"right={self._last_obs_grip_right:.3f})."
         )
+
+    def _before_policy_init(self) -> None:
+        """Hook run after the robot is homed and before the policy/env-state load.
+
+        Default no-op. Subclasses may override to capture a head frame and compute
+        ``self._positions_npz`` (e.g. live SceneDiff conditioning) so that the
+        subsequent ``initialize_policy`` -> ``_load_position_conditions`` picks it up
+        through the normal path. Runs while the policy is not yet on the GPU.
+        """
 
     @staticmethod
     def _warmup_gripper(arm, side: str) -> float:
@@ -917,6 +952,16 @@ class PolicyRolloutController:
             np.uint16
         )
         return policy_head, left_rgb, depth_u16
+
+    def capture_head_frame(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(full_left_rgb uint8 [H,W,3], depth_u16 [H,W] mm)`` from the live
+        head camera at the current (homed) pose.
+
+        Used by live-conditioning subclasses (``_before_policy_init``) to build a
+        SceneDiff "before" frame that matches the rollout's start viewpoint exactly.
+        """
+        _, left_rgb, depth_u16 = self._read_head_camera()
+        return left_rgb, depth_u16
 
     def _read_wrist_camera(self) -> tuple[np.ndarray, np.ndarray]:
         """Read the wrist ZED-M left eye for policy input + recording.
@@ -1821,8 +1866,8 @@ def main(
         record: Dump per-policy-tick frames to HDF5 for debug analysis.
         record_dir: Override save root. Each rollout records under the next
             numeric subdirectory (``0``, ``1``, ...). Defaults to
-            ``/home/yixuan/Dexmate/deploy/<model-variant>`` derived from
-            ``policy_path``.
+            ``/home/yixuan/Dexmate/deploy/<model-tag>/<step>`` derived from
+            ``policy_path`` (e.g. ``.../dexmate_eef_eef_abs_film/200000/``).
         positions_npz: Path to the precomputed changed-object positions
             ``episode_<N>.npz`` (from scene_diff/scripts/extract_object_positions.py,
             driven by run_img_with_depth.sh). REQUIRED when the policy declares
