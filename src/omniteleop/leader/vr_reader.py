@@ -531,6 +531,31 @@ class VRReader:
         self._last_ik_solve_ms: float = float("nan")
         self._last_publish_ms: float = float("nan")
 
+        # Per-iteration main-loop timing — only collected/logged when
+        # save_debug. Accumulated over ~1 s windows and flushed by
+        # _record_loop_timing so we can see whether one iteration's work fits in
+        # the record period before tuning publish_rate/record_rate.
+        self._loop_timing: dict[str, list[float]] = {
+            "total": [],
+            "get_obs": [],
+            "cam_poll": [],
+            "gripper": [],
+            "head_ik": [],
+            "arm_ik": [],
+            "wksp_fk": [],
+            "record": [],
+            "publish": [],
+        }
+        self._loop_timing_last_log_t: float = 0.0
+        # Per-section sub-timings — reset to NaN each iteration, set only when
+        # the section runs, so skipped sections drop out of the stats (matches
+        # the arm-IK/publish convention).
+        self._last_cam_poll_ms: float = float("nan")
+        self._last_gripper_ms: float = float("nan")
+        self._last_head_ik_ms: float = float("nan")
+        self._last_wksp_fk_ms: float = float("nan")
+        self._last_record_ms: float = float("nan")
+
         # Gripper FC03 status cache. `_last_obs_grip_*` holds gPO/255 ∈ [0,1].
         # Monitors queue FC03 replies separately from FC16 ACKs so recording
         # never depends on dexcontrol's single latest-response slot.
@@ -891,7 +916,7 @@ class VRReader:
             self._robot_base_t_vr_base @ vr_head,
             eef_idx=self.head_eef_idx,
             active_qmask=self.head_qmask,
-            damp=1000.0,
+            damp=100.0,
         )
         # self.mm.torso.set_joint_pos(head_qpos[self.torso_indices].tolist())
         for i in np.where(self.head_qmask)[0]:
@@ -1529,6 +1554,8 @@ class VRReader:
         if now_t > self._next_record_t:
             self._next_record_t = now_t + self._record_period_s
 
+        _rec_t0 = time.perf_counter()
+
         # Sample observed joints once and FK them to the head camera link to
         # get world_t_cam (matches scripts/compute_extrinsics.py output).
         obs_torso = np.array(self._cam_robot.torso.get_joint_pos(), dtype=np.float32)
@@ -1690,6 +1717,7 @@ class VRReader:
             },
         }
         self.debug_recorder.record(debug_frame)
+        self._last_record_ms = (time.perf_counter() - _rec_t0) * 1000.0
         return left_pos, right_pos
 
     def _publish(
@@ -1736,6 +1764,58 @@ class VRReader:
         self._scene.update_render()
         self._viewer.render()
         return not self._viewer.closed
+
+    def _record_loop_timing(self, total_ms: float, get_obs_ms: float) -> None:
+        """Accumulate main-loop iteration timings and log a summary ~1 Hz.
+
+        Only called when ``save_debug`` is True. ``total_ms`` is the wall-clock
+        work per iteration (excludes the RateLimiter sleep); the IK and publish
+        sub-costs are read from ``_last_ik_solve_ms`` / ``_last_publish_ms``
+        (skipped frames contribute NaN and are dropped). The logged effective Hz
+        vs. the record period (1/record_rate) shows whether one iteration fits
+        the budget before tuning publish_rate/record_rate.
+        """
+        t = self._loop_timing
+        t["total"].append(total_ms)
+        t["get_obs"].append(get_obs_ms)
+        for key, val in (
+            ("cam_poll", self._last_cam_poll_ms),
+            ("gripper", self._last_gripper_ms),
+            ("head_ik", self._last_head_ik_ms),
+            ("arm_ik", self._last_ik_solve_ms),
+            ("wksp_fk", self._last_wksp_fk_ms),
+            ("record", self._last_record_ms),
+            ("publish", self._last_publish_ms),
+        ):
+            if np.isfinite(val):
+                t[key].append(val)
+
+        now = time.monotonic()
+        elapsed = now - self._loop_timing_last_log_t
+        if elapsed < 1.0:
+            return
+
+        n = len(t["total"])
+        eff_hz = n / elapsed if elapsed > 0 else float("nan")
+        period_ms = 1000.0 / self.record_rate
+
+        def stat(key: str) -> str:
+            vals = t[key]
+            if not vals:
+                return f"{key}=n/a"
+            arr = np.asarray(vals)
+            return f"{key} μ{arr.mean():.1f}/max{arr.max():.1f}"
+
+        logger.info(
+            f"[loop timing] {eff_hz:.1f} Hz over {n} iters "
+            f"(record period {period_ms:.1f} ms) | "
+            f"{stat('total')} | {stat('get_obs')} | {stat('cam_poll')} | "
+            f"{stat('gripper')} | {stat('head_ik')} | {stat('arm_ik')} | "
+            f"{stat('wksp_fk')} | {stat('record')} | {stat('publish')} [ms]"
+        )
+        self._loop_timing_last_log_t = now
+        for v in t.values():
+            v.clear()
 
     # ── Main loop ──────────────────────────────────────────────────────────────
 
@@ -1788,6 +1868,7 @@ class VRReader:
             monitor.send_status_request()
 
         rate_limiter = RateLimiter(self.publish_rate)
+        self._loop_timing_last_log_t = time.monotonic()
         if self._debug_display:
             self._debug_display.start()
         console.rule("[bold cyan]Stage static — hold right trigger ≥ 1 s to start head tracking")
@@ -1795,11 +1876,19 @@ class VRReader:
         try:
             step = 0
             while self.running:
+                iter_t0 = time.perf_counter()
                 transforms = self.quest.get_latest_transformation()
                 if transforms is None:
                     rate_limiter.sleep()
                     continue
 
+                self._last_cam_poll_ms = float("nan")
+                self._last_gripper_ms = float("nan")
+                self._last_head_ik_ms = float("nan")
+                self._last_wksp_fk_ms = float("nan")
+                self._last_record_ms = float("nan")
+
+                cam_t0 = time.perf_counter()
                 if self._head_keys:
                     head_imgs = self._cam_robot.sensors.head_camera.get_obs(
                         obs_keys=self._head_keys
@@ -1834,24 +1923,33 @@ class VRReader:
                         self._wrist_first_frame_logged = True
                     elif not self._last_wrist_imgs:
                         self._warn_missing_wrist_streams()
+                get_obs_ms = (time.perf_counter() - cam_t0) * 1000.0
                 if step % 4 == 0:
+                    _t = time.perf_counter()
                     self._camera_poll()
+                    self._last_cam_poll_ms = (time.perf_counter() - _t) * 1000.0
                 vr_head = transforms["head"]
                 vr_l = transforms["left_wrist"]
                 vr_r = transforms["right_wrist"]
 
+                _t = time.perf_counter()
                 self._poll_gripper_status_step()
+                self._last_gripper_ms = (time.perf_counter() - _t) * 1000.0
 
                 if self._calib_stage == "resetting":
                     head_pos, left_pos, right_pos = self._resetting_step(transforms)
                     self._mark_ik_skipped("skipped_resetting")
                     ik_l, ik_r = None, None
                 else:
+                    _t = time.perf_counter()
                     head_pos = self._head_ik_step(vr_head)
+                    self._last_head_ik_ms = (time.perf_counter() - _t) * 1000.0
                     left_pos, right_pos, ik_l, ik_r = self._arm_ik_step(vr_l, vr_r)
                 if self._workspace_check_enabled:
+                    _t = time.perf_counter()
                     self._update_left_eef_workspace_status(left_pos)
                     self._update_right_eef_workspace_status(right_pos)
+                    self._last_wksp_fk_ms = (time.perf_counter() - _t) * 1000.0
                 chassis_vx, chassis_vy, chassis_wz = self._thumbstick_to_chassis(transforms)
 
                 self._handle_stage_transition(transforms)
@@ -1877,6 +1975,11 @@ class VRReader:
 
                 if self.visualize and not self._update_visualization(ik_l, ik_r):
                     break
+
+                if self.save_debug:
+                    self._record_loop_timing(
+                        (time.perf_counter() - iter_t0) * 1000.0, get_obs_ms
+                    )
 
                 rate_limiter.sleep()
 
@@ -1933,7 +2036,7 @@ def main() -> None:
         stick_deadzone: float = 0.1
         """Thumbstick deadzone"""
 
-        publish_rate: float = 15.0
+        publish_rate: float = 30.0
         """Main loop rate (Hz). VR-pose poll, IK solve and command publish all
         run at this rate. Default matches record_rate so each loop iter records
         one frame (no throttle skipping). Must be ≥ record_rate; pick an integer
@@ -1955,7 +2058,7 @@ def main() -> None:
         urdf_path: str = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"  # noqa
         """Path to robot URDF for Sapien visualizer (required if --visualize)"""
 
-        save_dir: str = "/home/yixuan/Dexmate/data/raw_data_tmp"
+        save_dir: str = "/home/yixuan/Dexmate/data/raw_data"
         """Directory to save episode_<N>.hdf5 files (A=start, B=stop)"""
 
         debug_save_dir: str = "/home/yixuan/omniteleop/Dexmate/debug/raw_data"
