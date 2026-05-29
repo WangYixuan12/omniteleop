@@ -555,11 +555,18 @@ def main() -> None:
     )
     side_panels.append(
         rrb.TimeSeriesView(
-            name="gripper (obs + action)",
+            name="left gripper (obs + action)",
             contents=[
                 "/plot/gripper/obs_left",
-                "/plot/gripper/obs_right",
                 "/plot/gripper/act_left",
+            ],
+        )
+    )
+    side_panels.append(
+        rrb.TimeSeriesView(
+            name="right gripper (obs + action)",
+            contents=[
+                "/plot/gripper/obs_right",
                 "/plot/gripper/act_right",
             ],
         )

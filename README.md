@@ -11,10 +11,6 @@ pip install omniteleop
 ## ✨ Features
 
 - 🕹️ **JoyCon Controller Support** - Use Nintendo JoyCon for robot control
-- 💪 **Exoskeleton Arm Control** - Intuitive arm teleoperation via Dynamixel exoskeleton
-- 🛡️ **Safety System** - Built-in emergency stop and joint limits enforcement
-- 📹 **Data Collection** - Record teleoperation data for policy learning
-- 🔄 **Trajectory Replay** - Replay recorded robot trajectories
 - 📊 **Telemetry Viewer** - Real-time visualization of joint data
 
 ## Official docs
@@ -22,9 +18,16 @@ pip install omniteleop
 - [Dexmate](https://docs.dexmate.ai/dSBwCBpol8PGkSXTS9bJ)
 - [ZED camera](https://www.stereolabs.com/docs) 
   - [Depth sensing](https://www.stereolabs.com/docs/depth-sensing)
+  - Update 'dexsensor gen-cfg' if reinstall
 
 ## Latency
 
+- Head camera
+  - Something worthy of trying if latency in dexmate@vega-1:~/.dexmate/sensors/default.toml
+    - Under [[sensors]] id = "head_camera" 
+      - [sensors.params] rate = 15
+      - [sensors.streams] right_rgb = false
+      - [sensors.params] depth_mode = "NEURAL_LIGHT"
 ```python
 python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending cmd in different curves
 ```
@@ -33,8 +36,8 @@ python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending c
 
 1. sshfs [yixuan@128.59.19.217](mailto:yixuan@128.59.19.217):/home/yixuan/omniteleop /home/dexmate/yixuan/omniteleop_yifan
 2. ssh dexmate, conda activate dexmate
-3. run '(dexmate) dextop node start' '(yixuan) python /home/dexmate/yixuan/omniteleop_yifan/tests/test_wrist_zedm_[depth.py](http://depth.py)
-  ' and then 'dexsensor launch --config ~/.dexmate/sensors/default.toml --sensor head_camera'  in tmux
+3. run '(dexmate) dextop node start' '(yixuan_yifan) python /home/dexmate/yixuan/omniteleop_yifan/tests/test_wrist_zedm_depth.py
+  ' and then '(yixuan_yifan) python /home/dexmate/yixuan/omniteleop_yifan/tests/test_head_zedx_depth.py'  in tmux
 
 3.1 test wrist camera via  ZED SDK (do not run dexsensor): 
 
@@ -72,13 +75,13 @@ fixed_pose mode:
 
 python /home/yixuan/omniteleop/scripts/save_rgb_print_fps.py # if you forgot position last time
 
-python examples/advanced_examples/admittance_control.py # manual adjustment
+python /home/dexmate/yixuan/omniteleop_yifan/scripts/admittance_control.py run
 
 before shutdown:
 python -m omniteleop.follower.safearm_shutdown # reposition arm so that they fall onto table
 
 visualize:
-python /home/yixuan/omniteleop/scripts/vis_episode.py --hdf5 /home/yixuan/Dexmate/data/raw_data/episode_0.hdf5
+python /home/yixuan/omniteleop/scripts/vis_episode.py --hdf5 /home/yixuan/Dexmate/data/raw_data/episode_100.hdf5
 ```
 
 - scripts/vis_episode.py (Optional)
@@ -89,45 +92,6 @@ python /home/yixuan/omniteleop/scripts/vis_episode.py --hdf5 /home/yixuan/Dexmat
 
 ```bash
 python /home/yixuan/omniteleop/scripts/vis_teleop_curves.py --episode-id 0 # (Optional) (Need to save_debug in vr_reader)
-```
-
-### Collected HDF5 structure
-
-```text
-/timestamp_ns                         | wall-clock time when this HDF5 frame was assembled |
-/action/joint/left_arm
-/action/joint/right_arm               | IK result after IK/workspace/joint-step limiting, to be published from VRJointData to follower |
-/action/joint/head
-/action/joint/chassis_vx          
-/action/joint/chassis_vy       
-/action/joint/chassis_wz        
-/action/gripper/left          
-/action/gripper/right                
-
-/obs/joint/left_arm                 
-/obs/joint/right_arm                  | actual robot joint feedback read through Robot API |
-/obs/joint/head                       
-/obs/joint/torso                    
-/obs/gripper/left                
-/obs/gripper/right                    
-/obs/images/left_rgb                  | used for training |
-/obs/images/right_rgb                 
-/obs/images/depth                     | `uint16` |
-/obs/images/intrinsic                 | hardcoded ZED intrinsics, repeated every frame |
-/obs/images/extrinsic                 | `world_t_cam` for `zed_depth_frame`, FK-derived from observed torso/head/arm joints |
-```
-
-If `save_debug=True`, `vr_reader.py` also writes
-
-```text
-/timing/{monotonic_ns,ik_solve_ms,publish_ms}
-/calib_stage
-/vr_raw/{head,left_wrist,right_wrist,left_thumbstick,right_thumbstick,left_trigger,right_trigger}
-/calib/{robot_base_t_vr_base,vr_to_robot_left,vr_to_robot_right}
-/target/eef_used_by_ik/{left,right}
-/ik/{left_arm_raw,right_arm_raw}
-/ik/status/{success,in_collision,within_limits,failure_reason}
-/publish/payload/{head_pos,left_arm_pos,right_arm_pos,left_gripper,right_gripper,chassis_vx,chassis_vy,chassis_wz,estop}
 ```
 
 ## Policy

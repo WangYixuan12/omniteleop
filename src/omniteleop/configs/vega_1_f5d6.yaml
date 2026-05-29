@@ -13,7 +13,7 @@ head_mode: 'fixed'
 # affects vr_robot_controller:
 #   'track' → follow vr.left_arm_pos (IK-solved from VR controller)
 #   'fixed' → hold at FIXED_LEFT_ARM_JOINTS from common/vr_mode_const.py
-left_arm_mode: 'track'
+left_arm_mode: 'fixed'
 
 # Input handler configurations for different teleop modes
 input_handlers:

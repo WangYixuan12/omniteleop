@@ -7,7 +7,9 @@ sourced entirely from processed parquet variants produced by
 Two variants of the same source episode are loaded in lockstep. Both are now
 BIMANUAL — each vector is the LEFT arm's block followed by the RIGHT arm's block:
 
-- ``--marker_and_plot_dir`` (the ``dexmate_eef_eef`` variant root):
+- ``--marker_and_plot_dir`` (optional; the ``dexmate_eef_eef`` variant root).
+  Omit to visualize only ``--urdf_joint_motion_dir`` (URDF + joint grippers;
+  cameras/depth use the joint variant sidecars). When set:
     * ``observation.state`` (N, 20) — per arm: FK on the OBSERVED arm joints
       (pos6d + raw gripper); the EEF pose the robot actually reached. Left =
       ``[0:10]``, Right = ``[10:20]``; each block = ``[tx,ty,tz, R6(6), grip]``.
@@ -58,8 +60,14 @@ Read instead from the sidecar at
 
 Usage::
 
+    # Full comparison (eef markers + joint URDF):
     python scripts/vis_episode_processed.py \\
         --marker_and_plot_dir /home/yixuan/omniteleop/Dexmate/data/processed_data/train/dexmate_eef_eef \\
+        --urdf_joint_motion_dir /home/yixuan/omniteleop/Dexmate/data/processed_data/train/dexmate_joint_joint \\
+        --episode_index 0
+
+    # Joint URDF only:
+    python scripts/vis_episode_processed.py \\
         --urdf_joint_motion_dir /home/yixuan/omniteleop/Dexmate/data/processed_data/train/dexmate_joint_joint \\
         --episode_index 0
 """
@@ -111,6 +119,7 @@ _ARM_SIDES = ("left", "right")
 _EEF_BASE = {"left": 0, "right": 10}             # start col of each 10-D eef block
 _EEF_GRIP_IDX = {"left": 9, "right": 19}         # gripper col within state_eef / action
 _JOINT_ARM_SLICE = {"left": slice(0, 7), "right": slice(8, 15)}  # 7 arm joints per side
+_JOINT_GRIP_IDX = {"left": 7, "right": 15}  # gripper col within joint state / action
 
 _GRIPPER_Y_MIN = -0.2
 _GRIPPER_Y_MAX = 1.1
@@ -408,7 +417,6 @@ def main() -> None:
     parser.add_argument(
         "--marker_and_plot_dir",
         type=str,
-        required=True,
         help="Path to the dexmate_eef_eef variant root. Provides "
              "observation.state (eef) + action for the rerun markers, gripper "
              "curves, matplotlib EEF xyz figures, and the RGB / depth / "
@@ -446,67 +454,84 @@ def main() -> None:
     if args.stride < 1:
         raise ValueError(f"--stride must be >= 1, got {args.stride}")
 
-    eef_root   = Path(args.marker_and_plot_dir)
+    eef_enabled = args.marker_and_plot_dir is not None
     joint_root = Path(args.urdf_joint_motion_dir)
-    if not eef_root.is_dir():
-        raise FileNotFoundError(f"--marker_and_plot_dir not a directory: {eef_root}")
     if not joint_root.is_dir():
         raise FileNotFoundError(f"--urdf_joint_motion_dir not a directory: {joint_root}")
+    eef_root: Path | None = None
+    if eef_enabled:
+        eef_root = Path(args.marker_and_plot_dir)
+        if not eef_root.is_dir():
+            raise FileNotFoundError(f"--marker_and_plot_dir not a directory: {eef_root}")
 
-    # ── Load the requested episode from both variants in lockstep ────────────
     # return_uint8=True: video frames default to float32 [0, 1]; we need raw
     # uint8 for direct rerun logging (and to avoid the all-zero astype trap).
-    dataset_eef = LeRobotDataset(
-        repo_id=eef_root.name,
-        root=eef_root,
-        episodes=[args.episode_index],
-        return_uint8=True,
-    )
     dataset_joint = LeRobotDataset(
         repo_id=joint_root.name,
         root=joint_root,
         episodes=[args.episode_index],
         return_uint8=True,
     )
-    N = len(dataset_eef)
-    if N == 0:
-        raise ValueError(f"Episode {args.episode_index} is empty under {eef_root}.")
-    if len(dataset_joint) != N:
-        raise ValueError(
-            f"frame count mismatch for episode {args.episode_index}: "
-            f"marker_and_plot_dir={N}, urdf_joint_motion_dir={len(dataset_joint)}"
+    dataset_eef: LeRobotDataset | None = None
+    if eef_enabled:
+        assert eef_root is not None
+        dataset_eef = LeRobotDataset(
+            repo_id=eef_root.name,
+            root=eef_root,
+            episodes=[args.episode_index],
+            return_uint8=True,
         )
+        N = len(dataset_eef)
+        if N == 0:
+            raise ValueError(f"Episode {args.episode_index} is empty under {eef_root}.")
+        if len(dataset_joint) != N:
+            raise ValueError(
+                f"frame count mismatch for episode {args.episode_index}: "
+                f"marker_and_plot_dir={N}, urdf_joint_motion_dir={len(dataset_joint)}"
+            )
+    else:
+        N = len(dataset_joint)
+        if N == 0:
+            raise ValueError(f"Episode {args.episode_index} is empty under {joint_root}.")
 
-    # Pre-collect numeric trails so future-trail markers are O(1) per frame.
-    state_eef   = np.stack([dataset_eef[i]["observation.state"].numpy()   for i in range(N)])  # (N, 20)
-    action      = np.stack([dataset_eef[i]["action"].numpy()              for i in range(N)])  # (N, 20)
+    # Cameras / depth sidecars live on whichever variant supplies RGB (eef when set).
+    camera_root = eef_root if eef_enabled else joint_root
+    dataset_rgb = dataset_eef if eef_enabled else dataset_joint
+
     state_joint = np.stack([dataset_joint[i]["observation.state"].numpy() for i in range(N)])  # (N, 16)
-    missing_position_features = [
-        key for key in (_OBS_ENV_STATE_KEY, _OBS_POS_CONDITION_MASK_KEY)
-        if key not in dataset_eef.meta.features
-    ]
-    if missing_position_features:
-        raise ValueError(
-            "--marker_and_plot_dir is missing position-conditioning feature(s): "
-            f"{missing_position_features}. Re-port with --positions-dir so the viewer "
-            "can overlay the selected 6-D position condition on the head RGB."
-        )
-    env_state = np.stack([dataset_eef[i][_OBS_ENV_STATE_KEY].numpy() for i in range(N)])
-    pos_condition_mask = np.stack([
-        dataset_eef[i][_OBS_POS_CONDITION_MASK_KEY].numpy() for i in range(N)
-    ])
-    position_condition = select_position_conditions(env_state, pos_condition_mask)  # (N, 6)
-    if position_condition.shape != (N, 6):
-        raise ValueError(
-            f"selected position condition must have shape {(N, 6)}, got "
-            f"{position_condition.shape}"
-        )
+    action_joint = np.stack([dataset_joint[i]["action"].numpy() for i in range(N)])  # (N, 16)
 
-    # Depth sidecar (NOT in the parquet — see docstring). Read from
-    # marker_and_plot_dir; both variants write the same sidecar content per
-    # (variant, episode).
+    state_eef: np.ndarray | None = None
+    action: np.ndarray | None = None
+    position_condition: np.ndarray | None = None
+    if eef_enabled:
+        assert dataset_eef is not None
+        state_eef = np.stack([dataset_eef[i]["observation.state"].numpy() for i in range(N)])  # (N, 20)
+        action = np.stack([dataset_eef[i]["action"].numpy() for i in range(N)])  # (N, 20)
+        missing_position_features = [
+            key for key in (_OBS_ENV_STATE_KEY, _OBS_POS_CONDITION_MASK_KEY)
+            if key not in dataset_eef.meta.features
+        ]
+        if missing_position_features:
+            raise ValueError(
+                "--marker_and_plot_dir is missing position-conditioning feature(s): "
+                f"{missing_position_features}. Re-port with --positions-dir so the viewer "
+                "can overlay the selected 6-D position condition on the head RGB."
+            )
+        env_state = np.stack([dataset_eef[i][_OBS_ENV_STATE_KEY].numpy() for i in range(N)])
+        pos_condition_mask = np.stack([
+            dataset_eef[i][_OBS_POS_CONDITION_MASK_KEY].numpy() for i in range(N)
+        ])
+        position_condition = select_position_conditions(env_state, pos_condition_mask)  # (N, 6)
+        if position_condition.shape != (N, 6):
+            raise ValueError(
+                f"selected position condition must have shape {(N, 6)}, got "
+                f"{position_condition.shape}"
+            )
+
+    # Depth sidecar (NOT in the parquet — see docstring).
     depth_sidecar = (
-        eef_root / "debug" / "depth" / f"episode_{args.episode_index:06d}.npz"
+        camera_root / "debug" / "depth" / f"episode_{args.episode_index:06d}.npz"
     )
     if not depth_sidecar.exists():
         raise FileNotFoundError(
@@ -525,7 +550,7 @@ def main() -> None:
     # Calibration sidecar: per-frame extrinsic (T, 4, 4) and intrinsic (T, 3, 3).
     # Intrinsic is already rescaled to the stored resize_h × resize_w frame.
     calib_sidecar = (
-        eef_root / "debug" / "calib" / f"episode_{args.episode_index:06d}.npz"
+        camera_root / "debug" / "calib" / f"episode_{args.episode_index:06d}.npz"
     )
     if not calib_sidecar.exists():
         raise FileNotFoundError(
@@ -548,51 +573,62 @@ def main() -> None:
         raise ValueError(
             f"--urdf_joint_motion_dir observation.state: expected bimanual (N, 16), got {state_joint.shape}"
         )
-    if state_eef.shape[1] != 20:
+    if eef_enabled:
+        assert state_eef is not None and action is not None
+        if state_eef.shape[1] != 20:
+            raise ValueError(
+                f"--marker_and_plot_dir observation.state: expected bimanual (N, 20), got {state_eef.shape}"
+            )
+        if action.shape[1] != 20:
+            raise ValueError(
+                f"--marker_and_plot_dir action: expected bimanual (N, 20), got {action.shape}"
+            )
+
+    if "observation.images.wrist_rgb" not in dataset_rgb.meta.features:
         raise ValueError(
-            f"--marker_and_plot_dir observation.state: expected bimanual (N, 20), got {state_eef.shape}"
-        )
-    if action.shape[1] != 20:
-        raise ValueError(
-            f"--marker_and_plot_dir action: expected bimanual (N, 20), got {action.shape}"
-        )
-    if "observation.images.wrist_rgb" not in dataset_eef.meta.features:
-        raise ValueError(
-            "--marker_and_plot_dir is missing observation.images.wrist_rgb; "
+            f"{camera_root.name} is missing observation.images.wrist_rgb; "
             "re-port with the bimanual port_dexmate_hdf5.py (stores head + wrist)."
         )
 
-    # Per-arm EEF position trails (LEFT block then RIGHT), keyed by side.
-    action_pos    = {side: action[:, _EEF_BASE[side]:_EEF_BASE[side] + 3]   for side in _ARM_SIDES}
-    state_eef_pos = {side: state_eef[:, _EEF_BASE[side]:_EEF_BASE[side] + 3] for side in _ARM_SIDES}
+    action_pos: dict[str, np.ndarray] = {}
+    state_eef_pos: dict[str, np.ndarray] = {}
+    if eef_enabled:
+        assert state_eef is not None and action is not None
+        action_pos = {
+            side: action[:, _EEF_BASE[side]:_EEF_BASE[side] + 3] for side in _ARM_SIDES
+        }
+        state_eef_pos = {
+            side: state_eef[:, _EEF_BASE[side]:_EEF_BASE[side] + 3] for side in _ARM_SIDES
+        }
 
-    # ── EEF xyz figures: action vs observation.state with lag ────────────────
-    # Built before the rerun loop so they pop up immediately. ``plt.show()`` at
-    # the end of main blocks until the user closes the windows; the spawned
-    # rerun viewer is a separate process and is unaffected.
-    dt_s = 1.0 / float(dataset_eef.fps) if dataset_eef.fps else 1.0 / 30.0
-    t_s = np.arange(N, dtype=np.float64) * dt_s
+    # ── EEF xyz figures (eef variant only) ───────────────────────────────────
+    dt_s = 1.0 / float(dataset_rgb.fps) if dataset_rgb.fps else 1.0 / 30.0
     eef_figs: list[plt.Figure] = []
-    for side in _ARM_SIDES:
-        eef_figs += _build_eef_xyz_figs(
-            t_s, action_pos[side], state_eef_pos[side], dt_s, prefix=f"{side} "
+    if eef_enabled:
+        assert state_eef is not None and action is not None
+        t_s = np.arange(N, dtype=np.float64) * dt_s
+        for side in _ARM_SIDES:
+            eef_figs += _build_eef_xyz_figs(
+                t_s, action_pos[side], state_eef_pos[side], dt_s, prefix=f"{side} "
+            )
+        print(
+            f"built {len(eef_figs)} EEF xyz figures (left+right) "
+            f"(dt = {dt_s*1000:.1f} ms, fps = {1.0/dt_s:.1f} Hz)"
         )
-    print(
-        f"built {len(eef_figs)} EEF xyz figures (left+right) "
-        f"(dt = {dt_s*1000:.1f} ms, fps = {1.0/dt_s:.1f} Hz)"
-    )
-    object_count = env_state.shape[1] // 6
-    mask_switches = (
-        np.flatnonzero(np.diff(np.argmax(pos_condition_mask, axis=1)) != 0) + 1
-    )
-    print(
-        f"position condition: env_state {env_state.shape[1]}D over "
-        f"{object_count} object slots -> selected 6D; mask switches at frames "
-        f"{mask_switches.tolist()}"
-    )
+        object_count = env_state.shape[1] // 6
+        mask_switches = (
+            np.flatnonzero(np.diff(np.argmax(pos_condition_mask, axis=1)) != 0) + 1
+        )
+        print(
+            f"position condition: env_state {env_state.shape[1]}D over "
+            f"{object_count} object slots -> selected 6D; mask switches at frames "
+            f"{mask_switches.tolist()}"
+        )
+    else:
+        print("joint-only mode: skipping EEF markers, position condition, and matplotlib EEF plots")
 
     # ── RGB dimensions (constant across frames) ──────────────────────────────
-    sample_rgb = _rgb_to_hwc(dataset_eef[0]["observation.images.head_rgb"])
+    sample_rgb = _rgb_to_hwc(dataset_rgb[0]["observation.images.head_rgb"])
     H, W = sample_rgb.shape[:2]
     print(f"episode {args.episode_index}: {N} frames  |  rgb: {H}x{W}  |  calib from sidecar")
 
@@ -689,14 +725,15 @@ def main() -> None:
         rr.set_time("frame", sequence=idx)
 
         if idx == N:
-            rr.log("world/action", rr.Clear(recursive=True))
-            rr.log("world/state",  rr.Clear(recursive=True))
-            rr.log("world/camera/eef_state_2d", rr.Clear(recursive=False))
-            rr.log("world/camera/position_condition_2d", rr.Clear(recursive=False))
-            rr.log("world/camera/position_condition_vector_2d", rr.Clear(recursive=False))
+            if eef_enabled:
+                rr.log("world/action", rr.Clear(recursive=True))
+                rr.log("world/state", rr.Clear(recursive=True))
+                rr.log("world/camera/eef_state_2d", rr.Clear(recursive=False))
+                rr.log("world/camera/position_condition_2d", rr.Clear(recursive=False))
+                rr.log("world/camera/position_condition_vector_2d", rr.Clear(recursive=False))
             continue
 
-        frame = dataset_eef[idx]
+        frame = dataset_rgb[idx]
 
         # Per-frame camera pose and intrinsics from calib sidecar.
         world_t_cam = extrinsic_stack[idx]          # (4, 4) world_T_cam
@@ -711,32 +748,33 @@ def main() -> None:
             rr.Pinhole(image_from_camera=K32, width=W, height=H),
         )
 
-        # Future-trail markers + current pose frames, per arm (action red, state blue).
-        # rot6 sits at cols base+3:base+9 within each arm's 10-D block.
-        for side in _ARM_SIDES:
-            b = _EEF_BASE[side]
-            rr.log(
-                f"world/action/{side}/marker",
-                rr.Points3D(action_pos[side][idx:], colors=[_COLOR_ACTION], radii=0.006),
-            )
-            rr.log(
-                f"world/action/{side}/frame",
-                rr.Transform3D(
-                    translation=action_pos[side][idx],
-                    mat3x3=gram_schmidt_6d_to_R(action[idx, b + 3:b + 9]),
-                ),
-            )
-            rr.log(
-                f"world/state/{side}/marker",
-                rr.Points3D(state_eef_pos[side][idx:], colors=[_COLOR_STATE], radii=0.006),
-            )
-            rr.log(
-                f"world/state/{side}/frame",
-                rr.Transform3D(
-                    translation=state_eef_pos[side][idx],
-                    mat3x3=gram_schmidt_6d_to_R(state_eef[idx, b + 3:b + 9]),
-                ),
-            )
+        if eef_enabled:
+            assert action is not None and state_eef is not None
+            # Future-trail markers + current pose frames, per arm (action red, state blue).
+            for side in _ARM_SIDES:
+                b = _EEF_BASE[side]
+                rr.log(
+                    f"world/action/{side}/marker",
+                    rr.Points3D(action_pos[side][idx:], colors=[_COLOR_ACTION], radii=0.006),
+                )
+                rr.log(
+                    f"world/action/{side}/frame",
+                    rr.Transform3D(
+                        translation=action_pos[side][idx],
+                        mat3x3=gram_schmidt_6d_to_R(action[idx, b + 3:b + 9]),
+                    ),
+                )
+                rr.log(
+                    f"world/state/{side}/marker",
+                    rr.Points3D(state_eef_pos[side][idx:], colors=[_COLOR_STATE], radii=0.006),
+                )
+                rr.log(
+                    f"world/state/{side}/frame",
+                    rr.Transform3D(
+                        translation=state_eef_pos[side][idx],
+                        mat3x3=gram_schmidt_6d_to_R(state_eef[idx, b + 3:b + 9]),
+                    ),
+                )
 
         # Head RGB from parquet; depth from sidecar (both under world/camera).
         rgb = _rgb_to_hwc(frame["observation.images.head_rgb"])
@@ -748,57 +786,58 @@ def main() -> None:
         wrist_rgb = _rgb_to_hwc(frame["observation.images.wrist_rgb"])
         rr.log("wrist/rgb", rr.Image(wrist_rgb))
 
-        # Project each arm's observation.state EEF position onto the head image.
-        uv_pts = []
-        for side in _ARM_SIDES:
-            uv, uv_valid = project_world_to_pixel(
-                state_eef_pos[side][idx : idx + 1], K, world_t_cam
-            )
-            if uv_valid[0]:
-                uv_pts.append(uv[0])
-        if uv_pts:
-            rr.log(
-                "world/camera/eef_state_2d",
-                rr.Points2D(np.asarray(uv_pts, dtype=np.float32), colors=[_COLOR_STATE], radii=2.0),
-            )
-        else:
-            rr.log("world/camera/eef_state_2d", rr.Clear(recursive=False))
+        if eef_enabled:
+            assert position_condition is not None
+            uv_pts = []
+            for side in _ARM_SIDES:
+                uv, uv_valid = project_world_to_pixel(
+                    state_eef_pos[side][idx : idx + 1], K, world_t_cam
+                )
+                if uv_valid[0]:
+                    uv_pts.append(uv[0])
+            if uv_pts:
+                rr.log(
+                    "world/camera/eef_state_2d",
+                    rr.Points2D(
+                        np.asarray(uv_pts, dtype=np.float32), colors=[_COLOR_STATE], radii=2.0
+                    ),
+                )
+            else:
+                rr.log("world/camera/eef_state_2d", rr.Clear(recursive=False))
 
-        # Project the selected 6-D position condition onto the head image:
-        # [before_xyz, after_xyz], chosen per-frame by observation.pos_condition_mask.
-        condition_xyz = position_condition[idx].reshape(2, 3)
-        condition_uv, condition_valid = project_world_to_pixel(
-            condition_xyz, K, world_t_cam
-        )
-        valid_condition_idx = np.flatnonzero(condition_valid)
-        if len(valid_condition_idx) > 0:
-            condition_colors = np.asarray(
-                [_COLOR_CONDITION_BEFORE, _COLOR_CONDITION_AFTER], dtype=np.uint8
-            )[valid_condition_idx]
-            rr.log(
-                "world/camera/position_condition_2d",
-                rr.Points2D(
-                    condition_uv[valid_condition_idx],
-                    colors=condition_colors,
-                    radii=np.full(len(valid_condition_idx), 3.0, dtype=np.float32),
-                ),
+            condition_xyz = position_condition[idx].reshape(2, 3)
+            condition_uv, condition_valid = project_world_to_pixel(
+                condition_xyz, K, world_t_cam
             )
-        else:
-            rr.log("world/camera/position_condition_2d", rr.Clear(recursive=False))
-        if np.all(condition_valid):
-            rr.log(
-                "world/camera/position_condition_vector_2d",
-                rr.LineStrips2D(
-                    [condition_uv.astype(np.float32)],
-                    colors=[_COLOR_CONDITION_LINE],
-                    radii=1.5,
-                ),
-            )
-        else:
-            rr.log(
-                "world/camera/position_condition_vector_2d",
-                rr.Clear(recursive=False),
-            )
+            valid_condition_idx = np.flatnonzero(condition_valid)
+            if len(valid_condition_idx) > 0:
+                condition_colors = np.asarray(
+                    [_COLOR_CONDITION_BEFORE, _COLOR_CONDITION_AFTER], dtype=np.uint8
+                )[valid_condition_idx]
+                rr.log(
+                    "world/camera/position_condition_2d",
+                    rr.Points2D(
+                        condition_uv[valid_condition_idx],
+                        colors=condition_colors,
+                        radii=np.full(len(valid_condition_idx), 3.0, dtype=np.float32),
+                    ),
+                )
+            else:
+                rr.log("world/camera/position_condition_2d", rr.Clear(recursive=False))
+            if np.all(condition_valid):
+                rr.log(
+                    "world/camera/position_condition_vector_2d",
+                    rr.LineStrips2D(
+                        [condition_uv.astype(np.float32)],
+                        colors=[_COLOR_CONDITION_LINE],
+                        radii=1.5,
+                    ),
+                )
+            else:
+                rr.log(
+                    "world/camera/position_condition_vector_2d",
+                    rr.Clear(recursive=False),
+                )
 
         # Point cloud (manual unproject + voxel downsample).
         depth_m = depth_mm.astype(np.float32) / 1000.0
@@ -831,17 +870,24 @@ def main() -> None:
                 rr.Transform3D(translation=tf[:3, 3], mat3x3=tf[:3, :3]),
             )
 
-        # Gripper scalars per arm: [action[grip], state_eef[grip]] → SeriesLines order.
+        # Gripper scalars per arm: [action[grip], observation.state[grip]].
         for side in _ARM_SIDES:
-            g = _EEF_GRIP_IDX[side]
-            rr.log(
-                f"plots/gripper_{side}",
-                rr.Scalars([float(action[idx, g]), float(state_eef[idx, g])]),
-            )
+            if eef_enabled:
+                assert action is not None and state_eef is not None
+                g = _EEF_GRIP_IDX[side]
+                rr.log(
+                    f"plots/gripper_{side}",
+                    rr.Scalars([float(action[idx, g]), float(state_eef[idx, g])]),
+                )
+            else:
+                g = _JOINT_GRIP_IDX[side]
+                rr.log(
+                    f"plots/gripper_{side}",
+                    rr.Scalars([float(action_joint[idx, g]), float(state_joint[idx, g])]),
+                )
 
-    # Block on the matplotlib windows so the user can inspect the EEF curves
-    # while the rerun viewer (separate process) continues running.
-    plt.show()
+    if eef_figs:
+        plt.show()
 
 
 if __name__ == "__main__":

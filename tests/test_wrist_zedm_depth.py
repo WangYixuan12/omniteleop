@@ -77,7 +77,12 @@ class Args:
     RGB-only, and the stereo matcher throttles the capture loop. Turn on only
     to debug depth."""
 
-    depth_mode: DepthMode = "NEURAL"
+    skip_right_rgb: bool = True
+    """Skip the right_rgb stream. On by default — vr_reader only consumes the
+    left wrist view, so publishing right doubles the bandwidth for no use.
+    Turn off to debug stereo."""
+
+    depth_mode: DepthMode = "NEURAL_LIGHT"
     """Depth estimation algorithm (only used when --enable-depth). NEURAL is
     best quality but heaviest."""
 
@@ -89,6 +94,16 @@ class Args:
 
     depth_max: float = 6.0
     """Maximum depth in metres."""
+
+    resize_h: int = 120
+    """Output height: each stream is resized to (resize_h, resize_w) before
+    publishing so only the small frame crosses WiFi. Set both resize_h and
+    resize_w to 0 to publish the raw capture resolution. NOTE: HD720 is 16:9
+    (1280x720); resizing to a non-16:9 target (e.g. 120x160) stretches the
+    image — crop first if you need the original aspect ratio."""
+
+    resize_w: int = 160
+    """Output width (see resize_h)."""
 
     verify: bool = False
     """Subscribe to our own topics each frame to print round-trip fps. Off by
@@ -171,9 +186,20 @@ def main() -> None:
         f"fw={info.camera_configuration.firmware_version}"
     )
 
+    if (args.resize_h > 0) != (args.resize_w > 0):
+        raise ValueError(
+            f"resize_h ({args.resize_h}) and resize_w ({args.resize_w}) must both "
+            "be >0 (resize) or both 0 (skip resize)."
+        )
+    out_hw: Optional[tuple[int, int]] = (
+        (args.resize_h, args.resize_w) if args.resize_h > 0 else None
+    )
     cam_res = info.camera_configuration.resolution
-    width, height = cam_res.width, cam_res.height
-    logger.info(f"Stream resolution: {width}x{height}")
+    raw_w, raw_h = cam_res.width, cam_res.height
+    # width/height are the *published* dims (after resize); all downstream
+    # publish/info fields use them, so resizing is transparent to subscribers.
+    width, height = (out_hw[1], out_hw[0]) if out_hw is not None else (raw_w, raw_h)
+    logger.info(f"Capture {raw_w}x{raw_h} → publish {width}x{height} (WxH)")
 
     # ── 2. Set up Zenoh pub/sub via dexcomm ──────────────────────────────────
     left_topic = f"sensors/{args.sensor_id}/left_rgb"
@@ -188,7 +214,11 @@ def main() -> None:
         f"ROBOT_NAME={os.getenv('ROBOT_NAME')!r}; node.namespace={node.namespace!r}"
     )
     left_pub = node.create_publisher(left_topic, encoder=RGBImageCodec.encode)
-    right_pub = node.create_publisher(right_topic, encoder=RGBImageCodec.encode)
+    right_pub = (
+        node.create_publisher(right_topic, encoder=RGBImageCodec.encode)
+        if not args.skip_right_rgb
+        else None
+    )
     depth_pub = (
         node.create_publisher(depth_topic, encoder=DepthImageCodec.encode)
         if args.enable_depth
@@ -199,7 +229,8 @@ def main() -> None:
     left_sub = right_sub = depth_sub = None
     if verify:
         left_sub = node.create_subscriber(left_topic, decoder=RGBImageCodec.decode)
-        right_sub = node.create_subscriber(right_topic, decoder=RGBImageCodec.decode)
+        if right_pub is not None:
+            right_sub = node.create_subscriber(right_topic, decoder=RGBImageCodec.decode)
         if args.enable_depth:
             depth_sub = node.create_subscriber(depth_topic, decoder=DepthImageCodec.decode)
 
@@ -239,7 +270,7 @@ def main() -> None:
             },
             "streams": {
                 "left_rgb": {"enabled": True, "transport": "zenoh", "topic": left_topic},
-                "right_rgb": {"enabled": True, "transport": "zenoh", "topic": right_topic},
+                "right_rgb": {"enabled": not args.skip_right_rgb, "transport": "zenoh", "topic": right_topic},
                 "depth": {"enabled": args.enable_depth, "transport": "zenoh", "topic": depth_topic},
             },
             "statistics": frame_stats,
@@ -251,17 +282,18 @@ def main() -> None:
         _camera_info,
         response_encoder=JsonDataCodec.encode,
     )
-    pub_topics = f"'{left_topic}', '{right_topic}'"
+    pub_topics = f"'{left_topic}'"
+    if right_pub is not None:
+        pub_topics += f", '{right_topic}'"
     if args.enable_depth:
         pub_topics += f", '{depth_topic}'"
     logger.info(f"Publishing on {pub_topics}  (depth={'on' if args.enable_depth else 'off'})")
     logger.info(f"Serving camera info on '{info_topic}'")
-    logger.info(
-        "Resolved wrist keys: "
-        f"left={node.resolve_topic(left_topic)!r}, "
-        f"right={node.resolve_topic(right_topic)!r}, "
-        f"info={node.resolve_topic(info_topic)!r}"
-    )
+    resolved = f"left={node.resolve_topic(left_topic)!r}"
+    if right_pub is not None:
+        resolved += f", right={node.resolve_topic(right_topic)!r}"
+    resolved += f", info={node.resolve_topic(info_topic)!r}"
+    logger.info(f"Resolved wrist keys: {resolved}")
     if verify:
         logger.info("Subscribing to the same topics to verify round-trip")
 
@@ -291,16 +323,24 @@ def main() -> None:
                 continue
 
             zed.retrieve_image(left_mat, sl.VIEW.LEFT)
-            zed.retrieve_image(right_mat, sl.VIEW.RIGHT)
             # ZED returns BGRA — convert to RGB (the RGBImageCodec / vr_reader /
             # rerun all expect RGB; publishing BGR swaps the red/blue channels).
             left_rgb = cv2.cvtColor(left_mat.get_data(), cv2.COLOR_BGRA2RGB)
-            right_rgb = cv2.cvtColor(right_mat.get_data(), cv2.COLOR_BGRA2RGB)
+            if out_hw is not None:  # INTER_AREA: anti-aliased downscale
+                left_rgb = cv2.resize(left_rgb, (width, height), interpolation=cv2.INTER_AREA)
+            right_rgb = None
+            if right_pub is not None:
+                zed.retrieve_image(right_mat, sl.VIEW.RIGHT)
+                right_rgb = cv2.cvtColor(right_mat.get_data(), cv2.COLOR_BGRA2RGB)
+                if out_hw is not None:
+                    right_rgb = cv2.resize(right_rgb, (width, height), interpolation=cv2.INTER_AREA)
 
             depth_safe = None
             if args.enable_depth:
                 zed.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
                 depth_m = np.ascontiguousarray(depth_mat.get_data())
+                if out_hw is not None:  # NEAREST: never average across invalid pixels
+                    depth_m = cv2.resize(depth_m, (width, height), interpolation=cv2.INTER_NEAREST)
                 # Replace NaN/Inf so DepthImageCodec doesn't choke on them
                 depth_safe = np.nan_to_num(
                     depth_m, nan=0.0, posinf=0.0, neginf=0.0
@@ -317,15 +357,16 @@ def main() -> None:
                     "height": height,
                 }
             )
-            right_pub.publish(
-                {
-                    "data": right_rgb,
-                    "timestamp_ns": ts,
-                    "sequence": seq,
-                    "width": width,
-                    "height": height,
-                }
-            )
+            if right_pub is not None:
+                right_pub.publish(
+                    {
+                        "data": right_rgb,
+                        "timestamp_ns": ts,
+                        "sequence": seq,
+                        "width": width,
+                        "height": height,
+                    }
+                )
             if depth_pub is not None:
                 depth_pub.publish(
                     {
@@ -348,19 +389,21 @@ def main() -> None:
             if verify:
                 # get_latest is non-blocking; lags pub by ~1 frame.
                 left_msg = left_sub.get_latest()
-                right_msg = right_sub.get_latest()
+                right_msg = right_sub.get_latest() if right_sub is not None else None
                 depth_msg = depth_sub.get_latest() if depth_sub is not None else None
 
-                rgb_ready = left_msg is not None and right_msg is not None
+                rgb_ready = left_msg is not None and (right_sub is None or right_msg is not None)
                 depth_ready = depth_sub is None or depth_msg is not None
                 if rgb_ready and depth_ready and not first_logged:
                     msg = (
                         f"First decoded frame — "
-                        f"left {left_msg['data'].shape} {left_msg['data'].dtype}, "
-                        f"right {right_msg['data'].shape} {right_msg['data'].dtype}"
+                        f"left {left_msg['data'].shape} {left_msg['data'].dtype}"
                     )
+                    if right_msg is not None:
+                        msg += f", right {right_msg['data'].shape} {right_msg['data'].dtype}"
                     assert left_msg["data"].shape == left_rgb.shape
-                    assert right_msg["data"].shape == right_rgb.shape
+                    if right_msg is not None:
+                        assert right_msg["data"].shape == right_rgb.shape
                     if depth_msg is not None:
                         msg += (
                             f", depth {depth_msg['data'].shape} {depth_msg['data'].dtype}, "
@@ -395,7 +438,6 @@ def main() -> None:
                 save_root is not None
                 and now - t_last_save >= 1.0
                 and left_msg is not None
-                and right_msg is not None
             ):
                 idx = int(now - t_start)
                 # decoded data is RGB; cv2.imwrite expects BGR
@@ -403,10 +445,11 @@ def main() -> None:
                     str(save_root / f"left_rgb_{idx:04d}.jpg"),
                     cv2.cvtColor(left_msg["data"], cv2.COLOR_RGB2BGR),
                 )
-                cv2.imwrite(
-                    str(save_root / f"right_rgb_{idx:04d}.jpg"),
-                    cv2.cvtColor(right_msg["data"], cv2.COLOR_RGB2BGR),
-                )
+                if right_msg is not None:
+                    cv2.imwrite(
+                        str(save_root / f"right_rgb_{idx:04d}.jpg"),
+                        cv2.cvtColor(right_msg["data"], cv2.COLOR_RGB2BGR),
+                    )
                 if depth_msg is not None:
                     depth_mm = np.clip(
                         depth_msg["data"] * 1000.0, 0, 65535
