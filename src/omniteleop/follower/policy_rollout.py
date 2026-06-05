@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""Live bimanual policy rollout on a Dexmate robot.
+"""Live policy rollout on a Dexmate robot (bimanual or single-arm).
 
-Drives BOTH arms + their Robotiq Hand-E grippers from a trained LeRobot
-policy (ACT or Diffusion). The policy variant (joint vs eef state/action,
-absolute vs relative) is auto-detected from ``policy.config`` so a single
-script handles every ``dexmate_<state>_<action>`` × {abs, delta} combo.
+Drives the policy's arm(s) + their Robotiq Hand-E grippers from a trained LeRobot
+policy (ACT or Diffusion). The policy variant (joint vs eef state/action, absolute vs
+relative, AND arm count) is auto-detected from ``policy.config`` so a single script
+handles every ``dexmate_[<side>_]<state>_<action>`` × {abs, delta} combo.
 
-Layout (matches ``port_dexmate_hdf5.py`` — LEFT block then RIGHT):
+A BIMANUAL policy (16-D joint / 20-D eef) drives both arms. A SINGLE-ARM policy
+(8-D joint / 10-D eef) requires ``--arm-side left|right`` (the side is not stored in the
+checkpoint); it drives only that arm and leaves the OTHER arm fully uncommanded (homed at
+startup, then held by its controller — the coupled IK still receives the inactive arm's
+observed pose so the solver holds it / collision-checks, but its solution is discarded).
+
+Layout (matches ``port_dexmate_hdf5.py`` — bimanual is LEFT block then RIGHT; single-arm
+is just the selected side's block):
 
   eef   (20-D): [L_pos(3), L_rot6d(3..8), L_grip@9,
                  R_pos(10..12), R_rot6d(13..18), R_grip@19]
@@ -14,11 +21,15 @@ Layout (matches ``port_dexmate_hdf5.py`` — LEFT block then RIGHT):
 
 Cameras (driven by ``policy.config.input_features``):
 
-  observation.images.head_rgb  — head ZED-X Mini left eye, cropped to the
-      training region [220:600, 150:800] then resized to the model's HxW.
-  observation.images.wrist_rgb — wrist ZED-M left eye (full frame, resized),
+  observation.images.head_rgb  — head ZED-X Mini left eye at the model's HxW.
+  observation.images.wrist_rgb — wrist ZED-M left eye at the model's HxW;
       requires a ZED-SDK publisher on ``sensors/wrist_zedm/*`` (optional;
       only read when the policy declares the feature).
+
+Both publishers (tests/test_{head_zedx,wrist_zedm}_depth.py) crop+resize ROBOT-SIDE to
+the model's HxW, so — exactly like the recorder leader/vr_reader.py — the frames are
+consumed AS-IS (no workstation crop/resize) and the head is stamped with the shared
+``omniteleop.common.head_camera.ZED_K`` intrinsic.
 
 Two-rate loop:
 
@@ -72,7 +83,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-import cv2
 import numpy as np
 import torch
 import tyro
@@ -87,6 +97,7 @@ from dexmotion.motion_manager import MotionManager
 from loguru import logger
 
 from omniteleop.common import get_config
+from omniteleop.common.head_camera import ZED_K
 from omniteleop.common.logging import setup_logging
 from omniteleop.common.recorder import EpisodeRecorder
 from omniteleop.common.vr_mode_const import (
@@ -121,23 +132,20 @@ from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_POS_CONDITION
 _WRIST_SENSOR_ID = "wrist_zedm"
 _WRIST_OBS_KEY = "left_rgb"
 
-# HEAD-camera crop (raw pixel coords; rows [CROP_TOP:CROP_BOTTOM], cols
-# [CROP_LEFT:CROP_RIGHT]) applied to the head RGB BEFORE resize. MUST match
-# port_dexmate_hdf5.py — the model was trained on this cropped head view.
-HEAD_CROP_TOP = 220
-HEAD_CROP_BOTTOM = 600
-HEAD_CROP_LEFT = 150
-HEAD_CROP_RIGHT = 800
+# The head publisher (tests/test_head_zedx_depth.py) crops+resizes ROBOT-SIDE to the
+# model's HxW before publishing, so — exactly like the recorder leader/vr_reader.py —
+# the rollout consumes the frame AS-IS (no workstation crop/resize) and stamps the
+# shared ZED_K (omniteleop.common.head_camera), the intrinsic of that cropped+resized
+# view. Keep the publisher --crop/--resize in sync with head_camera.HEAD_CROP_TBLR /
+# HEAD_RESIZE_HW (which define ZED_K).
 
-# Full-resolution head ZED intrinsics used by the teleop recorder and visualizers.
-ZED_K = np.array(
-    [
-        [770.1868 / 2.0, 0.0, 990.2711 / 2.0],
-        [0.0, 770.1868 / 2.0, 637.7721 / 2.0],
-        [0.0, 0.0, 1.0],
-    ],
-    dtype=np.float32,
-)
+# Canonical bimanual block order + per-side EEF frame / joint-name prefix. The rollout
+# DRIVES only the policy's arm side(s) (``self._arm_sides``); for a single-arm policy the
+# OTHER arm is left fully uncommanded (the coupled IK still receives its current observed
+# pose so the solver holds it in place, but its solution is never sent).
+_ARM_ORDER = ("left", "right")
+_ARM_FRAME = {"left": "L_ee", "right": "R_ee"}
+_ARM_PREFIX = {"left": "L", "right": "R"}
 
 
 # ── small math helpers (mirror port_dexmate_hdf5.py) ──────────────────────────
@@ -200,16 +208,17 @@ class _Mode(Enum):
 
 @dataclass
 class _Variant:
-    """Variant routing flags derived from policy.config (bimanual).
+    """Variant routing flags derived from policy.config.
 
     Per-arm block is 10-D (eef: 9-D pose + gripper) or 8-D (joint: 7 joints +
-    gripper); the full vector is LEFT block then RIGHT block.
+    gripper). Bimanual is LEFT block then RIGHT block (16/20-D); single-arm is one
+    block (8/10-D) for the side named by --arm-side (see controller._arm_sides).
     """
 
     state_dim: int
     action_dim: int
-    state_is_eef: bool  # True if state_dim == 20 (10 per arm)
-    action_is_eef: bool  # True if action_dim == 20 (10 per arm)
+    state_is_eef: bool  # True if eef state (10-D single / 20-D bimanual)
+    action_is_eef: bool  # True if eef action (10-D single / 20-D bimanual)
     arm_action_block: int  # 10 (eef) or 8 (joint) — per-arm slice width
     uses_relative: bool
     # Action-side last-dim indices that stay absolute when relative mode is on
@@ -235,8 +244,17 @@ class PolicyRolloutController:
         record: bool = True,
         record_dir: Optional[str] = None,
         positions_npz: Optional[str] = None,
+        arm_side: Optional[str] = None,
     ) -> None:
         self.node = Node(name="policy_rollout", namespace=namespace)
+
+        # Which arm a SINGLE-ARM policy drives. Required (and validated) only when the
+        # policy turns out to be single-arm (8/10-D); ignored for bimanual policies.
+        # Resolved into self._arm_sides in initialize_policy() once the dims are known.
+        if arm_side is not None and arm_side not in _ARM_ORDER:
+            raise ValueError(f"--arm-side must be 'left' or 'right', got {arm_side!r}")
+        self._arm_side_flag = arm_side
+        self._arm_sides: tuple[str, ...] = _ARM_ORDER
 
         self._robot_info = RobotInfo()
         self.has_torso = self._robot_info.has_torso
@@ -300,17 +318,16 @@ class PolicyRolloutController:
         # Per-arm workspace gates (in robot base frame). Left mirrors right
         # across the sagittal plane (see workspace_check.DEFAULT_LEFT_BOUNDS).
         if workspace_check:
-            self._right_workspace_checker: Optional[WorkspaceChecker] = (
-                WorkspaceChecker()
-            )
-            self._left_workspace_checker: Optional[WorkspaceChecker] = WorkspaceChecker(
-                arm_link=DEFAULT_LEFT_LINK,
-                arm_joint_names=tuple(f"L_arm_j{i}" for i in range(1, 8)),
-                bounds=DEFAULT_LEFT_BOUNDS,
-            )
+            self._workspace_checker: dict[str, Optional[WorkspaceChecker]] = {
+                "right": WorkspaceChecker(),
+                "left": WorkspaceChecker(
+                    arm_link=DEFAULT_LEFT_LINK,
+                    arm_joint_names=tuple(f"L_arm_j{i}" for i in range(1, 8)),
+                    bounds=DEFAULT_LEFT_BOUNDS,
+                ),
+            }
         else:
-            self._right_workspace_checker = None
-            self._left_workspace_checker = None
+            self._workspace_checker = {"left": None, "right": None}
             logger.warning("WorkspaceChecker disabled (both arms).")
         self._last_workspace_warn_t = {"left": 0.0, "right": 0.0}
         self._fixed_motion_joint_limits: dict[str, tuple[float, float]] = {}
@@ -320,10 +337,8 @@ class PolicyRolloutController:
         # on estop release. Mirrors the leader's implicit chain through
         # mm.{left,right}_arm. initialize_robot() seeds them; _init_motion_manager()
         # writes the ArmProcessors. Both run inside this __init__.
-        self._chained_left_arm_qpos: Optional[np.ndarray] = None
-        self._chained_right_arm_qpos: Optional[np.ndarray] = None
-        self._left_proc: Optional[ArmProcessor] = None
-        self._right_proc: Optional[ArmProcessor] = None
+        self._chained: dict[str, Optional[np.ndarray]] = {"left": None, "right": None}
+        self._proc: dict[str, Optional[ArmProcessor]] = {"left": None, "right": None}
         self._head_camera_intrinsic: Optional[np.ndarray] = None
         self._head_camera_extrinsic: Optional[np.ndarray] = None
 
@@ -361,6 +376,9 @@ class PolicyRolloutController:
         self._last_obs_qpos_right: Optional[np.ndarray] = None
         self._last_obs_eef9_left: Optional[np.ndarray] = None
         self._last_obs_eef9_right: Optional[np.ndarray] = None
+        # Observed EEF SE(3) per side (set each obs build); used to hold the inactive arm
+        # in place during single-arm coupled IK.
+        self._last_obs_eef_se3: Optional[dict[str, np.ndarray]] = None
         self._last_obs_gripper_left = None  # np.float32; set in _build_observation
         self._last_obs_gripper_right = None
 
@@ -467,8 +485,8 @@ class PolicyRolloutController:
         self._last_cmd_left = np.array(self.robot.left_arm.get_joint_pos())
         self._last_cmd_right = np.array(self.robot.right_arm.get_joint_pos())
         # Initialise both IK chains at the observed home pose.
-        self._chained_left_arm_qpos = self._last_cmd_left.astype(np.float32)
-        self._chained_right_arm_qpos = self._last_cmd_right.astype(np.float32)
+        self._chained["left"] = self._last_cmd_left.astype(np.float32)
+        self._chained["right"] = self._last_cmd_right.astype(np.float32)
 
         # Robotiq Hand-E achieved-position sensors (one per arm). Training-time
         # observation.state[9]/[19] is the raw float `gPO/255` (the achieved
@@ -556,21 +574,49 @@ class PolicyRolloutController:
             preprocessor_overrides={"device_processor": {"device": device}},
         )
 
-        # Auto-detect variant routing (bimanual: 20-D eef / 16-D joint).
+        # Auto-detect variant routing: bimanual (16 joint / 20 eef = two arms) or
+        # single-arm (8 joint / 10 eef = one arm). state/action share the per-arm block
+        # size (8 joint, 10 eef) and the same arm COUNT.
         from lerobot.utils.constants import OBS_STATE, ACTION
 
         in_feats = self._policy.config.input_features
         out_feats = self._policy.config.output_features
         state_dim = int(in_feats[OBS_STATE].shape[0])
         action_dim = int(out_feats[ACTION].shape[0])
-        if state_dim not in (16, 20):
+        _VALID_DIMS = (8, 10, 16, 20)
+        if state_dim not in _VALID_DIMS:
             raise ValueError(
-                f"unexpected bimanual state_dim={state_dim} (expected 16 joint / 20 eef)"
+                f"unexpected state_dim={state_dim} (expected 8/10 single-arm, 16/20 bimanual)"
             )
-        if action_dim not in (16, 20):
+        if action_dim not in _VALID_DIMS:
             raise ValueError(
-                f"unexpected bimanual action_dim={action_dim} (expected 16 joint / 20 eef)"
+                f"unexpected action_dim={action_dim} (expected 8/10 single-arm, 16/20 bimanual)"
             )
+        n_arms_state = 2 if state_dim in (16, 20) else 1
+        n_arms_action = 2 if action_dim in (16, 20) else 1
+        if n_arms_state != n_arms_action:
+            raise ValueError(
+                f"state ({state_dim}-D) and action ({action_dim}-D) imply different arm "
+                "counts; they must match (both single-arm or both bimanual)"
+            )
+
+        # Resolve which arm(s) to DRIVE. A single-arm policy REQUIRES --arm-side (the side
+        # is not recoverable from the checkpoint); bimanual drives both and ignores it.
+        if n_arms_state == 1:
+            if self._arm_side_flag is None:
+                raise ValueError(
+                    f"single-arm policy (state_dim={state_dim}) requires --arm-side "
+                    "left|right; the side is not stored in the checkpoint config"
+                )
+            self._arm_sides = (self._arm_side_flag,)
+        else:
+            self._arm_sides = _ARM_ORDER
+            if self._arm_side_flag is not None:
+                logger.warning(
+                    f"--arm-side={self._arm_side_flag} ignored for a bimanual policy "
+                    f"(state_dim={state_dim})."
+                )
+
         rel_exclude_map = getattr(pcfg, "relative_exclude_dims", None) or {}
         rel_exclude_action = (
             list(rel_exclude_map.get("action", []))
@@ -580,9 +626,9 @@ class PolicyRolloutController:
         self.variant = _Variant(
             state_dim=state_dim,
             action_dim=action_dim,
-            state_is_eef=(state_dim == 20),
-            action_is_eef=(action_dim == 20),
-            arm_action_block=(10 if action_dim == 20 else 8),
+            state_is_eef=(state_dim in (10, 20)),
+            action_is_eef=(action_dim in (10, 20)),
+            arm_action_block=(10 if action_dim in (10, 20) else 8),
             uses_relative=bool(getattr(pcfg, "use_relative_actions", False)),
             relative_exclude_action_dims=rel_exclude_action,
         )
@@ -607,6 +653,7 @@ class PolicyRolloutController:
         self._n_action_steps = max(1, int(n_act)) if n_act is not None else 1
         logger.info(
             f"Policy: type={pcfg.type} state_dim={state_dim} action_dim={action_dim} "
+            f"arm_sides={self._arm_sides} "
             f"state_is_eef={self.variant.state_is_eef} "
             f"action_is_eef={self.variant.action_is_eef} "
             f"chunk/horizon={chunk} n_action_steps={n_act} n_obs_steps={n_obs} "
@@ -753,16 +800,18 @@ class PolicyRolloutController:
         self._motion_manager.set_joint_pos(self._motion_manager_state_dict())
         # Per-arm processors: provide limit_joint_step (10°/tick clamp) and
         # apply_positions, exactly as on the leader (vr_reader.py:475-476).
-        self._left_proc = ArmProcessor(
+        self._proc["left"] = ArmProcessor(
             "left", self.config, self._motion_manager, self._robot_info, "vr"
         )
-        self._right_proc = ArmProcessor(
+        self._proc["right"] = ArmProcessor(
             "right", self.config, self._motion_manager, self._robot_info, "vr"
         )
         logger.info("MotionManager + LocalPinkIKSolver + ArmProcessors initialised.")
 
     def _cache_head_camera_calibration(self) -> None:
         """Cache head-camera calibration once before rollout recording starts."""
+        # ZED_K is the intrinsic of the publisher's cropped+resized frame — the SAME
+        # value leader/vr_reader.py stamps and the reference scene stores.
         self._head_camera_intrinsic = ZED_K.copy()
         self._head_camera_extrinsic = self._compute_head_camera_extrinsic()
         xyz = self._head_camera_extrinsic[:3, 3]
@@ -920,56 +969,48 @@ class PolicyRolloutController:
                 return obs[k]
         raise KeyError(f"obs key {key!r} not found (available: {list(obs)})")
 
-    def _read_head_camera(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Read head camera streams for policy input + HDF5 recording.
+    def _read_head_camera(self) -> tuple[np.ndarray, np.ndarray]:
+        """Read the head camera streams for policy input + HDF5 recording.
 
-        Returns ``(policy_head_hwc, full_left_rgb, depth_u16)``. The policy view
-        is the head left eye cropped to the training region [220:600, 150:800]
-        then resized to (image_w, image_h); the full-resolution left_rgb and
-        depth (metres → uint16 millimetres) are kept for the recorder.
+        Consumes the publisher's frames AS-IS — identical to leader/vr_reader.py: the
+        head publisher (tests/test_head_zedx_depth.py) already crops+resizes robot-side
+        to the model's HxW, so there is NO workstation crop/resize. Returns
+        ``(left_rgb uint8, depth_u16 mm)``; the matching intrinsic is the shared ZED_K.
         """
         obs = self.robot.sensors.head_camera.get_obs(obs_keys=["left_rgb", "depth"])
         left_rgb = self._pick_obs(obs, "left_rgb")
         if left_rgb.dtype != np.uint8:
             left_rgb = np.clip(left_rgb, 0, 255).astype(np.uint8)
-
-        h, w = left_rgb.shape[0], left_rgb.shape[1]
-        if h < HEAD_CROP_BOTTOM or w < HEAD_CROP_RIGHT:
+        if left_rgb.shape[:2] != (self.image_h, self.image_w):
             raise ValueError(
-                f"head frame {h}x{w} too small for training crop "
-                f"rows [{HEAD_CROP_TOP}:{HEAD_CROP_BOTTOM}], "
-                f"cols [{HEAD_CROP_LEFT}:{HEAD_CROP_RIGHT}]"
+                f"head frame {left_rgb.shape[:2]} != policy input "
+                f"({self.image_h}, {self.image_w}); the publisher must crop+resize to the "
+                "model HxW (tests/test_head_zedx_depth.py --crop/--resize, matching "
+                "head_camera.HEAD_CROP_TBLR / HEAD_RESIZE_HW)"
             )
-        cropped = left_rgb[
-            HEAD_CROP_TOP:HEAD_CROP_BOTTOM, HEAD_CROP_LEFT:HEAD_CROP_RIGHT
-        ]
-        # cv2.resize takes (W, H).
-        policy_head = cv2.resize(
-            cropped, (self.image_w, self.image_h), interpolation=cv2.INTER_AREA
-        )
-
+        # Depth metres → uint16 millimetres, as-is (matches vr_reader).
         depth_u16 = np.clip(self._pick_obs(obs, "depth") * 1000, 0, 65535).astype(
             np.uint16
         )
-        return policy_head, left_rgb, depth_u16
-
-    def capture_head_frame(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return ``(full_left_rgb uint8 [H,W,3], depth_u16 [H,W] mm)`` from the live
-        head camera at the current (homed) pose.
-
-        Used by live-conditioning subclasses (``_before_policy_init``) to build a
-        SceneDiff "before" frame that matches the rollout's start viewpoint exactly.
-        """
-        _, left_rgb, depth_u16 = self._read_head_camera()
         return left_rgb, depth_u16
 
-    def _read_wrist_camera(self) -> tuple[np.ndarray, np.ndarray]:
+    def capture_head_frame(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(left_rgb uint8 [H,W,3], depth_u16 [H,W] mm)`` from the live head
+        camera at the current (homed) pose — the publisher's model-HxW frame, as-is.
+
+        Used by live-conditioning subclasses (``_before_policy_init``) to build a
+        SceneDiff "before" frame that matches the rollout start viewpoint AND the
+        reference scene's shape (which make_deploy_before_hdf5.py validates).
+        """
+        return self._read_head_camera()
+
+    def _read_wrist_camera(self) -> np.ndarray:
         """Read the wrist ZED-M left eye for policy input + recording.
 
-        Returns ``(policy_wrist_hwc, full_left_rgb)``. The wrist view is NOT
-        cropped (matches the porter) — just resized to (image_w, image_h). A
-        momentarily-missing publisher frame reuses the last good frame; a total
-        absence raises so the operator fixes the wrist publisher before driving.
+        Consumes the publisher's frame AS-IS (no crop/resize), identical to vr_reader —
+        the wrist publisher (tests/test_wrist_zedm_depth.py) already resized robot-side
+        to the model's HxW. A momentarily-missing publisher frame reuses the last good
+        frame; a total absence raises so the operator fixes the publisher before driving.
         """
         obs = self.robot.sensors.wrist_zedm.get_obs(obs_keys=[_WRIST_OBS_KEY])
         try:
@@ -987,10 +1028,13 @@ class PolicyRolloutController:
         if wrist.dtype != np.uint8:
             wrist = np.clip(wrist, 0, 255).astype(np.uint8)
         self._last_wrist_full = wrist
-        policy_wrist = cv2.resize(
-            wrist, (self.image_w, self.image_h), interpolation=cv2.INTER_AREA
-        )
-        return policy_wrist, wrist
+        if wrist.shape[:2] != (self.image_h, self.image_w):
+            raise ValueError(
+                f"wrist frame {wrist.shape[:2]} != policy input "
+                f"({self.image_h}, {self.image_w}); the publisher must resize to the "
+                "model HxW (tests/test_wrist_zedm_depth.py --resize)"
+            )
+        return wrist
 
     def _current_eef_poses(self) -> dict[str, np.ndarray]:
         """4x4 SE(3) of L_ee and R_ee in robot base frame, via MotionManager FK
@@ -1023,11 +1067,14 @@ class PolicyRolloutController:
     def _build_observation(self) -> dict:
         """Construct an unbatched dataset-style sample for ``self._pre()``.
 
-        Builds the full bimanual ``observation.state`` (LEFT block then RIGHT,
-        each ending in the achieved gripper) and the declared camera views.
+        Builds ``observation.state`` over the DRIVEN arm side(s) (bimanual: LEFT block
+        then RIGHT; single-arm: just that side), each block ending in the achieved
+        gripper, plus the declared camera views. Both arms' obs are still read/cached for
+        the recorder, and both observed EEF poses are cached so a single-arm rollout can
+        hold the inactive arm in place during the coupled IK.
         """
         # Refresh achieved grippers before reading state — training-time
-        # observation.state[9]/[19] are the raw FC03 ``actual`` values.
+        # observation.state grippers are the raw FC03 ``actual`` values.
         self._poll_gripper_status_step()
         grip_left = self._last_obs_grip_left
         grip_right = self._last_obs_grip_right
@@ -1035,32 +1082,39 @@ class PolicyRolloutController:
         left_arm = np.asarray(self.robot.left_arm.get_joint_pos(), dtype=np.float32)
         right_arm = np.asarray(self.robot.right_arm.get_joint_pos(), dtype=np.float32)
 
-        # FK both EEFs (needed for eef state; also recorded for joint variants).
+        # FK both EEFs (needed for eef state; also recorded for joint variants, and used
+        # to hold the inactive arm in place during single-arm IK).
         poses = self._current_eef_poses()
+        self._last_obs_eef_se3 = {"left": poses["L_ee"], "right": poses["R_ee"]}
         eef9_left = _mat_to_pos6d(poses["L_ee"])
         eef9_right = _mat_to_pos6d(poses["R_ee"])
 
-        if self.variant.state_is_eef:
-            state = np.concatenate(
-                [eef9_left, [grip_left], eef9_right, [grip_right]]
-            ).astype(np.float32)
-        else:
-            state = np.concatenate(
-                [left_arm, [grip_left], right_arm, [grip_right]]
-            ).astype(np.float32)
+        # Assemble the policy state from the DRIVEN arm side(s) only, in canonical order.
+        _grip = {"left": grip_left, "right": grip_right}
+        _arm = {"left": left_arm, "right": right_arm}
+        _eef9 = {"left": eef9_left, "right": eef9_right}
+        state = np.concatenate(
+            [
+                np.concatenate(
+                    [_eef9[s] if self.variant.state_is_eef else _arm[s], [_grip[s]]]
+                ).astype(np.float32)
+                for s in self._arm_sides
+            ]
+        ).astype(np.float32)
 
         sample: dict = {"observation.state": torch.from_numpy(state)}
 
-        policy_head, head_full, depth_u16 = self._read_head_camera()
+        policy_head, depth_u16 = self._read_head_camera()
         if self._use_head:
             sample["observation.images.head_rgb"] = _to_chw(policy_head)
         if self._use_wrist:
-            policy_wrist, wrist_full = self._read_wrist_camera()
+            policy_wrist = self._read_wrist_camera()
             sample["observation.images.wrist_rgb"] = _to_chw(policy_wrist)
-            self._last_obs_wrist_rgb = wrist_full
+            self._last_obs_wrist_rgb = policy_wrist
 
-        # Cache for the recorder.
-        self._last_obs_head_rgb = head_full
+        # Cache the model-view frames for the recorder so deploy HDF5s match the
+        # teleop recordings (model HxW + adjusted intrinsic), as vr_reader stores them.
+        self._last_obs_head_rgb = policy_head
         self._last_obs_depth_u16 = depth_u16
         self._last_obs_qpos_left = left_arm.copy()
         self._last_obs_qpos_right = right_arm.copy()
@@ -1275,12 +1329,20 @@ class PolicyRolloutController:
 
     # ── action decode + safety ─────────────────────────────────────────────────
 
-    def _split_action_blocks(
-        self, action: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return (left_block, right_block) per the bimanual layout."""
+    def _robot_arm(self, side: str):
+        """The hardware arm handle for ``side`` ("left"/"right")."""
+        return self.robot.left_arm if side == "left" else self.robot.right_arm
+
+    def _split_action_blocks(self, action: np.ndarray) -> dict[str, np.ndarray]:
+        """Split the policy action into the DRIVEN arm blocks, keyed by side.
+
+        Bimanual → ``{"left": action[:b], "right": action[b:2b]}``; single-arm → one
+        block ``{side: action[:b]}`` (``b`` = ``arm_action_block``).
+        """
         b = self.variant.arm_action_block
-        return action[:b], action[b : 2 * b]
+        return {
+            side: action[i * b : (i + 1) * b] for i, side in enumerate(self._arm_sides)
+        }
 
     @staticmethod
     def _block_to_se3(block: np.ndarray) -> np.ndarray:
@@ -1292,103 +1354,106 @@ class PolicyRolloutController:
 
     def _action_to_joint_targets(
         self, action: np.ndarray
-    ) -> tuple[Optional[dict[str, np.ndarray]], str, float, float]:
-        """Convert bimanual policy output to per-arm joint targets + grippers.
+    ) -> tuple[Optional[dict[str, np.ndarray]], str, dict[str, float]]:
+        """Convert the policy output to per-arm joint targets + grippers for the DRIVEN
+        arm side(s).
 
-        Both variants share the same safety pipeline: seed MM with the chained
-        (last-commanded) state for both arms → produce raw 7-DOF targets (a
-        single coupled Pink IK for EEF, the action blocks for joint) → per-arm
-        ``limit_joint_step`` (10°/tick clamp) → ``_check_arm_joint_target``
-        (hardware joint limits) → ``_check_safety`` (NaN + Cartesian workspace).
-        The IK chains commit only after EVERY guard passes for BOTH arms, so a
-        rejected tick leaves both chains anchored to the last safe pose.
+        Shared safety pipeline: seed MM with the chained (last-commanded) driven arms (and
+        any inactive arm at its observed pose) → produce raw 7-DOF targets (a coupled Pink
+        IK for EEF, the action blocks for joint) → per-arm ``limit_joint_step`` (10°/tick
+        clamp) → ``_check_arm_joint_target`` (hardware joint limits) → ``_check_safety``
+        (NaN + Cartesian workspace). The IK chains commit only after EVERY guard passes for
+        ALL driven arms, so a rejected tick leaves them anchored to the last safe pose.
 
-        Returns ``(targets, reason, left_grip, right_grip)`` where ``targets``
-        is ``{"left": joint7, "right": joint7}`` on success or ``None`` on any
-        rejection (caller freezes/exits on this tick). Grippers are the raw
-        (un-binarized) policy outputs and are returned in both cases.
+        For a single-arm policy the OTHER arm is never a free IK target: the coupled solve
+        receives its current OBSERVED pose (so dexmotion holds it in place / collision-
+        checks correctly) and its solution is discarded — it is left fully uncommanded.
+
+        Returns ``(targets, reason, grips)`` where ``targets`` maps each driven side to its
+        7-DOF target on success (``None`` on any rejection) and ``grips`` maps each driven
+        side to its raw (un-binarized) policy gripper output.
         """
         assert self._motion_manager is not None
-        assert self._left_proc is not None and self._right_proc is not None
-        assert self._chained_left_arm_qpos is not None
-        assert self._chained_right_arm_qpos is not None
+        for side in self._arm_sides:
+            assert self._proc[side] is not None
+            assert self._chained[side] is not None
 
-        left_block, right_block = self._split_action_blocks(action)
-        left_grip = float(left_block[-1])
-        right_grip = float(right_block[-1])
+        blocks = self._split_action_blocks(action)  # {side: block} over driven sides
+        grips = {side: float(blocks[side][-1]) for side in self._arm_sides}
 
-        # Seed MM with both chained (last-commanded) arms so:
-        #   - (EEF only) Pink IK warm-starts from there (matches leader),
-        #   - limit_joint_step clamps each raw target against its chained arm.
-        # mm.ik() does NOT commit its solution back into mm.{left,right}_arm, so
-        # the MM state stays at the chained values across the call.
+        # Seed MM: driven arms at their chained (last-commanded) pose so limit_joint_step
+        # clamps against it and (EEF) Pink IK warm-starts there; any inactive arm at its
+        # live observed pose. mm.ik() does NOT commit back into mm.{left,right}_arm.
+        seed: dict[str, Optional[np.ndarray]] = {"left": None, "right": None}
+        for side in self._arm_sides:
+            seed[side] = self._chained[side]
         self._motion_manager.set_joint_pos(
-            self._motion_manager_state_dict(
-                left_arm=self._chained_left_arm_qpos,
-                right_arm=self._chained_right_arm_qpos,
-            )
+            self._motion_manager_state_dict(left_arm=seed["left"], right_arm=seed["right"])
         )
 
+        raw: dict[str, list] = {}
         if self.variant.action_is_eef:
-            # Coupled bimanual IK — both EEF targets in one solve so dexmotion
-            # accounts for inter-arm self-collision (mirrors vr_reader).
+            # Coupled IK over BOTH frames so dexmotion accounts for inter-arm collision:
+            # each driven arm targets the policy pose; an inactive arm targets its current
+            # observed pose (held in place). Only driven-arm joints are extracted/sent.
             target_pose = {
-                "L_ee": self._block_to_se3(left_block),
-                "R_ee": self._block_to_se3(right_block),
+                _ARM_FRAME[side]: self._block_to_se3(blocks[side])
+                for side in self._arm_sides
             }
+            for side in _ARM_ORDER:
+                if side not in self._arm_sides:
+                    if self._last_obs_eef_se3 is None:
+                        return None, "no_observed_eef_for_inactive_arm", grips
+                    target_pose[_ARM_FRAME[side]] = self._last_obs_eef_se3[side].astype(
+                        np.float64
+                    )
             try:
                 arm_solution, in_collision, within_limits = self._motion_manager.ik(
                     target_pose=target_pose,
                     type="pink",
                 )
             except Exception as e:  # solver internals can throw on degenerate inputs
-                return None, f"ik_exception: {e}", left_grip, right_grip
+                return None, f"ik_exception: {e}", grips
             if not arm_solution:
-                return None, "ik_no_solution", left_grip, right_grip
+                return None, "ik_no_solution", grips
             if in_collision:
-                return None, "ik_collision", left_grip, right_grip
+                return None, "ik_collision", grips
             if not within_limits:
-                return None, "ik_outside_limits", left_grip, right_grip
+                return None, "ik_outside_limits", grips
             try:
-                raw_left = [arm_solution[f"L_arm_j{i}"] for i in range(1, 8)]
-                raw_right = [arm_solution[f"R_arm_j{i}"] for i in range(1, 8)]
+                for side in self._arm_sides:
+                    p = _ARM_PREFIX[side]
+                    raw[side] = [arm_solution[f"{p}_arm_j{i}"] for i in range(1, 8)]
             except KeyError as e:
-                return None, f"ik_missing_joint:{e}", left_grip, right_grip
+                return None, f"ik_missing_joint:{e}", grips
         else:
-            # Joint action — raw targets straight from the policy blocks.
-            raw_left = left_block[:7].astype(np.float64).tolist()
-            raw_right = right_block[:7].astype(np.float64).tolist()
+            # Joint action — raw targets straight from each driven block.
+            for side in self._arm_sides:
+                raw[side] = blocks[side][:7].astype(np.float64).tolist()
 
-        # 10°/tick clamp against each chained arm (clamps read MM arm state,
+        # 10°/tick clamp against each chained driven arm (clamps read MM arm state,
         # which was just seeded to the chained values and is unchanged by IK).
-        safe_left = self._left_proc.limit_joint_step(raw_left)
-        safe_right = self._right_proc.limit_joint_step(raw_right)
-        target_left = safe_left.astype(np.float32)
-        target_right = safe_right.astype(np.float32)
+        safe = {
+            side: self._proc[side].limit_joint_step(raw[side]) for side in self._arm_sides
+        }
+        targets = {side: safe[side].astype(np.float32) for side in self._arm_sides}
 
-        # Validate BOTH post-clamp targets before committing either chain.
-        for side, target in (("left", target_left), ("right", target_right)):
-            ok, why = self._check_arm_joint_target(side, target)
+        # Validate EVERY driven arm's post-clamp target before committing any chain.
+        for side in self._arm_sides:
+            ok, why = self._check_arm_joint_target(side, targets[side])
             if not ok:
-                return None, why, left_grip, right_grip
-            ok, why = self._check_safety(side, target)
+                return None, why, grips
+            ok, why = self._check_safety(side, targets[side])
             if not ok:
-                return None, why, left_grip, right_grip
+                return None, why, grips
 
-        # Commit both chains (mm.{left,right}_arm advance → next tick's
-        # limit_joint_step clamps against these; _chained_* mirror them so the
-        # next IK call re-seeds MM from a known place).
-        self._left_proc.apply_positions(safe_left.tolist())
-        self._right_proc.apply_positions(safe_right.tolist())
-        self._chained_left_arm_qpos = target_left
-        self._chained_right_arm_qpos = target_right
+        # Commit driven chains (mm.{side}_arm advance → next tick's limit_joint_step
+        # clamps against these; _chained mirrors them so the next IK re-seeds MM cleanly).
+        for side in self._arm_sides:
+            self._proc[side].apply_positions(safe[side].tolist())
+            self._chained[side] = targets[side]
 
-        return (
-            {"left": target_left, "right": target_right},
-            "ok",
-            left_grip,
-            right_grip,
-        )
+        return targets, "ok", grips
 
     def _action_eef_record(
         self,
@@ -1466,11 +1531,7 @@ class PolicyRolloutController:
         # 2) Workspace check (this arm, in robot base frame). Head/torso are held
         # at their INIT poses for the duration of the rollout, so we use those
         # constants for FK rather than the current measurements.
-        checker = (
-            self._left_workspace_checker
-            if side == "left"
-            else self._right_workspace_checker
-        )
+        checker = self._workspace_checker[side]
         if checker is not None:
             in_bounds, eef_xyz = checker.is_in_workspace(
                 arm_joints=command_target.tolist(),
@@ -1542,11 +1603,16 @@ class PolicyRolloutController:
         rate = RateLimiter(self.control_rate)
         logger.info(f"Control loop at {self.control_rate} Hz")
 
-        # Targets that persist between policy ticks (held flat).
-        joint_target_left = self._last_cmd_left.copy()
-        joint_target_right = self._last_cmd_right.copy()
-        gripper_target_left = self._last_gripper_cmd_left
-        gripper_target_right = self._last_gripper_cmd_right
+        # Targets that persist between policy ticks (held flat), one entry per DRIVEN arm.
+        _last_cmd = {"left": self._last_cmd_left, "right": self._last_cmd_right}
+        _last_gcmd = {
+            "left": self._last_gripper_cmd_left,
+            "right": self._last_gripper_cmd_right,
+        }
+        joint_targets: dict[str, np.ndarray] = {
+            s: _last_cmd[s].copy() for s in self._arm_sides
+        }
+        gripper_targets: dict[str, float] = {s: _last_gcmd[s] for s in self._arm_sides}
         consecutive_rejects = 0
         REJECT_LIMIT = 1
         chunk_idx = -1
@@ -1573,33 +1639,28 @@ class PolicyRolloutController:
                     # and capture a new one from the post-resume observation.
                     self._chunk_ref_state = None
                     self._active_position_condition = None
-                    # Re-sync both IK chains to the observed arm poses — the
+                    # Re-sync each DRIVEN IK chain to the observed arm pose — the
                     # operator may have moved an arm while paused. Re-seed
-                    # mm.{left,right}_arm via apply_positions so the next
-                    # limit_joint_step clamps against the live state.
-                    if self._left_proc is not None and self._right_proc is not None:
-                        obs_left = np.array(
-                            self.robot.left_arm.get_joint_pos(), dtype=np.float32
-                        )
-                        obs_right = np.array(
-                            self.robot.right_arm.get_joint_pos(), dtype=np.float32
-                        )
-                        self._chained_left_arm_qpos = obs_left
-                        self._chained_right_arm_qpos = obs_right
-                        self._left_proc.apply_positions(obs_left.tolist())
-                        self._right_proc.apply_positions(obs_right.tolist())
-                        # Align the held commands with the live pose so the
-                        # first post-resume send doesn't snap either arm back to
-                        # the pre-estop target before the next policy tick.
-                        joint_target_left = obs_left.copy()
-                        joint_target_right = obs_right.copy()
+                    # mm.{side}_arm via apply_positions so the next limit_joint_step
+                    # clamps against the live state. (An inactive arm is uncommanded,
+                    # so it needs no resync.)
+                    if all(self._proc[s] is not None for s in self._arm_sides):
+                        for s in self._arm_sides:
+                            obs = np.array(
+                                self._robot_arm(s).get_joint_pos(), dtype=np.float32
+                            )
+                            self._chained[s] = obs
+                            self._proc[s].apply_positions(obs.tolist())
+                            # Align the held command with the live pose so the first
+                            # post-resume send doesn't snap the arm back to the
+                            # pre-estop target before the next policy tick.
+                            joint_targets[s] = obs.copy()
                     self._mode = _Mode.RUNNING
 
                 # ─── inner: policy at policy_fps ──────────────────────────────
                 step_info: Optional[dict] = None
                 targets: Optional[dict[str, np.ndarray]] = None
-                cand_left_grip: float = 0.0
-                cand_right_grip: float = 0.0
+                cand_grips: dict[str, float] = {}
                 action: Optional[np.ndarray] = None
                 if tick % self._policy_period_ticks == 0:
                     try:
@@ -1610,9 +1671,7 @@ class PolicyRolloutController:
                         tick += 1
                         continue
 
-                    targets, reason, cand_left_grip, cand_right_grip = (
-                        self._action_to_joint_targets(action)
-                    )
+                    targets, reason, cand_grips = self._action_to_joint_targets(action)
                     if targets is None:
                         consecutive_rejects += 1
                         logger.warning(f"Action rejected: {reason}")
@@ -1622,26 +1681,22 @@ class PolicyRolloutController:
                             )
                             break
                     else:
-                        joint_target_left = targets["left"]
-                        joint_target_right = targets["right"]
-                        gripper_target_left = (
-                            1.0 if cand_left_grip >= self.gripper_threshold else 0.0
-                        )
-                        gripper_target_right = (
-                            1.0 if cand_right_grip >= self.gripper_threshold else 0.0
-                        )
+                        for s in self._arm_sides:
+                            joint_targets[s] = targets[s]
+                            gripper_targets[s] = (
+                                1.0 if cand_grips[s] >= self.gripper_threshold else 0.0
+                            )
                         consecutive_rejects = 0
 
-                # ─── outer: send (all safety guards ran in _action_to_joint_targets) ─
-                self.robot.left_arm.set_joint_pos(joint_target_left.tolist())
-                self.robot.right_arm.set_joint_pos(joint_target_right.tolist())
+                # ─── outer: send DRIVEN arms only (an inactive arm stays uncommanded;
+                #     all safety guards ran in _action_to_joint_targets) ─
+                for s in self._arm_sides:
+                    self._robot_arm(s).set_joint_pos(joint_targets[s].tolist())
                 publish_command_ns = time.time_ns()
-                self.robot.left_arm.send_ee_pass_through_message(
-                    build_hande_command(gripper_target_left)
-                )
-                self.robot.right_arm.send_ee_pass_through_message(
-                    build_hande_command(gripper_target_right)
-                )
+                for s in self._arm_sides:
+                    self._robot_arm(s).send_ee_pass_through_message(
+                        build_hande_command(gripper_targets[s])
+                    )
                 t_send = time.monotonic()
                 if step_info is not None and step_info["replan"]:
                     if t_send - last_replan_log_t > 0.95:
@@ -1652,10 +1707,14 @@ class PolicyRolloutController:
                             f"inference={step_info['inference_ms']:.1f}ms "
                             f"obs→send={obs_to_send_ms:.1f}ms"
                         )
-                self._last_cmd_left = joint_target_left
-                self._last_cmd_right = joint_target_right
-                self._last_gripper_cmd_left = gripper_target_left
-                self._last_gripper_cmd_right = gripper_target_right
+                self._last_cmd_left = joint_targets.get("left", self._last_cmd_left)
+                self._last_cmd_right = joint_targets.get("right", self._last_cmd_right)
+                self._last_gripper_cmd_left = gripper_targets.get(
+                    "left", self._last_gripper_cmd_left
+                )
+                self._last_gripper_cmd_right = gripper_targets.get(
+                    "right", self._last_gripper_cmd_right
+                )
 
                 # ─── record (per inner policy tick) ──────────────────────────
                 if step_info is not None and action is not None:
@@ -1669,8 +1728,7 @@ class PolicyRolloutController:
                             self._record_frame(
                                 action=action,
                                 targets=targets,
-                                cand_left_grip=cand_left_grip,
-                                cand_right_grip=cand_right_grip,
+                                cand_grips=cand_grips,
                                 step_info=step_info,
                                 publish_command_ns=publish_command_ns,
                                 chunk_idx=chunk_idx,
@@ -1692,30 +1750,54 @@ class PolicyRolloutController:
         self,
         action: np.ndarray,
         targets: Optional[dict[str, np.ndarray]],
-        cand_left_grip: float,
-        cand_right_grip: float,
+        cand_grips: dict[str, float],
         step_info: dict,
         publish_command_ns: int,
         chunk_idx: int,
     ) -> None:
-        """Assemble + push one bimanual debug frame to the recorder."""
-        left_block, right_block = self._split_action_blocks(action)
+        """Assemble + push one debug frame to the recorder.
 
-        def proposed_joint(block: np.ndarray, committed: Optional[np.ndarray]):
-            if not self.variant.action_is_eef:
-                return block[:7].astype(np.float32)
-            if committed is not None:
-                return committed.astype(np.float32)
-            return np.full(7, np.nan, dtype=np.float32)
+        Each DRIVEN arm records the policy's proposed action; an inactive (uncommanded)
+        arm records it HOLDING its last observed pose, so the bimanual recorder layout
+        (both left + right blocks) stays intact for single-arm rollouts too.
+        """
+        blocks = self._split_action_blocks(action)  # {side: block} over driven sides
+        obs_qpos = {"left": self._last_obs_qpos_left, "right": self._last_obs_qpos_right}
+        obs_eef9 = {"left": self._last_obs_eef9_left, "right": self._last_obs_eef9_right}
+        held_grip_cmd = {
+            "left": self._last_gripper_cmd_left,
+            "right": self._last_gripper_cmd_right,
+        }
 
-        committed_left = targets["left"] if targets is not None else None
-        committed_right = targets["right"] if targets is not None else None
-        pj_left = proposed_joint(left_block, committed_left)
-        pj_right = proposed_joint(right_block, committed_right)
-        pg_left = np.float32(1.0 if cand_left_grip >= self.gripper_threshold else 0.0)
-        pg_right = np.float32(1.0 if cand_right_grip >= self.gripper_threshold else 0.0)
-        eef4_left, eef9_left = self._action_eef_record("left", left_block, pj_left)
-        eef4_right, eef9_right = self._action_eef_record("right", right_block, pj_right)
+        eef4: dict[str, np.ndarray] = {}
+        eef9: dict[str, np.ndarray] = {}
+        pj: dict[str, np.ndarray] = {}
+        pg: dict[str, np.float32] = {}
+        for side in _ARM_ORDER:
+            if side in self._arm_sides:
+                block = blocks[side]
+                committed = targets[side] if targets is not None else None
+                if not self.variant.action_is_eef:
+                    pj[side] = block[:7].astype(np.float32)
+                elif committed is not None:
+                    pj[side] = committed.astype(np.float32)
+                else:
+                    pj[side] = np.full(7, np.nan, dtype=np.float32)
+                pg[side] = np.float32(
+                    1.0 if cand_grips.get(side, 0.0) >= self.gripper_threshold else 0.0
+                )
+                eef4[side], eef9[side] = self._action_eef_record(side, block, pj[side])
+            else:
+                # Inactive arm: uncommanded → record it holding its last observed pose.
+                assert obs_qpos[side] is not None and obs_eef9[side] is not None
+                pj[side] = obs_qpos[side].astype(np.float32)
+                pg[side] = np.float32(held_grip_cmd[side])
+                eef9[side] = obs_eef9[side].astype(np.float32)
+                eef4[side] = (
+                    self._last_obs_eef_se3[side].astype(np.float32)
+                    if self._last_obs_eef_se3 is not None
+                    else np.full((4, 4), np.nan, dtype=np.float32)
+                )
 
         obs_head = self._last_obs_head_rgb
         obs_depth = self._last_obs_depth_u16
@@ -1739,8 +1821,9 @@ class PolicyRolloutController:
         # Image keys mirror the teleop layout written by leader/vr_reader.py
         # (obs/images/{head_left_rgb, head_depth, left_wrist_rgb}) so a single
         # viewer (scripts/vis_episode.py --deploy) reads both raw and rollout
-        # episodes. These are the full-resolution head left eye / depth / wrist
-        # left eye — the same streams those keys carry in teleop recordings.
+        # episodes. These are the model-view head left eye / depth / wrist left eye
+        # (the same cropped+resized streams + intrinsic those keys carry in teleop
+        # recordings, since the publisher crops+resizes robot-side).
         images = {"head_left_rgb": obs_head, "head_depth": obs_depth}
         if self._use_wrist:
             assert self._last_obs_wrist_rgb is not None
@@ -1786,10 +1869,10 @@ class PolicyRolloutController:
                 },
                 "obs": obs,
                 "action": {
-                    "eef": {"left": eef4_left, "right": eef4_right},
-                    "eef_9d": {"left": eef9_left, "right": eef9_right},
-                    "joint": {"left_arm": pj_left, "right_arm": pj_right},
-                    "gripper": {"left": pg_left, "right": pg_right},
+                    "eef": {"left": eef4["left"], "right": eef4["right"]},
+                    "eef_9d": {"left": eef9["left"], "right": eef9["right"]},
+                    "joint": {"left_arm": pj["left"], "right_arm": pj["right"]},
+                    "gripper": {"left": pg["left"], "right": pg["right"]},
                 },
             }
         )
@@ -1841,8 +1924,9 @@ def main(
     record: bool = True,
     record_dir: Optional[str] = None,
     positions_npz: Optional[str] = None,
+    arm_side: Optional[str] = None,
 ) -> None:
-    """Run live bimanual policy rollout on a Dexmate robot.
+    """Run a live policy rollout on a Dexmate robot (bimanual or single-arm).
 
     Args:
         policy_path: Path to a LeRobot ``pretrained_model`` directory
@@ -1873,6 +1957,10 @@ def main(
             driven by run_img_with_depth.sh). REQUIRED when the policy declares
             ``observation.environment_state``: loaded before the control loop and fed as
             env-state conditioning. Ignored for non-position-conditioned policies.
+        arm_side: REQUIRED for a single-arm policy (8-D joint / 10-D eef) — "left" or
+            "right", the arm that policy drives. The side is not stored in the checkpoint,
+            so it must be given explicitly. The OTHER arm is left fully uncommanded (homed
+            at startup, then held by its controller). Ignored for bimanual policies.
     """
     setup_logging(debug)
     ctrl = PolicyRolloutController(
@@ -1888,6 +1976,7 @@ def main(
         record=record,
         record_dir=record_dir,
         positions_npz=positions_npz,
+        arm_side=arm_side,
     )
     ctrl.run()
 

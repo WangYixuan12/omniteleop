@@ -38,8 +38,7 @@ Run:
     python scripts/robotiq_gripper_cmd_actual_omni.py --mode continuous
     python scripts/robotiq_gripper_cmd_actual_omni.py --mode square --signal-frequency 0.5
     python scripts/robotiq_gripper_cmd_actual_omni.py --mode triangle --signal-frequency 0.25
-    python scripts/robotiq_gripper_cmd_actual_omni.py --mode sine --signal-frequency 0.5
-    python scripts/robotiq_gripper_cmd_actual_omni.py --sides right --duration 15
+    python scripts/robotiq_gripper_cmd_actual_omni.py --sides right --mode sine --signal-frequency 0.5
 """
 
 import argparse

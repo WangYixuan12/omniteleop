@@ -28,6 +28,7 @@ pip install omniteleop
       - [sensors.params] rate = 15
       - [sensors.streams] right_rgb = false
       - [sensors.params] depth_mode = "NEURAL_LIGHT"
+
 ```python
 python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending cmd in different curves
 ```
@@ -43,6 +44,12 @@ python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending c
 
 ```python
 python /home/dexmate/yixuan/omniteleop/tests/test_wrist_zedm_depth.py --duration 10 --save-dir /home/dexmate/yixuan/Dexmate
+```
+
+3.2 check RoI:
+
+```python
+python /home/yixuan/omniteleop/tests/crop_and_resize.py
 ```
 
 1. ssh lambda, conda activate dexmate
@@ -87,7 +94,7 @@ python /home/yixuan/omniteleop/scripts/vis_episode.py --hdf5 /home/yixuan/Dexmat
 - scripts/vis_episode.py (Optional)
 
 ```bash
-1. python /home/yixuan/omniteleop/scripts/rename_raw_data.py # revise train/val/test range
+python /home/yixuan/omniteleop/scripts/rename_raw_data.py # revise train/val/test range
 ```
 
 ```bash
@@ -105,12 +112,14 @@ Run infer_dexmate.py before deploy.
 python -m omniteleop.follower.policy_rollout \
       --policy-path /home/yixuan/Dexmate/model/act/dexmate_eef_eef_abs_2cam_pos_20_10/checkpoints/last/pretrained_model \
       --record_dir /home/yixuan/Dexmate/deploy/act/dexmate_eef_eef_abs_2cam_pos_20_10/last
+(--arm-side right) # only for single-arm
 # ACT deploy uses checkpoint n_action_steps and temporal_ensemble_coeff by default.
 # use the training stats baked into the checkpoint
 
-python -m omniteleop.follower.live_scenediff_rollout \
-    --policy-path /home/yixuan/Dexmate/model/dp/dexmate_eef_eef_abs_film_pos_16_8/checkpoints/200000/pretrained_model \
-    --prompt-before-capture
+(dexmate_lerobot) python -m omniteleop.follower.live_scenediff_rollout \
+    --policy-path /home/yixuan/Dexmate/model/dp/dexmate_right_eef_eef_abs_film/checkpoints/last/pretrained_model \
+    --prompt-before-capture \
+ --pos-cond-matching prompt --prompt-after-capture --arm-side right # only for single-arm
 # [--record-dir]
 ```
 
@@ -121,7 +130,7 @@ python scripts/vis_deploy.py \
 ```
 
 ```bash
-python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef_abs_2cam_film_16_8/200000/9/episode_0.hdf5
+python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixuan/Dexmate/deploy/dp/dexmate_right_eef_eef_abs_film/checkpoints/last/0/episode_0.hdf5
 # rerun, transmission latency plot under debug/
 ```
 
