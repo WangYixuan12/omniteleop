@@ -1,5 +1,20 @@
 """Shared safety machinery for the Vega whole-body IK solvers (real-robot use).
 
+1. **Self-collision avoidance.** Each solver adds a *proactive* in-solve constraint
+   (Pink :class:`~pink.barriers.SelfCollisionBarrier`; Mink
+   :class:`~mink.CollisionAvoidanceLimit`) built from the Dexmate **collision-sphere**
+   model (``vega_1_collision_spheres.collision.urdf`` -- 90 spheres whose link names
+   match ``vega_no_effector.urdf``). The spheres are grouped into body / left-arm /
+   right-arm sets and only *cross-group* pairs are checked (arm-vs-arm, arm-vs-body),
+   matching the reference ``deps/rby1-wbc`` setup.
+
+2. **Reactive hold gate** (:class:`SafetyGate`). The gate is the hard guarantee: after each candidate step the solver
+   evaluates the CoM-over-base stability margin and the closest self-collision
+   distance, and if either is below its safety floor **and getting worse**, the step
+   is rejected -- the robot *holds* its previous configuration and a warning is
+   surfaced. Motion that recovers (increases the margin/distance) is always allowed,
+   so the robot is never permanently stuck.
+
 Both the Pink (:mod:`omniteleop.follower.whole_body_ik`) and Mink
 (:mod:`omniteleop.follower.whole_body_ik_mink`) solvers use this module to add two
 aggressive safety layers, so the behavior is identical across backends:
@@ -15,30 +30,41 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import yaml
+
+# --- safety defaults: loaded from wbik.yaml (the single source of truth) --------
+# The canonical values live in wbik.yaml next to this module -- the same file
+# WBCConfig (whole_body_ik) loads its defaults from -- so editing the YAML changes
+# the solver config and these barrier/gate constants consistently.
+_WBIK_YAML = Path(__file__).with_name("wbik.yaml")
+with open(_WBIK_YAML, "r", encoding="utf-8") as _f:
+    _WBIK = yaml.safe_load(_f)
+if not isinstance(_WBIK, dict):
+    raise ValueError(
+        f"{_WBIK_YAML}: expected a top-level mapping, got {type(_WBIK).__name__}"
+    )
 
 # Dexmate collision-sphere URDF (link names match vega_no_effector.urdf; primitives
 # only, so it needs no mesh package dirs). Absolute path => readable from any env.
-DEFAULT_COLLISION_SPHERES_URDF = (
-    "/home/yixuan/miniforge3/envs/dexmate/lib/python3.12/site-packages/"
-    "dexmate_urdf/robots/humanoid/vega_1/vega_1_collision_spheres.collision.urdf"
-)
-
-# --- safety defaults (meters) --------------------------------------------------
-# Proactive separation the in-solve constraint tries to maintain between cross-group
-# spheres. Reactive floor below which a *worsening* step is vetoed (robot holds).
-DEFAULT_SELF_COLLISION_SAFE_DIST = 0.02
-DEFAULT_SELF_COLLISION_FLOOR = 0.01
-# Mink-only: distance at which the velocity limit starts decelerating the approach.
-DEFAULT_COLLISION_DETECT_DIST = 0.10
+DEFAULT_COLLISION_SPHERES_URDF = str(_WBIK["collision_spheres_urdf"])
+# Proactive separation (m) the in-solve constraint tries to maintain between
+# cross-group spheres, and the reactive floor (m) below which a *worsening* step is
+# vetoed (robot holds).
+DEFAULT_SELF_COLLISION_SAFE_DIST = float(_WBIK["self_collision_safe_dist"])
+DEFAULT_SELF_COLLISION_FLOOR = float(_WBIK["self_collision_floor"])
 # SRDF filter: drop cross-group pairs closer than this at the nominal posture.
-DEFAULT_NOMINAL_PAIR_KEEP_DIST = 0.02
+DEFAULT_NOMINAL_PAIR_KEEP_DIST = float(_WBIK["nominal_pair_keep_dist"])
 # Pink-only: number of closest pairs the barrier constrains (QP rows).
-DEFAULT_N_COLLISION_PAIRS = 40
+DEFAULT_N_COLLISION_PAIRS = int(_WBIK["n_collision_pairs"])
 # CoM ground-projection must stay at least this far inside the wheel support polygon.
-DEFAULT_COM_SAFETY_MARGIN = 0.08
+DEFAULT_COM_SAFETY_MARGIN = float(_WBIK["com_safety_margin"])
+# Mink-only: distance at which the velocity limit starts decelerating the approach.
+# Not in wbik.yaml (its keys map 1:1 to WBCConfig fields, and this is not one).
+DEFAULT_COLLISION_DETECT_DIST = 0.10
 
 # Cross-group collision pairs to check (never intra-group: adjacent links in a chain
 # are always in contact). Mirrors deps/rby1-wbc's (base_torso, arm) and (arm, arm).

@@ -4,7 +4,7 @@ These dataclasses define the structure of messages passed via Zenoh.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Any
+from typing import Any, Dict, List
 
 @dataclass
 class ExoJointData:
@@ -78,3 +78,11 @@ class VRJointData:
     recalibrate: bool = False
     # Calibration stage: A=head, B=arms preview, C=live teleop
     calib_stage: str = "A"
+    left_ee_pose: List[float] = field(default_factory=list)
+    right_ee_pose: List[float] = field(default_factory=list)
+    # Calibrated headset pose (flattened row-major 4x4) in the robot base frame at
+    # calibration -- the head-frame (zed_depth_frame) teleop target. Published by
+    # wbc_vr_leader; the WBC follower solves its own head IK against this from the
+    # live whole-body configuration (so base yaw / torso lean are compensated).
+    # Empty when not teleoperating. vr_reader publishes head_pos joints instead.
+    head_ee_pose: List[float] = field(default_factory=list)

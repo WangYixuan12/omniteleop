@@ -124,12 +124,6 @@ python -m omniteleop.follower.policy_rollout \
 ```
 
 ```bash
-python scripts/vis_deploy.py \
-        --gt /home/yixuan/Dexmate/data/raw_data_renamed/test/episode_0.hdf5 \
-        --infer /home/yixuan/Dexmate/deploy/dp/dexmate_eef_eef/last/2/episode_0.hdf5
-```
-
-```bash
 python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixuan/Dexmate/deploy/dp/dexmate_right_eef_eef_abs_film/checkpoints/last/0/episode_0.hdf5
 # rerun, transmission latency plot under debug/
 ```
@@ -140,3 +134,16 @@ python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixu
 python /home/yixuan/omniteleop/src/omniteleop/leader/check_eef_pos.py # robot.right_arm.get_joint_pos() first, and the run this to calculate eef from joint 
 ```
 
+# WBC
+
+```bash
+python /home/yixuan/omniteleop/scripts/inspect_joints_sapien.py
+
+python /home/yixuan/omniteleop/scripts/wbc_waypoints_record.py --output /home/yixuan/Dexmate/wbc/wbc_waypoint_wheel_open.mp4 --physics --base-loop open
+
+python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py
+python /home/yixuan/omniteleop/scripts/wbc_vr_record.py --output /home/yixuan/Dexmate/wbc/wbc_teleop_06_10.mp4 --base-loop open
+
+
+python scripts/play_side_by_side_videos.py --video_1 /home/yixuan/Dexmate/wbc/wbc_waypoint_kinematics.mp4 --video_2 /home/yixuan/Dexmate/wbc/wbc_waypoint_wheel.mp4 --video_result /home/yixuan/Dexmate/wbc/wbc_waypoint.mp4
+```

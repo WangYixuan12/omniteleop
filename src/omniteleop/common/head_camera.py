@@ -18,9 +18,20 @@ from __future__ import annotations
 import numpy as np
 
 # Crop applied to the raw SVGA frame as rows [top:bottom], cols [left:right], then a
-# resize to (height, width). Must match tests/test_head_zedx_depth.py --crop/--resize.
-HEAD_CROP_TBLR: tuple[int, int, int, int] = (300, 600, 375, 775)
-HEAD_RESIZE_HW: tuple[int, int] = (120, 160)  # (height, width) after the crop
+# resize to (height, width). SINGLE SOURCE OF TRUTH for the head-camera geometry,
+# consumed by every stage so they stay in lock-step:
+#   * tests/test_head_zedx_depth.py — --crop/--resize default to these (robot-side).
+#   * leader/vr_reader.py, follower/policy_rollout.py — stamp ZED_K (derived below).
+#   * scripts/drive_box_record.py — records ZED_K alongside the head frames.
+# Change them HERE and every consumer follows.
+#
+# Currently set to the FULL SVGA frame — cropping and downscaling are DISABLED
+# (crop spans the whole 960x600 frame; resize is a no-op to the same size, so
+# ZED_K == HEAD_BASE_K). To re-enable the manipulation-ROI crop, restore:
+#     HEAD_CROP_TBLR = (300, 600, 375, 775)   # 300x400 ROI
+#     HEAD_RESIZE_HW = (120, 160)
+HEAD_CROP_TBLR: tuple[int, int, int, int] = (0, 600, 0, 960)  # (300, 600, 375, 775) 
+HEAD_RESIZE_HW: tuple[int, int] = (120, 160) # does not affect pose tracking that uses (600, 960) original
 
 # Intrinsics of the raw SVGA head frame (960x600), pre-crop.
 HEAD_BASE_K = np.array(

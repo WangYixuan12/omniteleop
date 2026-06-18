@@ -116,6 +116,7 @@ from yixuan_utilities.kinematics_helper import KinHelper
 
 from omniteleop.common import get_config
 from omniteleop.common.debug_display import get_debug_display
+from omniteleop.common.head_camera import ZED_K
 from omniteleop.common.log_utils import suppress_loguru_module
 from omniteleop.common.logging import setup_logging
 from omniteleop.common.recorder import (
@@ -193,12 +194,12 @@ INVALID_RIGHT_POSE = np.array(
     ]
 )
 
-# HARDCODED right now
-fx = 770.1868 / 2.0
-fy = 770.1868 / 2.0
-cx = 990.2711 / 2.0
-cy = 637.7721 / 2.0
-ZED_K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+# Head-camera intrinsics recorded into obs/images/intrinsic. The head publisher
+# (tests/test_head_zedx_depth.py) crops + resizes ROBOT-SIDE before publishing, so
+# we record the frame as-is and stamp ZED_K — the intrinsic of that cropped+resized
+# view. The crop/resize geometry + ZED_K live in omniteleop.common.head_camera
+# (imported at the top), shared with follower/policy_rollout.py which consumes the
+# same cropped head_camera frames at inference.
 
 _HEAD_IK_JOINTS = {"head_j2", "head_j3"}
 _HEAD_MOTOR_JOINTS = ["head_j1", "head_j2", "head_j3"]

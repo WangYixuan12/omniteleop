@@ -4,8 +4,13 @@ Sibling to ``scripts/vis_episode_online.py`` — same rendering structure, but
 sourced entirely from processed parquet variants produced by
 ``examples/port_datasets/port_dexmate_hdf5.py`` (no raw HDF5 input).
 
-Two variants of the same source episode are loaded in lockstep. Both are now
-BIMANUAL — each vector is the LEFT arm's block followed by the RIGHT arm's block:
+Two variants of the same source episode are loaded in lockstep. The viewer handles
+BOTH bimanual and single-arm datasets: the active arm side(s) and per-block column
+offsets are read from each variant's stored axis names, so dims scale automatically
+(joint 8-D, eef 10-D per arm). The shapes below describe the BIMANUAL case — each
+vector is the LEFT arm's block followed by the RIGHT arm's block; a single-arm dataset
+carries just the one selected side's block (half the dims), and any arm absent from the
+data is pinned to its INIT_*_ARM_JOINTS in the URDF view:
 
 - ``--marker_and_plot_dir`` (optional; the ``dexmate_eef_eef`` variant root).
   Omit to visualize only ``--urdf_joint_motion_dir`` (URDF + joint grippers;
@@ -89,6 +94,7 @@ from yixuan_utilities.robot_mesh_generator import RobotMeshGenerator
 from omniteleop.common.vr_mode_const import (
     INIT_HEAD_JOINTS,
     INIT_LEFT_ARM_JOINTS,
+    INIT_RIGHT_ARM_JOINTS,
     INIT_TORSO_JOINTS,
 )
 
@@ -113,13 +119,43 @@ _COLOR_CONDITION_LINE = (255, 255, 255)  # white  — before->after condition ve
 _OBS_ENV_STATE_KEY = "observation.environment_state"
 _OBS_POS_CONDITION_MASK_KEY = "observation.pos_condition_mask"
 
-# Bimanual layout (LEFT block then RIGHT). EEF blocks are 10-D
-# [tx,ty,tz, R6(6), gripper]; joint blocks are 8-D [7 joints, gripper].
-_ARM_SIDES = ("left", "right")
-_EEF_BASE = {"left": 0, "right": 10}             # start col of each 10-D eef block
-_EEF_GRIP_IDX = {"left": 9, "right": 19}         # gripper col within state_eef / action
-_JOINT_ARM_SLICE = {"left": slice(0, 7), "right": slice(8, 15)}  # 7 arm joints per side
-_JOINT_GRIP_IDX = {"left": 7, "right": 15}  # gripper col within joint state / action
+# State/action layout (porter output). Per-arm block: eef = 10-D
+# [tx,ty,tz, R6(6), gripper]; joint = 8-D [7 joints, gripper]. Bimanual is the LEFT
+# block then the RIGHT block; single-arm is just one side's block. The active arm
+# side(s) and their per-block column offsets are recovered from each variant's stored
+# axis names below, so the same viewer handles bimanual and single-arm datasets.
+_INIT_ARM_JOINTS = {"left": INIT_LEFT_ARM_JOINTS, "right": INIT_RIGHT_ARM_JOINTS}
+
+
+def arm_sides_from_axes(axes: list[str]) -> tuple[str, ...]:
+    """Ordered (left-then-right) arm sides present in a state/action axis-name list.
+
+    The porter names every dim ``{side}_*`` (e.g. ``left_tx`` / ``right_arm_j0``),
+    so the active arm(s) are recovered from the prefixes. Raises if none are found.
+    """
+    seen = [str(ax).split("_", 1)[0] for ax in axes]
+    sides = tuple(s for s in ("left", "right") if s in seen)
+    if not sides:
+        raise ValueError(f"could not parse any arm side (left/right) from axes {axes}")
+    return sides
+
+
+def eef_index_maps(
+    arm_sides: tuple[str, ...],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Per-side start column + gripper column for the 10-D eef blocks."""
+    base = {side: i * 10 for i, side in enumerate(arm_sides)}
+    grip = {side: i * 10 + 9 for i, side in enumerate(arm_sides)}
+    return base, grip
+
+
+def joint_index_maps(
+    arm_sides: tuple[str, ...],
+) -> tuple[dict[str, slice], dict[str, int]]:
+    """Per-side 7-joint slice + gripper column for the 8-D joint blocks."""
+    arm_slice = {side: slice(i * 8, i * 8 + 7) for i, side in enumerate(arm_sides)}
+    grip = {side: i * 8 + 7 for i, side in enumerate(arm_sides)}
+    return arm_slice, grip
 
 _GRIPPER_Y_MIN = -0.2
 _GRIPPER_Y_MAX = 1.1
@@ -498,16 +534,36 @@ def main() -> None:
     camera_root = eef_root if eef_enabled else joint_root
     dataset_rgb = dataset_eef if eef_enabled else dataset_joint
 
-    state_joint = np.stack([dataset_joint[i]["observation.state"].numpy() for i in range(N)])  # (N, 16)
-    action_joint = np.stack([dataset_joint[i]["action"].numpy() for i in range(N)])  # (N, 16)
+    # Active arm side(s) + per-block column maps, read from the joint variant's stored
+    # axis names (self-describing: bimanual -> (left, right); single-arm -> one side).
+    arm_sides = arm_sides_from_axes(
+        dataset_joint.meta.features["observation.state"]["names"]["axes"]
+    )
+    n_arms = len(arm_sides)
+    joint_arm_slice, joint_grip_idx = joint_index_maps(arm_sides)
+    eef_base, eef_grip_idx = eef_index_maps(arm_sides)
+    if eef_enabled:
+        assert dataset_eef is not None
+        eef_sides = arm_sides_from_axes(
+            dataset_eef.meta.features["observation.state"]["names"]["axes"]
+        )
+        if eef_sides != arm_sides:
+            raise ValueError(
+                f"arm sides differ between variants: urdf_joint_motion_dir={arm_sides}, "
+                f"marker_and_plot_dir={eef_sides}; pass the same episode's variants."
+            )
+    print(f"arm mode: {'bimanual' if n_arms == 2 else 'single-arm'} (sides={arm_sides})")
+
+    state_joint = np.stack([dataset_joint[i]["observation.state"].numpy() for i in range(N)])  # (N, 8*n_arms)
+    action_joint = np.stack([dataset_joint[i]["action"].numpy() for i in range(N)])  # (N, 8*n_arms)
 
     state_eef: np.ndarray | None = None
     action: np.ndarray | None = None
     position_condition: np.ndarray | None = None
     if eef_enabled:
         assert dataset_eef is not None
-        state_eef = np.stack([dataset_eef[i]["observation.state"].numpy() for i in range(N)])  # (N, 20)
-        action = np.stack([dataset_eef[i]["action"].numpy() for i in range(N)])  # (N, 20)
+        state_eef = np.stack([dataset_eef[i]["observation.state"].numpy() for i in range(N)])  # (N, 10*n_arms)
+        action = np.stack([dataset_eef[i]["action"].numpy() for i in range(N)])  # (N, 10*n_arms)
         missing_position_features = [
             key for key in (_OBS_ENV_STATE_KEY, _OBS_POS_CONDITION_MASK_KEY)
             if key not in dataset_eef.meta.features
@@ -569,25 +625,28 @@ def main() -> None:
             f"calib sidecar intrinsic frame count {intrinsic_stack.shape[0]} != {N}"
         )
 
-    if state_joint.shape[1] != 16:
+    if state_joint.shape[1] != 8 * n_arms:
         raise ValueError(
-            f"--urdf_joint_motion_dir observation.state: expected bimanual (N, 16), got {state_joint.shape}"
+            f"--urdf_joint_motion_dir observation.state: expected (N, {8 * n_arms}) "
+            f"for arm_sides={arm_sides}, got {state_joint.shape}"
         )
     if eef_enabled:
         assert state_eef is not None and action is not None
-        if state_eef.shape[1] != 20:
+        if state_eef.shape[1] != 10 * n_arms:
             raise ValueError(
-                f"--marker_and_plot_dir observation.state: expected bimanual (N, 20), got {state_eef.shape}"
+                f"--marker_and_plot_dir observation.state: expected (N, {10 * n_arms}) "
+                f"for arm_sides={arm_sides}, got {state_eef.shape}"
             )
-        if action.shape[1] != 20:
+        if action.shape[1] != 10 * n_arms:
             raise ValueError(
-                f"--marker_and_plot_dir action: expected bimanual (N, 20), got {action.shape}"
+                f"--marker_and_plot_dir action: expected (N, {10 * n_arms}) "
+                f"for arm_sides={arm_sides}, got {action.shape}"
             )
 
     if "observation.images.wrist_rgb" not in dataset_rgb.meta.features:
         raise ValueError(
             f"{camera_root.name} is missing observation.images.wrist_rgb; "
-            "re-port with the bimanual port_dexmate_hdf5.py (stores head + wrist)."
+            "re-port with port_dexmate_hdf5.py (always stores head + wrist)."
         )
 
     action_pos: dict[str, np.ndarray] = {}
@@ -595,10 +654,10 @@ def main() -> None:
     if eef_enabled:
         assert state_eef is not None and action is not None
         action_pos = {
-            side: action[:, _EEF_BASE[side]:_EEF_BASE[side] + 3] for side in _ARM_SIDES
+            side: action[:, eef_base[side]:eef_base[side] + 3] for side in arm_sides
         }
         state_eef_pos = {
-            side: state_eef[:, _EEF_BASE[side]:_EEF_BASE[side] + 3] for side in _ARM_SIDES
+            side: state_eef[:, eef_base[side]:eef_base[side] + 3] for side in arm_sides
         }
 
     # ── EEF xyz figures (eef variant only) ───────────────────────────────────
@@ -607,7 +666,7 @@ def main() -> None:
     if eef_enabled:
         assert state_eef is not None and action is not None
         t_s = np.arange(N, dtype=np.float64) * dt_s
-        for side in _ARM_SIDES:
+        for side in arm_sides:
             eef_figs += _build_eef_xyz_figs(
                 t_s, action_pos[side], state_eef_pos[side], dt_s, prefix=f"{side} "
             )
@@ -674,8 +733,10 @@ def main() -> None:
                     column_shares=[2.0, 1.3, 1.3],
                 ),
                 rrb.Horizontal(
-                    _gripper_view("plots/gripper_left", "Left gripper"),
-                    _gripper_view("plots/gripper_right", "Right gripper"),
+                    *[
+                        _gripper_view(f"plots/gripper_{s}", f"{s.capitalize()} gripper")
+                        for s in arm_sides
+                    ],
                 ),
                 row_shares=[2.2, 1.0],
             ),
@@ -687,7 +748,7 @@ def main() -> None:
     #   action[grip]            (red)  — binarized commanded gripper
     #   observation.state[grip] (blue) — raw obs gripper /obs/gripper/{side}
     # Left gripper = dim 9, right gripper = dim 19.
-    for side in _ARM_SIDES:
+    for side in arm_sides:
         rr.log(
             f"plots/gripper_{side}",
             rr.SeriesLines(
@@ -751,8 +812,8 @@ def main() -> None:
         if eef_enabled:
             assert action is not None and state_eef is not None
             # Future-trail markers + current pose frames, per arm (action red, state blue).
-            for side in _ARM_SIDES:
-                b = _EEF_BASE[side]
+            for side in arm_sides:
+                b = eef_base[side]
                 rr.log(
                     f"world/action/{side}/marker",
                     rr.Points3D(action_pos[side][idx:], colors=[_COLOR_ACTION], radii=0.006),
@@ -789,7 +850,7 @@ def main() -> None:
         if eef_enabled:
             assert position_condition is not None
             uv_pts = []
-            for side in _ARM_SIDES:
+            for side in arm_sides:
                 uv, uv_valid = project_world_to_pixel(
                     state_eef_pos[side][idx : idx + 1], K, world_t_cam
                 )
@@ -846,14 +907,20 @@ def main() -> None:
         pts, cols = voxel_downsample(pts, cols, args.voxel)
         rr.log("world/pcd", rr.Points3D(pts, colors=cols, radii=0.003))
 
-        # Robot pose: BOTH arms from the dexmate_joint_joint variant (left arm
-        # state_joint[0:7], right arm state_joint[8:15]); torso/head pinned INIT_*.
-        # Geometry is static (logged once above); here we emit only per-link transforms.
+        # Robot pose: each PRESENT arm follows the joint variant; an arm absent from a
+        # single-arm dataset is pinned to its INIT_*_ARM_JOINTS (like torso/head) so the
+        # full URDF still renders. Geometry is static (logged once above); here we emit
+        # only per-link transforms.
+        def _arm_vals(side: str) -> list[float]:
+            if side in arm_sides:
+                return state_joint[idx, joint_arm_slice[side]].tolist()
+            return list(_INIT_ARM_JOINTS[side])
+
         joint_vals = (
             [0.0] * len(_WHEEL_NAMES)
             + list(INIT_TORSO_JOINTS)
-            + state_joint[idx, _JOINT_ARM_SLICE["left"]].tolist()
-            + state_joint[idx, _JOINT_ARM_SLICE["right"]].tolist()
+            + _arm_vals("left")
+            + _arm_vals("right")
             + list(INIT_HEAD_JOINTS)
         )
         joint_names = _WHEEL_NAMES + _OBS_NAMES
@@ -871,16 +938,16 @@ def main() -> None:
             )
 
         # Gripper scalars per arm: [action[grip], observation.state[grip]].
-        for side in _ARM_SIDES:
+        for side in arm_sides:
             if eef_enabled:
                 assert action is not None and state_eef is not None
-                g = _EEF_GRIP_IDX[side]
+                g = eef_grip_idx[side]
                 rr.log(
                     f"plots/gripper_{side}",
                     rr.Scalars([float(action[idx, g]), float(state_eef[idx, g])]),
                 )
             else:
-                g = _JOINT_GRIP_IDX[side]
+                g = joint_grip_idx[side]
                 rr.log(
                     f"plots/gripper_{side}",
                     rr.Scalars([float(action_joint[idx, g]), float(state_joint[idx, g])]),

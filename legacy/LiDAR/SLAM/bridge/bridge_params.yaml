@@ -1,0 +1,42 @@
+# Parameters for zenoh_ros_bridge.py (plain YAML, not ros2 params).
+robot_prefix: dm/vg3cfe65689d-1
+
+topics:
+  lidar: sensors/lidar_2d_front/scan     # 10 Hz, dexsensor (Jetson clock, ~1 ms offset)
+  steer: state/chassis/steer             # ~100 Hz, firmware (+73 ms clock offset)
+  drive: state/chassis/drive             # ~100 Hz, firmware
+  pose_out: slam/pose                    # bridge -> zenoh (JSON)
+
+frames:
+  base: base_link
+  laser: laser
+  odom: odom
+  map: map
+
+scan:
+  # Calibration (see README): angle_sign +1 = raw angles are CCW/REP-103.
+  # NOT yet verified — confirm with the Foxglove walk-test (Step 2) and flip
+  # to -1.0 if the scan is mirrored.
+  angle_sign: 1.0
+  laser_yaw: 0.0                         # rad, extra yaw of lidar zero vs base x
+  num_bins: 720                          # uniform grid for slam_toolbox
+  range_min: 0.15                        # m, drops RPLidar 0.0 invalids + self-hits
+  range_max: 12.0                        # m, matches sensor's reported range_max
+  # 'sensor' stamping verified OK for lidar (offset ~1 ms).
+  stamp_mode: sensor
+
+# base_link -> laser translation from dexmate_urdf vega_1.urdf `lidar_mount`.
+laser_mount_xyz: [0.2975, 0.0, 0.144]
+
+odom:
+  rate_hz: 50.0
+  # Firmware topics have a constant ~+73 ms clock offset vs the Jetson ->
+  # stamp odometry with receive time so /odom and /scan share one clock.
+  stamp_mode: receive
+  # 'ms' = state/chassis/drive `vel` is already signed m/s contact speed;
+  # 'rad' = raw joint rad/s needing DRIVE_SIGN * vel * wheel_radius.
+  # Resolved empirically with scripts/odom_sanity.py (Step 3).
+  drive_state_mode: ms
+  lateral_weight: 0.5                    # no-slip rows weight in lstsq FK
+
+pose_out_rate_hz: 20.0

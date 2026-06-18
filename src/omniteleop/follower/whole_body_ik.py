@@ -1,5 +1,24 @@
 """Whole-body inverse kinematics for the Dexmate (Vega) mobile manipulator.
 
+Task-based QP differential IK that coordinates the **mobile base, torso, and both
+arms in a single solve** to track dual-arm end-effector targets. This is the key
+capability beyond omniteleop's existing arm-only IK (``dexmotion`` is configured
+with ``joint_regions_to_lock=["BASE"]``, so the base is never in the kinematic
+chain and the chassis is a separate velocity pass-through).
+
+The design mirrors the reference whole-body controller in ``deps/rby1-wbc``
+(``rby1/whole_body_ik.py`` + ``config/wbik.yaml``), which uses the ``mink``
+framework on a MuJoCo model. Here we use ``pink`` — the same task-based QP-IK
+framework (same ``FrameTask``/``PostureTask``/``VelocityLimit``/``solve_ik`` API)
+— on a Pinocchio model loaded directly from the existing Vega URDF. ``pink`` is
+already a dependency of omniteleop (via ``dexmotion``); no MuJoCo model is needed.
+
+The mobile base enters the kinematic chain as a **planar root joint** (x, y, yaw),
+which structurally fixes z/roll/pitch to the ground plane. A base ``FrameTask`` is
+re-targeted to the *current* base pose on every solve (pure velocity damping, the
+analog of the reference's ``base_ground_task``), so the base stays where it is pushed
+and the arms steer it only when they cannot otherwise reach the targets.
+
 Following ``deps/rby1-wbc``, the QP is built explicitly (:func:`pink.build_ik`),
 augmented with a hard **CoM-over-base** inequality that bounds a centroid proxy
 (by default the top torso link, like the reference; optionally the true CoM) near
@@ -7,12 +26,10 @@ its nominal lean to prevent tip-over, and solved with ``daqp`` -- the reference'
 solver -- rather than calling :func:`pink.solve_ik` directly.
 """
 
-# paras in WBCConfig, consider posture_cost: 100, current_posture_cost: 100
-
 from __future__ import annotations
 
 import warnings as _warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Union
 
@@ -23,17 +40,38 @@ from pink import Configuration, build_ik
 from pink.barriers import SelfCollisionBarrier
 from pink.limits import ConfigurationLimit, VelocityLimit
 from pink.tasks import FrameTask, PostureTask
+from pink.utils import get_root_joint_dim
 from scipy.spatial import ConvexHull
 
 from omniteleop.follower import wbc_safety
 from omniteleop.follower.wbc_safety import SafetyGate, collision_group
 
+# --- Canonical config (single source of truth) ---------------------------------
+# wbik.yaml -- not this module -- holds the WBC tunables (costs, limits, solver,
+# flags, safety distances, nominal posture). WBCConfig loads its defaults from it at
+# import, so WBCConfig() / VegaWholeBodyIK() read the YAML automatically with no
+# caller changes. (wbc_safety derives its DEFAULT_* constants from the same file.)
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("wbik.yaml")
+
+
+def _load_config_yaml(path: Union[str, Path]) -> Dict:
+    """Load a WBC YAML config into a plain dict (must be a top-level mapping)."""
+    import yaml
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{path}: expected a top-level mapping, got {type(data).__name__}"
+        )
+    return data
+
+
+_DEFAULTS: Dict = _load_config_yaml(DEFAULT_CONFIG_PATH)
+
 # --- Vega model constants (vega_no_effector.urdf convention) -------------------
 
-DEFAULT_URDF = (
-    "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/"
-    "vega-urdf/vega_no_effector.urdf"
-)
+DEFAULT_URDF = _DEFAULTS["urdf_path"]
 
 WHEEL_JOINTS = [
     "B_wheel_j1", "B_wheel_j2",
@@ -49,23 +87,22 @@ LEFT_EE_FRAME = "L_ee"
 RIGHT_EE_FRAME = "R_ee"
 HEAD_FRAME = "zed_depth_frame"
 BASE_FRAME = "base"
+# Torso-top x anchor frame: "arm_center" is the fixed mount at the top of torso_l3
+# (torso_j3 is the link's lower joint; head_j1 attaches right next to it), carrying
+# both arms and the head chain. The QP holds its base-frame x at the value it has at
+# the config nominal posture (see solve()); its height -- and torso_j3 itself -- stay
+# free, so the torso can still crouch and fold.
+TORSO_TOP_FRAME = "arm_center"
 
-# Nominal "natural" posture, in the *URDF* joint convention. This matches the
-# known-good init used by tests/test_vr_ik_sapien.py for this exact URDF.
+# Nominal "natural" posture, in the *URDF* joint convention. The values are loaded
+# from wbik.yaml (the single source of truth); this constant is kept for importers.
+# It matches the known-good init used by tests/test_vr_ik_sapien.py for this URDF.
 #
 # IMPORTANT: this is NOT the same convention as
 # ``omniteleop.common.vr_mode_const.INIT_*`` — those constants are in the
 # real-robot/dexcontrol convention (e.g. torso ~= pi there, which exceeds this
 # URDF's torso limit of 1.57 rad). Do not reuse them here.
-DEFAULT_NOMINAL_POSTURE: Dict[str, float] = {
-    "torso_j1": np.pi / 6,
-    "torso_j2": np.pi / 3,
-    "torso_j3": np.pi / 8,
-    "L_arm_j1": np.pi / 2,
-    "L_arm_j4": -np.pi / 2,
-    "R_arm_j1": -np.pi / 2,
-    "R_arm_j4": -np.pi / 2,
-}
+DEFAULT_NOMINAL_POSTURE: Dict[str, float] = dict(_DEFAULTS["nominal_posture"])
 
 Pose = Union[np.ndarray, pin.SE3]
 
@@ -120,10 +157,14 @@ def _signed_dist_to_convex_polygon(point: np.ndarray, polygon: np.ndarray) -> fl
 class WBCConfig:
     """Tunable parameters for :class:`VegaWholeBodyIK`.
 
+    The default values below are **loaded from** the canonical ``wbik.yaml`` next to
+    this module (see ``_DEFAULTS``) -- that file, not this dataclass, is the single
+    source of truth for the values. This class is the typed schema and override surface:
+    ``WBCConfig()`` reads the YAML, ``WBCConfig(ee_position_cost=...)`` overrides a key,
+    and ``WBCConfig.from_yaml(path)`` loads an alternate file.
+
     Task-cost magnitudes preserve the priority hierarchy of the reference
-    (end-effector >> posture >> base regularization). Absolute values follow
-    Pink conventions rather than Mink's, so they differ numerically from
-    ``deps/rby1-wbc/config/wbik.yaml`` while keeping the same ordering.
+    (end-effector >> posture >> base regularization).
     """
 
     urdf_path: str = DEFAULT_URDF
@@ -133,63 +174,120 @@ class WBCConfig:
     # reference's literal value; it is only a *gauge* -- Pink's QP depends solely on the
     # ratios of the other costs to this one, so scaling every cost together is a no-op.
     # What matters is that base/posture/current below are set as ratios of it.
-    ee_position_cost: float = 10000.0
-    ee_orientation_cost: float = 10000.0
-    lm_damping_ee: float = 1e-5
+    ee_position_cost: float = _DEFAULTS["ee_position_cost"]
+    ee_orientation_cost: float = _DEFAULTS["ee_orientation_cost"]
+    lm_damping_ee: float = _DEFAULTS["lm_damping_ee"]
 
     # Base regularization. The base task is re-targeted to the *current* base pose every
     # solve (see solve()), so these costs act as velocity damping -- how hard the base
     # resists translating/rotating to help the arms reach, not a restoring force toward
-    # home. These are the reference's literal values (deps/rby1-wbc:
-    # base_ground_position_cost [50,50,1e5], base_ground_orientation_cost [1e5,1e5,50]);
-    # only their ratio to ee_position_cost (10000) matters. Per-axis:
-    #   position    -> (x, y, z): x/y = 50 (ratio 0.005 to EE) so the base may translate;
-    #                  z = 1e5 is a no-op (the planar joint fixes z).
-    #   orientation -> (roll, pitch, yaw): roll/pitch = 1e5 are no-ops (planar-fixed);
-    #                  yaw = 50 (ratio 0.005). The yaw ratio must stay small or the base
-    #                  won't rotate to follow the operator -- the arms just contort
-    #                  instead (at ratio 0.05 a 45 deg turn rotated the base only ~4 deg;
-    #                  at 0.005 it tracks fully). A stiffer base xy (ratio 0.05) kept the
-    #                  base ~2x steadier under sensor jitter but is otherwise equivalent
-    #                  for tracking now that the collision barrier no longer biases base
-    #                  motion (see collision_safe_displacement_gain).
-    base_position_cost: Sequence[float] = (50.0, 50.0, 100000.0)
-    base_orientation_cost: Sequence[float] = (100000.0, 100000.0, 50.0)
-    lm_damping_base: float = 1e-6  # matches the reference's base_ground lm_damping
+    # home. Damping-only means any soft axis collects every persistent residual and
+    # drifts without ever being pulled back. Only the ratio to ee_position_cost (10000)
+    # matters (and pink squares costs in the QP Hessian). Unlike the reference's
+    # *free-joint* base (base_ground_position_cost [50,50,1e5], base_ground_orientation_cost
+    # [1e5,1e5,50], whose big z/roll/pitch terms pin a 6-DOF base to the ground), Vega's
+    # planar root joint fixes z/roll/pitch *structurally*, so those three axes carry **no
+    # cost here** (0): the base FrameTask error on them is identically zero, so the
+    # reference's 1e5 values were pure no-ops and are dropped. Per-axis:
+    #   position    -> (x, y, z):          x/y are stiff (5x EE) so small reachable
+    #                                      hand translations stay in the arms; z = 0
+    #                                      (planar-fixed, no-op).
+    #   orientation -> (roll, pitch, yaw): roll/pitch = 0 (planar-fixed, no-ops); yaw is
+    #                                      stiff like x/y (5x EE). A soft yaw (RBY1's 50)
+    #                                      next to stiff x/y left yaw the only cheap base
+    #                                      DOF: stationary hand wiggles spun the chassis
+    #                                      continuously. Stiff yaw costs no tracking
+    #                                      accuracy -- the arms absorb even 90 deg turns
+    #                                      (see wbik.yaml & scripts/probe_wbc_yaw_drift.py).
+    base_position_cost: Sequence[float] = tuple(_DEFAULTS["base_position_cost"])
+    base_orientation_cost: Sequence[float] = tuple(_DEFAULTS["base_orientation_cost"])
+    lm_damping_base: float = _DEFAULTS["lm_damping_base"]  # reference's base_ground lm_damping
 
-    # Posture regularization toward the nominal arm/torso/head configuration.
-    posture_cost: float = 50.0
+    # Posture regularization toward the nominal configuration, weighted *per group* like
+    # the reference (deps/rby1-wbc: nominal_posture_cost_torso/_arm/_head). Pink's
+    # PostureTask accepts a per-DOF cost vector, which we build (see _posture_cost_vector)
+    # so the head can be weighted differently from the torso/arms. Vega weights torso
+    # much higher than arms so local EE changes use arm redundancy without leaning the
+    # upper body. The head cost is **0**: the head is teleoperated *externally*
+    # (vr_reader-style ``head_pos`` joint commands, see ``solve(head_joints=...)``)
+    # and its DOFs are pinned to zero velocity in the QP, so a posture pull on them
+    # would only fight the pin. (The reference likewise uses nominal_posture_cost_head
+    # 0, because its head is governed by a dedicated task.)
+    posture_cost_torso: float = _DEFAULTS["posture_cost_torso"]
+    posture_cost_arm: float = _DEFAULTS["posture_cost_arm"]
+    posture_cost_head: float = _DEFAULTS["posture_cost_head"]
 
-    # Joint-space velocity damping -- the analog of the reference's *second* posture
-    # task (deps/rby1-wbc: current_posture_cost_main). A PostureTask re-targeted to the
-    # *current* configuration every solve has zero error, so it contributes only a
-    # per-DOF term cost**2 * ||dq_joints||**2 to the QP Hessian: velocity damping on the
-    # actuated joints. (Pink's PostureTask excludes the planar root, which base_task
-    # already damps -- so this targets only joint-space jitter / null-space drift.) It is
-    # markedly stronger than the global ``damping`` below (1e-6). Default matches
-    # ``posture_cost`` (both 50 = the reference's literal current==nominal weighting,
-    # deps/rby1-wbc: current_posture_cost_main 50; ratio 0.005 to EE) -- a mild velocity
-    # damping. (Raising the ratio to ~0.01, i.e. 100 here, trims joint accel/jerk a
-    # further ~10% under sensor jitter at no measurable EE cost.) 0 disables it.
-    current_posture_cost: float = 50.0
+    # Joint-space velocity damping -- the analog of the reference's *second* posture task
+    # (deps/rby1-wbc: current_posture_cost_main/_head). A PostureTask re-targeted to the
+    # *current* configuration every solve has zero error, so it contributes only a per-DOF
+    # term cost**2 * ||dq_joints||**2 to the QP Hessian: velocity damping on the actuated
+    # joints. (Pink's PostureTask excludes the planar root, which base_task already damps.)
+    # It stays low so arms can respond to small target changes; torso quieting comes from
+    # the higher nominal torso cost plus CoM/torso-top constraints. The head value is 0
+    # (reference: current_posture_cost_head 0). Set ``_main`` to 0 to disable the task
+    # entirely.
+    current_posture_cost_main: float = _DEFAULTS["current_posture_cost_main"]
+    current_posture_cost_head: float = _DEFAULTS["current_posture_cost_head"]
 
-    # Optional head-frame tracking (off by default; head holds nominal posture).
-    enable_head_task: bool = False
-    head_position_cost: float = 0.5
-    head_orientation_cost: float = 0.2
+    # NOTE: deliberately NO head task (the reference's head_pos_cost / head_ori_cost
+    # 10000 zed_depth_frame FrameTask is not ported). The head follows omniteleop's
+    # vr_reader head-teleop semantics (the follower's ``head_mode: 'track'`` path)
+    # instead, solved by a *dedicated* damped head IK -- :meth:`solve_head` -- on
+    # head_j2/j3 only, against the **live whole-body configuration** (so base yaw and
+    # torso lean are compensated; vr_reader's leader-side KinHelper version assumed a
+    # frozen nominal body). Its output is a joint command fed back through
+    # ``solve(head_joints=...)``, which writes it into the model while QP equality
+    # rows pin the head DOFs (see solve()).
+
+    # Head teleop IK (solve_head): exponential convergence rate (1/s) toward the
+    # headset target; the per-tick step is min(1, gain*dt) of the damped-LS
+    # solution. The default 100 saturates that to a FULL step at the 100 Hz loop --
+    # a stiff tracker, the same role the QP plays for the EE targets -- so the
+    # base-yaw/torso-lean compensation is never low-passed (a tau=0.14s filter here
+    # turned fast base yaw into ~4-7 deg transient view swings); smoothing of the
+    # 10 Hz operator commands is the caller's interpolator (wbc_vr_record blends
+    # head_ee_pose alongside the EE targets). 7.0 instead reproduces vr_reader's
+    # heavy exponential smoothing (its KinHelper call at damp=100 advances ~39% per
+    # 15 Hz frame ~= rate 7.4/s, tau ~= 0.14 s).
+    head_ik_gain: float = _DEFAULTS["head_ik_gain"]
+    # Damped-least-squares regularization of the solve_head step. Pure conditioning
+    # (the smoothing above comes from head_ik_gain): keeps the 2-DOF step bounded
+    # when the pan/tilt axes degenerate against the orientation error near the
+    # joint-range extremes.
+    head_ik_damp: float = _DEFAULTS["head_ik_damp"]
+
+    # Torso-top x anchor -- the Vega port of the *intent* of the reference's hard
+    # torso equality rows (_add_torso_velocity_equalities: torso_0/4/5 pinned and
+    # torso_3 = -(torso_1 + torso_2), which keep RBY1's arm/head mount from pitching
+    # fore-aft). Vega's three independent pitch joints need no linkage; instead the
+    # same problem.A slot carries one equality row holding the torso_l3 top mount
+    # (TORSO_TOP_FRAME "arm_center", which carries both arms and the head) at the
+    # SAME base-frame x it has at the config nominal posture: EE load can never lean
+    # the upper body fore-aft over the base -- the base drives instead. Only x is
+    # anchored; the mount's height, the lower torso joints (torso_j3 included), and
+    # torso_l3's pitch stay free, so the torso can still crouch and fold. The anchor
+    # is recomputed from the config nominal on reset(), like the tip-over box's.
+    enable_torso_top_x_anchor: bool = _DEFAULTS["enable_torso_top_x_anchor"]
+    # Correction rate (1/s) for the equality's RHS: each tick servos
+    # min(1, gain*dt) of the residual offset from the anchor (the head_ik_gain
+    # convention), so off-anchor states (measured current_q, custom reset poses)
+    # recover instead of holding their lean; the per-tick correction is clipped to
+    # half the velocity-limit headroom of the row so the equality can never by
+    # itself make the QP infeasible. 100 => full correction per 100 Hz tick.
+    torso_top_x_anchor_gain: float = _DEFAULTS["torso_top_x_anchor_gain"]
 
     # Velocity limits. Arm/torso/head limits come from the URDF; the planar base
     # is unbounded in the URDF, so we cap it here (matches reference base limits).
-    base_xy_max_vel: float = 1.0   # m/s
-    base_yaw_max_vel: float = 1.0  # rad/s
+    base_xy_max_vel: float = _DEFAULTS["base_xy_max_vel"]   # m/s
+    base_yaw_max_vel: float = _DEFAULTS["base_yaw_max_vel"]  # rad/s
     # Global headroom factor applied to every velocity limit (base + joints), matching
     # the reference's ``velocity_limit_scale`` -- keeps a margin below the hard limits.
-    velocity_limit_scale: float = 0.9
+    velocity_limit_scale: float = _DEFAULTS["velocity_limit_scale"]
 
     # QP solver. ``daqp`` matches the reference (deps/rby1-wbc); the solve path mirrors
     # it too -- build_ik -> augment with the CoM-over-base inequality -> solve_problem.
-    solver: str = "daqp"
-    damping: float = 1e-6
+    solver: str = _DEFAULTS["solver"]
+    damping: float = _DEFAULTS["damping"]
 
     # --- Safety (for real-robot use); see omniteleop.follower.wbc_safety ---------
     # Self-collision: a proactive SelfCollisionBarrier over the Dexmate collision-sphere
@@ -200,14 +298,14 @@ class WBCConfig:
     # the robot keeps moving while staying upright instead of stopping after the fact.
     # The barrier degrades gracefully to off (with a warning) if pink lacks barriers or
     # the sphere URDF is unavailable.
-    enable_collision_avoidance: bool = True
-    enable_com_safety: bool = True  # add the hard CoM-over-base QP inequality
-    collision_spheres_urdf: str = wbc_safety.DEFAULT_COLLISION_SPHERES_URDF
-    self_collision_safe_dist: float = wbc_safety.DEFAULT_SELF_COLLISION_SAFE_DIST
-    self_collision_floor: float = wbc_safety.DEFAULT_SELF_COLLISION_FLOOR
-    nominal_pair_keep_dist: float = wbc_safety.DEFAULT_NOMINAL_PAIR_KEEP_DIST
-    n_collision_pairs: int = wbc_safety.DEFAULT_N_COLLISION_PAIRS
-    collision_barrier_gain: float = 1.0
+    enable_collision_avoidance: bool = _DEFAULTS["enable_collision_avoidance"]
+    enable_com_safety: bool = _DEFAULTS["enable_com_safety"]  # hard CoM-over-base inequality
+    collision_spheres_urdf: str = _DEFAULTS["collision_spheres_urdf"]
+    self_collision_safe_dist: float = _DEFAULTS["self_collision_safe_dist"]
+    self_collision_floor: float = _DEFAULTS["self_collision_floor"]
+    nominal_pair_keep_dist: float = _DEFAULTS["nominal_pair_keep_dist"]
+    n_collision_pairs: int = _DEFAULTS["n_collision_pairs"]
+    collision_barrier_gain: float = _DEFAULTS["collision_barrier_gain"]
     # pink's SelfCollisionBarrier adds, *besides* its hard CBF distance constraint, a
     # "safe backup velocity" regularization term to the QP *objective* (weighted by this
     # gain). At Pink's O(1) task-cost scale that term is strong enough to bias the
@@ -217,19 +315,47 @@ class WBCConfig:
     # (gain 1.0->0 sweeps the base 53->90 deg / 33->60 cm) while the hard 2 cm collision
     # constraint is unaffected (verified still held), and matches the reference's
     # constraint-only collision avoidance (mink CollisionAvoidanceLimit has no such term).
-    collision_safe_displacement_gain: float = 0.0
+    collision_safe_displacement_gain: float = _DEFAULTS["collision_safe_displacement_gain"]
     # Centroid proxy whose horizontal over-base offset the tip-over inequality bounds:
     # top link "torso_l3", or "com" for the true whole-body centre of
     # mass. The torso-link proxy is a jacobian-linearized lean indicator, exactly like
     # the reference; "com" swaps in the real CoM (jacobianCenterOfMass).
-    com_centroid: str = "torso_l3"
+    com_centroid: str = _DEFAULTS["com_centroid"]
     # Half-width (m) of the box the centroid proxy's over-base offset may deviate from
-    # its nominal value before the QP inequality clamps it (reference uses ~0.08 m).
-    com_safety_margin: float = wbc_safety.DEFAULT_COM_SAFETY_MARGIN
+    # its nominal value before the QP inequality clamps it (follows the reference's
+    # com_over_base_xy_bounds [0.08, 0.08]).
+    com_safety_margin: float = _DEFAULTS["com_safety_margin"]
+    # Soft CoM-over-base centering weight -- the reference's com_over_base_pos_cost
+    # ([1e5, 1e5, 0], 10x the EE cost): a high-priority *objective* term that
+    # continuously pulls the centroid proxy's horizontal over-base offset back to its
+    # nominal value, with the hard box above as the safety backstop. Added directly to
+    # the QP objective on the same base-frame xy offset/Jacobian as the hard box (see
+    # _add_com_over_base_soft_objective for why pink's RelativeFrameTask is not used).
+    # 0 disables the term; it is only active when enable_com_safety is true (it shares
+    # the centroid proxy and the nominal anchor with the hard box).
+    com_over_base_pos_cost: float = _DEFAULTS["com_over_base_pos_cost"]
 
     nominal_posture: Dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_NOMINAL_POSTURE)
     )
+
+    @classmethod
+    def from_yaml(cls, path: Optional[Union[str, Path]] = None) -> "WBCConfig":
+        """Load a config from a YAML file, the way the reference does.
+
+        ``path`` defaults to the canonical ``wbik.yaml`` -- the same file the in-code
+        defaults are loaded from -- so ``from_yaml() == WBCConfig()``. Each key overrides
+        its default (an alternate file may set only a subset); unknown keys raise
+        ``ValueError`` (typo guard). Mirrors ``deps/rby1-wbc``'s YAML-driven config.
+        """
+        data = _load_config_yaml(DEFAULT_CONFIG_PATH if path is None else path)
+        unknown = set(data) - {f.name for f in fields(cls)}
+        if unknown:
+            raise ValueError(f"unknown config keys {sorted(unknown)}")
+        # YAML sequences -> tuples, matching the dataclass defaults (which must be
+        # immutable), so ``from_yaml() == WBCConfig()`` holds exactly.
+        data = {k: tuple(v) if isinstance(v, list) else v for k, v in data.items()}
+        return cls(**data)
 
 
 @dataclass
@@ -243,7 +369,8 @@ class WBCResult:
     torso: np.ndarray        # (3,)
     left_arm: np.ndarray     # (7,)
     right_arm: np.ndarray    # (7,)
-    head: np.ndarray         # (3,)
+    head: np.ndarray         # (3,) -- echoes the external head_joints command (the
+                             # head is not an IK DOF; see solve(head_joints=...))
     left_ee_error: float     # meters, target vs. achieved L_ee position
     right_ee_error: float    # meters
     success: bool            # False if the QP solve failed (configuration held)
@@ -270,39 +397,20 @@ class VegaWholeBodyIK:
             display(result.q)                        # e.g. Meshcat / SAPIEN
     """
 
-    def __init__(self, config: Optional[WBCConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[WBCConfig] = None,
+        *,
+        config_path: Optional[Union[str, Path]] = None,
+    ) -> None:
+        if config is not None and config_path is not None:
+            raise ValueError("pass either config or config_path, not both")
+        if config is None and config_path is not None:
+            config = WBCConfig.from_yaml(config_path)
         self.config = config or WBCConfig()
         self._build_model()
         self._build_tasks_and_limits()
         self.reset()
-        self._warn_if_barrier_infeasible()
-
-    def _warn_if_barrier_infeasible(self) -> None:
-        """Warn if the self-collision barrier is already infeasible at the start posture.
-
-        The ``SelfCollisionBarrier`` enforces a *hard* QP constraint that the closest
-        cross-group self-collision distance stay >= ``self_collision_safe_dist``. If the
-        nominal posture already sits below that threshold, the QP is infeasible from the
-        very first solve, so every :meth:`solve` fails (``success=False``) and the robot
-        holds in place while the targets move -- while the reactive gate still reports
-        "ok" (it is a *solver* infeasibility, not a gate trip). The default safe distance
-        clears the nominal posture by only ~2 mm, so raising it, or editing the nominal
-        posture, easily tips into this silent freeze. Surface it loudly instead.
-        """
-        if not self._collision_enabled:
-            return
-        d = self._min_self_distance()
-        d_min = self.config.self_collision_safe_dist
-        if d < d_min:
-            _warnings.warn(
-                f"self-collision barrier is infeasible at the start posture: closest "
-                f"self-distance {d * 100:.2f} cm < self_collision_safe_dist "
-                f"{d_min * 100:.2f} cm. The whole-body QP will be infeasible and the "
-                f"robot will hold in place every step (solve() success=False, gate "
-                f"'ok'). Lower self_collision_safe_dist below {d * 100:.2f} cm, fix the "
-                f"nominal posture, or set enable_collision_avoidance=False.",
-                stacklevel=2,
-            )
 
     # -- construction -----------------------------------------------------------
 
@@ -374,6 +482,36 @@ class VegaWholeBodyIK:
             for j in range(1, self.model.njoints)
         }
 
+        # The head is teleoperated by its own damped IK (solve_head -> head_pos
+        # command fed back via solve(head_joints=...)) and is never a *whole-body* IK
+        # DOF: cache the head q/tangent indices and the QP equality rows that pin
+        # dq_head = 0 (see solve()). The head joints stay in the model -- rather than
+        # being locked like the wheels -- so the commanded head pose feeds FK, the
+        # collision spheres, and the CoM/stability checks.
+        self._head_idx_q = [self._idx_q[n] for n in HEAD_JOINTS]
+        self._head_idx_v = [
+            self.model.idx_vs[self.model.getJointId(n)] for n in HEAD_JOINTS
+        ]
+        # solve_head actuates only head_j2/j3, exactly like vr_reader's head IK
+        # (_HEAD_IK_JOINTS = {head_j2, head_j3}); head_j1 rides at its current value.
+        self._head_ik_idx_q = self._head_idx_q[1:]
+        self._head_ik_idx_v = self._head_idx_v[1:]
+        self._head_pin_A = np.zeros((len(self._head_idx_v), self.model.nv))
+        for row, idx_v in enumerate(self._head_idx_v):
+            self._head_pin_A[row, idx_v] = 1.0
+
+        # Torso-top x anchor: resolve the anchored frame; the anchor value itself
+        # (the mount's base-frame x at the config nominal posture) is set in reset().
+        self._torso_top_fid: Optional[int] = None
+        self._torso_top_x_target: Optional[float] = None
+        if cfg.enable_torso_top_x_anchor:
+            if not self.model.existFrame(TORSO_TOP_FRAME):
+                raise ValueError(
+                    f"enable_torso_top_x_anchor: frame {TORSO_TOP_FRAME!r} not "
+                    f"found in {cfg.urdf_path}"
+                )
+            self._torso_top_fid = self.model.getFrameId(TORSO_TOP_FRAME)
+
         # Self-collision pairs (after _idx_q, since the nominal filter needs it).
         self._collision_enabled = False
         self.collision_sphere_data = None
@@ -428,8 +566,8 @@ class VegaWholeBodyIK:
         the link CoM, ~50-56% up). Tracking the CoM -- a material point on the same body
         -- restores that mid-link placement (``torso_l3`` CoM is ~56% up). The link CoM
         lever is constant in the joint frame, so it is cached here; the nominal over-base
-        offset the box bound is centred on is computed later in :meth:`reset` (needs
-        ``q0``).
+        offset the box bound is centred on is computed later in :meth:`reset` (from the
+        config nominal posture, independent of the reset pose).
         """
         cfg = self.config
         self._com_use_com = False
@@ -472,9 +610,14 @@ class VegaWholeBodyIK:
             BASE_FRAME, list(cfg.base_position_cost), list(cfg.base_orientation_cost),
             lm_damping=cfg.lm_damping_base,
         )
-        # PostureTask covers actuated joints only (the planar root is excluded by
-        # Pink), so base regularization lives in base_task above.
-        self.posture_task = PostureTask(cost=cfg.posture_cost)
+        # PostureTask covers actuated joints only (the planar root is excluded by Pink),
+        # so base regularization lives in base_task above. The cost is a per-DOF vector so
+        # the torso / arms / head can be weighted independently (like the reference).
+        self.posture_task = PostureTask(
+            cost=self._posture_cost_vector(
+                cfg.posture_cost_torso, cfg.posture_cost_arm, cfg.posture_cost_head
+            )
+        )
 
         self.tasks = [
             self.left_ee_task,
@@ -483,22 +626,23 @@ class VegaWholeBodyIK:
             self.posture_task,
         ]
 
-        # Optional second posture task, re-targeted to the *current* configuration each
-        # solve (zero error => pure joint-space velocity damping; see WBCConfig). The
-        # analog of the reference's current_posture_task. Off by default (cost 0); the
-        # base already has its own velocity damping via base_task.
+        # Second posture task, re-targeted to the *current* configuration each solve (zero
+        # error => pure joint-space velocity damping; see WBCConfig). The analog of the
+        # reference's current_posture_task. Enabled by default (_main = 50); the head DOFs
+        # get current_posture_cost_head (0 by default, matching the reference).
         self.current_posture_task: Optional[PostureTask] = None
-        if cfg.current_posture_cost > 0.0:
-            self.current_posture_task = PostureTask(cost=cfg.current_posture_cost)
+        if cfg.current_posture_cost_main > 0.0 or cfg.current_posture_cost_head > 0.0:
+            self.current_posture_task = PostureTask(
+                cost=self._posture_cost_vector(
+                    cfg.current_posture_cost_main,
+                    cfg.current_posture_cost_main,
+                    cfg.current_posture_cost_head,
+                )
+            )
             self.tasks.append(self.current_posture_task)
 
-        self.head_task: Optional[FrameTask] = None
-        if cfg.enable_head_task:
-            self.head_task = FrameTask(
-                HEAD_FRAME, cfg.head_position_cost, cfg.head_orientation_cost,
-                lm_damping=cfg.lm_damping_ee,
-            )
-            self.tasks.append(self.head_task)
+        # No head task: the head is externally teleoperated (vr_reader head_pos
+        # commands via solve(head_joints=...)) and its DOFs are pinned in the QP.
 
         self.config_limit = ConfigurationLimit(self.model)
         self.velocity_limit = VelocityLimit(self.model)
@@ -529,6 +673,21 @@ class VegaWholeBodyIK:
             enable_collision=self._collision_enabled,
         )
 
+    def _posture_cost_vector(self, torso: float, arm: float, head: float) -> np.ndarray:
+        """Per-DOF PostureTask cost vector (``arm`` default, torso/head overridden).
+
+        Pink's PostureTask error and Jacobian span the actuated joints only -- the planar
+        root's ``nv_root`` tangent DOFs are dropped -- so the vector has length
+        ``model.nv - nv_root`` and each joint maps to index ``idx_v - nv_root``.
+        """
+        nvr = get_root_joint_dim(self.model)[1]
+        vec = np.full(self.model.nv - nvr, float(arm))
+        for name in TORSO_JOINTS:
+            vec[self.model.idx_vs[self.model.getJointId(name)] - nvr] = torso
+        for name in HEAD_JOINTS:
+            vec[self.model.idx_vs[self.model.getJointId(name)] - nvr] = head
+        return vec
+
     # -- posture / state --------------------------------------------------------
 
     def nominal_q(self) -> np.ndarray:
@@ -549,7 +708,9 @@ class VegaWholeBodyIK:
         when the end-effector targets do not require otherwise. The base target is
         *not* anchored: :meth:`solve` re-sets it to the current base pose each step
         (velocity damping), so the base stays where it is pushed rather than springing
-        back here. The set below is just an initial seed.
+        back here. The set below is just an initial seed. The tip-over box is anchored
+        to the **config nominal** posture (not ``q``): resetting to a leaned pose keeps
+        the safety bound centred on the canonical safe lean.
         """
         q0 = self.nominal_q() if q is None else np.asarray(q, dtype=float).copy()
         if self._collision_enabled:
@@ -567,9 +728,17 @@ class VegaWholeBodyIK:
             self.configuration.get_transform_frame_to_world(BASE_FRAME)
         )
         self._nominal_q = q0.copy()
-        # Anchor the tip-over box bound on the centroid proxy's nominal over-base offset.
+        # Anchor the tip-over box on the centroid proxy's over-base offset at the *config
+        # nominal* posture -- NOT at q0 -- so resetting to a leaned pose cannot silently
+        # re-center the safety box around an already-risky lean (the reference likewise
+        # anchors once, from its nominal posture). Resetting outside the box is safe: the
+        # inequality's recovery branch allows move-back-only rather than wedging.
         if self.config.enable_com_safety:
-            self._com_over_base_target = self._centroid_over_base(q0)[0]
+            self._com_over_base_target = self._centroid_over_base(self.nominal_q())[0]
+        # The torso-top x anchor is likewise anchored at the *config nominal* (not
+        # q0): resetting to a leaned pose must not re-anchor the hold around the lean.
+        if self._torso_top_fid is not None:
+            self._torso_top_x_target = self._torso_top_x_offset(self.nominal_q())[0]
         self._gate.reset(self.stability_margin(q0), self._min_self_distance())
         return q0
 
@@ -606,12 +775,94 @@ class VegaWholeBodyIK:
 
     # -- solve ------------------------------------------------------------------
 
+    def solve_head(self, head_target: Pose, dt: float) -> np.ndarray:
+        """One damped head-IK step toward a world-frame head target (teleop 'track').
+
+        The vr_reader head-teleop IK, relocated follower-side and solved against the
+        **live whole-body configuration** instead of vr_reader's frozen nominal-body
+        KinHelper model: because the live base yaw and torso lean enter the head
+        Jacobian/FK, the pan/tilt command automatically counter-rotates when the WBC
+        turns the base or pitches the torso, keeping the camera on the operator's
+        gaze direction in the calibrated world frame. Like vr_reader, only
+        head_j2/j3 are actuated (head_j1 rides at its current value). The per-tick
+        step is ``min(1, head_ik_gain * dt)`` of the damped-LS solution: at the
+        default gain (100) that is a full step per 100 Hz tick -- stiff tracking,
+        so command smoothing belongs to the caller (wbc_vr_record interpolates the
+        head target alongside the EE targets) and body-motion compensation is not
+        low-passed -- while gain 7 reproduces vr_reader's damp-100 exponential
+        smoothing (tau ~= 0.14 s). Per-axis steps are always clamped to the scaled
+        URDF velocity limits.
+
+        **Viewing-direction only**: the error is the rotation taking the camera's
+        optical axis (the ``zed_depth_frame`` local z) onto the target's -- a 2-DOF
+        error for 2 DOFs, generically exactly solvable. Not the position (a
+        pan/tilt head has no position authority, and with a live base the mapped
+        headset *position* can sit meters from the camera), and not the full 3D
+        orientation either: with 2 DOFs against a 3D rotation error, damped LS
+        converges to a stationary point whose residual is orthogonal to the
+        pan/tilt span -- an axis that is NOT in general the camera's roll axis, so
+        the viewing axis itself can be left stuck off-target (10+ deg observed once
+        the torso left the original nominal). Camera roll is unactuatable and is
+        deliberately ignored.
+
+        Args:
+            head_target: desired ``zed_depth_frame`` pose in the solver's world
+                frame (the calibrated base frame) -- 4x4 matrix or ``pin.SE3``.
+                Only the rotation is used.
+            dt: control timestep (s), scales this step's progress.
+
+        Returns:
+            ``(3,)`` head joint command ``(head_j1, head_j2, head_j3)``, clamped to
+            the URDF position and (scaled) velocity limits. Solver state is NOT
+            modified -- feed the command to :meth:`solve` via ``head_joints`` (and
+            to the real head servo), exactly like a leader-published ``head_pos``.
+        """
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError(f"dt must be finite and > 0, got {dt}")
+        target = _as_se3(head_target)
+        fk = self.configuration.get_transform_frame_to_world(HEAD_FRAME)
+        # Viewing-direction error: the rotation (world frame) taking the current
+        # optical axis onto the target's, then expressed in the LOCAL frame to
+        # match the local Jacobian. Perpendicular to the roll axis by construction.
+        cur_axis = fk.rotation[:, 2]
+        tgt_axis = target.rotation[:, 2]
+        cross = np.cross(cur_axis, tgt_axis)
+        sin_a = float(np.linalg.norm(cross))
+        angle = float(np.arctan2(sin_a, float(cur_axis @ tgt_axis)))
+        if sin_a > 1e-12:
+            err_world = (angle / sin_a) * cross
+        elif angle > 1.0:  # axes antiparallel: any perpendicular recovery axis works
+            perp = np.cross(cur_axis, np.array([0.0, 0.0, 1.0]))
+            if np.linalg.norm(perp) < 1e-6:
+                perp = np.cross(cur_axis, np.array([0.0, 1.0, 0.0]))
+            err_world = angle * perp / np.linalg.norm(perp)
+        else:  # aligned: nothing to do
+            err_world = np.zeros(3)
+        err = fk.rotation.T @ err_world
+        jac = self.configuration.get_frame_jacobian(HEAD_FRAME)  # 6 x nv, LOCAL
+        jw = jac[3:6][:, self._head_ik_idx_v]  # angular rows, pan/tilt columns (3x2)
+        lam = self.config.head_ik_damp
+        dq = np.linalg.solve(jw.T @ jw + lam * np.eye(jw.shape[1]), jw.T @ err)
+        step = min(1.0, self.config.head_ik_gain * dt) * dq
+
+        q = self.configuration.q
+        cmd = np.array([q[i] for i in self._head_idx_q])
+        lo, hi = self.model.lowerPositionLimit, self.model.upperPositionLimit
+        for k, (idx_q, idx_v) in enumerate(
+            zip(self._head_ik_idx_q, self._head_ik_idx_v)
+        ):
+            v_max = self.model.velocityLimit[idx_v]  # already velocity_limit_scale'd
+            delta = float(np.clip(step[k], -v_max * dt, v_max * dt))
+            cmd[k + 1] = float(np.clip(q[idx_q] + delta, lo[idx_q], hi[idx_q]))
+        return cmd
+
     def solve(
         self,
         left_target: Pose,
         right_target: Pose,
         dt: float,
-        head_target: Optional[Pose] = None,
+        head_joints: Optional[Sequence[float]] = None,
+        current_q: Optional[np.ndarray] = None,
     ) -> WBCResult:
         """Run one differential-IK step toward the given end-effector targets.
 
@@ -619,17 +870,32 @@ class VegaWholeBodyIK:
             left_target: desired ``L_ee`` pose (4x4 matrix or ``pin.SE3``).
             right_target: desired ``R_ee`` pose.
             dt: integration timestep (s).
-            head_target: optional ``zed_depth_frame`` pose (only used when the
-                config enables the head task).
+            head_joints: optional external head joint command ``(head_j1, head_j2,
+                head_j3)`` in radians (URDF convention) -- typically this solver's
+                own :meth:`solve_head` output (or a leader-published
+                ``VRJointData.head_pos``). It is written into the model (clamped to
+                the URDF limits) so FK, the collision spheres, and the CoM checks
+                see the commanded head; the head DOFs themselves are pinned in the
+                QP and are never IK variables. Omitted => the head stays where it
+                last was.
+            current_q: optional measured configuration ``(nq,)`` to re-seed the
+                internal model from before solving -- the closed-loop analog of the
+                reference's ``solve(current_qpos=...)``, for hardware use where the
+                solver must track the *measured* robot state instead of integrating
+                open-loop. Unlike :meth:`reset` it has no side effects: the posture
+                anchor, the tip-over box, and the safety-gate ratchet are untouched.
 
         Returns:
             A :class:`WBCResult` with the updated configuration and a per-component
             decomposition (base pose/twist, torso, arms, head) plus EE errors.
         """
+        if current_q is not None:
+            self._update_from_measured(current_q)
+        if head_joints is not None:
+            self._set_head_joints(head_joints)
         self.left_ee_task.set_target(_as_se3(left_target))
         self.right_ee_task.set_target(_as_se3(right_target))
-        if self.head_task is not None and head_target is not None:
-            self.head_task.set_target(_as_se3(head_target))
+        tasks = self.tasks
         # Damp the base at its current pose (re-targeted every solve), so it stays
         # where pushed instead of springing toward home (matches deps/rby1-wbc).
         self.base_task.set_target(
@@ -641,34 +907,38 @@ class VegaWholeBodyIK:
 
         q_before = self.configuration.q.copy()
         success = True
-        qp_error = ""
         try:
             # Build the IK QP explicitly, augment it with the hard CoM-over-base
             # inequality, then solve -- the reference's build_ik -> add inequalities
             # -> solve_problem path (rather than calling pink.solve_ik directly).
             self.configuration.check_limits(safety_break=False)
             problem = build_ik(
-                self.configuration, self.tasks, dt,
+                self.configuration, tasks, dt,
                 self.config.damping, limits=self.limits, barriers=self.barriers,
             )
-            # The reference also injects torso *velocity equalities* here (problem.A) to
-            # enforce its 6-joint torso linkage (torso_0/4/5 == 0, torso_3 ==
-            # -(torso_1+torso_2); 6 joints, 2 independent DOFs). Vega's torso is three
-            # independent revolute joints with no mimic/coupling, so there is nothing to
-            # constrain and that step is intentionally omitted (problem.A stays None).
-            self._add_com_over_base_inequality(problem)
+            # Velocity equalities (problem.A) -- the slot where the reference enforces
+            # its 6-joint torso linkage (torso_0/4/5 == 0, torso_3 == -(torso_1+torso_2),
+            # which keeps its link_torso_5 -- the arm/head mount -- upright). Two uses
+            # here: (1) pin the head DOFs (dq_head = 0). The head is teleoperated
+            # externally (head_joints above) and has no task, so without the pin the
+            # damping-only head would be the QP's *cheapest* lever to satisfy
+            # head-vs-arm collision rows -- silently steering a head it does not
+            # command; pinned, the QP must move the arm away instead. (2) the
+            # torso-top x anchor row -- the Vega analog of the reference's linkage --
+            # holding the torso_l3 top mount (arms + head) at the base-frame x it has
+            # at the config nominal, so EE load cannot lean the upper body fore-aft
+            # over the base (the base drives instead).
+            problem.A = self._head_pin_A
+            problem.b = np.zeros(len(self._head_idx_v))
+            self._add_torso_top_x_equality(problem, dt)
+            self._add_com_over_base_terms(problem)
             result = qpsolvers.solve_problem(problem, solver=self.config.solver)
             if not result.found or result.x is None:
-                raise RuntimeError("no QP solution (infeasible constraints?)")
+                raise RuntimeError("no QP solution")
             velocity = result.x / dt
-        except Exception as exc:  # infeasible QP / barrier / limit hit: hold the pose
-            # Don't swallow the reason: a persistent failure here (e.g. a self-collision
-            # barrier that is infeasible already at the start posture, see
-            # _warn_if_barrier_infeasible) otherwise manifests as the robot silently
-            # freezing while the targets move, with the gate still reporting "ok".
+        except Exception:  # infeasible QP / barrier / limit hit: hold the current pose
             velocity = np.zeros(self.model.nv)
             success = False
-            qp_error = f"{type(exc).__name__}: {exc}"
 
         self.configuration.integrate_inplace(velocity, dt)
 
@@ -692,11 +962,112 @@ class VegaWholeBodyIK:
                 velocity[3:] = 0.0                           # zero joint vel, keep base twist
             self_dist = self._min_self_distance()
 
-        safety_status = status.message if success else f"QP solve failed -- {qp_error}"
         return self._decompose(
             velocity, left_target, right_target, success,
-            held=held, min_self_distance=self_dist, safety_status=safety_status,
+            held=held, min_self_distance=self_dist, safety_status=status.message,
         )
+
+    def _update_from_measured(self, current_q: np.ndarray) -> None:
+        """Re-seed the internal configuration from a measured ``q`` (closed loop).
+
+        ``Configuration.update`` runs forward kinematics *and* recomputes the
+        collision-pair distances, so the barrier, the gate metric, and the tip-over
+        inequality all see the measured state. The planar-root rotation block
+        ``q[2:4]`` must be a (cos, sin) pair; after validation it is renormalized to
+        machine precision (Pinocchio integration assumes a unit pair).
+        """
+        q = np.asarray(current_q, dtype=float)
+        if q.shape != (self.model.nq,):
+            raise ValueError(
+                f"current_q has shape {q.shape}, expected ({self.model.nq},)"
+            )
+        if not np.all(np.isfinite(q)):
+            raise ValueError("current_q contains non-finite values")
+        norm = float(np.hypot(q[2], q[3]))
+        if abs(norm - 1.0) > 1e-3:
+            raise ValueError(
+                f"current_q[2:4] (planar cos, sin) must be unit norm, got {norm:.6f}"
+            )
+        q = q.copy()
+        q[2:4] /= norm
+        self.configuration.update(q)
+
+    def _set_head_joints(self, head_joints: Sequence[float]) -> None:
+        """Write an external head joint command into the model (vr_reader 'track').
+
+        The head is not a whole-body IK DOF (its tangent DOFs are pinned in the QP),
+        so this is the only way it moves. Values are clamped to the URDF position
+        limits (solve_head already clamps; this also covers external publishers).
+        ``Configuration.update`` re-runs FK and the collision-pair distances, so the
+        barrier, the gate metric, and the CoM terms all see the commanded head.
+        """
+        arr = np.asarray(head_joints, dtype=float).reshape(-1)
+        if arr.shape != (len(self._head_idx_q),):
+            raise ValueError(
+                f"head_joints has shape {arr.shape}, "
+                f"expected ({len(self._head_idx_q)},) for joints {HEAD_JOINTS}"
+            )
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"head_joints contains non-finite values: {arr}")
+        q = self.configuration.q.copy()
+        lo, hi = self.model.lowerPositionLimit, self.model.upperPositionLimit
+        for idx_q, val in zip(self._head_idx_q, arr):
+            q[idx_q] = np.clip(val, lo[idx_q], hi[idx_q])
+        self.configuration.update(q)
+
+    def _torso_top_x_offset(self, q: np.ndarray) -> tuple[float, np.ndarray]:
+        """Base-frame x of the torso-top mount over the base, and its gradient row.
+
+        Returns ``(x_off, row)`` where ``x_off`` (m) is the x-component, in the
+        base frame, of ``TORSO_TOP_FRAME``'s position relative to the base (the
+        quantity the anchor holds at its nominal value) and ``row`` (nv,) is its
+        gradient w.r.t. the configuration displacement. Like
+        :meth:`_centroid_over_base`, the offset is invariant to the planar base
+        DOFs (translating/yawing the base carries the mount along), so those
+        Jacobian columns are zeroed; with Vega's all-parallel-pitch torso the row
+        is supported on the three torso joints only.
+        """
+        data = self._com_data
+        pin.forwardKinematics(self.model, data, q)
+        pin.computeJointJacobians(self.model, data, q)
+        pin.updateFramePlacements(self.model, data)
+        point = data.oMf[self._torso_top_fid].translation
+        jac = pin.getFrameJacobian(
+            self.model, data, self._torso_top_fid, pin.LOCAL_WORLD_ALIGNED
+        )[:3]
+        jac = np.asarray(jac).copy()
+        jac[:, :3] = 0.0  # invariant to the planar base DOFs (x, y, yaw)
+        x, y, yaw = self.base_pose_from_q(q)
+        cos_y, sin_y = np.cos(-yaw), np.sin(-yaw)  # world -> base rotation
+        x_off = cos_y * (point[0] - x) - sin_y * (point[1] - y)
+        row = cos_y * jac[0] - sin_y * jac[1]
+        return float(x_off), row
+
+    def _add_torso_top_x_equality(
+        self, problem: qpsolvers.Problem, dt: float
+    ) -> None:
+        """Stack the torso-top x anchor equality row onto the QP.
+
+        The Vega analog of the reference's hard torso rows in the same
+        ``problem.A`` slot (its torso_3 = -(torso_1 + torso_2) coupling keeps the
+        arm/head mount from pitching fore-aft): one row constrains the
+        displacement of the top mount's base-frame x. The RHS servos
+        ``min(1, torso_top_x_anchor_gain * dt)`` of the residual offset from the
+        nominal anchor -- zero when on the anchor (a pure velocity constraint,
+        the reference's b = 0), a recovery step when off it (measured
+        ``current_q`` / custom reset poses) -- clipped to half the row's
+        velocity-limit headroom so the equality alone can never make the QP
+        infeasible.
+        """
+        if self._torso_top_fid is None or self._torso_top_x_target is None:
+            return
+        x_off, row = self._torso_top_x_offset(self.configuration.q)
+        err = x_off - self._torso_top_x_target
+        delta = -err * min(1.0, self.config.torso_top_x_anchor_gain * dt)
+        cap = 0.5 * float(np.abs(row) @ self.model.velocityLimit) * dt
+        delta = float(np.clip(delta, -cap, cap))
+        problem.A = np.vstack([problem.A, row[None, :]])
+        problem.b = np.hstack([problem.b, [delta]])
 
     def _centroid_over_base(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Horizontal offset of the tip-over centroid from the base, and its Jacobian.
@@ -732,7 +1103,54 @@ class VegaWholeBodyIK:
         jac_base = rot @ jac[:2, :]
         return d_base, jac_base
 
-    def _add_com_over_base_inequality(self, problem: qpsolvers.Problem) -> None:
+    def _add_com_over_base_terms(self, problem: qpsolvers.Problem) -> None:
+        """Augment the IK QP with the CoM-over-base safety terms.
+
+        Computes the centroid proxy's horizontal over-base offset (and Jacobian)
+        once, then adds both ports of the reference's CoM handling: the **hard**
+        tip-over box inequality (:meth:`_add_com_over_base_inequality`) and the
+        **soft** centering objective (:meth:`_add_com_over_base_soft_objective`).
+        """
+        if not self.config.enable_com_safety or self._com_over_base_target is None:
+            return
+        d_base, jac_base = self._centroid_over_base(self.configuration.q)
+        err = d_base - self._com_over_base_target
+        self._add_com_over_base_inequality(problem, err, jac_base)
+        self._add_com_over_base_soft_objective(problem, err, jac_base)
+
+    def _add_com_over_base_soft_objective(
+        self, problem: qpsolvers.Problem, err: np.ndarray, jac_base: np.ndarray
+    ) -> None:
+        """Add the reference's *soft* CoM-over-base centering task to the QP objective.
+
+        Ports ``com_over_base_xy_task`` (mink RelativeFrameTask, position_cost
+        ``[c, c, 0]`` with ``c = com_over_base_pos_cost = 1e5`` -- 10x the EE cost): a
+        weighted least-squares term ``||c (J dq + err)||^2`` that continuously pulls
+        the centroid proxy's horizontal over-base offset back to its nominal value,
+        while the hard box inequality remains the safety backstop. The contribution
+        matches pink's task convention (``H += (cJ)^T (cJ)``, ``q += c^2 J^T err``,
+        gain 1), so ``c`` weighs exactly like a pink task cost.
+
+        Implemented directly on the QP -- **not** as a pink ``RelativeFrameTask`` --
+        because both pink's and mink's relative-task error twists live in the
+        *target's local frame*. The reference's ``[c, c, 0]`` mask is horizontal only
+        because RBY1's torso linkage (torso_3 = -(torso_1+torso_2)) keeps link 5
+        upright; Vega's ``torso_l3`` is pitched 7.5 deg at nominal, so that mask
+        would leak ~13% of vertical proxy motion into the 1e5 term (an effective
+        ~1.3e4 vertical stiffness, above the EE cost itself). Reusing the hard box's
+        base-frame xy offset/Jacobian keeps the masked axis exactly vertical and the
+        two ports mutually consistent.
+        """
+        c = self.config.com_over_base_pos_cost
+        if c <= 0.0:
+            return
+        weighted_jac = c * jac_base
+        problem.P = problem.P + weighted_jac.T @ weighted_jac
+        problem.q = problem.q + (c * c) * (jac_base.T @ err)
+
+    def _add_com_over_base_inequality(
+        self, problem: qpsolvers.Problem, err: np.ndarray, jac_base: np.ndarray
+    ) -> None:
         """Augment the IK QP with the hard tip-over (CoM-over-base) inequality.
 
         Ports the reference's ``_add_com_over_base_xy_inequalities``: rather than a
@@ -746,13 +1164,7 @@ class VegaWholeBodyIK:
         relaxes to "move back only" (``h = 0``), matching the reference's recovery
         branch, so the solver is never wedged.
         """
-        cfg = self.config
-        if not cfg.enable_com_safety or self._com_over_base_target is None:
-            return
-
-        d_base, jac_base = self._centroid_over_base(self.configuration.q)
-        err = d_base - self._com_over_base_target
-        bound = cfg.com_safety_margin
+        bound = self.config.com_safety_margin
 
         g_rows: list[np.ndarray] = []
         h_rows: list[float] = []
@@ -788,38 +1200,6 @@ class VegaWholeBodyIK:
         The planar root joint stores its rotation as (cos, sin) at q[2:4].
         """
         return np.array([q[0], q[1], float(np.arctan2(q[3], q[2]))])
-
-    def ee_targets_from_arm_joints(
-        self,
-        left_arm: Sequence[float],
-        right_arm: Sequence[float],
-        head: Optional[Sequence[float]] = None,
-    ) -> tuple[pin.SE3, pin.SE3]:
-        """Recover Cartesian L_ee/R_ee target poses from arm joint angles.
-
-        ``vr_reader`` publishes IK-solved *joint* positions, not Cartesian EEF
-        poses. This builds a configuration from the nominal posture with the given
-        arm (and optional head) joints substituted in, then returns the forward
-        kinematics of the two end-effector frames -- the targets the whole-body
-        solver then tracks while coordinating the base and torso.
-
-        Arm joint angles use the same convention as this URDF (verified against
-        ``tests/test_vr_ik_sapien.py``, which applies dexmotion's arm solutions
-        directly to this model). Out-of-range values are clamped to the limits.
-        """
-        q = self.nominal_q()
-        for name, val in zip(LEFT_ARM_JOINTS, left_arm, strict=True):
-            q[self._idx_q[name]] = val
-        for name, val in zip(RIGHT_ARM_JOINTS, right_arm, strict=True):
-            q[self._idx_q[name]] = val
-        if head is not None:
-            for name, val in zip(HEAD_JOINTS, head, strict=True):
-                if name in self._idx_q:
-                    q[self._idx_q[name]] = val
-        lo, hi = self.model.lowerPositionLimit, self.model.upperPositionLimit
-        finite = np.isfinite(lo) & np.isfinite(hi)
-        q[finite] = np.clip(q[finite], lo[finite] + 1e-3, hi[finite] - 1e-3)
-        return self.frame_pose(LEFT_EE_FRAME, q), self.frame_pose(RIGHT_EE_FRAME, q)
 
     def center_of_mass(self, q: Optional[np.ndarray] = None) -> np.ndarray:
         """World-frame center of mass at ``q`` (defaults to the current state)."""

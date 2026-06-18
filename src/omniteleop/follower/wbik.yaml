@@ -1,0 +1,184 @@
+# Whole-body IK config for the Dexmate (Vega) mobile manipulator.
+#
+# SINGLE SOURCE OF TRUTH for the WBC tunables: WBCConfig
+# (omniteleop.follower.whole_body_ik) loads its field defaults from this file at
+# import -- so WBCConfig() / VegaWholeBodyIK() always reflect it -- and wbc_safety
+# derives its DEFAULT_* barrier/gate constants from it as well. Every key below is
+# therefore required here, and every key must name a WBCConfig field (from_yaml
+# rejects unknown keys). An *alternate* file passed to WBCConfig.from_yaml(path) /
+# VegaWholeBodyIK(config_path=...) may set any subset; unlisted keys keep these
+# canonical values.
+#
+# Adapted from the reference deps/rby1-wbc/config/wbik.yaml (RBY1 robot, mink/MuJoCo
+# backend) to Vega + the pink/Pinocchio backend. Each key's comment states what it is
+# used for and whether it follows the original RBY1 setting. RBY1 keys intentionally
+# NOT ported:
+#   use_ik_adjustment / legacy.*  -- RBY1's older soft-task mode; only its (current)
+#                                    hard-inequality path is implemented here.
+#   joint_velocity_limits         -- Vega's URDF carries per-joint velocity limits;
+#                                    RBY1's MJCF needed them supplied via YAML.
+#   (torso velocity equalities)   -- RBY1's in-code linkage constraints for its
+#                                    6-joint torso; Vega's 3 torso joints are
+#                                    independent, so there is nothing to couple.
+#                                    (The problem.A equality slot pins the head
+#                                    DOFs instead; see the head note below.)
+#   head_pos_cost / head_ori_cost -- RBY1's head FrameTask. The head is teleoperated
+#                                    by a dedicated damped IK instead (solve_head,
+#                                    vr_reader head_mode-'track' semantics; see the
+#                                    head section below), not a WBC task at all.
+
+# Robot model: Pinocchio loads this URDF with a planar (x, y, yaw) root joint so the
+# mobile base is part of the kinematic chain. RBY1 counterpart: model_path (a MuJoCo
+# MJCF for mink) -- same role, robot-specific value.
+urdf_path: "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"
+
+# --- End-effector tracking (highest-priority task) ---------------------------------------
+# Dual-arm FrameTask weights. Absolute magnitude is only a gauge; every other cost
+# matters as a ratio to these. RBY1 uses the same 10000 position/orientation scale;
+# its soft CoM-centering task is 100000 (10x EE, ported below), while posture and
+# mobile base x/y/yaw regularization are 50 (0.005x EE).
+ee_position_cost: 10000.0     # follows RBY1 ee_pos_cost: 10000
+ee_orientation_cost: 10000.0  # follows RBY1 ee_ori_cost: 10000 (pos == ori)
+# Levenberg-Marquardt damping on the EE tasks (regularizes near-singular Jacobians).
+# RBY1 hardcodes 1e-5 in code; same value, surfaced as config here.
+lm_damping_ee: 1.0e-5
+
+# --- Base regularization (velocity damping) -----------------------------------------------
+# The base FrameTask is re-targeted to the *current* base pose every solve, so these
+# costs damp base motion (how hard the base resists translating/yawing to help the
+# arms reach) rather than springing it home. Follows RBY1 base_ground_position_cost
+# [50, 50, 1e5] / base_ground_orientation_cost [1e5, 1e5, 50] on its 6-DOF free-joint
+# base. The 50 terms are the deliberately soft mobile DOFs (x/y/yaw, 0.005x EE);
+# the 1e5 terms are high-priority ground/upright pins for z/roll/pitch (10x EE).
+# Vega's planar root fixes z/roll/pitch *structurally*, so those 1e5 pins are no-ops
+# here and carry 0 instead.
+base_position_cost: [50.0, 50.0, 0.0]      # x, y follow RBY1 (50); z: structural no-op
+base_orientation_cost: [0.0, 0.0, 50.0]    # roll/pitch: structural no-ops; yaw follows RBY1 (50)
+# LM damping on the base task. RBY1 hardcodes 1e-6 in code; same value.
+lm_damping_base: 1.0e-6
+
+# --- Posture regularization toward the nominal posture ------------------------------------
+# Per-group PostureTask cost: resolves redundancy by pulling joints toward
+# nominal_posture (below) when the EE targets leave slack. RBY1 uses 50 for torso
+# and arms (0.005x EE) and 0 for the head (its head has a dedicated task; here the
+# head is externally commanded and QP-pinned, so a pull would only fight the pin).
+posture_cost_torso: 50.0   # follows RBY1 nominal_posture_cost_torso: 50
+posture_cost_arm: 50.0     # follows RBY1 nominal_posture_cost_arm: 50
+posture_cost_head: 0.0     # follows RBY1 nominal_posture_cost_head: 0 (head not an IK DOF)
+
+# --- Joint-space velocity damping ----------------------------------------------------------
+# Second PostureTask, re-targeted to the *current* configuration each solve (zero
+# error => pure per-joint velocity damping on the actuated joints). RBY1 uses the
+# same 50 main / 0 head scale, so this damping is on the same order as nominal
+# posture and mobile-base damping, far below EE tracking.
+current_posture_cost_main: 50.0  # torso + arms; follows RBY1 current_posture_cost_main: 50
+current_posture_cost_head: 0.0   # follows RBY1 current_posture_cost_head: 0
+
+# --- Head: dedicated teleop IK, NOT a whole-body task ----------------------------------------
+# The head follows omniteleop's vr_reader head-teleop semantics (the follower's
+# head_mode 'track' path), but the IK is solved follower-side by
+# VegaWholeBodyIK.solve_head against the LIVE whole-body configuration -- so base yaw
+# and torso lean are compensated, unlike vr_reader's leader-side KinHelper version
+# (frozen nominal body). solve_head is a damped least-squares step on head_j2/j3 only
+# (head_j1 rides, like vr_reader's qmask), orientation-only, toward the calibrated
+# headset pose the leader publishes (VRJointData.head_ee_pose). Its joint command is
+# fed back through solve(head_joints=...), which writes it into the model (so
+# collisions / CoM / FK track the commanded head) while QP equality rows pin the head
+# DOFs out of the whole-body QP.
+# Exponential convergence rate (1/s) toward the headset target. 7.0 reproduces
+# vr_reader's smoothing (its KinHelper call at damp=100 advances ~39% per 15 Hz
+# frame ~= rate 7.4/s) as an explicit rate-independent time constant, tau ~= 0.14 s.
+head_ik_gain: 7.0
+# Damped-LS regularization of the solve_head step. Pure conditioning (smoothing comes
+# from head_ik_gain): bounds the 2-DOF step when the pan/tilt axes degenerate against
+# the orientation error near the joint-range extremes.
+head_ik_damp: 1.0e-2
+
+# --- Velocity limits -----------------------------------------------------------------------
+# Planar-base velocity caps (the URDF leaves the root joint unbounded). Per-joint
+# limits come from the URDF here; RBY1 lists joint_velocity_limits in YAML instead.
+base_xy_max_vel: 1.0    # m/s;   follows RBY1 base_xy_velocity_limit: 1.0
+base_yaw_max_vel: 1.0   # rad/s; follows RBY1 base_rz_velocity_limit: 1.0
+# Global headroom factor applied to every velocity limit (base and joints alike).
+velocity_limit_scale: 0.9  # follows RBY1 velocity_limit_scale: 0.9
+
+# --- QP solver -----------------------------------------------------------------------------
+solver: "daqp"    # follows RBY1 (same build_ik -> augment -> solve_problem path)
+damping: 1.0e-6   # global QP Tikhonov damping; follows RBY1 damping: 1e-6
+
+# --- Safety: self-collision avoidance ------------------------------------------------------
+# Two layers reproduce RBY1's two-distance mink CollisionAvoidanceLimit
+# (safety_distance 0.01 hard / influence_distance 0.02 soft) on the pink backend:
+# a proactive SelfCollisionBarrier CBF in the QP (safe_dist) plus the reactive
+# SafetyGate hold as the hard backstop (floor).
+enable_collision_avoidance: true  # Vega-only switch (RBY1's collision limit is always on)
+# Dexmate 90-sphere collision model (link names match urdf_path; spheres only, so
+# clean sphere-sphere distances). Vega-specific: RBY1's collision geoms live inside
+# its MJCF and are grouped by hand in code.
+collision_spheres_urdf: "/home/yixuan/miniforge3/envs/dexmate/lib/python3.12/site-packages/dexmate_urdf/robots/humanoid/vega_1/vega_1_collision_spheres.collision.urdf"
+# CBF separation target (m): the barrier asymptotically forbids cross-group sphere
+# pairs closer than this. Follows RBY1 influence_distance: 0.02 (where mink's damper
+# starts braking) -- same value, different mechanism.
+self_collision_safe_dist: 0.02
+# Reactive hard floor (m): a step below this distance that is also *worsening* is
+# held (joints freeze; the base may keep moving). Follows RBY1 safety_distance: 0.01
+# (mink's in-QP hard minimum) -- same value, enforced reactively here.
+self_collision_floor: 0.01
+# Build-time SRDF-style filter: drop cross-group sphere pairs closer than this at the
+# nominal posture (the by-design shoulder-in-torso overlaps), so the barrier starts
+# feasible. No RBY1 counterpart -- its hand-curated geom groups never form such pairs.
+nominal_pair_keep_dist: 0.02
+# pink-only: the barrier constrains the N closest pairs per solve (QP rows). No RBY1
+# counterpart -- mink constrains every pair within its detection distance. 120 is the
+# smallest value with zero candidate floor breaches across clap/cross/torso scenarios
+# at the 100 Hz IK rate AND at a 5x-degraded 20 Hz rate (loop-overrun stress); 40/80
+# let fast-approaching pairs outside the N closest crash through at degraded rates
+# (scripts/probe_collision_rule_compare.py). Solve cost ~6.4 ms of the 10 ms tick.
+n_collision_pairs: 120
+# CBF gain (h_dot >= -gain*h): shapes how fast pairs may approach safe_dist.
+# pink-only; RBY1's mink velocity damper has no gain knob.
+collision_barrier_gain: 1.0
+# 0 drops pink's "safe backup velocity" objective term (it otherwise biases the
+# redundancy resolution and stalls the base mid-maneuver: a 90 deg operator turn
+# rotated the base only ~53 deg). Matches RBY1's constraint-only collision avoidance
+# (mink has no such term); the hard distance constraint is unaffected.
+collision_safe_displacement_gain: 0.0
+
+# --- Safety: tip-over (CoM-over-base: hard QP inequality + soft centering) -----------------
+# Ports RBY1's _add_com_over_base_xy_inequalities: the QP bounds the centroid proxy's
+# horizontal over-base offset within +/-com_safety_margin of its value at the config
+# nominal posture, so the robot keeps moving while staying upright (no reactive stop).
+enable_com_safety: true  # Vega-only switch (RBY1: active when com_over_base_xy_bounds is set)
+# Soft CoM-over-base centering weight, ported from RBY1's com_over_base_pos_cost
+# [100000, 100000, 0] (10x the EE cost): a high-priority *objective* term that
+# continuously pulls the proxy's horizontal over-base offset back to nominal, with
+# the hard box below as the safety backstop. Added directly to the QP objective on
+# the same base-frame xy offset/Jacobian as the hard box -- NOT as a pink
+# RelativeFrameTask, whose [c, c, 0] mask lives in the target's local frame: Vega's
+# torso_l3 is pitched 7.5 deg at nominal (no RBY1-style torso linkage to keep it
+# upright), so the mask would leak ~13% of *vertical* proxy motion into the 1e5
+# term. 0 disables the term (requires enable_com_safety).
+com_over_base_pos_cost: 100000.0
+# Centroid proxy whose over-base offset is bounded: the top torso link, like RBY1's
+# hardcoded "link_torso_5" lean proxy (tracked at the link CoM, mid-link). "com"
+# swaps in the true whole-body centre of mass (Vega extension).
+com_centroid: "torso_l3"
+# Box half-width (m), applied to both axes. Follows RBY1 com_over_base_xy_bounds:
+# [0.08, 0.08]. Also reused by the (Mink-backend) reactive gate as its minimum
+# CoM-inside-support-polygon margin.
+com_safety_margin: 0.08
+
+# --- Nominal "natural" posture (URDF joint convention, radians) ----------------------------
+# Posture-task target and reset() default; joints not listed default to 0. The
+# tip-over box above is anchored at this posture. Same role as RBY1's
+# nominal_torso_rad / nominal_*_arm_rad / nominal_head_rad; the values are
+# Vega-specific (the known-good init from tests/test_vr_ik_sapien.py -- NOT the
+# real-robot/dexcontrol convention of vr_mode_const.INIT_*).
+nominal_posture:
+  torso_j1: 0.78 # 0.5235987755982988    # pi/6
+  torso_j2: 1.5707963267948966 # 1.0471975511965976    # pi/3
+  torso_j3: 0.0 # 0.39269908169872414   # pi/8
+  L_arm_j1: 1.5707963267948966    # pi/2
+  L_arm_j4: -1.5707963267948966   # -pi/2
+  R_arm_j1: -1.5707963267948966   # -pi/2
+  R_arm_j4: -1.5707963267948966   # -pi/2

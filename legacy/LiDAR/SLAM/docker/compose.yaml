@@ -1,0 +1,55 @@
+# Vega-1 2D SLAM stack (slam_toolbox + zenoh bridge + foxglove).
+#
+#   cd <repo>/SLAM/docker
+#   docker compose build
+#   docker compose --profile mapping up -d          # online mapping
+#   ./../scripts/save_map.sh <name>                  # serialize the map
+#   docker compose --profile mapping down
+#   MAP_NAME=<name> docker compose --profile localization up -d
+#
+# Host networking is required: the robot's zenoh runs as an mTLS peer overlay
+# with multicast scouting on 224.0.0.237:50297 (config + certs mounted below).
+x-slam-base: &slam-base
+  image: yixuan-slam:humble
+  build:
+    context: .
+    # tegra kernel lacks the iptables `raw` table -> bridge endpoints fail
+    network: host
+  network_mode: host
+  ipc: host
+  restart: unless-stopped
+  environment:
+    - ROS_DOMAIN_ID=42
+    - ROBOT_NAME=dm/vg3cfe65689d-1
+    - ZENOH_CONFIG=/home/dexmate/.dexmate/comm/zenoh/robopil/zenoh_peer_config.json5
+  volumes:
+    # The repo lives on sshfs (FUSE) which the docker daemon cannot bind-mount;
+    # scripts/sync_to_local.sh rsyncs SLAM/ to this local ext4 dir. maps/ and
+    # debug/ persist only on the local side.
+    - /home/dexmate/yixuan_slam_runtime:/slam
+    - /home/dexmate/.dexmate/comm/zenoh/robopil:/home/dexmate/.dexmate/comm/zenoh/robopil:ro
+
+services:
+  mapping:
+    <<: *slam-base
+    container_name: yixuan-slam-mapping
+    profiles: [mapping]
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+               ros2 launch /slam/launch/slam_mapping.launch.py"
+
+  localization:
+    <<: *slam-base
+    container_name: yixuan-slam-localization
+    profiles: [localization]
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash &&
+               ros2 launch /slam/launch/slam_localization.launch.py map:=/slam/maps/${MAP_NAME:-map}"
+
+  # One-off shell for probes / ros2 CLI:  docker compose run --rm tools bash
+  tools:
+    <<: *slam-base
+    container_name: yixuan-slam-tools
+    restart: "no"
+    profiles: [tools]
+    command: bash

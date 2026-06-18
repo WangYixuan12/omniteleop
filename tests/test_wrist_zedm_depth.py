@@ -25,7 +25,7 @@ stereo matcher + 1.8 MB depth frames throttle the capture loop hard. Run with
 
 This is a long-running dependency, *not* a one-shot test — start it and leave
 it running for the whole vr_reader session (no ``--duration``). Confirm it is
-reaching the workstation with ``python scripts/probe_wrist_stream.py`` there.
+reaching the workstation with ``python scripts/diagnostics/probe_wrist_stream.py`` there.
 
 Important: only one process can hold the V4L2 device. Stop
 ``dexsensor launch ... --sensor wrist_zedm`` before running.
