@@ -147,3 +147,13 @@ python /home/yixuan/omniteleop/scripts/wbc_vr_record.py --output /home/yixuan/De
 
 python scripts/play_side_by_side_videos.py --video_1 /home/yixuan/Dexmate/wbc/wbc_waypoint_kinematics.mp4 --video_2 /home/yixuan/Dexmate/wbc/wbc_waypoint_wheel.mp4 --video_result /home/yixuan/Dexmate/wbc/wbc_waypoint.mp4
 ```
+
+```bash
+(yixuan_yifan) python /home/dexmate/yixuan/omniteleop_yifan/tests/test_head_zedx_depth.py
+
+(yixuan_yifan) python scripts/drive_box_record.py --output /home/dexmate/yixuan/Dexmate/SLAM/test/box_closed.hdf5 --closed-loop-source odom
+
+(yixuan_yifan) python scripts/misc/plot_drive_box.py --input /home/dexmate/yixuan/Dexmate/SLAM/test/box_closed.hdf5
+```
+```
+
