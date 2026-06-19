@@ -14,15 +14,15 @@
    ``wbc_vr_record.py`` consumes to drive its whole-body IK (base + torso + arms);
 4. each ``teleop`` frame also publishes the **calibrated headset pose**
 
-       head_ee_pose = robot_base_t_vr_base @ vr_headset
+       head_ee_pose[:3, :3] = (robot_base_t_vr_base @ vr_headset)[:3, :3]
+       head_ee_pose[:3,  3] = (robot_base_t_vr_base_eef @ vr_headset)[:3, 3]
 
-   -- the head-frame (zed_depth_frame) teleop target, mapped through the full
-   head calibration. The follower solves its own damped head IK toward it
-   (``VegaWholeBodyIK.solve_head``, head_j2/j3 only -- vr_reader's ``head_mode:
-   'track'`` semantics) against its **live** whole-body configuration, so base yaw
-   and torso lean are compensated and the camera stays on the operator's gaze. The
-   head is NOT a whole-body-IK task: the WBC pins its head DOFs and takes the head
-   command via ``solve(head_joints=...)``.
+   -- the head-frame (zed_depth_frame) teleop target. Its orientation uses the full
+   head calibration, while its position uses the gravity-aligned room calibration so
+   horizontal headset motion stays horizontal even if the robot's nominal optical
+   frame is pitched down. The follower either tracks this pose as a WBC head task
+   (``head_mode: 'ik'``) or uses its orientation for dedicated pan/tilt head IK
+   (``head_mode: 'track'``).
 
 Commands are published at a low rate (``--rate``, default **10 Hz**); the follower
 lerp/slerp-interpolates each command over ``1/rate`` up to its 100 Hz IK ticks
@@ -33,10 +33,11 @@ deps/rby1-wbc split: 10 Hz ``trajectory_frequency_hz`` commands, 100 Hz
 This preserves the ``vr_reader`` controller convention (controller forward 10 cm ->
 target forward 10 cm in the calibrated base frame), with two deliberate changes:
 
-  **Gravity-aligned EEF calibration.** The nominal ``zed_depth_frame`` is pitched
-  downward, so using the full head frame to calibrate wrists would make a horizontal
-  walk create a fake target-height change. EEF targets therefore use headset yaw +
-  translation only; head tracking keeps the full pose calibration.
+  **Gravity-aligned translational calibration.** The nominal ``zed_depth_frame`` is
+  pitched downward, so using the full head frame to calibrate target positions would
+  make a horizontal walk create a fake target-height change. EEF targets therefore
+  use headset yaw + translation only. The head target uses that same translation
+  calibration, while keeping the full head-frame orientation calibration.
 
   **No legacy ``INIT_JOINT`` constants.** ``vr_reader`` anchors the calibration on
   ``FK(head_link)`` evaluated at ``omniteleop.common.vr_mode_const.INIT_*`` (the
@@ -244,7 +245,7 @@ class WBCVRLeader:
         return vx, vy, wz
 
     def _calibrate(self, headset_pose: np.ndarray) -> None:
-        """Anchor robot_base_t_vr_base so the headset frame maps onto the nominal head."""
+        """Anchor room-to-base transforms so the headset maps onto the nominal head."""
         headset_pose = np.asarray(headset_pose, dtype=float)
         if headset_pose.shape != (4, 4):
             raise ValueError(f"headset pose has shape {headset_pose.shape}, expected (4, 4)")
@@ -256,16 +257,21 @@ class WBCVRLeader:
     def _map_head_target(self, vr_head: np.ndarray) -> np.ndarray:
         """Calibrated head target: the headset pose mapped into the robot base frame.
 
-        This uses the full head calibration (not the gravity-aligned EEF transform);
-        at the calibration instant it equals the nominal head pose by construction.
-        The follower's ``solve_head`` tracks its *orientation* with the head pan/tilt
-        from the live whole-body configuration.
+        Orientation uses the full head calibration. Translation uses the
+        gravity-aligned transform, because in WBC ``head_mode: "ik"`` this
+        translation is a real whole-body target; mapping it through the downward
+        pitched optical frame would turn horizontal headset motion into a height
+        command. At the calibration instant the mixed pose still equals the nominal
+        head pose by construction.
         """
         assert self.robot_base_t_vr_base is not None
+        assert self.robot_base_t_vr_base_eef is not None
         vr_head = np.asarray(vr_head, dtype=float)
         if vr_head.shape != (4, 4):
             raise ValueError(f"headset pose has shape {vr_head.shape}, expected (4, 4)")
-        return self.robot_base_t_vr_base @ vr_head
+        out = self.robot_base_t_vr_base @ vr_head
+        out[:3, 3] = (self.robot_base_t_vr_base_eef @ vr_head)[:3, 3]
+        return out
 
     def _map_targets(self, vr_l: np.ndarray, vr_r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Map controller poses to base-frame EEF targets, holding last-good if untracked."""

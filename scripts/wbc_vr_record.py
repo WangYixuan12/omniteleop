@@ -198,12 +198,11 @@ class TargetInterpolator:
     (default 10 Hz) while the IK runs at ``--rate`` (default 100 Hz). Each arriving
     command starts a new blend segment toward it, traversed in ``duration =
     1/cmd-rate``: ``alpha = min(1, elapsed/duration)``, position lerped,
-    orientation slerped. This is the reference's interpolation (deps/rby1-wbc
-    ``ee_targets.get_for_ik`` with ``use_interpolation: true``, ``duration =
-    1/trajectory_frequency_hz``), with one refinement: the segment *start* is the
-    pose currently being output (not the previous raw command), so the output stays
-    continuous under command jitter. ``duration <= 0`` degrades to pass-through
-    (zero-order hold, the old behavior).
+    orientation slerped. This matches the reference's interpolation
+    (deps/rby1-wbc ``ee_targets.get_for_ik`` with ``use_interpolation: true``,
+    ``duration = 1/trajectory_frequency_hz``): the segment start is the previous
+    raw command target, not the current interpolated output. ``duration <= 0``
+    degrades to pass-through (zero-order hold, the old behavior).
     """
 
     def __init__(self, duration: float, *poses0: np.ndarray) -> None:
@@ -224,10 +223,10 @@ class TargetInterpolator:
         self._t0 = -np.inf  # alpha clamps to 1 -> output the end poses
 
     def push(self, *poses: np.ndarray, now: float) -> None:
-        """Start a new segment from the current output toward a fresh command."""
+        """Start a new segment from the previous raw command toward a fresh command."""
         if len(poses) != self._n:
             raise ValueError(f"expected {self._n} poses, got {len(poses)}")
-        self._start = self.at(now)
+        self._start = tuple(p.copy() for p in self._end)
         self._end = tuple(p.copy() for p in poses)
         self._t0 = now
 
@@ -437,12 +436,20 @@ def main() -> None:
                 last_cmd_ns = vr.timestamp_ns
                 interp.push(left_cmd, right_cmd, head_cmd, now=now)
             left_target, right_target, head_target = interp.at(now)
-            # Stiff head IK from the LIVE configuration (compensates base yaw /
-            # torso lean within a tick), then the whole-body solve with the head
-            # pinned at that command.
-            head_joints = ik.solve_head(head_target, dt)
-
-            result = ik.solve(left_target, right_target, dt, head_joints=head_joints)
+            if cfg.head_mode == "ik":
+                # Head is a whole-body QP DOF: the head FrameTask tracks the headset
+                # pose directly, so base + torso + head co-track it (no solve_head).
+                result = ik.solve(
+                    left_target, right_target, dt, head_target=head_target
+                )
+            else:
+                # Stiff head IK from the LIVE configuration (compensates base yaw /
+                # torso lean within a tick), then the whole-body solve with the head
+                # pinned at that command.
+                head_joints = ik.solve_head(head_target, dt)
+                result = ik.solve(
+                    left_target, right_target, dt, head_joints=head_joints
+                )
 
             robot.left_arm.set_joint_pos(result.left_arm)
             robot.right_arm.set_joint_pos(result.right_arm)

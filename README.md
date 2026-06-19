@@ -128,10 +128,10 @@ python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixu
 # rerun, transmission latency plot under debug/
 ```
 
-## Misc
+## Misc (/home/yixuan/omniteleop/scripts/misc)
 
 ```bash
-python /home/yixuan/omniteleop/src/omniteleop/leader/check_eef_pos.py # robot.right_arm.get_joint_pos() first, and the run this to calculate eef from joint 
+python /home/yixuan/omniteleop/scripts/misc/check_eef_pos.py # robot.right_arm.get_joint_pos() first, and the run this to calculate eef from joint 
 ```
 
 # WBC
@@ -141,8 +141,9 @@ python /home/yixuan/omniteleop/scripts/inspect_joints_sapien.py
 
 python /home/yixuan/omniteleop/scripts/wbc_waypoints_record.py --output /home/yixuan/Dexmate/wbc/wbc_waypoint_wheel_open.mp4 --physics --base-loop open
 
-python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py
-python /home/yixuan/omniteleop/scripts/wbc_vr_record.py --output /home/yixuan/Dexmate/wbc/wbc_teleop_06_10.mp4 --base-loop open
+(dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py
+(dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_record.py --output /home/yixuan/Dexmate/wbc/wbc_teleop_06_19_wheelclosed.mp4 --physics --base-loop closed
+# raise --base-kp-xy/--base-kp-yaw for snappier physics tracking
 
 
 python scripts/play_side_by_side_videos.py --video_1 /home/yixuan/Dexmate/wbc/wbc_waypoint_kinematics.mp4 --video_2 /home/yixuan/Dexmate/wbc/wbc_waypoint_wheel.mp4 --video_result /home/yixuan/Dexmate/wbc/wbc_waypoint.mp4
@@ -154,6 +155,5 @@ python scripts/play_side_by_side_videos.py --video_1 /home/yixuan/Dexmate/wbc/wb
 (yixuan_yifan) python scripts/drive_box_record.py --output /home/dexmate/yixuan/Dexmate/SLAM/test/box_closed.hdf5 --closed-loop-source odom
 
 (yixuan_yifan) python scripts/misc/plot_drive_box.py --input /home/dexmate/yixuan/Dexmate/SLAM/test/box_closed.hdf5
-```
 ```
 

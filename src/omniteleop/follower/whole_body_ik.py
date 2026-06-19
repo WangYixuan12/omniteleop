@@ -198,7 +198,7 @@ class WBCConfig:
     #                                      DOF: stationary hand wiggles spun the chassis
     #                                      continuously. Stiff yaw costs no tracking
     #                                      accuracy -- the arms absorb even 90 deg turns
-    #                                      (see wbik.yaml & scripts/probe_wbc_yaw_drift.py).
+    #                                      (see wbik.yaml & scripts/diagnostics/probe_wbc_yaw_drift.py).
     base_position_cost: Sequence[float] = tuple(_DEFAULTS["base_position_cost"])
     base_orientation_cost: Sequence[float] = tuple(_DEFAULTS["base_orientation_cost"])
     lm_damping_base: float = _DEFAULTS["lm_damping_base"]  # reference's base_ground lm_damping
@@ -229,8 +229,10 @@ class WBCConfig:
     current_posture_cost_main: float = _DEFAULTS["current_posture_cost_main"]
     current_posture_cost_head: float = _DEFAULTS["current_posture_cost_head"]
 
-    # NOTE: deliberately NO head task (the reference's head_pos_cost / head_ori_cost
-    # 10000 zed_depth_frame FrameTask is not ported). The head follows omniteleop's
+    # NOTE: by default (head_mode "track") there is NO head task -- the reference's
+    # head_pos_cost / head_ori_cost 10000 zed_depth_frame FrameTask is only added in
+    # head_mode "ik" (see head_mode / head_position_cost / head_orientation_cost
+    # below). In "track" the head follows omniteleop's
     # vr_reader head-teleop semantics (the follower's ``head_mode: 'track'`` path)
     # instead, solved by a *dedicated* damped head IK -- :meth:`solve_head` -- on
     # head_j2/j3 only, against the **live whole-body configuration** (so base yaw and
@@ -255,6 +257,25 @@ class WBCConfig:
     # when the pan/tilt axes degenerate against the orientation error near the
     # joint-range extremes.
     head_ik_damp: float = _DEFAULTS["head_ik_damp"]
+
+    # Head whole-body IK mode (rby1 `ik` port), an ALTERNATIVE to the solve_head
+    # "track" path above. "track" (default): head is externally commanded
+    # (solve(head_joints=...)) and pinned out of the QP. "ik": the head DOFs become
+    # whole-body QP variables and a head FrameTask tracks the headset pose
+    # (solve(head_target=...)), so base + torso + head co-track it -- the base follows
+    # head turn/translation and is anchored when the head is still. In BOTH modes
+    # head_j1 (pan) is fixed (dq_head_j1 = 0): "track" pins all head DOFs, "ik" pins
+    # only j1 and leaves j2/j3 as IK DOFs -- so head yaw always resolves through the
+    # base (turn-follow) rather than the neck. NOTE this is a WBCConfig/wbik.yaml
+    # field, distinct from vr_robot_controller's unrelated head_mode (track/fixed).
+    head_mode: str = _DEFAULTS["head_mode"]
+    # Head FrameTask weights for head_mode "ik" (ignored in "track"). Follow rby1
+    # head_pos_cost / head_ori_cost (10000). Roll about the camera forward axis is
+    # unactuatable (planar-yaw base + pitch torso + pan/tilt head); the QP just leaves
+    # it as residual (rby1 keeps roll weighted too), so zero the roll axis only if that
+    # residual ever biases the solve.
+    head_position_cost: float = _DEFAULTS["head_position_cost"]
+    head_orientation_cost: Sequence[float] = tuple(_DEFAULTS["head_orientation_cost"])
 
     # Torso-top x anchor -- the Vega port of the *intent* of the reference's hard
     # torso equality rows (_add_torso_velocity_equalities: torso_0/4/5 pinned and
@@ -317,9 +338,9 @@ class WBCConfig:
     # constraint-only collision avoidance (mink CollisionAvoidanceLimit has no such term).
     collision_safe_displacement_gain: float = _DEFAULTS["collision_safe_displacement_gain"]
     # Centroid proxy whose horizontal over-base offset the tip-over inequality bounds:
-    # top link "torso_l3", or "com" for the true whole-body centre of
-    # mass. The torso-link proxy is a jacobian-linearized lean indicator, exactly like
-    # the reference; "com" swaps in the real CoM (jacobianCenterOfMass).
+    # top link frame "torso_l3", or "com" for the true whole-body centre of mass. The
+    # torso-link frame origin is a jacobian-linearized lean indicator, exactly like the
+    # reference; "com" swaps in the real CoM (jacobianCenterOfMass).
     com_centroid: str = _DEFAULTS["com_centroid"]
     # Half-width (m) of the box the centroid proxy's over-base offset may deviate from
     # its nominal value before the QP inequality clamps it (follows the reference's
@@ -369,8 +390,9 @@ class WBCResult:
     torso: np.ndarray        # (3,)
     left_arm: np.ndarray     # (7,)
     right_arm: np.ndarray    # (7,)
-    head: np.ndarray         # (3,) -- echoes the external head_joints command (the
-                             # head is not an IK DOF; see solve(head_joints=...))
+    head: np.ndarray         # (3,) -- head_mode "track": echoes the external
+                             # head_joints command (head pinned, not an IK DOF).
+                             # head_mode "ik": the QP-solved head joints (see solve()).
     left_ee_error: float     # meters, target vs. achieved L_ee position
     right_ee_error: float    # meters
     success: bool            # False if the QP solve failed (configuration held)
@@ -408,6 +430,11 @@ class VegaWholeBodyIK:
         if config is None and config_path is not None:
             config = WBCConfig.from_yaml(config_path)
         self.config = config or WBCConfig()
+        if self.config.head_mode not in ("track", "ik"):
+            raise ValueError(
+                f"head_mode must be 'track' or 'ik', got {self.config.head_mode!r}"
+            )
+        self._head_mode = self.config.head_mode
         self._build_model()
         self._build_tasks_and_limits()
         self.reset()
@@ -499,6 +526,12 @@ class VegaWholeBodyIK:
         self._head_pin_A = np.zeros((len(self._head_idx_v), self.model.nv))
         for row, idx_v in enumerate(self._head_idx_v):
             self._head_pin_A[row, idx_v] = 1.0
+        # head_mode "ik": the head is a whole-body IK DOF, but this equality matrix
+        # pins selected head DOFs. By default it pins head_j1; callers such as
+        # wbc_vr_record.py may replace it with multiple rows to pin head_j1/head_j2
+        # together, forcing yaw follow through the base while leaving camera tilt free.
+        self._head_j1_pin_A = np.zeros((1, self.model.nv))
+        self._head_j1_pin_A[0, self._head_idx_v[0]] = 1.0
 
         # Torso-top x anchor: resolve the anchored frame; the anchor value itself
         # (the mount's base-frame x at the config nominal posture) is set in reset().
@@ -558,22 +591,14 @@ class VegaWholeBodyIK:
     def _resolve_com_centroid(self) -> None:
         """Resolve the tip-over centroid proxy from ``cfg.com_centroid``.
 
-        Sets ``_com_use_com`` (true whole-body CoM) or ``_com_frame_id`` (a torso link,
-        the reference's torso-link lean proxy). For a link the tracked point is the
-        link's **centre of mass** (mid-link), not the BODY-frame origin: that origin
-        sits at the proximal joint (the *bottom* of the link, ~14% up for ``torso_l3``),
-        whereas the reference rides mid-link (its torso-5 frame origin coincides with
-        the link CoM, ~50-56% up). Tracking the CoM -- a material point on the same body
-        -- restores that mid-link placement (``torso_l3`` CoM is ~56% up). The link CoM
-        lever is constant in the joint frame, so it is cached here; the nominal over-base
-        offset the box bound is centred on is computed later in :meth:`reset` (from the
-        config nominal posture, independent of the reset pose).
+        Sets ``_com_use_com`` (true whole-body CoM) or ``_com_frame_id`` (the
+        reference-style torso-link frame-origin lean proxy). The nominal over-base
+        offset the box bound is centred on is computed later in :meth:`reset` from the
+        config nominal posture, independent of the reset pose.
         """
         cfg = self.config
         self._com_use_com = False
         self._com_frame_id = -1
-        self._com_frame_joint = -1
-        self._com_link_lever = np.zeros(3)
         self._com_over_base_target: Optional[np.ndarray] = None
         if not cfg.enable_com_safety:
             return
@@ -582,14 +607,6 @@ class VegaWholeBodyIK:
             self._com_use_com = True
         elif self.model.existFrame(name):
             self._com_frame_id = self.model.getFrameId(name)
-            jid = self.model.frames[self._com_frame_id].parentJoint
-            self._com_frame_joint = jid
-            inertia = self.model.inertias[jid]
-            # Cache the link CoM lever (mid-link point). For a (near-)massless frame,
-            # fall back to a zero lever -> the frame origin, so the proxy stays defined.
-            self._com_link_lever = (
-                inertia.lever.copy() if inertia.mass > 1e-6 else np.zeros(3)
-            )
         else:
             raise ValueError(
                 f"com_centroid {name!r} is not a model frame; use a torso link name "
@@ -641,8 +658,16 @@ class VegaWholeBodyIK:
             )
             self.tasks.append(self.current_posture_task)
 
-        # No head task: the head is externally teleoperated (vr_reader head_pos
-        # commands via solve(head_joints=...)) and its DOFs are pinned in the QP.
+        # Head task: in head_mode "ik" the head is a whole-body QP DOF and a FrameTask
+        # tracks the headset pose (rby1-style: base + torso + head co-track it). In
+        # "track" (default) the head is externally commanded via solve(head_joints=...)
+        # and pinned, so the task is built (reset() may seed it) but NOT added to the QP.
+        self.head_task = FrameTask(
+            HEAD_FRAME, cfg.head_position_cost, list(cfg.head_orientation_cost),
+            lm_damping=cfg.lm_damping_ee,
+        )
+        if self._head_mode == "ik":
+            self.tasks.append(self.head_task)
 
         self.config_limit = ConfigurationLimit(self.model)
         self.velocity_limit = VelocityLimit(self.model)
@@ -727,6 +752,12 @@ class VegaWholeBodyIK:
         self.base_task.set_target(  # initial seed; solve() re-targets to current pose
             self.configuration.get_transform_frame_to_world(BASE_FRAME)
         )
+        if self._head_mode == "ik":
+            # Seed the head task at the current head pose so the first solve before a
+            # head_target arrives holds the head where it is (no jump).
+            self.head_task.set_target(
+                self.configuration.get_transform_frame_to_world(HEAD_FRAME)
+            )
         self._nominal_q = q0.copy()
         # Anchor the tip-over box on the centroid proxy's over-base offset at the *config
         # nominal* posture -- NOT at q0 -- so resetting to a leaned pose cannot silently
@@ -862,6 +893,7 @@ class VegaWholeBodyIK:
         right_target: Pose,
         dt: float,
         head_joints: Optional[Sequence[float]] = None,
+        head_target: Optional[Pose] = None,
         current_q: Optional[np.ndarray] = None,
     ) -> WBCResult:
         """Run one differential-IK step toward the given end-effector targets.
@@ -870,14 +902,18 @@ class VegaWholeBodyIK:
             left_target: desired ``L_ee`` pose (4x4 matrix or ``pin.SE3``).
             right_target: desired ``R_ee`` pose.
             dt: integration timestep (s).
-            head_joints: optional external head joint command ``(head_j1, head_j2,
-                head_j3)`` in radians (URDF convention) -- typically this solver's
-                own :meth:`solve_head` output (or a leader-published
-                ``VRJointData.head_pos``). It is written into the model (clamped to
-                the URDF limits) so FK, the collision spheres, and the CoM checks
-                see the commanded head; the head DOFs themselves are pinned in the
-                QP and are never IK variables. Omitted => the head stays where it
-                last was.
+            head_joints: (head_mode "track" only) optional external head joint command
+                ``(head_j1, head_j2, head_j3)`` in radians (URDF convention) --
+                typically this solver's own :meth:`solve_head` output (or a
+                leader-published ``VRJointData.head_pos``). It is written into the model
+                (clamped to the URDF limits) so FK, the collision spheres, and the CoM
+                checks see the commanded head; the head DOFs themselves are pinned in
+                the QP and are never IK variables. Omitted => the head stays where it
+                last was. Ignored in head_mode "ik".
+            head_target: (head_mode "ik" only) desired ``zed_depth_frame`` pose (4x4 or
+                ``pin.SE3``) tracked by the whole-body head FrameTask, so base + torso +
+                head co-track it. Ignored in head_mode "track". Omitted => the head task
+                holds its previous target (seeded at reset to the current head pose).
             current_q: optional measured configuration ``(nq,)`` to re-seed the
                 internal model from before solving -- the closed-loop analog of the
                 reference's ``solve(current_qpos=...)``, for hardware use where the
@@ -891,7 +927,12 @@ class VegaWholeBodyIK:
         """
         if current_q is not None:
             self._update_from_measured(current_q)
-        if head_joints is not None:
+        if self._head_mode == "ik":
+            # Head is a whole-body QP DOF; the FrameTask (added in _build_tasks_and_limits)
+            # tracks the headset pose. head_joints is ignored in this mode.
+            if head_target is not None:
+                self.head_task.set_target(_as_se3(head_target))
+        elif head_joints is not None:
             self._set_head_joints(head_joints)
         self.left_ee_task.set_target(_as_se3(left_target))
         self.right_ee_task.set_target(_as_se3(right_target))
@@ -928,8 +969,16 @@ class VegaWholeBodyIK:
             # holding the torso_l3 top mount (arms + head) at the base-frame x it has
             # at the config nominal, so EE load cannot lean the upper body fore-aft
             # over the base (the base drives instead).
-            problem.A = self._head_pin_A
-            problem.b = np.zeros(len(self._head_idx_v))
+            if self._head_mode == "ik":
+                # Head is an IK DOF (tracked by head_task), but selected head joints are
+                # pinned. The recorder replaces the default one-row pin with a two-row
+                # head_j1/head_j2 pin so yaw resolves through the base and head_j3 keeps
+                # camera tilt authority. The torso-top anchor stacks onto these rows.
+                problem.A = self._head_j1_pin_A
+                problem.b = np.zeros(problem.A.shape[0])
+            else:
+                problem.A = self._head_pin_A
+                problem.b = np.zeros(len(self._head_idx_v))
             self._add_torso_top_x_equality(problem, dt)
             self._add_com_over_base_terms(problem)
             result = qpsolvers.solve_problem(problem, solver=self.config.solver)
@@ -1076,7 +1125,7 @@ class VegaWholeBodyIK:
         position relative to the base, expressed in the base frame and projected to the
         ground plane, and ``jac_base_xy`` (2 x nv) is ``d(d_base_xy)/dΔq``. The centroid
         is the true whole-body CoM (``com_centroid == "com"``) or a torso link frame
-        (the reference's lean proxy).
+        origin (the reference-style lean proxy).
 
         The offset is invariant to the planar base DOFs -- translating or yawing the
         base moves the centroid and the base together -- so those Jacobian columns are

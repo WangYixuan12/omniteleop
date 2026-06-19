@@ -6,12 +6,10 @@ Drives the whole-body IK solver
 through dexmate's **high-level motion-control API surface**:
 
 - arms / torso / head -> ``set_joint_pos(q)``  (joint position control)
-- mobile base -> velocity control, either:
-    * high-level (default): ``chassis.move_straight`` / ``move_sideways`` / ``turn``
-      (one dominant axis per tick), or
-    * ``--direct_control``: ``chassis.set_velocity(vx, vy, wz)`` (coordinated,
-      fine-grained; this is what ``set_motion_state`` / ``set_steering_angle`` /
-      ``set_wheel_velocity`` build on).
+- mobile base -> the coordinated ``chassis.set_velocity(vx, vy, wz, wait_time=0.0,
+  sequential_steering=False)`` (the official non-sequential, send-now path), routed
+  through :class:`~omniteleop.follower.wbc_sapien_sim.BaseVelocityController`, which adds
+  a velocity deadband, slew (acceleration) limiting, and an e-stop.
 
 By default the commands are applied to a SAPIEN simulation
 (:class:`omniteleop.follower.wbc_sapien_sim.SapienSimRobot`). ``--real`` swaps in the
@@ -33,9 +31,6 @@ Examples::
     # interactive SAPIEN sim (needs a display):
     python scripts/wbc_sim_sapien.py --interactive
 
-    # fine-grained base velocity control:
-    python scripts/wbc_sim_sapien.py --interactive --direct_control
-
     # drive real hardware:
     python scripts/wbc_sim_sapien.py --interactive --real
 
@@ -53,9 +48,9 @@ import pinocchio as pin
 
 from omniteleop.follower.wbc_demo_utils import TargetController
 from omniteleop.follower.wbc_sapien_sim import (
+    BaseVelocityController,
     DexcontrolRobotSink,
     SapienSimRobot,
-    dispatch_base,
 )
 from omniteleop.follower.whole_body_ik import (
     LEFT_EE_FRAME,
@@ -71,8 +66,9 @@ from omniteleop.follower.whole_body_ik import (
 SAFE_STABILITY_MARGIN = 0.06
 
 
-def run_loop(ik, robot, args, controller: TargetController | None) -> None:
-    """Main control loop: solve WBC, dispatch via the dexmate API, render."""
+def run_loop(ik, robot, args, controller: TargetController | None,
+             base_ctrl: BaseVelocityController) -> None:
+    """Main control loop: solve WBC, drive the base via BaseVelocityController, render."""
     left0 = ik.frame_pose(LEFT_EE_FRAME)
     right0 = ik.frame_pose(RIGHT_EE_FRAME)
     dt = 1.0 / args.rate
@@ -104,7 +100,9 @@ def run_loop(ik, robot, args, controller: TargetController | None) -> None:
         robot.right_arm.set_joint_pos(result.right_arm)
         robot.torso.set_joint_pos(result.torso)
         robot.head.set_joint_pos(result.head)
-        dispatch_base(robot, result.base_twist, args.direct_control)
+        # Single official-aligned base path: deadband -> slew -> e-stop -> coordinated
+        # set_velocity(..., sequential_steering=False). hold stops the base on IK failure.
+        base_ctrl.command(robot, result.base_twist, hold=not result.success)
 
         robot.set_targets(left_target, right_target)
         robot.step(dt)
@@ -147,9 +145,6 @@ def main() -> None:
                         help="control/render rate in Hz (default: 100).")
     parser.add_argument("--interactive", action="store_true",
                         help="control the targets from the terminal (arrow keys / type xyz).")
-    parser.add_argument("--direct_control", action="store_true",
-                        help="base via fine-grained set_velocity instead of high-level "
-                             "move_straight/move_sideways/turn.")
     parser.add_argument("--real", action="store_true",
                         help="drive the real dexcontrol.Robot (needs a live robot over Zenoh).")
     parser.add_argument("--no-viewer", action="store_true",
@@ -177,9 +172,9 @@ def main() -> None:
     else:
         robot = SapienSimRobot(urdf_path=ik.config.urdf_path, with_viewer=not args.no_viewer)
 
-    base_mode = "set_velocity (fine-grained)" if args.direct_control \
-        else "move_straight/sideways/turn (high-level)"
-    print(f"[wbc_sapien] base control: {base_mode}  "
+    base_ctrl = BaseVelocityController(dt=1.0 / args.rate)
+    print("[wbc_sapien] base control: coordinated set_velocity(sequential_steering=False) "
+          "+ deadband + slew + e-stop  "
           f"{'(interactive)' if args.interactive else '(holding nominal pose)'} "
           "-- Ctrl-C to stop.")
 
@@ -190,12 +185,13 @@ def main() -> None:
             with TargetController(
                 left0.translation, right0.translation, log_prefix="[wbc_sapien]"
             ) as controller:
-                run_loop(ik, robot, args, controller)
+                run_loop(ik, robot, args, controller, base_ctrl)
         else:
-            run_loop(ik, robot, args, None)
+            run_loop(ik, robot, args, None, base_ctrl)
     except KeyboardInterrupt:
         pass
     finally:
+        base_ctrl.estop()
         if hasattr(robot.chassis, "stop"):
             robot.chassis.stop()
         robot.close()
