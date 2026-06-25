@@ -11,10 +11,10 @@ thread owns the SAPIEN viewer (the GL context must be rendered from the main
 thread) and applies every command, so all robot/state mutation and printing happen
 on one thread (no races). The viewer stays responsive while you type.
 
-Joint names / groups / nominal posture come from
-:mod:`omniteleop.follower.whole_body_ik` (the canonical source); the joint *list*,
-*limits*, and qpos *indices* are read directly from the loaded articulation, so the
-tool is correct for whatever URDF is passed.
+Joint names / groups mirror :mod:`omniteleop.follower.whole_body_ik`; the nominal
+posture is read from ``wbik.yaml`` when available. The joint *list*, *limits*, and
+qpos *indices* are read directly from the loaded articulation, so the tool is
+correct for whatever URDF is passed.
 
 Commands (type here; watch the SAPIEN window):
     <joint> <value>          set one joint, e.g.  L_arm_j1 1.57   or by index  10 1.57
@@ -31,9 +31,15 @@ Commands (type here; watch the SAPIEN window):
 Values are RADIANS; append ``d`` or ``deg`` for degrees (e.g. ``head_j1 30d``).
 Out-of-range values are clamped to the URDF joint limits (noted when it happens).
 
+The default URDF is ``vega_with_robotiq.urdf``, which now carries the 2F85 gripper
+visual + collision baked into the ``L_robotiq``/``R_robotiq`` links; this tool no
+longer injects a separate gripper mesh at runtime.
+
 Run with the dexmate conda env, e.g.::
 
-    /home/yixuan/miniforge3/envs/dexmate/bin/python scripts/inspect_joints_sapien.py
+    /home/yixuan/miniforge3/envs/dexmate/bin/python scripts/misc/inspect_joints_sapien.py
+    python scripts/misc/inspect_joints_sapien.py --urdf no_effector
+    python scripts/misc/inspect_joints_sapien.py --urdf /path/to/vega_no_effector.urdf
 """
 
 from __future__ import annotations
@@ -44,27 +50,93 @@ import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 import numpy as np
 
-from omniteleop.follower.whole_body_ik import (
-    BASE_FRAME,
-    DEFAULT_CONFIG_PATH,
-    DEFAULT_NOMINAL_POSTURE,
-    DEFAULT_URDF,
-    HEAD_JOINTS,
-    LEFT_ARM_JOINTS,
-    RIGHT_ARM_JOINTS,
-    TORSO_JOINTS,
-    TORSO_TOP_FRAME,
-    WHEEL_JOINTS,
-)
+from omniteleop.follower.sapien_env import prepare_sapien_render_env
 
 PROMPT = "joint> "
 _QUIT = object()  # sentinel queued when stdin reaches EOF
 _ARM_CENTER_AXIS_LEN = 0.18
 _ARM_CENTER_AXIS_RADIUS = 0.006
 _ARM_CENTER_ANCHOR_RADIUS = 0.025
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Keep this misc viewer runnable without importing the full follower runtime (which
+# may require robot communication dependencies that are irrelevant for visualization).
+DEFAULT_CONFIG_PATH = _REPO_ROOT / "src" / "omniteleop" / "follower" / "wbik.yaml"
+_DEXMATE_VEGA_URDF_DIR = Path(
+    "/home/dexmate/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf"
+)
+_FALLBACK_NOMINAL_POSTURE = {
+    "torso_j1": 0.78,
+    "torso_j2": 1.5707963267948966,
+    "torso_j3": 0.0,
+    "L_arm_j1": 0.844,
+    "L_arm_j2": 0.3,
+    "L_arm_j4": -1.556,
+    "L_arm_j5": 1.271,
+    "R_arm_j1": -0.844,
+    "R_arm_j2": -0.3,
+    "R_arm_j4": -1.556,
+    "R_arm_j5": -1.271,
+}
+
+
+def _load_wbc_defaults(path: Path) -> dict:
+    """Load WBC defaults without importing the follower package."""
+    if not path.exists():
+        return {}
+    try:
+        import yaml  # noqa: PLC0415 - optional at import time for this script
+
+        with path.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception as exc:  # pragma: no cover - defensive CLI warning
+        print(f"[inspect_joints] warning: could not read {path}: {exc}", file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print(
+            f"[inspect_joints] warning: {path} is not a top-level mapping",
+            file=sys.stderr,
+        )
+        return {}
+    return data
+
+
+_WBC_DEFAULTS = _load_wbc_defaults(DEFAULT_CONFIG_PATH)
+DEFAULT_URDF = str(
+    _WBC_DEFAULTS.get(
+        "urdf_path", _DEXMATE_VEGA_URDF_DIR / "vega_no_effector.urdf"
+    )
+)
+DEFAULT_NOMINAL_POSTURE = dict(
+    _WBC_DEFAULTS.get("nominal_posture", _FALLBACK_NOMINAL_POSTURE)
+)
+
+WHEEL_JOINTS = [
+    "B_wheel_j1",
+    "B_wheel_j2",
+    "R_wheel_j1",
+    "R_wheel_j2",
+    "L_wheel_j1",
+    "L_wheel_j2",
+]
+TORSO_JOINTS = ["torso_j1", "torso_j2", "torso_j3"]
+LEFT_ARM_JOINTS = [f"L_arm_j{i}" for i in range(1, 8)]
+RIGHT_ARM_JOINTS = [f"R_arm_j{i}" for i in range(1, 8)]
+HEAD_JOINTS = ["head_j1", "head_j2", "head_j3"]
+BASE_FRAME = "base"
+TORSO_TOP_FRAME = "arm_center"
+
+_VEGA_URDF_ALIASES = {
+    "no_effector": "vega_no_effector.urdf",
+    "vega_no_effector": "vega_no_effector.urdf",
+    "robotiq": "vega_with_robotiq.urdf",
+    "with_robotiq": "vega_with_robotiq.urdf",
+    "vega_with_robotiq": "vega_with_robotiq.urdf",
+}
 
 # Logical groups for the joint table and the group-set commands ("larm", etc.).
 _GROUP_TABLE = [
@@ -80,6 +152,64 @@ _GROUP_CMDS = {
     "torso": TORSO_JOINTS,
     "head": HEAD_JOINTS,
 }
+
+
+def _normalize_urdf_alias(value: str) -> str:
+    """Normalize a basename-like URDF alias."""
+    name = value.strip().lower()
+    if name.endswith(".urdf"):
+        name = name[: -len(".urdf")]
+    return name.replace("-", "_")
+
+
+def _vega_urdf_dirs() -> list[Path]:
+    """Return candidate Vega URDF directories, most local first."""
+    candidates = [_DEXMATE_VEGA_URDF_DIR]
+    default_dir = Path(DEFAULT_URDF).expanduser().parent
+    if default_dir != _DEXMATE_VEGA_URDF_DIR:
+        candidates.append(default_dir)
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key not in seen:
+            out.append(path)
+            seen.add(key)
+    return out
+
+
+def _find_vega_urdf(filename: str) -> Path:
+    """Find a known Vega URDF by filename across the local asset directories."""
+    for directory in _vega_urdf_dirs():
+        path = directory / filename
+        if path.exists():
+            return path.resolve()
+    return _DEXMATE_VEGA_URDF_DIR / filename
+
+
+def resolve_urdf_path(value: str) -> Path:
+    """Resolve a user-supplied URDF path or built-in Vega alias."""
+    raw_path = Path(value).expanduser()
+    if raw_path.exists():
+        return raw_path.resolve()
+    if raw_path.is_absolute() or raw_path.parent != Path("."):
+        raise FileNotFoundError(f"URDF not found: {raw_path}")
+
+    filename = _VEGA_URDF_ALIASES.get(_normalize_urdf_alias(value))
+    if filename is None:
+        raise FileNotFoundError(
+            f"URDF not found: {raw_path}. Known aliases: "
+            f"{', '.join(sorted(_VEGA_URDF_ALIASES))}"
+        )
+
+    path = _find_vega_urdf(filename)
+    if path.exists():
+        return path
+    searched = ", ".join(str(directory / filename) for directory in _vega_urdf_dirs())
+    raise FileNotFoundError(
+        f"alias {value!r} maps to {filename}, but no file exists. Searched: {searched}"
+    )
 
 
 def _vec3(value: Sequence[float], name: str) -> np.ndarray:
@@ -456,6 +586,7 @@ def build_scene(urdf_path: str, ground_z: float = -0.1):
     Mirrors the known-good setup in ``omniteleop.follower.wbc_sapien_sim``: the
     robot faces +x and the camera sits in front of it looking back.
     """
+    prepare_sapien_render_env()
     import sapien  # noqa: PLC0415 - heavy, env-specific dep; imported on use
 
     scene = sapien.Scene()
@@ -478,7 +609,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--urdf", default=DEFAULT_URDF, help="URDF to load.")
+    parser.add_argument(
+        "--urdf",
+        default="vega_with_robotiq",
+        help=(
+            "URDF path or alias to load. Defaults to vega_with_robotiq (the 2F85 "
+            "gripper is baked into its L_robotiq/R_robotiq links). Aliases include "
+            "vega_with_robotiq/robotiq and vega_no_effector/no_effector."
+        ),
+    )
     parser.add_argument(
         "--init",
         choices=("zero", "nominal"),
@@ -499,7 +638,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    scene, viewer, robot = build_scene(args.urdf)
+    try:
+        urdf_path = resolve_urdf_path(args.urdf)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"[inspect_joints] {exc}") from None
+
+    scene, viewer, robot = build_scene(str(urdf_path))
     model = JointModel(robot)
     if args.init == "nominal":
         model.set_nominal()
@@ -512,7 +656,7 @@ def main() -> None:
         except ValueError as exc:
             print(f"[inspect_joints] arm_center marker disabled: {exc}")
 
-    print(f"[inspect_joints] loaded {args.urdf}")
+    print(f"[inspect_joints] loaded {urdf_path}")
     print(f"[inspect_joints] {model.dof} joints. Type a joint + value; watch the window.")
     if arm_center_viz is not None:
         print(

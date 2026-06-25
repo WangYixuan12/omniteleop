@@ -36,12 +36,18 @@ from typing import Dict, Optional, Sequence, Union
 import numpy as np
 import pinocchio as pin
 import qpsolvers
+import yaml
 from pink import Configuration, build_ik
 from pink.barriers import SelfCollisionBarrier
 from pink.limits import ConfigurationLimit, VelocityLimit
 from pink.tasks import FrameTask, PostureTask
 from pink.utils import get_root_joint_dim
 from scipy.spatial import ConvexHull
+
+try:
+    import coal as _coal
+except ImportError:  # pragma: no cover - compatibility with older Pinocchio stacks
+    import hppfcl as _coal
 
 from omniteleop.follower import wbc_safety
 from omniteleop.follower.wbc_safety import SafetyGate, collision_group
@@ -53,11 +59,15 @@ from omniteleop.follower.wbc_safety import SafetyGate, collision_group
 # caller changes. (wbc_safety derives its DEFAULT_* constants from the same file.)
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("wbik.yaml")
 
+# Sibling YAML sections in wbik.yaml that are NOT WBCConfig fields: they are consumed by
+# OTHER loaders from the same single-source-of-truth file (``vr_teleop`` -> the VR
+# follower control-loop tunables, loaded by ``omniteleop.wbc_teleop.VRTeleopConfig``).
+# ``from_yaml`` drops them before validation so they don't trip the unknown-key guard.
+_NON_WBC_SECTIONS = frozenset({"vr_teleop"})
+
 
 def _load_config_yaml(path: Union[str, Path]) -> Dict:
     """Load a WBC YAML config into a plain dict (must be a top-level mapping)."""
-    import yaml
-
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     if not isinstance(data, dict):
@@ -85,6 +95,8 @@ HEAD_JOINTS = ["head_j1", "head_j2", "head_j3"]
 
 LEFT_EE_FRAME = "L_ee"
 RIGHT_EE_FRAME = "R_ee"
+LEFT_GRIPPER_FRAME = "L_robotiq"
+RIGHT_GRIPPER_FRAME = "R_robotiq"
 HEAD_FRAME = "zed_depth_frame"
 BASE_FRAME = "base"
 # Torso-top x anchor frame: "arm_center" is the fixed mount at the top of torso_l3
@@ -93,6 +105,16 @@ BASE_FRAME = "base"
 # the config nominal posture (see solve()); its height -- and torso_j3 itself -- stay
 # free, so the torso can still crouch and fold.
 TORSO_TOP_FRAME = "arm_center"
+
+# Fixed Robotiq 2F-85 proxy spheres, expressed in the L_robotiq/R_robotiq link frame.
+# The external Dexmate collision-sphere URDF stops at L_ee/R_ee, so these append enough
+# distal gripper volume for the WBC self-collision barrier without switching to mesh
+# distances inside the QP.
+ROBOTIQ_PROXY_SPHERES: tuple[tuple[str, tuple[float, float, float], float], ...] = (
+    ("palm", (0.0, 0.0, -0.205), 0.055),
+    ("finger_pos", (0.050, 0.0, -0.125), 0.055),
+    ("finger_neg", (-0.050, 0.0, -0.125), 0.055),
+)
 
 # Nominal "natural" posture, in the *URDF* joint convention. The values are loaded
 # from wbik.yaml (the single source of truth); this constant is kept for importers.
@@ -189,19 +211,25 @@ class WBCConfig:
     # planar root joint fixes z/roll/pitch *structurally*, so those three axes carry **no
     # cost here** (0): the base FrameTask error on them is identically zero, so the
     # reference's 1e5 values were pure no-ops and are dropped. Per-axis:
-    #   position    -> (x, y, z):          x/y are stiff (5x EE) so small reachable
-    #                                      hand translations stay in the arms; z = 0
-    #                                      (planar-fixed, no-op).
-    #   orientation -> (roll, pitch, yaw): roll/pitch = 0 (planar-fixed, no-ops); yaw is
-    #                                      stiff like x/y (5x EE). A soft yaw (RBY1's 50)
-    #                                      next to stiff x/y left yaw the only cheap base
-    #                                      DOF: stationary hand wiggles spun the chassis
-    #                                      continuously. Stiff yaw costs no tracking
-    #                                      accuracy -- the arms absorb even 90 deg turns
-    #                                      (see wbik.yaml & scripts/diagnostics/probe_wbc_yaw_drift.py).
+    #   position    -> (x, y, z)
+    #   orientation -> (roll, pitch, yaw): roll/pitch = 0 (planar-fixed, no-ops)
     base_position_cost: Sequence[float] = tuple(_DEFAULTS["base_position_cost"])
     base_orientation_cost: Sequence[float] = tuple(_DEFAULTS["base_orientation_cost"])
     lm_damping_base: float = _DEFAULTS["lm_damping_base"]  # reference's base_ground lm_damping
+
+    # Base velocity SMOOTHING (anti-jitter). Per-axis (vx, vy, wz) cost penalizing the
+    # *change* in base twist between consecutive solves -- a base-ACCELERATION term, not
+    # damping. base_position_cost above damps the base toward ZERO velocity and so resists
+    # every base motion (a wanted straight drive included); this instead penalizes only
+    # frame-to-frame REVERSALS/jumps, leaving any steady twist unpenalized. It targets the
+    # leader-side EE-target noise that the QP would otherwise resolve into a laterally
+    # whipping base (sub-mm EE gain bought with ~0.9 m/s vy swings per tick). Expressed on
+    # the SAME scale as base_position_cost (both act on the base displacement Δq): the term
+    # is 0.5 * Σ_k cost_k^2 (Δbase_k - v_prev_k·dt)^2 over the planar-root DOFs. 0 disables
+    # (per axis). See VegaWholeBodyIK._add_base_velocity_smoothing.
+    base_velocity_smoothing_cost: Sequence[float] = tuple(
+        _DEFAULTS["base_velocity_smoothing_cost"]
+    )
 
     # Posture regularization toward the nominal configuration, weighted *per group* like
     # the reference (deps/rby1-wbc: nominal_posture_cost_torso/_arm/_head). Pink's
@@ -370,6 +398,9 @@ class WBCConfig:
         ``ValueError`` (typo guard). Mirrors ``deps/rby1-wbc``'s YAML-driven config.
         """
         data = _load_config_yaml(DEFAULT_CONFIG_PATH if path is None else path)
+        # Drop sibling sections owned by other loaders (e.g. vr_teleop) so they are not
+        # mistaken for typo'd WBCConfig keys; the remaining keys must map 1:1 to fields.
+        data = {k: v for k, v in data.items() if k not in _NON_WBC_SECTIONS}
         unknown = set(data) - {f.name for f in fields(cls)}
         if unknown:
             raise ValueError(f"unknown config keys {sorted(unknown)}")
@@ -441,6 +472,33 @@ class VegaWholeBodyIK:
 
     # -- construction -----------------------------------------------------------
 
+    @staticmethod
+    def _add_gripper_collision_spheres(
+        model: pin.Model,
+        geometry_model: pin.GeometryModel,
+    ) -> None:
+        """Append fixed Robotiq proxy spheres to the sphere collision model if needed."""
+        existing = {obj.name for obj in geometry_model.geometryObjects}
+        for frame_name in (LEFT_GRIPPER_FRAME, RIGHT_GRIPPER_FRAME):
+            if not model.existFrame(frame_name):
+                continue
+            if any(name.startswith(frame_name) for name in existing):
+                continue
+            frame_id = model.getFrameId(frame_name)
+            frame = model.frames[frame_id]
+            for label, xyz, radius in ROBOTIQ_PROXY_SPHERES:
+                name = f"{frame_name}_{label}"
+                local_center = pin.SE3(np.eye(3), np.asarray(xyz, dtype=float))
+                geom = pin.GeometryObject(
+                    name,
+                    frame.parentJoint,
+                    frame_id,
+                    frame.placement * local_center,
+                    _coal.Sphere(radius),
+                )
+                geometry_model.addGeometryObject(geom)
+                existing.add(name)
+
     def _build_model(self) -> None:
         cfg = self.config
         urdf = cfg.urdf_path
@@ -455,9 +513,10 @@ class VegaWholeBodyIK:
             model_full, urdf, pin.GeometryType.COLLISION, package_dirs=package_dir
         )
 
-        # Self-collision geometry: the Dexmate collision-sphere model (90 spheres;
-        # link names match this URDF). Loaded as a separate geometry model so the
-        # SelfCollisionBarrier uses clean sphere-sphere distances. Optional/graceful.
+        # Self-collision geometry: the Dexmate collision-sphere model, augmented with
+        # fixed gripper proxies when the URDF has Robotiq links. Loaded as a separate
+        # geometry model so the SelfCollisionBarrier uses clean sphere-sphere distances.
+        # Optional/graceful.
         sphere_full = None
         if cfg.enable_collision_avoidance and SelfCollisionBarrier is not None:
             try:
@@ -486,6 +545,8 @@ class VegaWholeBodyIK:
         )
         self.visual_model, self.collision_model = reduced_geoms[0], reduced_geoms[1]
         self.collision_sphere_model = reduced_geoms[2] if sphere_full is not None else None
+        if self.collision_sphere_model is not None:
+            self._add_gripper_collision_spheres(self.model, self.collision_sphere_model)
 
         # Cap mobile-base velocity (planar nv layout: 0=vx, 1=vy, 2=yaw-rate).
         self.model.velocityLimit[0] = cfg.base_xy_max_vel
@@ -627,6 +688,21 @@ class VegaWholeBodyIK:
             BASE_FRAME, list(cfg.base_position_cost), list(cfg.base_orientation_cost),
             lm_damping=cfg.lm_damping_base,
         )
+        # Base velocity-smoothing weights (vx, vy, wz), applied directly to the planar
+        # root's QP objective in solve() (see _add_base_velocity_smoothing). Validated
+        # once here; _prev_base_velocity holds the last commanded base twist (zeroed at
+        # reset and after each solve) that the smoothing references.
+        self._base_vel_smooth_cost = np.asarray(
+            cfg.base_velocity_smoothing_cost, dtype=float
+        )
+        if self._base_vel_smooth_cost.shape != (3,) or not np.all(
+            np.isfinite(self._base_vel_smooth_cost)
+        ) or np.any(self._base_vel_smooth_cost < 0.0):
+            raise ValueError(
+                "base_velocity_smoothing_cost must be 3 finite, non-negative values "
+                f"(vx, vy, wz); got {cfg.base_velocity_smoothing_cost!r}"
+            )
+        self._prev_base_velocity = np.zeros(3)
         # PostureTask covers actuated joints only (the planar root is excluded by Pink),
         # so base regularization lives in base_task above. The cost is a per-DOF vector so
         # the torso / arms / head can be weighted independently (like the reference).
@@ -759,6 +835,9 @@ class VegaWholeBodyIK:
                 self.configuration.get_transform_frame_to_world(HEAD_FRAME)
             )
         self._nominal_q = q0.copy()
+        # Clear the base velocity-smoothing history: the first solve after an engage/reset
+        # then smooths against a standstill (no lurch into the previous take's twist).
+        self._prev_base_velocity = np.zeros(3)
         # Anchor the tip-over box on the centroid proxy's over-base offset at the *config
         # nominal* posture -- NOT at q0 -- so resetting to a leaned pose cannot silently
         # re-center the safety box around an already-risky lean (the reference likewise
@@ -880,7 +959,7 @@ class VegaWholeBodyIK:
         cmd = np.array([q[i] for i in self._head_idx_q])
         lo, hi = self.model.lowerPositionLimit, self.model.upperPositionLimit
         for k, (idx_q, idx_v) in enumerate(
-            zip(self._head_ik_idx_q, self._head_ik_idx_v)
+            zip(self._head_ik_idx_q, self._head_ik_idx_v, strict=True)
         ):
             v_max = self.model.velocityLimit[idx_v]  # already velocity_limit_scale'd
             delta = float(np.clip(step[k], -v_max * dt, v_max * dt))
@@ -981,6 +1060,7 @@ class VegaWholeBodyIK:
                 problem.b = np.zeros(len(self._head_idx_v))
             self._add_torso_top_x_equality(problem, dt)
             self._add_com_over_base_terms(problem)
+            self._add_base_velocity_smoothing(problem, dt)
             result = qpsolvers.solve_problem(problem, solver=self.config.solver)
             if not result.found or result.x is None:
                 raise RuntimeError("no QP solution")
@@ -1010,6 +1090,11 @@ class VegaWholeBodyIK:
                 velocity = velocity.copy()
                 velocity[3:] = 0.0                           # zero joint vel, keep base twist
             self_dist = self._min_self_distance()
+
+        # Remember the base twist actually committed this tick (post-hold, so a frozen or
+        # base-only-hold tick anchors smoothing on what the chassis really did) for the
+        # next solve's base velocity-smoothing reference.
+        self._prev_base_velocity = velocity[:3].copy()
 
         return self._decompose(
             velocity, left_target, right_target, success,
@@ -1060,7 +1145,7 @@ class VegaWholeBodyIK:
             raise ValueError(f"head_joints contains non-finite values: {arr}")
         q = self.configuration.q.copy()
         lo, hi = self.model.lowerPositionLimit, self.model.upperPositionLimit
-        for idx_q, val in zip(self._head_idx_q, arr):
+        for idx_q, val in zip(self._head_idx_q, arr, strict=True):
             q[idx_q] = np.clip(val, lo[idx_q], hi[idx_q])
         self.configuration.update(q)
 
@@ -1117,6 +1202,43 @@ class VegaWholeBodyIK:
         delta = float(np.clip(delta, -cap, cap))
         problem.A = np.vstack([problem.A, row[None, :]])
         problem.b = np.hstack([problem.b, [delta]])
+
+    def _add_base_velocity_smoothing(
+        self, problem: qpsolvers.Problem, dt: float
+    ) -> None:
+        """Penalize the change in base twist between consecutive solves (anti-jitter).
+
+        Adds a base-ACCELERATION regularizer to the QP objective: a pink-style task that
+        drives this tick's base displacement ``Δbase = Δq[:3]`` toward the previous tick's
+        displacement ``v_prev·dt``, weighted per axis by ``base_velocity_smoothing_cost``
+        (vx, vy, wz)::
+
+            0.5 * Σ_k cost_k² (Δbase_k − v_prev_k·dt)²
+
+        Unlike ``base_position_cost`` (which damps the base toward ZERO velocity and so
+        resists every base motion, a wanted straight drive included), this is zero for any
+        STEADY twist and penalizes only frame-to-frame reversals/jumps -- the leader-noise
+        lateral whip the operator cannot avoid. Mapping ``0.5‖cost·(Δq[:3] − v_prev·dt)‖²``
+        into the qpsolvers objective ``0.5 Δqᵀ P Δq + qᵀ Δq`` touches only the planar
+        root's diagonal: ``P_kk += cost_k²`` and ``q_k += −cost_k²·v_prev_k·dt`` for the
+        three base DOFs, so the head/torso equality and CoM inequality rows are untouched
+        and P stays PSD (the added diagonal is non-negative).
+
+        ``v_prev`` is the previous commanded twist in its own (base) frame and ``Δq[:3]``
+        is this tick's in the current base frame; over one 100 Hz tick the ≤0.01 rad yaw
+        between them makes the frame mismatch negligible, and matching the chassis command
+        convention (body frame) is exactly what should be smoothed.
+        """
+        cost = self._base_vel_smooth_cost
+        if not np.any(cost > 0.0):
+            return
+        v_prev = self._prev_base_velocity
+        for k in range(3):  # planar root tangent DOFs: vx, vy, wz
+            c2 = float(cost[k]) ** 2
+            if c2 <= 0.0:
+                continue
+            problem.P[k, k] += c2
+            problem.q[k] += -c2 * float(v_prev[k]) * dt
 
     def _centroid_over_base(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Horizontal offset of the tip-over centroid from the base, and its Jacobian.

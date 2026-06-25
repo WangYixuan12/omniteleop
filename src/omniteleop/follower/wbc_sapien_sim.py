@@ -33,6 +33,11 @@ from typing import Dict, Optional, Protocol, Sequence
 
 import numpy as np
 
+from omniteleop.follower.sapien_env import prepare_sapien_render_env
+from omniteleop.follower.sapien_video import (
+    VideoRecordingConfig,
+    make_video_recording_config,
+)
 from omniteleop.follower.whole_body_ik import (
     DEFAULT_URDF,
     HEAD_JOINTS,
@@ -79,7 +84,7 @@ class RobotSink(Protocol):
         """Return the mobile base to the world origin (sim only; no-op on hardware)."""
         ...
 
-    def render(self) -> None:
+    def render(self, record_video: bool = True) -> None:
         """Render the current state, if the backend has a viewer."""
         ...
 
@@ -324,6 +329,7 @@ class SapienSimRobot:
         video_fps: float = 15.0,
         video_size: tuple[int, int] = (960, 540),
     ) -> None:
+        prepare_sapien_render_env()
         import sapien  # noqa: PLC0415 - heavy, env-specific dep; imported on use
 
         self._sapien = sapien
@@ -384,42 +390,37 @@ class SapienSimRobot:
         # Optional offscreen camera + video recorder.
         self._writer = None
         self._camera = None
+        self._video_config: Optional[VideoRecordingConfig] = None
         self._video_path: Optional[str] = None
+        self._video_frame_count = 0
         if record_video is not None:
-            self._setup_recording(record_video, video_fps, video_size)
+            self._video_config = make_video_recording_config(
+                record_video, video_fps, video_size
+            )
+            self._video_path = self._video_config.path
+            self._frame_interval = 1.0 / self._video_config.fps
+            self._next_frame_sim_time = 0.0
 
         self._robot.set_qpos(self._qpos)
         self._apply_base_pose()
 
     # -- video recording -------------------------------------------------------
 
-    def _setup_recording(self, path: str, fps: float, size: tuple[int, int]) -> None:
-        import os  # noqa: PLC0415
-
+    def _setup_recording(self, config: VideoRecordingConfig) -> None:
         import cv2  # noqa: PLC0415 - optional dep, only needed when recording
 
-        # cv2.VideoWriter silently returns an unopened writer (no exception) when the
-        # parent directory is missing, so create it up front to fail loudly otherwise.
-        parent = os.path.dirname(os.path.abspath(path))
-        os.makedirs(parent, exist_ok=True)
-        width, height = size
+        path = config.path
+        width, height = config.size
         self._camera = self._scene.add_camera("recorder", width, height, 1.0, 0.05, 100.0)
         # Fixed world vantage point (does NOT follow the robot), in front of the robot
         # (it faces +x) so the base driving around the origin is clearly visible.
         self._camera.set_local_pose(self._look_at(eye=[3.0, 0.0, 1.6], target=[0.3, 0.0, 0.9]))
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        self._writer = cv2.VideoWriter(path, fourcc, fps, (width, height))
+        self._writer = cv2.VideoWriter(path, fourcc, config.fps, (width, height))
         if not self._writer.isOpened():
             raise RuntimeError(f"could not open a video writer for {path!r}")
         self._video_path = path
-        # The control loop runs much faster than the video fps, so emit (and take a
-        # camera picture for) only one frame per 1/fps of simulated time -- a real-time
-        # video at the requested fps regardless of the control rate. The deadline
-        # advances by exactly one interval per frame (not reset to now), so the average
-        # rate is exactly fps with at most +/-1 control-step of jitter.
-        self._frame_interval = 1.0 / float(fps)
-        self._next_frame_sim_time = 0.0
-        print(f"[sapien] recording video -> {path} ({width}x{height} @ {fps:g} fps)")
+        print(f"[sapien] recording video -> {path} ({width}x{height} @ {config.fps:g} fps)")
 
     def _look_at(self, eye, target, up=(0.0, 0.0, 1.0)):
         """Camera pose looking from ``eye`` to ``target`` (SAPIEN +x-forward frame)."""
@@ -561,7 +562,7 @@ class SapienSimRobot:
         self._robot.set_qpos(self._qpos)
         self._apply_base_pose()
 
-    def render(self) -> None:
+    def render(self, record_video: bool = True) -> None:
         """Update the scene; render to the viewer and/or write a video frame.
 
         Video frames are decimated to the recording fps: the control loop runs much
@@ -569,11 +570,25 @@ class SapienSimRobot:
         captured, giving a real-time video at the requested fps. The viewer (when
         present) still renders every tick for smoothness.
         """
-        if self._viewer is None and self._camera is None:
+        has_pending_video = self._video_config is not None
+        if self._viewer is None and self._camera is None and not (
+            record_video and has_pending_video
+        ):
             return
+        if has_pending_video and not record_video:
+            self._next_frame_sim_time = self._sim_time
+        if record_video and has_pending_video and self._writer is None:
+            self._next_frame_sim_time = self._sim_time
+        write_due = (
+            record_video and
+            has_pending_video and
+            self._sim_time >= self._next_frame_sim_time - 1e-9
+        )
+        if write_due and self._writer is None:
+            self._setup_recording(self._video_config)
         write_frame = (
+            write_due and
             self._writer is not None
-            and self._sim_time >= self._next_frame_sim_time - 1e-9
         )
         if self._viewer is None and not write_frame:
             return  # between video frames and no viewer: nothing to draw this tick
@@ -586,6 +601,7 @@ class SapienSimRobot:
             rgba = np.asarray(self._camera.get_picture("Color"))
             frame = (np.clip(rgba[..., :3], 0.0, 1.0) * 255.0).astype(np.uint8)[..., ::-1]
             self._writer.write(np.ascontiguousarray(frame))
+            self._video_frame_count += 1
 
     @property
     def viewer_closed(self) -> bool:
@@ -597,7 +613,8 @@ class SapienSimRobot:
         if self._writer is not None:
             self._writer.release()
             self._writer = None
-            print(f"[sapien] saved video -> {self._video_path}")
+            if self._video_frame_count > 0:
+                print(f"[sapien] saved video -> {self._video_path}")
         if self._viewer is not None:
             self._viewer.close()
             self._viewer = None
@@ -674,7 +691,7 @@ class DexcontrolRobotSink:
     def reset_base(self) -> None:
         """No-op: the real robot's physical base cannot be teleported to the origin."""
 
-    def render(self) -> None:
+    def render(self, record_video: bool = True) -> None:
         """No-op: nothing to render for the hardware backend."""
 
     @property

@@ -230,17 +230,24 @@ class Leg:
 
 
 def build_legs(args: Args) -> list[Leg]:
-    """Box trajectory plus a final in-place revolution."""
+    """Box trajectory plus a final in-place revolution.
+
+    Translation closes to the origin (forward/back and right/left cancel) and the
+    final full revolution closes heading, so return-to-origin is a closure check.
+    For the sim wheel model, each leg exercises a distinct transient: the y legs
+    force a ~90 deg steer slew before driving (steering dynamics), the x legs are a
+    clean straight drive ramp, and the turn is steer-to-tangential + drive. The y
+    legs run 2x leg_time (the ~2:1 box of the original script).
+    """
     s, t = args.speed, args.leg_time
     turn_time = 2.0 * np.pi * abs(args.turn_revolutions) / abs(args.turn_speed)
     return [
-       Leg(f"turn {360 * abs(args.turn_revolutions):.0f}deg", 0.0, 0.0, args.turn_speed, turn_time),
+        Leg("forward +x", +s, 0.0, 0.0, t),
+        Leg("right -y", 0.0, -s, 0.0, 2 * t),
+        Leg("back -x", -s, 0.0, 0.0, t),
+        Leg("left +y", 0.0, +s, 0.0, 2 * t),
+        Leg(f"turn {360 * abs(args.turn_revolutions):.0f}deg", 0.0, 0.0, args.turn_speed, turn_time),
     ]
-        #     Leg("forward +x", +s, 0.0, 0.0, t),
-        # Leg("right -y", 0.0, -s, 0.0, 2*t),
-        # Leg("back -x", -s, 0.0, 0.0, t),
-        # Leg("left +y", 0.0, +s, 0.0, 2*t),
-        # Leg(f"turn {360 * abs(args.turn_revolutions):.0f}deg", 0.0, 0.0, args.turn_speed, turn_time),
 
 class SharedState:
     """Thread-shared command + latest-pose state, lock-guarded."""
@@ -259,7 +266,7 @@ class SharedState:
         self.stop_flag = False
 
 
-def odom_thread(robot, shared: SharedState, args: Args) -> None:
+def odom_thread(robot, shared: SharedState, args: Args, t_epoch: float, hr: dict) -> None:
     """Integrate swerve odometry from live wheel state, gated on the firmware
     sample timestamp.
 
@@ -271,7 +278,12 @@ def odom_thread(robot, shared: SharedState, args: Args) -> None:
     stalled stream stops advancing the pose -- and stops refreshing
     ``odom_update_t``, so the closed-loop freshness check trips instead of
     dead-reckoning a stale velocity. The recorder samples the integrated pose at
-    the (slower) record rate."""
+    the (slower) record rate.
+
+    This loop is also the high-rate wheel logger: every distinct firmware sample
+    it integrates is appended to ``hr`` (raw steer/drive/encoder + command
+    snapshot + integrated pose), giving the chassis-publish-rate stream needed to
+    fit the steering/drive transients that the 10 Hz recorder under-samples."""
     # Validity bounds track the robot's actual operating limits, read live from
     # the chassis config (SwerveOdometry scales them by its margin for headroom).
     chassis = robot.chassis
@@ -308,6 +320,11 @@ def odom_thread(robot, shared: SharedState, args: Args) -> None:
                 and wvel.shape == (2,)
                 and (prev_ts is None or ts > prev_ts)
             ):
+                # Read the rest of the raw sample from the same poll for the
+                # high-rate log (only on an advancing sample, so dedup'd polls add
+                # no extra reads); appended below iff update_at accepts the sample.
+                enc = np.asarray(robot.chassis.wheel_encoder_pos, dtype=np.float64)
+                steer_ts = int(robot.chassis.chassis_steer.get_timestamp_ns())
                 try:
                     pose = odo.update_at(steer, wvel, ts)
                 except OdometryInputError as exc:
@@ -322,11 +339,27 @@ def odom_thread(robot, shared: SharedState, args: Args) -> None:
                         last_bad_warn = now
                 else:
                     prev_ts = ts
+                    twist = odo.twist
                     with shared.lock:
+                        cmd = shared.cmd.copy()
+                        cmd_label = shared.cmd_label
                         shared.odom_pose = pose.copy()
-                        shared.odom_twist = odo.twist.copy()
+                        shared.odom_twist = twist.copy()
                         shared.odom_update_t = now  # wall clock: consumed by fresh_age_s
                         shared.odom_updates += 1
+                    # High-rate wheel log: one row per distinct firmware sample.
+                    hr["t"].append(now - t_epoch)
+                    hr["drive_ts_ns"].append(ts)
+                    hr["steer_ts_ns"].append(steer_ts)
+                    hr["steer_l"].append(float(steer[0])); hr["steer_r"].append(float(steer[1]))
+                    hr["wvel_l"].append(float(wvel[0])); hr["wvel_r"].append(float(wvel[1]))
+                    hr["enc_l"].append(float(enc[0])); hr["enc_r"].append(float(enc[1]))
+                    hr["cmd_vx"].append(float(cmd[0])); hr["cmd_vy"].append(float(cmd[1]))
+                    hr["cmd_wz"].append(float(cmd[2])); hr["cmd_label"].append(cmd_label)
+                    hr["odom_x"].append(float(pose[0])); hr["odom_y"].append(float(pose[1]))
+                    hr["odom_yaw"].append(float(pose[2]))
+                    hr["odom_vx"].append(float(twist[0])); hr["odom_vy"].append(float(twist[1]))
+                    hr["odom_w"].append(float(twist[2]))
         except Exception:
             logger.exception("odom thread stopped on error")
             break
@@ -410,9 +443,18 @@ def main() -> None:
         "cl_err_x", "cl_err_y", "cl_err_yaw",
         "head_j1", "head_j2", "head_j3", "torso_j1", "torso_j2", "torso_j3",
         "head_rgb", "head_depth")}
+    # High-rate wheel-state log (chassis publish rate, deduped on the firmware
+    # timestamp), filled by odom_thread -- the steering/drive transients the 10 Hz
+    # recorder under-samples. Persisted to obs/chassis_highrate.
+    hr: dict[str, list] = {k: [] for k in (
+        "t", "drive_ts_ns", "steer_ts_ns",
+        "steer_l", "steer_r", "wvel_l", "wvel_r", "enc_l", "enc_r",
+        "cmd_vx", "cmd_vy", "cmd_wz", "cmd_label",
+        "odom_x", "odom_y", "odom_yaw", "odom_vx", "odom_vy", "odom_w")}
 
     t_epoch = time.perf_counter()  # single clock origin shared by rec["t"] AND leg windows
-    odo_t = threading.Thread(target=odom_thread, args=(robot, shared, args), daemon=True)
+    odo_t = threading.Thread(
+        target=odom_thread, args=(robot, shared, args, t_epoch, hr), daemon=True)
     odo_t.start()
 
     rec_stop = threading.Event()
@@ -635,7 +677,7 @@ def main() -> None:
         odo_t.join(timeout=2.0)
 
     # ── persist + metrics ─────────────────────────────────────────────────────
-    _write_hdf5(out, rec, args, legs)
+    _write_hdf5(out, rec, hr, args, legs)
     metrics = compute_metrics(rec, legs, args)
     metrics_path = out.with_suffix(".metrics.json")
     metrics_path.write_text(json.dumps(metrics, indent=2))
@@ -664,7 +706,7 @@ def _stack(values: list) -> np.ndarray:
     return np.asarray(filled)
 
 
-def _write_hdf5(out: pathlib.Path, rec: dict, args: Args, legs: list[Leg]) -> None:
+def _write_hdf5(out: pathlib.Path, rec: dict, hr: dict, args: Args, legs: list[Leg]) -> None:
     import h5py
 
     n = len(rec["t"])
@@ -713,6 +755,25 @@ def _write_hdf5(out: pathlib.Path, rec: dict, args: Args, legs: list[Leg]) -> No
         og = f.create_group("obs/odom")
         og.create_dataset("pose", data=np.column_stack([arr("odom_x"), arr("odom_y"), arr("odom_yaw")]))
         og.create_dataset("twist", data=np.column_stack([arr("odom_vx"), arr("odom_vy"), arr("odom_w")]))
+
+        # High-rate wheel state, one row per distinct firmware sample (deduped on
+        # the drive timestamp): effective rate is the chassis publish rate, NOT
+        # record_rate. Use this (not obs/chassis) to fit the steering/drive
+        # transients for the sim wheel model in wbc_sapien_physics.py.
+        hg = f.create_group("obs/chassis_highrate")
+        harr = lambda k: np.asarray(hr[k])
+        hg.attrs["n_samples"] = len(hr["t"])
+        hg.attrs["note"] = "per-firmware-sample wheel state; rate = chassis publish rate"
+        hg.create_dataset("t_wall_s", data=harr("t"))
+        hg.create_dataset("drive_ts_ns", data=harr("drive_ts_ns"))
+        hg.create_dataset("steer_ts_ns", data=harr("steer_ts_ns"))
+        hg.create_dataset("steering_angle", data=np.column_stack([harr("steer_l"), harr("steer_r")]))
+        hg.create_dataset("wheel_velocity", data=np.column_stack([harr("wvel_l"), harr("wvel_r")]))
+        hg.create_dataset("wheel_encoder_pos", data=np.column_stack([harr("enc_l"), harr("enc_r")]))
+        hg.create_dataset("cmd_vel", data=np.column_stack([harr("cmd_vx"), harr("cmd_vy"), harr("cmd_wz")]))
+        hg.create_dataset("cmd_label", data=np.array(hr["cmd_label"], dtype="S24"))
+        hg.create_dataset("odom_pose", data=np.column_stack([harr("odom_x"), harr("odom_y"), harr("odom_yaw")]))
+        hg.create_dataset("odom_twist", data=np.column_stack([harr("odom_vx"), harr("odom_vy"), harr("odom_w")]))
 
         clg = f.create_group("control/closed_loop")
         clg.create_dataset("reference_pose", data=np.column_stack([arr("cl_ref_x"), arr("cl_ref_y"), arr("cl_ref_yaw")]))

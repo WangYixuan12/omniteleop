@@ -4,7 +4,7 @@
 # Adapted from the reference /home/yixuan/hommi/deps/rby1-wbc/config/wbik.yaml. 
 # RBY1 keys intentionally NOT ported: (torso_0/4/5 pinned, torso_3 coupled)
 
-urdf_path: "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"
+urdf_path: "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_with_robotiq.urdf" #"/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"
 
 # every other cost matters as a ratio to these.
 ee_position_cost: 10000.0
@@ -12,28 +12,23 @@ ee_orientation_cost: 10000.0
 lm_damping_ee: 1.0e-5
 
 # --- Base regularization (velocity damping) -----------------------------------------------
-# RBY1 uses soft mobile DOFs [50, 50] / yaw 50
-# (0.005x EE -- and pink SQUARES costs in the QP Hessian, so that resists the EE
-# task at (50/10000)^2 = 4e-5: effectively free). Vega instead damps ALL THREE
-# planar DOFs at 50000 (5x EE) so hand motion resolves in the arms and the chassis
-# moves only when the targets are otherwise unreachable (then it creeps in at a
-# rate proportional to the residual). Yaw was previously left at RBY1's soft 50 for
-# turn-follow; with x/y stiff that made yaw the only cheap base DOF, and a
-# stationary operator merely wiggling a controller spun the chassis +/-10..16 deg
-# continuously (~0.5-1.8 deg/s, never settling). Sweeps with
-# scripts/diagnostics/probe_wbc_yaw_drift.py show stiff yaw costs nothing in tracking
-# accuracy: steady-state EE error stays <= 2 mm / ~0 deg at every yaw cost, even
-# for 90 deg operator turns (the 7-DOF arms absorb them; the base only comes
-# around ~22 deg) -- while intermediate yaw costs (2000-10000) still wander 3-16
-# deg and keep a ~11 deg parasitic skew after a 0.5 m walk. Only fast >= 180 deg
-# turns now resolve slowly (base creeps ~3.6 deg/s with a transient few-cm EE
-# residual); accepted for tabletop teleop.
 # Vega's planar root fixes z/roll/pitch *structurally*, so those ground/upright
-# pins are no-ops here and carry 0.
-base_position_cost: [5000.0, 5000.0, 0.0]  # x/y: local hand shifts prefer arms; z: no-op
-base_orientation_cost: [0.0, 0.0, 5000.0]   # roll/pitch: no-ops; yaw stiff like x/y (no drift)
+# pins are no-ops here and carry 0. x/y/yaw are heavily damped so stationary and
+# hand-only VR target changes stay in the arms/torso, while large head/body motion
+# can still wake the chassis through the WBC base twist.
+base_position_cost: [10000.0, 10000.0, 0.0]  # x/y: hand-only shifts prefer arms; z: no-op
+base_orientation_cost: [0.0, 0.0, 10000.0]   # roll/pitch: no-ops; yaw stiff like x/y
 # LM damping on the base task. RBY1 hardcodes 1e-6 in code; same value.
 lm_damping_base: 1.0e-6
+
+# --- Base velocity smoothing (anti-jitter) -------------------------------------------------
+# Per-axis (vx, vy, wz) penalty on the CHANGE in base twist between consecutive 100 Hz
+# solves -- a base-ACCELERATION term, NOT damping. base_position_cost above damps the base
+# toward zero velocity (resists ALL base motion, a wanted straight drive included); this
+# leaves any steady twist unpenalized and resists only frame-to-frame reversals/jumps. It
+# exists because teleop EE targets carry inevitable leader-side noise that the redundant QP
+# would otherwise resolve into a laterally whipping base. Lower than base_position_cost.
+base_velocity_smoothing_cost: [1000.0, 1000.0, 1000.0]
 
 # --- Posture regularization toward the nominal posture ------------------------------------
 # Per-group PostureTask cost: resolves redundancy by pulling joints toward
@@ -179,13 +174,58 @@ com_centroid: "torso_l3"
 # CoM-inside-support-polygon margin.
 com_safety_margin: 0.08
 
-# joints not listed default to 0. 
-# The tip-over box above is anchored at this posture. 
+# joints not listed default to 0.
+# The tip-over box above is anchored at this posture.
+#
+# Torso + arms reproduce the operational pose of dexcontrol's
+# `examples/advanced_examples/fold_robot.py --unfold` so the WBC's redundancy
+# resolution rests at the same configuration the robot powers up into.
 nominal_posture:
   torso_j1: 0.78 # 0.5235987755982988    # pi/6
   torso_j2: 1.5707963267948966 # 1.0471975511965976    # pi/3
   torso_j3: 0.0 # 0.39269908169872414   # pi/8
-  L_arm_j1: 1.5707963267948966    # pi/2
-  L_arm_j4: -1.5707963267948966   # -pi/2
-  R_arm_j1: -1.5707963267948966   # -pi/2
-  R_arm_j4: -1.5707963267948966   # -pi/2
+  L_arm_j1: 0.844    # L_shape 0.064 + torso pitch 0.78
+  L_arm_j2: 0.3      # L_shape
+  L_arm_j4: -1.556   # L_shape
+  L_arm_j5: 1.271    # L_shape
+  R_arm_j1: -0.844   # L_shape -0.064 - torso pitch 0.78
+  R_arm_j2: -0.3     # L_shape
+  R_arm_j4: -1.556   # L_shape
+  R_arm_j5: -1.271   # L_shape
+
+# --- VR teleop follower control loop (NOT a WBCConfig field) ----------------------------------
+# Shared command-stream shaping for BOTH whole-body VR followers -- the SAPIEN sim
+# follower (scripts/wbc_vr_record.py) and the real-robot follower
+# (scripts/wbc_vr_robot.py). Loaded by omniteleop.wbc_teleop.VRTeleopConfig and bound to
+# both followers' argparse defaults, so a take recorded/visualized in sim replays the SAME
+# way on hardware (the head/base shaping must match). Kept HERE, beside the WBC solver
+# tunables, so there is one follower config file. WBCConfig.from_yaml deliberately IGNORES
+# this block -- these are control-loop parameters, not solver parameters (see
+# _NON_WBC_SECTIONS in whole_body_ik.py). The hardware/replay bring-up knobs (homing,
+# joint-step clamp, base max speed, the sim follower's OPEN-loop base deadband, ...) stay
+# local to each script.
+vr_teleop:
+  # Replay speed multiplier (<1 = slower). The staged bring-up replays sim takes slowly.
+  replay_speed: 0.5
+  # Head-target first-order low-pass time constant (s) before IK; suppresses headset dither
+  # that would otherwise resolve into base yaw in head_mode "ik". 0 disables.
+  head_lpf_tau: 0.2
+  # Planar head-target deadband: radial x/y (m) and heading-yaw (rad) held at the nominal
+  # anchor so small headset drift does not wake the base, while larger motion passes through
+  # (direction-preserving).
+  head_planar_pos_deadband: 0.04
+  head_planar_yaw_deadband: 0.12
+  # Closed-loop base PD gains on the (solver base pose - measured base pose) error -- the
+  # real-robot values, shared with scripts/drive_box_record.py's base controller.
+  base_kp_xy: 1.0
+  base_kp_yaw: 1.5
+  # Closed-loop base-twist pre-deadband (m/s; angular = 2x): the quiet band fed into
+  # base_closed_loop.shape_twist. Shared by BOTH followers' closed loop -- the sim
+  # follower's separate OPEN-loop deadband stays script-local.
+  base_deadband: 0.04
+  # Base-twist slew limit (m/s^2; angular = 2x), applied by base_closed_loop.shape_twist.
+  base_accel: 2.0
+  # Per-axis base-twist post-deadband (linear m/s, angular rad/s) applied AFTER
+  # deadband/clamp/slew, using the pre-slew raw command as the activity reference.
+  base_post_linear_deadband: 0.18
+  base_post_angular_deadband: 0.08

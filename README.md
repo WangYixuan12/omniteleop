@@ -82,7 +82,7 @@ fixed_pose mode:
 
 python /home/yixuan/omniteleop/scripts/save_rgb_print_fps.py # if you forgot position last time
 
-python /home/dexmate/yixuan/omniteleop_yifan/scripts/admittance_control.py run
+python /home/dexmate/yixuan/omniteleop_yifan/scripts/admittance_control.py run #calibrate first
 
 before shutdown:
 python -m omniteleop.follower.safearm_shutdown # reposition arm so that they fall onto table
@@ -155,5 +155,29 @@ python scripts/play_side_by_side_videos.py --video_1 /home/yixuan/Dexmate/wbc/wb
 (yixuan_yifan) python scripts/drive_box_record.py --output /home/dexmate/yixuan/Dexmate/SLAM/test/box_closed.hdf5 --closed-loop-source odom
 
 (yixuan_yifan) python scripts/misc/plot_drive_box.py --input /home/dexmate/yixuan/Dexmate/SLAM/test/box_closed.hdf5
+```
+
+```bash
+python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py
+python scripts/wbc_vr_record.py --hdf5 /home/yixuan/Dexmate/wbc/real/test.hdf5 --physics --base-loop closed
+python scripts/wbc_vr_record.py --replay /home/yixuan/Dexmate/wbc/real/teleop_demo.hdf5 --speed 0.5 --output /home/yixuan/Dexmate/wbc/real/teleop_replay.mp4
+
+# on lambda machine
+python scripts/wbc_vr_robot.py --replay /home/yixuan/Dexmate/wbc/real/test_625.hdf5 --speed 0.5 --record
+ #   add --grippers to actuate grippers; --closed-loop-q once joint readback is confirmed
+ # robot.chassis.set_steering_angle(0.0, wait_time=1.5)
+python scripts/diagnostics/visualize_head_lpf_and_base_chain.py /home/yixuan/Dexmate/wbc/real/test.hdf5 --out /home/yixuan/Dexmate/wbc/real/test.png
+```
+
+# Debug
+
+```bash
+ipython
+  import numpy as np
+  q = robot.right_arm.get_joint_pos().copy(); q[5] = 0.3   # j6 -> +0.3
+  robot.right_arm.set_joint_pos(q.tolist(), wait_time=2.0, exit_on_reach=True)
+# if dead
+python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py get --side both
+python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py set --side right --enable
 ```
 

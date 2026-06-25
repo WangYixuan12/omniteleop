@@ -3,17 +3,17 @@
 1. **Self-collision avoidance.** Each solver adds a *proactive* in-solve constraint
    (Pink :class:`~pink.barriers.SelfCollisionBarrier`; Mink
    :class:`~mink.CollisionAvoidanceLimit`) built from the Dexmate **collision-sphere**
-   model (``vega_1_collision_spheres.collision.urdf`` -- 90 spheres whose link names
-   match ``vega_no_effector.urdf``). The spheres are grouped into body / left-arm /
-   right-arm sets and only *cross-group* pairs are checked (arm-vs-arm, arm-vs-body),
-   matching the reference ``deps/rby1-wbc`` setup.
+   model (``vega_1_collision_spheres.collision.urdf``) plus any fixed gripper
+   proxy spheres injected by the solver. The spheres are grouped into body /
+   left-arm / right-arm sets and only *cross-group* pairs are checked
+   (arm-vs-arm, arm-vs-body), matching the reference ``deps/rby1-wbc`` setup.
 
-2. **Reactive hold gate** (:class:`SafetyGate`). The gate is the hard guarantee: after each candidate step the solver
-   evaluates the CoM-over-base stability margin and the closest self-collision
-   distance, and if either is below its safety floor **and getting worse**, the step
-   is rejected -- the robot *holds* its previous configuration and a warning is
-   surfaced. Motion that recovers (increases the margin/distance) is always allowed,
-   so the robot is never permanently stuck.
+2. **Reactive hold gate** (:class:`SafetyGate`). The gate is the hard guarantee:
+   after each candidate step the solver evaluates the CoM-over-base stability margin
+   and the closest self-collision distance, and if either is below its safety floor
+   **and getting worse**, the step is rejected -- the robot *holds* its previous
+   configuration and a warning is surfaced. Motion that recovers (increases the
+   margin/distance) is always allowed, so the robot is never permanently stuck.
 
 Both the Pink (:mod:`omniteleop.follower.whole_body_ik`) and Mink
 (:mod:`omniteleop.follower.whole_body_ik_mink`) solvers use this module to add two
@@ -82,9 +82,9 @@ def collision_group(name: str) -> Optional[str]:
     both start with the link name (e.g. ``"L_arm_l3_0"`` -> ``"left"``, ``"torso_l2"``
     -> ``"body"``). Wheels and the ``arm_center``/camera frames have no spheres.
     """
-    if name.startswith("L_arm"):
+    if name.startswith(("L_arm", "L_ee", "L_robotiq")):
         return "left"
-    if name.startswith("R_arm"):
+    if name.startswith(("R_arm", "R_ee", "R_robotiq")):
         return "right"
     if name.startswith(("base", "torso", "head")):
         return "body"

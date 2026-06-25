@@ -5,13 +5,21 @@
 2. on a trigger-hold, captures the headset pose and computes two calibration
    transforms: a full head-pose transform for gaze tracking, and a gravity-aligned
    yaw+translation transform for wrist/EEF target positions;
-3. each frame publishes the **Cartesian L_ee / R_ee target poses**
+3. each frame publishes the **Cartesian L_ee / R_ee target poses** on the
+   ``vr/joints`` topic (``VRJointData``), exactly the field ``wbc_vr_record.py``
+   consumes to drive its whole-body IK (base + torso + arms). Two mappings (``--mapping``):
 
-       left_ee_pose  = robot_base_t_vr_base_eef @ vr_left_controller
-       right_ee_pose = robot_base_t_vr_base_eef @ vr_right_controller
-
-   on the ``vr/joints`` topic (``VRJointData``), exactly the field
-   ``wbc_vr_record.py`` consumes to drive its whole-body IK (base + torso + arms);
+       relative (default)  POSITION is incremental from the robot's nominal EE position,
+                           so teleop ENGAGES WITH NO arm lunge; ORIENTATION tracks the
+                           controller absolutely (same as ``absolute``), which keeps big
+                           wrist rotations out of the arm's joint limits:
+                               t = nominal_ee_pos + R_yaw @ (vr_now_pos - vr_calib_pos)
+                               R = R_yaw @ vr_now_rot
+                           (A fully relative orientation was tried but contorts the wrist
+                           on large rolls -- scripts/diagnostics/decompose_rel_contortion.py.)
+       absolute            left_ee_pose = robot_base_t_vr_base_eef @ vr_left_controller
+                           (the controller's absolute pose); snaps the EEFs to wherever
+                           the hands are at calibration -- the original behavior;
 4. each ``teleop`` frame also publishes the **calibrated headset pose**
 
        head_ee_pose[:3, :3] = (robot_base_t_vr_base @ vr_headset)[:3, :3]
@@ -65,7 +73,8 @@ Run in the dexmate conda env (has pinocchio + pink + dexcomm + aiohttp/socketio)
 Controls (mirrors ``vr_reader``):
   * **hold right grip trigger >= 1 s** in ``static`` -> capture calibration and
     begin streaming targets (``teleop``);
-  * **left X button** -> back to ``static`` (re-calibrate on the next trigger-hold);
+  * right front/index trigger in ``teleop`` -> recording start gate;
+  * **left X button** -> publish an exit request and stop the take;
   * index triggers -> ``left_gripper`` / ``right_gripper`` [0, 1];
   * left thumbstick -> ``chassis_vx`` / ``chassis_vy``; right thumbstick x ->
     ``chassis_wz`` (published, but unused by ``wbc_vr_record``).
@@ -76,11 +85,14 @@ from __future__ import annotations
 import argparse
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import yaml
 from dexcomm import Node
 from dexcomm.codecs import DictDataCodec
+from scipy.spatial.transform import Rotation
 
 from omniteleop.common import get_config
 from omniteleop.common.schemas import VRJointData
@@ -107,6 +119,13 @@ DEFAULT_CERT = "/home/yixuan/omniteleop/tests/cert.pem"
 DEFAULT_KEY = "/home/yixuan/omniteleop/tests/key.pem"
 _TRIGGER_PRESS = 0.7  # right grip value counted as a press
 _TRACK_ATOL = 1e-6  # tolerance for matching the untracked sentinel poses
+
+# Default file storing the per-side controller->gripper orientation offset (see
+# WBCVRLeader._eef_target / --calibrate-ee-offset). Version-controlled with the repo so a
+# dataset's mapping convention is reproducible; absent -> identity (raw controller frame).
+DEFAULT_EE_OFFSET_FILE = str(
+    Path(__file__).resolve().parents[1] / "src" / "omniteleop" / "leader" / "ee_offset.yaml"
+)
 
 
 def _to_mat(pose) -> np.ndarray:
@@ -158,9 +177,104 @@ def _gravity_aligned_calibration(
     return out
 
 
+def _is_valid_pose(pose: np.ndarray) -> bool:
+    """True if ``pose`` is a finite 4x4 with a valid ``[0, 0, 0, 1]`` bottom row.
+
+    Guards against malformed/NaN frames: ``np.allclose(x, sentinel)`` is False for
+    NaN, so without this a NaN pose would read as "tracked" and poison the last-good
+    target (or, at calibration, the captured anchors -- and thus every later target).
+    """
+    pose = np.asarray(pose, dtype=float)
+    return (
+        pose.shape == (4, 4)
+        and bool(np.all(np.isfinite(pose)))
+        and bool(np.allclose(pose[3, :], [0.0, 0.0, 0.0, 1.0], atol=1e-6))
+    )
+
+
 def _is_tracked(pose: np.ndarray, sentinel: np.ndarray) -> bool:
-    """True unless ``pose`` matches the untracked-controller sentinel."""
-    return not np.allclose(pose, sentinel, atol=_TRACK_ATOL)
+    """True only if ``pose`` is a valid 4x4 that isn't the untracked sentinel."""
+    return _is_valid_pose(pose) and not np.allclose(pose, sentinel, atol=_TRACK_ATOL)
+
+
+def _left_x_stop_requested(*, x_now: bool, prev_x: bool) -> bool:
+    """True on the rising edge of the left X button."""
+    return bool(x_now and not prev_x)
+
+
+def _project_so3(rot: np.ndarray) -> np.ndarray:
+    """Nearest proper rotation (det = +1) to ``rot`` via SVD orthonormalization."""
+    u, _, vt = np.linalg.svd(np.asarray(rot, dtype=float))
+    out = u @ vt
+    if np.linalg.det(out) < 0.0:
+        u = u.copy()
+        u[:, -1] *= -1.0
+        out = u @ vt
+    return out
+
+
+def _mean_rotation(mats: list[np.ndarray]) -> np.ndarray:
+    """Chordal-L2 mean of a list of 3x3 SO(3) matrices (proper rotation average)."""
+    if not mats:
+        raise ValueError("cannot average an empty list of rotations")
+    return Rotation.from_matrix(np.stack(mats)).mean().as_matrix()
+
+
+def _load_ee_offsets(path: Optional[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Per-side controller->gripper offset rotations ``(C_left, C_right)`` from YAML.
+
+    The file stores a scipy ``[x, y, z, w]`` quaternion per side under keys ``left`` and
+    ``right``. A missing/None path -- or a side left unspecified -- yields identity: the
+    gripper then inherits the controller's raw axis convention (the pre-calibration
+    behavior). Each quaternion is normalized to a valid SO(3) matrix on load.
+    """
+    ident = (np.eye(3), np.eye(3))
+    if not path or not Path(path).exists():
+        return ident
+    data = yaml.safe_load(Path(path).read_text()) or {}
+
+    def _side(key: str) -> np.ndarray:
+        q = data.get(key)
+        if q is None:
+            return np.eye(3)
+        q = np.asarray(q, dtype=float)
+        if q.shape != (4,):
+            raise ValueError(
+                f"ee_offset '{key}' must be a 4-vector quaternion [x, y, z, w]; got {q.shape}"
+            )
+        return Rotation.from_quat(q).as_matrix()
+
+    return _side("left"), _side("right")
+
+
+def _save_ee_offsets(path: str, c_left: np.ndarray, c_right: np.ndarray) -> None:
+    """Write per-side offset rotations as ``[x, y, z, w]`` quaternions to a YAML file."""
+    ql = Rotation.from_matrix(_project_so3(c_left)).as_quat().tolist()
+    qr = Rotation.from_matrix(_project_so3(c_right)).as_quat().tolist()
+    header = (
+        "# Controller -> gripper orientation offset: a fixed body-frame 'tool-mount'\n"
+        "# re-labeling captured by `wbc_vr_leader.py --calibrate-ee-offset`. Applied as\n"
+        "#   R_target = R_yaw @ vr_controller_R @ C   (per side)\n"
+        "# so the operator's NEUTRAL grip maps to the nominal L_ee/R_ee frame\n"
+        "# (x:down, y:left, z:forward). Quaternions are scipy [x, y, z, w]. Delete this\n"
+        "# file (or set a side to [0, 0, 0, 1]) to fall back to the raw controller frame.\n"
+    )
+    body = yaml.safe_dump({"left": ql, "right": qr}, default_flow_style=True, sort_keys=False)
+    Path(path).write_text(header + body)
+
+
+def _describe_axes(rot: np.ndarray) -> str:
+    """Where each local axis of ``rot`` points in the base frame (x-fwd, y-left, z-up)."""
+    names = {
+        (1, 0, 0): "forward", (-1, 0, 0): "back",
+        (0, 1, 0): "left", (0, -1, 0): "right",
+        (0, 0, 1): "up", (0, 0, -1): "down",
+    }
+    out = []
+    for ax, col in zip("xyz", np.asarray(rot, dtype=float).T, strict=True):
+        key = tuple(int(c) for c in np.rint(col))
+        out.append(f"{ax}:{names.get(key, 'oblique')}")
+    return ", ".join(out)
 
 
 class WBCVRLeader:
@@ -173,6 +287,25 @@ class WBCVRLeader:
         self.stick_max_vy = args.stick_max_vy
         self.stick_max_wz = args.stick_max_wz
         self.stick_deadzone = args.stick_deadzone
+        self.mapping = args.mapping
+        # Per-side constant controller->gripper orientation offset C, right-multiplied in
+        # _eef_target (R = R_yaw @ vr_controller_R @ C). Identity unless --calibrate-ee-offset
+        # wrote a file: identity makes the gripper inherit the controller's raw axis
+        # convention; a calibrated C maps the neutral grip to the nominal L_ee/R_ee frame
+        # (x:down, y:left, z:forward). Frozen on purpose (see _eef_target docstring).
+        self._ee_offset_file = getattr(args, "ee_offset_file", None)
+        self._ee_offset_left, self._ee_offset_right = _load_ee_offsets(self._ee_offset_file)
+        if np.allclose(self._ee_offset_left, np.eye(3)) and np.allclose(
+            self._ee_offset_right, np.eye(3)
+        ):
+            print("[wbc_vr_leader] EEF orientation offset: identity (gripper uses the raw "
+                  "controller convention). Run --calibrate-ee-offset to map your neutral grip "
+                  "to the nominal x:down,y:left,z:forward gripper frame.")
+        else:
+            ol = np.rad2deg(Rotation.from_matrix(self._ee_offset_left).magnitude())
+            orr = np.rad2deg(Rotation.from_matrix(self._ee_offset_right).magnitude())
+            print(f"[wbc_vr_leader] EEF orientation offset loaded from {self._ee_offset_file} "
+                  f"(L {ol:.1f} deg, R {orr:.1f} deg from identity).")
 
         # Zenoh publisher on the same topic the follower subscribes to.
         self.node = Node(name="wbc_vr_leader", namespace=args.namespace)
@@ -210,6 +343,10 @@ class WBCVRLeader:
         self.stage = "static"  # "static" (estop) or "teleop"
         self.robot_base_t_vr_base: Optional[np.ndarray] = None
         self.robot_base_t_vr_base_eef: Optional[np.ndarray] = None
+        # Controller poses captured at calibration. Relative mapping references their
+        # POSITION so the first streamed target sits at the nominal EE position (no lunge).
+        self._vr_left0: Optional[np.ndarray] = None
+        self._vr_right0: Optional[np.ndarray] = None
         self.last_left_target: Optional[np.ndarray] = None
         self.last_right_target: Optional[np.ndarray] = None
         self._trigger_start: Optional[float] = None
@@ -273,13 +410,94 @@ class WBCVRLeader:
         out[:3, 3] = (self.robot_base_t_vr_base_eef @ vr_head)[:3, 3]
         return out
 
+    def _capture_eef_anchors(self, vr_left: np.ndarray, vr_right: np.ndarray) -> None:
+        """Snapshot the controller poses at calibration, used by relative mapping.
+
+        Relative mapping anchors each EEF target's POSITION at the robot's nominal EE
+        position and adds the controller's translation *relative* to these captured
+        poses, so the first streamed target sits at the nominal position (the arm does
+        not lunge to the operator's hands at engage). Orientation tracks the controller
+        absolutely and so does not use these anchors. Always captured -- absolute mapping
+        just ignores them -- so ``--mapping`` is uniform to reason about.
+        """
+        vr_left = np.asarray(vr_left, dtype=float)
+        vr_right = np.asarray(vr_right, dtype=float)
+        if vr_left.shape != (4, 4) or vr_right.shape != (4, 4):
+            raise ValueError(
+                f"controller anchor poses must be (4, 4); got "
+                f"{vr_left.shape} and {vr_right.shape}"
+            )
+        self._vr_left0 = vr_left.copy()
+        self._vr_right0 = vr_right.copy()
+
+    def _eef_target(self, side: str, vr_now: np.ndarray) -> np.ndarray:
+        """Map one controller pose to its base-frame EEF target per ``--mapping``.
+
+        ``side`` (``"left"``/``"right"``) selects the per-arm nominal EE pose and
+        calibration anchor. Only the relative branch reads them, so absolute mode never
+        touches any calibration-anchor state.
+
+        ``absolute``: rigid room->base map of the controller's *absolute* pose, so the
+        target snaps to wherever the hand is at calibration -- a large first-frame jump.
+
+        ``relative`` (default): track the controller's POSITION incrementally from the
+        robot's nominal EE position -- so teleop engages with NO position lunge (the fix
+        for the first-frame arm teleport) -- while the ORIENTATION tracks the controller
+        ABSOLUTELY, exactly as ``absolute`` does::
+
+            pos = nominal_ee_pos + R_yaw @ (vr_now_pos - vr0_pos)
+            rot = R_yaw @ vr_now_rot            # == (robot_base_t_vr_base_eef @ vr_now)[:3, :3]
+
+        where ``R_yaw = robot_base_t_vr_base_eef[:3, :3]``. Position rides the gravity-
+        aligned room yaw (a horizontal hand move stays horizontal) and starts at nominal.
+        Orientation is byte-identical to ``absolute``: it tracks the operator's actual hand
+        orientation -- which they servo by sight -- so a large wrist rotation does NOT drive
+        the arm into joint limits.
+
+        A purely relative orientation (``nominal_ee_rot @ vr0_rot.T @ vr_now_rot``) was
+        tried first: it has no orientation jump at engage, but it re-anchors the rotation at
+        the nominal gripper and sweeps it through the operator's *full* rotation from there,
+        which contorts the wrist into its limits on big rolls -- verified on real logs in
+        ``scripts/diagnostics/decompose_rel_contortion.py``. The only engage discontinuity
+        here is a small IN-PLACE wrist alignment to the controller's orientation (a slerp,
+        not an arm swing); the follower interpolates it over one command tick.
+
+        A fixed per-side offset ``C`` (``self._ee_offset_left``/``_right``; identity unless
+        ``--calibrate-ee-offset`` wrote a file) is right-multiplied onto the orientation
+        (``... @ vr_now_rot @ C``). It is a constant body-frame re-labeling of the controller
+        axes onto the gripper, so the operator's neutral grip reads as the nominal
+        ``L_ee``/``R_ee`` frame (x:down, y:left, z:forward) instead of the controller's raw
+        convention, while a controller rotation still rotates the gripper about the matching
+        axes. Being CONSTANT it preserves the absolute (non-contorting) property; recomputing
+        ``C`` from the engage pose each frame would instead reproduce the rejected relative
+        orientation (deviation tied to rotation-since-engage).
+        """
+        # Fixed controller->gripper "tool-mount" offset (identity unless calibrated).
+        ee_offset = getattr(self, f"_ee_offset_{side}", None)
+        if ee_offset is None:
+            ee_offset = np.eye(3)
+        if self.mapping == "absolute":
+            out = self.robot_base_t_vr_base_eef @ vr_now
+            out[:3, :3] = out[:3, :3] @ ee_offset
+            return out
+        # vr0 is the calibration anchor; relative mapping needs its POSITION (the
+        # orientation tracks the controller absolutely, like absolute mode).
+        vr0 = self._vr_left0 if side == "left" else self._vr_right0
+        nominal_ee = self._nominal_left if side == "left" else self._nominal_right
+        assert vr0 is not None, "relative mapping requires calibration anchors"
+        rot_yaw = self.robot_base_t_vr_base_eef[:3, :3]
+        out = np.eye(4)
+        out[:3, 3] = nominal_ee[:3, 3] + rot_yaw @ (vr_now[:3, 3] - vr0[:3, 3])
+        out[:3, :3] = rot_yaw @ vr_now[:3, :3] @ ee_offset
+        return out
+
     def _map_targets(self, vr_l: np.ndarray, vr_r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Map controller poses to base-frame EEF targets, holding last-good if untracked."""
         assert self.robot_base_t_vr_base_eef is not None
         if _is_tracked(vr_l, INVALID_LEFT_POSE):
-            self.last_left_target = self.robot_base_t_vr_base_eef @ vr_l
+            self.last_left_target = self._eef_target("left", vr_l)
         if _is_tracked(vr_r, INVALID_RIGHT_POSE):
-            self.last_right_target = self.robot_base_t_vr_base_eef @ vr_r
+            self.last_right_target = self._eef_target("right", vr_r)
         return self.last_left_target, self.last_right_target
 
     def _publish(
@@ -290,6 +508,8 @@ class WBCVRLeader:
         left_gripper: float,
         right_gripper: float,
         chassis: tuple[float, float, float],
+        *,
+        exit_requested: bool = False,
     ) -> None:
         left_flat = left_target.reshape(-1).tolist() if left_target is not None else []
         right_flat = right_target.reshape(-1).tolist() if right_target is not None else []
@@ -305,6 +525,7 @@ class WBCVRLeader:
             chassis_vy=float(chassis[1]),
             chassis_wz=float(chassis[2]),
             estop=(self.stage == "static"),
+            exit_requested=bool(exit_requested),
             calib_stage=self.stage,
             left_ee_pose=left_flat,
             right_ee_pose=right_flat,
@@ -337,16 +558,18 @@ class WBCVRLeader:
                     time.sleep(dt)
                     continue
 
-                # left X -> reset to static (re-calibrate on next trigger-hold).
+                # left X -> publish one final exit frame so recorders can stop/save.
                 x_now = bool(transforms["left_x_button"])
-                if x_now and not self._prev_x:
-                    self.stage = "static"
-                    self.robot_base_t_vr_base = None
-                    self.robot_base_t_vr_base_eef = None
-                    self.last_left_target = None
-                    self.last_right_target = None
-                    print("\n[wbc_vr_leader] reset -> static (left X). "
-                          "Hold right grip to re-calibrate.")
+                if _left_x_stop_requested(x_now=x_now, prev_x=self._prev_x):
+                    self._prev_x = x_now
+                    self._publish(
+                        self.last_left_target, self.last_right_target, None,
+                        transforms["left_index_trigger"], transforms["right_index_trigger"],
+                        self._thumbstick_to_chassis(transforms),
+                        exit_requested=True,
+                    )
+                    print("\n[wbc_vr_leader] stop requested (left X).")
+                    break
                 self._prev_x = x_now
 
                 vr_l = transforms["left_wrist"]
@@ -354,22 +577,30 @@ class WBCVRLeader:
 
                 if self.stage == "static":
                     if self._trigger_held(transforms):
-                        if not (_is_tracked(vr_l, INVALID_LEFT_POSE)
+                        if not (_is_valid_pose(transforms["head"])
+                                and _is_tracked(vr_l, INVALID_LEFT_POSE)
                                 and _is_tracked(vr_r, INVALID_RIGHT_POSE)):
-                            print("\n[wbc_vr_leader] both controllers must be tracked "
-                                  "to calibrate — hold them in view and retry.")
+                            print("\n[wbc_vr_leader] headset + both controllers must be "
+                                  "tracked to calibrate — hold them in view and retry.")
                         else:
                             self._calibrate(transforms["head"])
+                            self._capture_eef_anchors(vr_l, vr_r)
                             self._map_targets(vr_l, vr_r)  # seed last-good targets
                             self.stage = "teleop"
                             d = self.last_left_target[:3, 3] - self._nominal_left[:3, 3]
-                            print(f"\n[wbc_vr_leader] calibrated -> teleop. "
-                                  f"L target offset from nominal = "
+                            print(f"\n[wbc_vr_leader] calibrated ({self.mapping}) -> teleop. "
+                                  f"L target pos offset from nominal = "
                                   f"[{d[0]:+.3f} {d[1]:+.3f} {d[2]:+.3f}] m")
                     self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
                 else:  # teleop
                     left_target, right_target = self._map_targets(vr_l, vr_r)
-                    head_target = self._map_head_target(transforms["head"])
+                    # Hold-last-good on a malformed/NaN headset frame: publish an empty
+                    # head target so the follower keeps its previous head command rather
+                    # than receiving (and rejecting) a NaN pose.
+                    head_target = (
+                        self._map_head_target(transforms["head"])
+                        if _is_valid_pose(transforms["head"]) else None
+                    )
                     chassis = self._thumbstick_to_chassis(transforms)
                     self._publish(
                         left_target, right_target, head_target,
@@ -402,6 +633,116 @@ class WBCVRLeader:
             self.node.shutdown()
             print("\n[wbc_vr_leader] stopped.")
 
+    # -- calibration helper -----------------------------------------------------
+
+    def calibrate_ee_offset(
+        self, capture_seconds: float, out_file: str
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Capture the neutral-grip controller orientation and save the offset ``C``.
+
+        Hold BOTH controllers in the grip you want to read as the gripper's nominal frame
+        (x:down, y:left, z:forward) -- typically pointing forward, fingers down -- while
+        facing the robot's forward, then hold the right grip trigger for ``hold_seconds``.
+        We average the controller orientations over ``capture_seconds``, compute
+        ``C_side = (R_yaw @ vr_ref_R)^T @ nom_R`` per side, project to SO(3), write them to
+        ``out_file``, and print residuals so you can confirm the result before trusting it.
+        Returns ``(C_left, C_right)``.
+        """
+        if not np.isfinite(capture_seconds) or capture_seconds <= 0:
+            raise ValueError(f"capture_seconds must be finite and > 0, got {capture_seconds}")
+        self.quest.start()
+        print("[calibrate-ee-offset] waiting for Quest data ...")
+        self.quest.wait_for_data()
+        print("[calibrate-ee-offset] Hold BOTH controllers in your NEUTRAL grip (the pose you\n"
+              "  want to read as gripper x:down,y:left,z:forward), face the robot's forward,\n"
+              f"  and hold the right grip trigger >= {self.hold_seconds:g}s to capture.")
+        try:
+            # 1) wait for a trigger-hold with the headset + both controllers tracked.
+            while True:
+                transforms = self.quest.get_latest_transformation()
+                if transforms is None:
+                    time.sleep(1.0 / self.rate)
+                    continue
+                if self._trigger_held(transforms):
+                    if not (_is_valid_pose(transforms["head"])
+                            and _is_tracked(transforms["left_wrist"], INVALID_LEFT_POSE)
+                            and _is_tracked(transforms["right_wrist"], INVALID_RIGHT_POSE)):
+                        print("[calibrate-ee-offset] headset + both controllers must be tracked "
+                              "-- hold them in view and retry.")
+                        continue
+                    break
+            # 2) average the orientations over the capture window.
+            heads, lefts, rights = [], [], []
+            t_end = time.perf_counter() + capture_seconds
+            while time.perf_counter() < t_end:
+                transforms = self.quest.get_latest_transformation()
+                if transforms is None:
+                    time.sleep(1.0 / self.rate)
+                    continue
+                head = transforms["head"]
+                vr_l, vr_r = transforms["left_wrist"], transforms["right_wrist"]
+                if (_is_valid_pose(head)
+                        and _is_tracked(vr_l, INVALID_LEFT_POSE)
+                        and _is_tracked(vr_r, INVALID_RIGHT_POSE)):
+                    heads.append(np.asarray(head, dtype=float))
+                    lefts.append(np.asarray(vr_l, dtype=float)[:3, :3])
+                    rights.append(np.asarray(vr_r, dtype=float)[:3, :3])
+                time.sleep(1.0 / self.rate)
+            if len(lefts) < 3:
+                raise RuntimeError(
+                    f"captured only {len(lefts)} tracked frames; hold steadier/longer and retry."
+                )
+        finally:
+            self.quest.close()
+
+        # 3) gravity-aligned yaw from the averaged headset; mean controller orientations.
+        head_avg = np.eye(4)
+        head_avg[:3, :3] = _mean_rotation([h[:3, :3] for h in heads])
+        head_avg[:3, 3] = np.mean([h[:3, 3] for h in heads], axis=0)
+        rot_yaw = _gravity_aligned_calibration(self.T_base_head, head_avg)[:3, :3]
+        vr_ref_l, vr_ref_r = _mean_rotation(lefts), _mean_rotation(rights)
+
+        # 4) C maps the neutral grip to nominal: R_yaw @ vr_ref @ C == nom_R.
+        c_left = _project_so3((rot_yaw @ vr_ref_l).T @ self._nominal_left[:3, :3])
+        c_right = _project_so3((rot_yaw @ vr_ref_r).T @ self._nominal_right[:3, :3])
+
+        # 5) report jitter (grip steadiness), offset magnitude, and the residual + resulting
+        #    gripper axes for the neutral grip (should land exactly on the nominal frame).
+        def _jitter(ref, mats):
+            return np.rad2deg(
+                (Rotation.from_matrix(ref).inv() * Rotation.from_matrix(np.stack(mats))).magnitude()
+            )
+
+        def _resid(ref, offset, nom):
+            got = rot_yaw @ ref @ offset
+            ang = np.rad2deg(
+                (Rotation.from_matrix(nom).inv() * Rotation.from_matrix(got)).magnitude()
+            )
+            return got, float(ang)
+
+        jit_l, jit_r = _jitter(vr_ref_l, lefts), _jitter(vr_ref_r, rights)
+        got_l, res_l = _resid(vr_ref_l, c_left, self._nominal_left[:3, :3])
+        got_r, res_r = _resid(vr_ref_r, c_right, self._nominal_right[:3, :3])
+        off_l = np.rad2deg(Rotation.from_matrix(c_left).magnitude())
+        off_r = np.rad2deg(Rotation.from_matrix(c_right).magnitude())
+        print(f"\n[calibrate-ee-offset] captured {len(lefts)} frames over {capture_seconds:g}s")
+        print(f"  grip jitter (max):   L={jit_l.max():5.2f} deg  R={jit_r.max():5.2f} deg "
+              "(re-do if large -- hold steadier)")
+        print(f"  offset magnitude:    L={off_l:5.1f} deg  R={off_r:5.1f} deg "
+              "(controller<->gripper convention gap)")
+        print(f"  neutral grip -> L gripper frame: {_describe_axes(got_l)} "
+              f"(residual {res_l:.2f} deg)")
+        print(f"  neutral grip -> R gripper frame: {_describe_axes(got_r)} "
+              f"(residual {res_r:.2f} deg)")
+        if max(res_l, res_r) > 1.0:
+            print("  WARNING: residual > 1 deg -- C did not land on nominal; check inputs.")
+
+        # 6) persist (version-controlled) so every later run auto-loads the same convention.
+        _save_ee_offsets(out_file, c_left, c_right)
+        print(f"[calibrate-ee-offset] wrote {out_file}. Re-run the leader (it auto-loads this "
+              "file) to teleop with the gripper in the x:down,y:left,z:forward convention.")
+        return c_left, c_right
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -421,16 +762,43 @@ def main() -> None:
     parser.add_argument("--urdf", default=None, help="override the Vega URDF path.")
     parser.add_argument("--hold-seconds", type=float, default=1.0,
                         help="right-grip hold time to calibrate/start (default 1.0).")
+    parser.add_argument("--mapping", choices=("relative", "absolute"), default="relative",
+                        help="EEF target mapping at calibration. 'relative' (default) tracks "
+                             "controller POSITION incrementally from the robot's nominal EE "
+                             "position (teleop engages with NO arm lunge) while ORIENTATION "
+                             "tracks the controller absolutely (so big wrist rotations stay out "
+                             "of the arm's joint limits). 'absolute' maps the controller's "
+                             "absolute pose through the room calibration, snapping the EEFs to "
+                             "wherever your hands are at calibration -- the original behavior.")
     parser.add_argument("--stick-max-vx", type=float, default=0.3)
     parser.add_argument("--stick-max-vy", type=float, default=0.2)
     parser.add_argument("--stick-max-wz", type=float, default=0.5)
-    parser.add_argument("--stick-deadzone", type=float, default=0.1)
+    parser.add_argument("--stick-deadzone", type=float, default=0.1,
+                        help="per-axis thumbstick deadzone applied independently before "
+                             "publishing chassis_vx, chassis_vy, and chassis_wz "
+                             "(default 0.1).")
+    parser.add_argument("--ee-offset-file", default=DEFAULT_EE_OFFSET_FILE,
+                        help="YAML of per-side controller->gripper orientation offsets (scipy "
+                             "[x,y,z,w] quats). Auto-loaded at startup; missing -> identity (raw "
+                             "controller convention). Written by --calibrate-ee-offset. "
+                             f"Default: {DEFAULT_EE_OFFSET_FILE}.")
+    parser.add_argument("--calibrate-ee-offset", action="store_true",
+                        help="One-time helper: hold both controllers in your neutral grip and "
+                             "hold the right grip trigger to capture the offset C that maps the "
+                             "neutral grip to the gripper's nominal x:down,y:left,z:forward frame, "
+                             "write it to --ee-offset-file, and exit (does not stream targets).")
+    parser.add_argument("--ee-capture-seconds", type=float, default=1.5,
+                        help="averaging window for --calibrate-ee-offset (default 1.5).")
     args = parser.parse_args()
 
     if args.rate <= 0:
         raise ValueError(f"--rate must be > 0, got {args.rate}")
 
-    WBCVRLeader(args).run()
+    leader = WBCVRLeader(args)
+    if args.calibrate_ee_offset:
+        leader.calibrate_ee_offset(args.ee_capture_seconds, args.ee_offset_file)
+    else:
+        leader.run()
 
 
 if __name__ == "__main__":
