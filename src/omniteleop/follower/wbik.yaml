@@ -241,7 +241,7 @@ vr_teleop:
   # follower's separate OPEN-loop deadband stays script-local.
   base_deadband: 0.04
   # Base-twist slew limit (m/s^2; angular = 2x), applied by base_closed_loop.shape_twist.
-  base_accel: 2.0
+  base_accel: 0.4
   # Per-axis base-twist post-deadband (linear m/s, angular rad/s) applied AFTER
   # deadband/clamp/slew, using the pre-slew raw command as the activity reference. Its job
   # is now only the post-slew tail-cut at start/stop/axis-switch (clean stops): cross-axis
