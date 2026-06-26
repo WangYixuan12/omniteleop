@@ -566,6 +566,9 @@ def main() -> None:
     # BaseVelocityController's internal _prev). Reset to zero on hold/e-stop so the next
     # command ramps from rest.
     prev_cmd = np.zeros(3)
+    # Active base axis for the post-PD single-axis projection (mirrors the WBC's own latch):
+    # reset to None on hold so the wheel command re-picks the dominant axis from rest.
+    base_axis = None
     if hasattr(source, "start"):
         source.start()
     t0 = time.perf_counter()
@@ -722,6 +725,7 @@ def main() -> None:
             if hold_base:
                 shaped_twist = np.zeros(3)
                 prev_cmd = np.zeros(3)
+                base_axis = None
             else:
                 if closed_loop:
                     raw_twist, pd_err = base_cl.pd_twist(
@@ -731,8 +735,21 @@ def main() -> None:
                     )
                 else:
                     raw_twist = np.asarray(result.base_twist, dtype=np.float64)
-                # Snapshot the PD/FF twist before shaping and final post-deadbanding.
+                # Snapshot the PD/FF twist before shaping and the single-axis mask.
                 pd_twist_out = np.asarray(raw_twist, dtype=np.float64).copy()
+                # Shape (deadband -> velocity clamp -> slew) the FULL multi-axis command and
+                # keep that multi-axis result as the slew anchor (prev_cmd), so EVERY axis
+                # stays "warm" across ticks. Mask to the single dominant axis LAST (below).
+                # Order matters: if the single-axis projection ran FIRST, it would feed
+                # shape_twist a signal that drops to zero on every momentary axis switch (the
+                # QP/PD resolves leader noise into a brief off-axis win or a quiet tick ~20% of
+                # the time), the post-deadband would then hard-zero the dominant axis, and the
+                # slew limiter would have to re-ramp it from zero -- throttling the chassis
+                # ~36-43% below the commanded speed. The base then never reaches the commanded
+                # velocity and the arms (riding the lagging base) fall behind the targets.
+                # Shaping the multi-axis command first keeps the dominant axis at its full
+                # slewed magnitude; the slew also low-passes the axis selection, so brief
+                # off-axis spikes no longer win the projection.
                 shaped_twist = base_cl.shape_twist(
                     raw_twist, prev_cmd, dt,
                     deadband_lin=base_deadband, deadband_ang=base_deadband_ang,
@@ -745,7 +762,18 @@ def main() -> None:
                     linear_deadband=args.base_post_linear_deadband,
                     angular_deadband=args.base_post_angular_deadband,
                 )
-                prev_cmd = shaped_twist
+                prev_cmd = shaped_twist  # slew anchor stays multi-axis (every axis warm)
+                # Mask the shaped command to ONE pure chassis motion (the SAME selector the WBC
+                # applies to its solve output) so the kept axis carries its full slewed
+                # magnitude. Open loop: the WBC twist is already single-axis, so ~idempotent.
+                if cfg.enable_base_single_axis:
+                    shaped_twist, base_axis = base_cl.project_planar_twist_single_axis(
+                        shaped_twist,
+                        xy_max_vel=cfg.base_xy_max_vel, yaw_max_vel=cfg.base_yaw_max_vel,
+                        deadband=cfg.base_single_axis_deadband,
+                        hysteresis_ratio=cfg.base_single_axis_hysteresis_ratio,
+                        prev_axis=base_axis,
+                    )
             robot.chassis.set_velocity(
                 vx=float(shaped_twist[0]), vy=float(shaped_twist[1]),
                 wz=float(shaped_twist[2]), wait_time=0.0, sequential_steering=False,

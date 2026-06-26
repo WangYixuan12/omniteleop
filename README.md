@@ -33,6 +33,8 @@ pip install omniteleop
 python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending cmd in different curves
 ```
 
+
+
 ## Data collection
 
 1. sshfs [yixuan@128.59.19.217](mailto:yixuan@128.59.19.217):/home/yixuan/omniteleop /home/dexmate/yixuan/omniteleop_yifan
@@ -101,6 +103,8 @@ python /home/yixuan/omniteleop/scripts/rename_raw_data.py # revise train/val/tes
 python /home/yixuan/omniteleop/scripts/vis_teleop_curves.py --episode-id 0 # (Optional) (Need to save_debug in vr_reader)
 ```
 
+
+
 ## Policy
 
 See [Lerobot README](../lerobot_yifan/README.md).
@@ -128,11 +132,15 @@ python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixu
 # rerun, transmission latency plot under debug/
 ```
 
+
+
 ## Misc (/home/yixuan/omniteleop/scripts/misc)
 
 ```bash
 python /home/yixuan/omniteleop/scripts/misc/check_eef_pos.py # robot.right_arm.get_joint_pos() first, and the run this to calculate eef from joint 
 ```
+
+
 
 # WBC
 
@@ -158,16 +166,20 @@ python scripts/play_side_by_side_videos.py --video_1 /home/yixuan/Dexmate/wbc/wb
 ```
 
 ```bash
+python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py --calibrate-ee-offset
+
 python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py
 python scripts/wbc_vr_record.py --hdf5 /home/yixuan/Dexmate/wbc/real/test.hdf5 --physics --base-loop closed
 python scripts/wbc_vr_record.py --replay /home/yixuan/Dexmate/wbc/real/teleop_demo.hdf5 --speed 0.5 --output /home/yixuan/Dexmate/wbc/real/teleop_replay.mp4
 
 # on lambda machine
-python scripts/wbc_vr_robot.py --replay /home/yixuan/Dexmate/wbc/real/test_625.hdf5 --speed 0.5 --record
+(dexmate) python scripts/wbc_vr_robot.py --replay /home/yixuan/Dexmate/wbc/real/move_straight.hdf5 --speed 0.5 --record
  #   add --grippers to actuate grippers; --closed-loop-q once joint readback is confirmed
  # robot.chassis.set_steering_angle(0.0, wait_time=1.5)
 python scripts/diagnostics/visualize_head_lpf_and_base_chain.py /home/yixuan/Dexmate/wbc/real/test.hdf5 --out /home/yixuan/Dexmate/wbc/real/test.png
 ```
+
+
 
 # Debug
 

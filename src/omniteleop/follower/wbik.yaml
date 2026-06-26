@@ -28,7 +28,7 @@ lm_damping_base: 1.0e-6
 # leaves any steady twist unpenalized and resists only frame-to-frame reversals/jumps. It
 # exists because teleop EE targets carry inevitable leader-side noise that the redundant QP
 # would otherwise resolve into a laterally whipping base. Lower than base_position_cost.
-base_velocity_smoothing_cost: [1000.0, 1000.0, 1000.0]
+base_velocity_smoothing_cost: [0.0, 0.0, 0.0] # disabled
 
 # --- Posture regularization toward the nominal posture ------------------------------------
 # Per-group PostureTask cost: resolves redundancy by pulling joints toward
@@ -115,6 +115,23 @@ torso_top_x_anchor_gain: 100.0
 base_xy_max_vel: 1.0
 base_yaw_max_vel: 1.0
 velocity_limit_scale: 0.9
+
+# --- Single-axis base motion (one pure chassis motion per tick) ----------------------------
+# The QP resolves leader/EE-target noise into small simultaneous vx/vy/wz, so a "drive
+# straight" leans sideways, an in-place turn wanders, and a meant-to-be-still base creeps.
+# When enabled, solve() keeps only the single dominant base axis (vx XOR vy XOR wz) and
+# zeroes the other two -- and zeroes all three when the base is quiet -- so each chassis
+# command is a pure forward, strafe, or yaw motion. (Distinct from the vr_teleop: deadbands,
+# which shape the already-chosen command follower-side.)
+enable_base_single_axis: true
+# Quiet floor on the dominant axis, as a fraction of the base velocity cap: |vx|,|vy| /
+# base_xy_max_vel and |wz| / base_yaw_max_vel compare on this common scale; below it the base
+# is held still (all three zeroed). The solver's "is the base meant to move at all" gate.
+base_single_axis_deadband: 0.04
+# Relative hysteresis on the axis choice: retain the previously active axis unless a
+# different axis beats it by this fraction, so two near-equal axes don't chatter the chassis
+# between (say) forward and turn at 100 Hz. 0 disables (pure per-tick argmax).
+base_single_axis_hysteresis_ratio: 0.2
 
 solver: "daqp"
 damping: 1.0e-6
@@ -226,6 +243,10 @@ vr_teleop:
   # Base-twist slew limit (m/s^2; angular = 2x), applied by base_closed_loop.shape_twist.
   base_accel: 2.0
   # Per-axis base-twist post-deadband (linear m/s, angular rad/s) applied AFTER
-  # deadband/clamp/slew, using the pre-slew raw command as the activity reference.
-  base_post_linear_deadband: 0.18
+  # deadband/clamp/slew, using the pre-slew raw command as the activity reference. Its job
+  # is now only the post-slew tail-cut at start/stop/axis-switch (clean stops): cross-axis
+  # leakage is owned upstream by the WBC single-axis projection (enable_base_single_axis), so
+  # the linear band no longer needs the large 0.18 that chopped slow single-axis drives (it
+  # zeroed legit forward/strafe commands on 35-150 ticks/take); back to the nominal quiet band.
+  base_post_linear_deadband: 0.04
   base_post_angular_deadband: 0.08

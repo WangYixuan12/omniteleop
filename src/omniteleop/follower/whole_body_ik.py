@@ -50,6 +50,7 @@ except ImportError:  # pragma: no cover - compatibility with older Pinocchio sta
     import hppfcl as _coal
 
 from omniteleop.follower import wbc_safety
+from omniteleop.follower.base_closed_loop import project_planar_twist_single_axis
 from omniteleop.follower.wbc_safety import SafetyGate, collision_group
 
 # --- Canonical config (single source of truth) ---------------------------------
@@ -230,6 +231,25 @@ class WBCConfig:
     base_velocity_smoothing_cost: Sequence[float] = tuple(
         _DEFAULTS["base_velocity_smoothing_cost"]
     )
+
+    # Single-axis base motion (one pure chassis motion per tick). The QP resolves
+    # leader/EE-target noise into small simultaneous vx/vy/wz, so a "drive straight" leans
+    # sideways, an in-place turn wanders, and a meant-to-be-still base creeps. When enabled,
+    # solve() keeps only the single dominant base axis (vx XOR vy XOR wz) and zeroes the
+    # other two -- and zeroes all three when the base is quiet -- so each chassis command is
+    # a pure forward, strafe, or yaw motion (see _project_base_twist_single_axis). Off => the
+    # raw QP base twist passes through.
+    enable_base_single_axis: bool = _DEFAULTS["enable_base_single_axis"]
+    # Quiet floor on the dominant base axis, as a fraction of the base velocity cap
+    # (|vx|,|vy| / base_xy_max_vel and |wz| / base_yaw_max_vel compare on this common scale):
+    # below it the chassis is held still (all three axes zeroed). This is the solver's "is the
+    # base meant to move at all" gate, distinct from the follower-loop vr_teleop deadbands
+    # that shape the already-chosen command.
+    base_single_axis_deadband: float = _DEFAULTS["base_single_axis_deadband"]
+    # Relative hysteresis on the axis choice: the previously active axis is retained unless a
+    # different axis's normalized magnitude beats it by this fraction, so two near-equal axes
+    # do not chatter the chassis between (say) forward and turn at 100 Hz. 0 => per-tick argmax.
+    base_single_axis_hysteresis_ratio: float = _DEFAULTS["base_single_axis_hysteresis_ratio"]
 
     # Posture regularization toward the nominal configuration, weighted *per group* like
     # the reference (deps/rby1-wbc: nominal_posture_cost_torso/_arm/_head). Pink's
@@ -548,7 +568,17 @@ class VegaWholeBodyIK:
         if self.collision_sphere_model is not None:
             self._add_gripper_collision_spheres(self.model, self.collision_sphere_model)
 
-        # Cap mobile-base velocity (planar nv layout: 0=vx, 1=vy, 2=yaw-rate).
+        # Cap mobile-base velocity (planar nv layout: 0=vx, 1=vy, 2=yaw-rate). Validate the
+        # caps (and the headroom scale) here, before they enter both the QP VelocityLimit and
+        # the single-axis projector's per-axis normalization (which would otherwise divide by a
+        # zero/NaN cap).
+        for name, value in (
+            ("base_xy_max_vel", cfg.base_xy_max_vel),
+            ("base_yaw_max_vel", cfg.base_yaw_max_vel),
+            ("velocity_limit_scale", cfg.velocity_limit_scale),
+        ):
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0, got {value!r}")
         self.model.velocityLimit[0] = cfg.base_xy_max_vel
         self.model.velocityLimit[1] = cfg.base_xy_max_vel
         self.model.velocityLimit[2] = cfg.base_yaw_max_vel
@@ -703,6 +733,23 @@ class VegaWholeBodyIK:
                 f"(vx, vy, wz); got {cfg.base_velocity_smoothing_cost!r}"
             )
         self._prev_base_velocity = np.zeros(3)
+        # Single-axis base projection (see _project_base_twist_single_axis): the index
+        # (0=vx,1=vy,2=wz) of the currently active base axis, or None when the base is
+        # quiet; carried across solves for the axis-choice hysteresis (cleared at reset).
+        if not np.isfinite(cfg.base_single_axis_deadband) or cfg.base_single_axis_deadband < 0.0:
+            raise ValueError(
+                "base_single_axis_deadband must be finite and >= 0, got "
+                f"{cfg.base_single_axis_deadband!r}"
+            )
+        if (
+            not np.isfinite(cfg.base_single_axis_hysteresis_ratio)
+            or cfg.base_single_axis_hysteresis_ratio < 0.0
+        ):
+            raise ValueError(
+                "base_single_axis_hysteresis_ratio must be finite and >= 0, got "
+                f"{cfg.base_single_axis_hysteresis_ratio!r}"
+            )
+        self._base_single_axis_idx: Optional[int] = None
         # PostureTask covers actuated joints only (the planar root is excluded by Pink),
         # so base regularization lives in base_task above. The cost is a per-DOF vector so
         # the torso / arms / head can be weighted independently (like the reference).
@@ -838,6 +885,9 @@ class VegaWholeBodyIK:
         # Clear the base velocity-smoothing history: the first solve after an engage/reset
         # then smooths against a standstill (no lurch into the previous take's twist).
         self._prev_base_velocity = np.zeros(3)
+        # Clear the single-axis active-axis latch so the first post-reset solve picks the
+        # dominant axis fresh (no carried hysteresis from a previous take).
+        self._base_single_axis_idx = None
         # Anchor the tip-over box on the centroid proxy's over-base offset at the *config
         # nominal* posture -- NOT at q0 -- so resetting to a leaned pose cannot silently
         # re-center the safety box around an already-risky lean (the reference likewise
@@ -1069,6 +1119,13 @@ class VegaWholeBodyIK:
             velocity = np.zeros(self.model.nv)
             success = False
 
+        # Constrain the chassis to ONE pure motion (forward XOR strafe XOR turn), zeroing
+        # the non-dominant base axes BEFORE integration so the solver's own base pose and
+        # the emitted base twist agree with what is commanded. (No-op on the QP-failure
+        # path, where velocity is already all zero.)
+        if self.config.enable_base_single_axis:
+            velocity = self._project_base_twist_single_axis(velocity)
+
         self.configuration.integrate_inplace(velocity, dt)
 
         # Reactive self-collision gate (tip-over is enforced by the QP inequality
@@ -1239,6 +1296,42 @@ class VegaWholeBodyIK:
                 continue
             problem.P[k, k] += c2
             problem.q[k] += -c2 * float(v_prev[k]) * dt
+
+    def _project_base_twist_single_axis(self, velocity: np.ndarray) -> np.ndarray:
+        """Zero all but the dominant base axis so the chassis does ONE pure motion.
+
+        The QP resolves leader/EE-target noise into small *simultaneous* vx/vy/wz, so a
+        "drive straight" leans sideways, an in-place turn wanders, and a base meant to hold
+        still creeps (observed on real takes: a 0.95 m forward drive drifted 4 cm laterally;
+        an in-place spin translated ~0.7 m out-and-back). This keeps only the single dominant
+        base axis (vx XOR vy XOR wz) of ``velocity[:3]`` and zeroes the other two, so every
+        chassis command is a pure forward, strafe, or yaw motion. Returns a copy; the caller
+        applies it BEFORE ``integrate_inplace`` so the solver's own (open-loop) base pose, the
+        emitted ``base_twist``, and the next tick's base-velocity-smoothing reference all stay
+        consistent with what is actually commanded.
+
+        The active-axis selection (normalize by the base velocity caps, argmax, the quiet
+        ``base_single_axis_deadband`` floor, and the ``base_single_axis_hysteresis_ratio``
+        anti-chatter latch) is the shared
+        :func:`~omniteleop.follower.base_closed_loop.project_planar_twist_single_axis`, the
+        SAME routine the followers apply to the post-PD wheel command -- so the solver and the
+        chassis pick the active axis identically. ``_base_single_axis_idx`` carries that axis
+        across solves (cleared on reset / when quiet).
+
+        Scope: this constrains the WBC solve output (the ``base_twist`` IK feed-forward); the
+        followers additionally re-project the post-PD command, so the open- AND closed-loop
+        wheel commands are also single-axis.
+        """
+        out = velocity.copy()
+        out[:3], self._base_single_axis_idx = project_planar_twist_single_axis(
+            out[:3],
+            xy_max_vel=self.config.base_xy_max_vel,
+            yaw_max_vel=self.config.base_yaw_max_vel,
+            deadband=self.config.base_single_axis_deadband,
+            hysteresis_ratio=self.config.base_single_axis_hysteresis_ratio,
+            prev_axis=self._base_single_axis_idx,
+        )
+        return out
 
     def _centroid_over_base(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Horizontal offset of the tip-over centroid from the base, and its Jacobian.

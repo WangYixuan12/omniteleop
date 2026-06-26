@@ -22,15 +22,20 @@
                            the hands are at calibration -- the original behavior;
 4. each ``teleop`` frame also publishes the **calibrated headset pose**
 
-       head_ee_pose[:3, :3] = (robot_base_t_vr_base @ vr_headset)[:3, :3]
+       head_ee_pose[:3, :3] = R_yaw @ vr_headset[:3, :3] @ C_head
        head_ee_pose[:3,  3] = (robot_base_t_vr_base_eef @ vr_headset)[:3, 3]
 
-   -- the head-frame (zed_depth_frame) teleop target. Its orientation uses the full
-   head calibration, while its position uses the gravity-aligned room calibration so
-   horizontal headset motion stays horizontal even if the robot's nominal optical
-   frame is pitched down. The follower either tracks this pose as a WBC head task
-   (``head_mode: 'ik'``) or uses its orientation for dedicated pan/tilt head IK
-   (``head_mode: 'track'``).
+   -- the head-frame (zed_depth_frame) teleop target. BOTH orientation and position
+   use the gravity-aligned room calibration (``R_yaw = robot_base_t_vr_base_eef``):
+   position so horizontal headset motion stays horizontal even though the nominal
+   optical frame is pitched ~45 deg down, and orientation so an operator yaw about
+   gravity stays a pure camera yaw instead of sweeping a tilted-axis cone (a yaw-only
+   head turn otherwise leaks ~100 deg of pitch/roll -- the exact symptom the full-frame
+   calibration produced). ``C_head`` is a constant body offset captured at calibration
+   so the camera still starts at the nominal -45 deg down-look (head_ee_pose == nominal
+   head FK at the calibration instant); this mirrors the EEF ``R_yaw @ vr @ C`` map.
+   The follower either tracks this pose as a WBC head task (``head_mode: 'ik'``) or
+   uses its orientation for dedicated pan/tilt head IK (``head_mode: 'track'``).
 
 Commands are published at a low rate (``--rate``, default **10 Hz**); the follower
 lerp/slerp-interpolates each command over ``1/rate`` up to its 100 Hz IK ticks
@@ -41,11 +46,12 @@ deps/rby1-wbc split: 10 Hz ``trajectory_frequency_hz`` commands, 100 Hz
 This preserves the ``vr_reader`` controller convention (controller forward 10 cm ->
 target forward 10 cm in the calibrated base frame), with two deliberate changes:
 
-  **Gravity-aligned translational calibration.** The nominal ``zed_depth_frame`` is
-  pitched downward, so using the full head frame to calibrate target positions would
-  make a horizontal walk create a fake target-height change. EEF targets therefore
-  use headset yaw + translation only. The head target uses that same translation
-  calibration, while keeping the full head-frame orientation calibration.
+  **Gravity-aligned calibration.** The nominal ``zed_depth_frame`` is pitched
+  downward, so using the full head frame to calibrate targets would make a horizontal
+  walk create a fake target-height change AND make an operator yaw sweep a tilted-axis
+  cone (leaking pitch/roll into a yaw-only head turn). EEF and head targets therefore
+  use headset yaw + translation only; the head orientation adds a constant body offset
+  so it still starts at the nominal down-look (see step 4).
 
   **No legacy ``INIT_JOINT`` constants.** ``vr_reader`` anchors the calibration on
   ``FK(head_link)`` evaluated at ``omniteleop.common.vr_mode_const.INIT_*`` (the
@@ -341,7 +347,10 @@ class WBCVRLeader:
 
         # State
         self.stage = "static"  # "static" (estop) or "teleop"
-        self.robot_base_t_vr_base: Optional[np.ndarray] = None
+        # Constant headset->camera body offset C_head (3x3), captured at calibration so
+        # the gravity-aligned head orientation map starts at the nominal zed_depth_frame
+        # (-45 deg down-look). None until _calibrate. See _map_head_target.
+        self._head_ori_offset: Optional[np.ndarray] = None
         self.robot_base_t_vr_base_eef: Optional[np.ndarray] = None
         # Controller poses captured at calibration. Relative mapping references their
         # POSITION so the first streamed target sits at the nominal EE position (no lunge).
@@ -386,28 +395,48 @@ class WBCVRLeader:
         headset_pose = np.asarray(headset_pose, dtype=float)
         if headset_pose.shape != (4, 4):
             raise ValueError(f"headset pose has shape {headset_pose.shape}, expected (4, 4)")
-        self.robot_base_t_vr_base = self.T_base_head @ np.linalg.inv(headset_pose)
         self.robot_base_t_vr_base_eef = _gravity_aligned_calibration(
             self.T_base_head, headset_pose
         )
+        # Head orientation rides the SAME gravity-aligned yaw R_yaw as the position/EEF
+        # map (so operator yaw about gravity stays a pure camera yaw -- no tilted-axis
+        # cone), plus a constant body offset C_head that re-labels the calibration
+        # headset orientation onto the nominal zed_depth_frame. Then
+        #   head_R = R_yaw @ vr_head_R @ C_head,
+        # and at calibration R_yaw @ vr_calib_R @ C_head == T_base_head (the camera
+        # starts at the nominal -45 deg down-look). Mirrors the EEF C-offset structure.
+        r_yaw = self.robot_base_t_vr_base_eef[:3, :3]
+        self._head_ori_offset = (r_yaw @ headset_pose[:3, :3]).T @ self.T_base_head[:3, :3]
 
     def _map_head_target(self, vr_head: np.ndarray) -> np.ndarray:
         """Calibrated head target: the headset pose mapped into the robot base frame.
 
-        Orientation uses the full head calibration. Translation uses the
-        gravity-aligned transform, because in WBC ``head_mode: "ik"`` this
-        translation is a real whole-body target; mapping it through the downward
-        pitched optical frame would turn horizontal headset motion into a height
-        command. At the calibration instant the mixed pose still equals the nominal
-        head pose by construction.
+        Both orientation and position ride the gravity-aligned room calibration
+        ``robot_base_t_vr_base_eef`` (yaw + translation), so neither couples gravity
+        into the wrong axis:
+
+          * POSITION: ``head_mode: "ik"`` makes this translation a real whole-body
+            target; mapping it through the downward-pitched optical frame would turn a
+            horizontal headset move into a height command.
+          * ORIENTATION: ``head_R = R_yaw @ vr_head_R @ C_head``. Because ``R_yaw`` is a
+            pure gravity yaw, an operator yaw about gravity stays a pure CAMERA yaw. The
+            earlier full-frame map (``robot_base_t_vr_base @ vr_head``) instead rotated
+            the camera about the optical frame's ~45-deg-down axis, so a yaw-only head
+            turn swept a cone and leaked ~100 deg of pitch/roll. ``C_head`` (captured in
+            _calibrate) is constant, so it preserves that no-coupling property while
+            re-anchoring the start at the nominal down-look.
+
+        At the calibration instant the pose equals the nominal head FK by construction.
         """
-        assert self.robot_base_t_vr_base is not None
+        assert self._head_ori_offset is not None
         assert self.robot_base_t_vr_base_eef is not None
         vr_head = np.asarray(vr_head, dtype=float)
         if vr_head.shape != (4, 4):
             raise ValueError(f"headset pose has shape {vr_head.shape}, expected (4, 4)")
-        out = self.robot_base_t_vr_base @ vr_head
-        out[:3, 3] = (self.robot_base_t_vr_base_eef @ vr_head)[:3, 3]
+        r_yaw = self.robot_base_t_vr_base_eef
+        out = np.eye(4)
+        out[:3, :3] = r_yaw[:3, :3] @ vr_head[:3, :3] @ self._head_ori_offset
+        out[:3, 3] = (r_yaw @ vr_head)[:3, 3]
         return out
 
     def _capture_eef_anchors(self, vr_left: np.ndarray, vr_right: np.ndarray) -> None:

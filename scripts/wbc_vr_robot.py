@@ -374,7 +374,11 @@ class HardwareDriver:
         self._episode: Optional[EpisodeRecorder] = None
         self.has_torso = False
         self.has_chassis = False
-        self._prev_base_cmd = np.zeros(3)
+        self._prev_base_cmd = np.zeros(3)        # post-projection: twist actually sent
+        self._prev_base_shaped = np.zeros(3)     # pre-projection multi-axis slew anchor
+        # Active base axis for the post-PD single-axis projection (parity with the WBC's
+        # latch); reset to None on hold/engage so the wheel command re-picks from rest.
+        self._base_axis: Optional[int] = None
         self._prev_cmd: dict = {grp: None for grp in self._joint_names}
         self._overstep_ticks = 0
         # Per-tick /debug scratch: measured_q / actuate / _drive_base stash their
@@ -408,6 +412,7 @@ class HardwareDriver:
                 self.robot = Robot(configs=configs)
             else:
                 self.robot = Robot()
+            self._check_startup_component_health()
             nq = ik.nominal_q()
             self._nominal = {
                 grp: np.array([nq[ik._idx_q[n]] for n in names])  # noqa: SLF001
@@ -445,6 +450,48 @@ class HardwareDriver:
         future URDF re-introduces a mismatch.
         """
         return np.asarray(joints, dtype=float)
+
+    def _check_startup_component_health(self) -> None:
+        """Fail before motion if dexcontrol reports unhealthy components."""
+        from dexcomm.codecs import ConnectionStatusEnum, OperationalStatusEnum  # noqa: PLC0415
+
+        status = self.robot.get_component_status(show=False)
+        states = status.get("states", {})
+        if not states:
+            raise SystemExit("[wbc_vr_robot] startup health check failed: no component status.")
+
+        requested = set()
+        if self.enable["arms"]:
+            requested.update(("left_arm", "right_arm"))
+        if self.enable["head"]:
+            requested.add("head")
+        if self.enable["torso"]:
+            requested.add("torso")
+        if self.enable["base"]:
+            requested.update(("chassis_drive", "chassis_steer"))
+
+        bad = []
+        for name, state in sorted(states.items()):
+            connected = state.get("connection") == ConnectionStatusEnum.CONNECTED
+            operation = state.get("operation")
+            error_info = state.get("error", {}) or {}
+            error_msg = error_info.get("error_message", "")
+
+            if not connected:
+                bad.append(f"{name}: disconnected")
+            if operation == OperationalStatusEnum.ERROR or error_msg:
+                bad.append(f"{name}: {error_msg or 'operation ERROR'}")
+            if name in requested and operation == OperationalStatusEnum.DISABLED:
+                bad.append(f"{name}: disabled but requested by --enable")
+            if name in requested and operation == OperationalStatusEnum.CALIBRATING:
+                bad.append(f"{name}: calibrating but requested by --enable")
+
+        if bad:
+            raise SystemExit(
+                "[wbc_vr_robot] startup health check FAILED; aborting before motion:\n  - "
+                + "\n  - ".join(bad)
+            )
+        print("[wbc_vr_robot] startup health check OK: all reported components healthy.")
 
     def _wait_chassis(self, timeout: float = 10.0) -> None:
         t0 = time.perf_counter()
@@ -531,6 +578,8 @@ class HardwareDriver:
         if self._odom is not None:
             self._odom.reset_origin()
         self._prev_base_cmd = np.zeros(3)
+        self._prev_base_shaped = np.zeros(3)
+        self._base_axis = None
         for grp in self._prev_cmd:
             self._prev_cmd[grp] = None
         # Begin the episode on the FIRST engage; a re-engage (live, after an e-stop)
@@ -559,17 +608,18 @@ class HardwareDriver:
 
         Returns None (open-loop) unless ``--closed-loop-q`` is set; also falls back to
         open-loop for any tick whose joint readback has an unexpected shape, so a bad
-        sample can never inject a malformed seed. Open-loop does NOT read the joints here
-        (that readback would sit in the pre-solve critical path and perturb the very
-        timing the open-loop run is the baseline for); debug_row() reads them after
-        actuation instead.
+        sample can never inject a malformed seed. By default this overlays measured
+        body joints only and leaves the solver's planar root on its internally
+        integrated reference; odometry remains feedback for the base PD. Open-loop does
+        NOT read the joints here (that readback would sit in the pre-solve critical path
+        and perturb the very timing the open-loop run is the baseline for); debug_row()
+        reads them after actuation instead.
         """
         if not self.args.closed_loop_q:
             self._dbg["meas_joints"] = None        # debug_row reads post-actuation
             self._dbg["seed_q"] = None
             self._dbg["closed_loop_active"] = False
             return None
-        from omniteleop.wbc_robot_util import set_base_in_q  # noqa: PLC0415
 
         meas = self._read_measured_joints()
         self._dbg["meas_joints"] = meas
@@ -581,8 +631,6 @@ class HardwareDriver:
         for grp, names in self._joint_names.items():
             for name, val in zip(names, meas[grp], strict=True):
                 q[ik._idx_q[name]] = float(val)  # noqa: SLF001
-        if self._odom is not None:
-            q = set_base_in_q(q, self._odom.pose)
         self._dbg["seed_q"] = q.copy()
         self._dbg["closed_loop_active"] = True
         return q
@@ -663,6 +711,8 @@ class HardwareDriver:
             chassis.set_velocity(vx=0.0, vy=0.0, wz=0.0, wait_time=0.0,
                                  sequential_steering=False)
             self._prev_base_cmd = np.zeros(3)
+            self._prev_base_shaped = np.zeros(3)
+            self._base_axis = None
             self._dbg["base_pd_raw"] = None
             self._dbg["base_pd_err"] = None
             self._dbg["base_cmd"] = np.zeros(3)
@@ -675,8 +725,20 @@ class HardwareDriver:
             kp_xy=self.args.base_kp_xy, kp_yaw=self.args.base_kp_yaw,
             max_lin_speed=max_lin, max_ang_speed=max_ang,
         )
+        pd_raw = np.asarray(raw, dtype=float).copy()  # pre-shaping PD/FF output (debug)
+        # Shape (deadband -> clamp -> slew) the FULL multi-axis command and keep that
+        # multi-axis result as the slew anchor (_prev_base_shaped), so EVERY axis stays
+        # "warm"; mask to the single dominant axis LAST. Order matters: if the single-axis
+        # projection ran FIRST, it would feed shape_twist a signal that drops to zero on every
+        # momentary axis switch (the QP/PD resolves leader noise into a brief off-axis win or a
+        # quiet tick ~20% of the time), the post-deadband would then hard-zero the dominant
+        # axis, and the slew limiter would re-ramp it from zero -- throttling the wheel command
+        # ~36-43% below the commanded speed, so the base lags and the arms fall behind the
+        # targets. Shaping first keeps the dominant axis at full slewed magnitude and low-passes
+        # the axis selection (far fewer spurious switches), while the chassis still receives a
+        # pure single-axis command. (See base_closed_loop.project_planar_twist_single_axis.)
         cmd = base_cl.shape_twist(
-            raw, self._prev_base_cmd, dt,
+            raw, self._prev_base_shaped, dt,
             deadband_lin=self.args.base_deadband, deadband_ang=2.0 * self.args.base_deadband,
             max_lin_speed=max_lin, max_ang_speed=max_ang,
             max_lin_accel=self.args.base_accel, max_ang_accel=2.0 * self.args.base_accel,
@@ -687,10 +749,19 @@ class HardwareDriver:
             linear_deadband=self.args.base_post_linear_deadband,
             angular_deadband=self.args.base_post_angular_deadband,
         )
-        self._prev_base_cmd = cmd
+        self._prev_base_shaped = cmd  # slew anchor stays multi-axis (every axis warm)
+        if self.cfg.enable_base_single_axis:
+            cmd, self._base_axis = base_cl.project_planar_twist_single_axis(
+                cmd,
+                xy_max_vel=self.cfg.base_xy_max_vel, yaw_max_vel=self.cfg.base_yaw_max_vel,
+                deadband=self.cfg.base_single_axis_deadband,
+                hysteresis_ratio=self.cfg.base_single_axis_hysteresis_ratio,
+                prev_axis=self._base_axis,
+            )
+        self._prev_base_cmd = cmd  # post-projection: the twist actually sent to the chassis
         chassis.set_velocity(vx=float(cmd[0]), vy=float(cmd[1]), wz=float(cmd[2]),
                              wait_time=0.0, sequential_steering=False)
-        self._dbg["base_pd_raw"] = np.asarray(raw, dtype=float)
+        self._dbg["base_pd_raw"] = pd_raw
         self._dbg["base_pd_err"] = np.asarray(err, dtype=float)
         self._dbg["base_cmd"] = np.asarray(cmd, dtype=float)
 
@@ -1214,10 +1285,11 @@ def main() -> None:
 
     hw = parser.add_argument_group("hardware")
     hw.add_argument("--closed-loop-q", action="store_true",
-                    help="seed the IK from the MEASURED robot config each tick "
-                         "(solve(current_q=)). Default OFF (open-loop), matching the SAPIEN "
-                         "replay path and avoiding joint-readback convention bugs; enable "
-                         "once readback conventions are confirmed.")
+                    help="seed the IK body joints from the MEASURED robot config each tick "
+                         "(solve(current_q=)), while keeping the solver's internally "
+                         "integrated base root. Default OFF (open-loop), matching the "
+                         "SAPIEN replay path and avoiding joint-readback convention bugs; "
+                         "enable once readback conventions are confirmed.")
     hw.add_argument("--home-tol", type=float, default=DEFAULT_HOME_TOL,
                     help=f"max measured-vs-nominal joint error (rad) to pass the homing gate "
                          f"(default {DEFAULT_HOME_TOL:g}). Tolerates position-control "
