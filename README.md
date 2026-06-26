@@ -175,8 +175,13 @@ python scripts/wbc_vr_record.py --replay /home/yixuan/Dexmate/wbc/real/teleop_de
 # on lambda machine
 (dexmate) python scripts/wbc_vr_robot.py --replay /home/yixuan/Dexmate/wbc/real/move_straight.hdf5 --speed 0.5 --record
 # base always has PD control from odom 
- #   add --grippers to actuate grippers; --closed-loop-q once joint readback is confirmed
- # robot.chassis.set_steering_angle(0.0, wait_time=1.5)
+# --closed-loop-q once joint readback is confirmed
+
+robot.chassis.set_steering_angle(0.0, wait_time=1.5)
+
+(dexmate) python scripts/wbc_vr_robot.py --record
+# add --grippers to actuate grippers
+
 python scripts/diagnostics/visualize_head_lpf_and_base_chain.py /home/yixuan/Dexmate/wbc/real/test.hdf5 --out /home/yixuan/Dexmate/wbc/real/test.png
 ```
 

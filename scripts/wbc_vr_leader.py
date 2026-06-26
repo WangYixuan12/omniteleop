@@ -79,9 +79,8 @@ Run in the dexmate conda env (has pinocchio + pink + dexcomm + aiohttp/socketio)
 Controls (mirrors ``vr_reader``):
   * **hold right grip trigger >= 1 s** in ``static`` -> capture calibration and
     begin streaming targets (``teleop``);
-  * right front/index trigger in ``teleop`` -> recording start gate;
-  * **left X button** -> publish an exit request and stop the take;
   * index triggers -> ``left_gripper`` / ``right_gripper`` [0, 1];
+  * **left X button** -> publish an exit request and stop the take;
   * left thumbstick -> ``chassis_vx`` / ``chassis_vy``; right thumbstick x ->
     ``chassis_wz`` (published, but unused by ``wbc_vr_record``).
 """

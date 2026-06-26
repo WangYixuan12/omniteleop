@@ -26,12 +26,14 @@ Both real-robot modes always write a per-tick ``/debug`` HDF5 (auto-named
 raw/err, shaped command), the closed-loop seed, and per-group joint command/sent/measured
 -- enough to diff a ``--closed-loop-q`` run against an open-loop one.
 
-``--record`` saves an episode while engaged, in the same ``EpisodeRecorder`` schema as
-``leader/vr_reader.py`` (so takes are interchangeable): ``action``/``obs`` joints plus
-``head_left_rgb``/``head_depth`` (+ ``intrinsic``/``extrinsic``). It adds ``torso`` to
-``action/joint`` (the WBC commands the torso) and uses the shaped base twist for the
-``chassis_*`` action. Grippers and the wrist camera are NOT recorded (not installed) --
-that code is kept in comments to restore once the hardware is mounted.
+``--record`` starts automatically on the first engage after VR calibration, matching
+``scripts/wbc_vr_record.py``'s post-calibration recording gate. It saves an episode in
+the same ``EpisodeRecorder`` schema as ``leader/vr_reader.py`` (so takes are
+interchangeable): ``action``/``obs`` joints plus ``head_left_rgb``/``head_depth`` (+
+``intrinsic``/``extrinsic``). It adds ``torso`` to ``action/joint`` (the WBC commands
+the torso) and uses the shaped base twist for the ``chassis_*`` action. Grippers and
+the wrist camera are NOT recorded (not installed) -- that code is kept in comments to
+restore once the hardware is mounted.
 
 Run in the dexmate conda env (pinocchio + pink + dexcomm + dexcontrol)::
 
@@ -70,7 +72,7 @@ from omniteleop.wbc_record import (
     DEFAULT_REPLAY_GAP_LIMIT_MULTIPLE,
     ReplaySource,
 )
-from omniteleop.wbc_robot_util import parse_enable_mask
+from omniteleop.wbc_robot_util import base_quiet_dispatch, parse_enable_mask
 from omniteleop.wbc_stream import (
     HeadTargetLowPassFilter,
     HeadTargetPlanarDeadbandFilter,
@@ -125,6 +127,9 @@ ARM_HOME_STEP = 0.005 # arm interpolation step when homing straight to nominal
 # immediate readback catches the arm mid-flight (the variable residual). This drains it.
 DEFAULT_HOME_SETTLE = 3.0
 DEFAULT_BASE_MAX_SPEED = 0.30   # m/s base velocity clamp (low for first bring-up; ang = 2x)
+# hold the current swerve steering if zero base command < quiet_hold_s seconds, then re-centering the wheels to 0deg. 
+# (set_velocity(0,0,0) -> steering 0)
+DEFAULT_BASE_QUIET_HOLD_S = 1
 _JOINT_STEP_ABORT_TICKS = 25    # consecutive ticks demanding > 2x clamp -> abort
 
 
@@ -176,7 +181,7 @@ class _TrajLog:
         "sent_torso", "sent_left_arm", "sent_right_arm", "sent_head",
         "meas_torso", "meas_left_arm", "meas_right_arm", "meas_head",
     )
-    _STR_KEYS = (("safety_status", 96), ("hold_reason", 32))
+    _STR_KEYS = (("safety_status", 96), ("hold_reason", 32), ("base_action", 12))
 
     def write(self) -> None:
         """Write the collected ticks under a ``/debug`` group (if a path is set).
@@ -379,6 +384,9 @@ class HardwareDriver:
         # Active base axis for the post-PD single-axis projection (parity with the WBC's
         # latch); reset to None on hold/engage so the wheel command re-picks from rest.
         self._base_axis: Optional[int] = None
+        # Seconds the base command has been continuously quiet (zero): gates the
+        # steering-hold-vs-recenter decision (base_quiet_dispatch). Reset on engage/hold.
+        self._base_quiet_elapsed = 0.0
         self._prev_cmd: dict = {grp: None for grp in self._joint_names}
         self._overstep_ticks = 0
         # Per-tick /debug scratch: measured_q / actuate / _drive_base stash their
@@ -450,6 +458,70 @@ class HardwareDriver:
         future URDF re-introduces a mismatch.
         """
         return np.asarray(joints, dtype=float)
+
+    def stop_all_motion(self) -> None:
+        """Immediately stop/hold every actuator this follower may have moved.
+
+        This is the left-X / teardown stop path. It runs before recorder flushing or
+        resource shutdown so a "stop the take" request cannot leave a previous 100 Hz
+        position target in flight while HDF5 saving begins. The base/head/torso expose
+        direct ``stop()`` methods; the arms do not, so cancel their previous position
+        target by commanding the currently measured joint position.
+        """
+        robot = getattr(self, "robot", None)
+        if robot is None:
+            return
+
+        errors: list[str] = []
+
+        def _try(label: str, fn) -> None:
+            try:
+                fn()
+            except Exception as exc:
+                errors.append(f"{label}: {exc!r}")
+
+        chassis = getattr(robot, "chassis", None)
+        if getattr(self, "has_chassis", False) and chassis is not None and hasattr(chassis, "stop"):
+            _try("chassis.stop", chassis.stop)
+
+        for name in ("torso", "head"):
+            comp = getattr(robot, name, None)
+            if comp is not None and hasattr(comp, "stop"):
+                _try(f"{name}.stop", comp.stop)
+
+        for name in ("left_arm", "right_arm"):
+            comp = getattr(robot, name, None)
+            if comp is None:
+                continue
+
+            def _hold_current(comp=comp) -> None:
+                q = np.asarray(comp.get_joint_pos(), dtype=float)
+                if q.ndim != 1 or not np.all(np.isfinite(q)):
+                    raise ValueError(f"bad measured joint position shape/value: {q}")
+                comp.set_joint_pos(q.tolist(), wait_time=0.0)
+
+            _try(f"{name}.hold_current", _hold_current)
+
+        for name in ("left_hand", "right_hand", "left_gripper", "right_gripper"):
+            comp = getattr(robot, name, None)
+            if comp is not None and hasattr(comp, "stop"):
+                _try(f"{name}.stop", comp.stop)
+
+        if hasattr(self, "_prev_cmd"):
+            for grp in self._prev_cmd:
+                self._prev_cmd[grp] = None
+        if hasattr(self, "_prev_base_cmd"):
+            self._prev_base_cmd = np.zeros(3)
+        if hasattr(self, "_prev_base_shaped"):
+            self._prev_base_shaped = np.zeros(3)
+        if hasattr(self, "_base_axis"):
+            self._base_axis = None
+        if hasattr(self, "_base_quiet_elapsed"):
+            self._base_quiet_elapsed = 0.0
+
+        if errors:
+            print("\n[wbc_vr_robot] WARNING: stop_all_motion partial failures: "
+                  + "; ".join(errors))
 
     def _check_startup_component_health(self) -> None:
         """Fail before motion if dexcontrol reports unhealthy components."""
@@ -580,6 +652,7 @@ class HardwareDriver:
         self._prev_base_cmd = np.zeros(3)
         self._prev_base_shaped = np.zeros(3)
         self._base_axis = None
+        self._base_quiet_elapsed = 0.0
         for grp in self._prev_cmd:
             self._prev_cmd[grp] = None
         # Begin the episode on the FIRST engage; a re-engage (live, after an e-stop)
@@ -701,6 +774,7 @@ class HardwareDriver:
             self._dbg["base_pd_raw"] = None
             self._dbg["base_pd_err"] = None
             self._dbg["base_cmd"] = None
+            self._dbg["base_action"] = "off"
             return
         # Snapshot odom ONCE: the pose fed to the PD and the raw wheels logged for this
         # tick come from the same integrated sample.
@@ -709,13 +783,15 @@ class HardwareDriver:
         chassis = self.robot.chassis
         if hold:
             chassis.set_velocity(vx=0.0, vy=0.0, wz=0.0, wait_time=0.0,
-                                 sequential_steering=False)
+                                 sequential_steering=True)
             self._prev_base_cmd = np.zeros(3)
             self._prev_base_shaped = np.zeros(3)
             self._base_axis = None
+            self._base_quiet_elapsed = 0.0
             self._dbg["base_pd_raw"] = None
             self._dbg["base_pd_err"] = None
             self._dbg["base_cmd"] = np.zeros(3)
+            self._dbg["base_action"] = "safety_hold"
             return
         base_cl = self._base_cl
         max_lin = self.args.base_max_speed
@@ -759,11 +835,37 @@ class HardwareDriver:
                 prev_axis=self._base_axis,
             )
         self._prev_base_cmd = cmd  # post-projection: the twist actually sent to the chassis
-        chassis.set_velocity(vx=float(cmd[0]), vy=float(cmd[1]), wz=float(cmd[2]),
-                             wait_time=0.0, sequential_steering=False)
+        # On a quiet (zero) tick, hold the current steering with ZERO drive for a short window
+        # instead of set_velocity(0,0,0): a swerve base re-centers its wheels to 0deg on a zero
+        # twist (_compute_wheel_control maps 0 speed -> steering 0), which snaps the wheels
+        # lateral->forward on brief intra-motion command dips; a sustained quiet re-centers
+        # cleanly. Only the dispatch differs -- the PD/shape/single-axis pipeline above is
+        # unchanged (see omniteleop.wbc_robot_util.base_quiet_dispatch).
+        action, self._base_quiet_elapsed = base_quiet_dispatch(
+            cmd, self._base_quiet_elapsed, dt, self.args.base_quiet_hold_s)
+        if action == "hold":
+            # Zero-drive hold of the CURRENT steering. Unlike set_velocity(0,0,0) -- which maps
+            # zero speed to a FIXED steering 0deg -- set_wheel_velocity re-reads and re-commands
+            # chassis.steering_angle, so a NaN/malformed read would publish a bad steer target.
+            # Validate the live read first; on a bad sample fall back to the safe
+            # set_velocity(0,0,0) re-center. The zero-drive hold itself is safe and exempt from
+            # follower/todo.md's "Avoid" rule, which targets COMBINED motion (NONZERO velocity +
+            # opposed steering -> wheels fight); at zero velocity there is no torque/scrub/fight.
+            steer = np.asarray(chassis.steering_angle, dtype=float)
+            if steer.shape == (2,) and np.all(np.isfinite(steer)):
+                assert float(np.max(np.abs(cmd))) <= 1e-6  # base_quiet_dispatch invariant
+                chassis.set_wheel_velocity(0.0)
+            else:
+                chassis.set_velocity(vx=0.0, vy=0.0, wz=0.0, wait_time=0.0,
+                                     sequential_steering=True)
+                action = "recenter"  # bad steering read -> safe re-center (logged in /debug)
+        else:  # "drive" sends the active twist; "recenter" sends cmd (==0) -> steering 0deg
+            chassis.set_velocity(vx=float(cmd[0]), vy=float(cmd[1]), wz=float(cmd[2]),
+                                 wait_time=0.0, sequential_steering=True)
         self._dbg["base_pd_raw"] = pd_raw
         self._dbg["base_pd_err"] = np.asarray(err, dtype=float)
         self._dbg["base_cmd"] = np.asarray(cmd, dtype=float)
+        self._dbg["base_action"] = action
 
     def debug_row(self, result) -> dict:
         """Assemble this tick's /debug record from the stashed intermediates.
@@ -794,6 +896,7 @@ class HardwareDriver:
             "base_pd_raw": vec(d.get("base_pd_raw"), 3),
             "base_pd_err": vec(d.get("base_pd_err"), 3),
             "base_cmd": vec(d.get("base_cmd"), 3),
+            "base_action": str(d.get("base_action", "off")),
             "clamp_max_over": np.float32(d.get("clamp_max_over", np.nan)),
             "odom_pose": vec(odom["pose"] if odom else None, 3),
             "odom_steer": vec(odom["steer"] if odom else None, 2),
@@ -959,13 +1062,7 @@ class HardwareDriver:
         Safe to call on a partially-initialized driver (robot/odom may be None) so the
         engage-time teardown works even if __init__ failed mid-setup.
         """
-        try:
-            if self.robot is not None and self.has_chassis and hasattr(
-                self.robot.chassis, "stop"
-            ):
-                self.robot.chassis.stop()
-        except Exception:
-            pass
+        self.stop_all_motion()
         if self._odom is not None:
             self._odom.stop()
         # Flush the episode BEFORE shutting the robot down. EpisodeRecorder saves in a
@@ -1046,7 +1143,10 @@ def run_loop(
             break
         vr = source.latest
         if vr is not None and vr.exit_requested:
-            print("\n[wbc_vr_robot] leader requested exit.")
+            # Left X is an immediate stop request, not a training frame: stop motion
+            # before recorder shutdown, and do not append the exit/stop state.
+            driver.stop_all_motion()
+            print("\n[wbc_vr_robot] leader requested exit; motion stopped.")
             break
 
         estop = bool(vr.estop) if vr is not None else True
@@ -1178,6 +1278,7 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
         "base_deadband": float(args.base_deadband),
         "base_accel": float(args.base_accel),
         "base_max_speed": float(args.base_max_speed),
+        "base_quiet_hold_s": float(args.base_quiet_hold_s),
         "source_timeout": float(args.source_timeout),
         "max_joint_step": float(args.max_joint_step),
         "head_lpf_tau": float(args.head_lpf_tau),
@@ -1320,6 +1421,11 @@ def main() -> None:
     hw.add_argument("--base-max-speed", type=float, default=DEFAULT_BASE_MAX_SPEED,
                     help=f"base linear velocity clamp m/s, ang=2x (default "
                          f"{DEFAULT_BASE_MAX_SPEED:g}; conservative for first bring-up).")
+    hw.add_argument("--base-quiet-hold-s", type=float, default=DEFAULT_BASE_QUIET_HOLD_S,
+                    help="on a quiet (zero) base command, hold the current swerve steering "
+                         "(zero drive) for this long before re-centering the wheels to 0deg "
+                         f"(default {DEFAULT_BASE_QUIET_HOLD_S:g}; 0 = re-center on every quiet "
+                         "tick, the original behavior).")
     hw.add_argument("--base-post-linear-deadband", type=float,
                     default=DEFAULT_BASE_POST_LINEAR_DEADBAND,
                     help="per-axis vx/vy deadband in m/s applied after base deadband/clamp/"
@@ -1347,7 +1453,8 @@ def main() -> None:
                       ("--head-planar-pos-deadband", args.head_planar_pos_deadband),
                       ("--head-planar-yaw-deadband", args.head_planar_yaw_deadband),
                       ("--base-post-linear-deadband", args.base_post_linear_deadband),
-                      ("--base-post-angular-deadband", args.base_post_angular_deadband)):
+                      ("--base-post-angular-deadband", args.base_post_angular_deadband),
+                      ("--base-quiet-hold-s", args.base_quiet_hold_s)):
         if not np.isfinite(val) or val < 0.0:
             parser.error(f"{flag} must be finite and >= 0")
     for flag, val in (("--base-accel", args.base_accel),
