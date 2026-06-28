@@ -6,6 +6,7 @@ These dataclasses define the structure of messages passed via Zenoh.
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+
 @dataclass
 class ExoJointData:
     """Joint positions and velocities from the exoskeleton."""
@@ -86,3 +87,19 @@ class VRJointData:
     # live whole-body configuration (so base yaw / torso lean are compensated).
     # Empty when not teleoperating. vr_reader publishes head_pos joints instead.
     head_ee_pose: List[float] = field(default_factory=list)
+
+
+@dataclass
+class WBCFollowerStatus:
+    """Live whole-body follower status for the VR headset HUD."""
+
+    timestamp_ns: int
+    stage: str = "static"
+    estop: bool = True
+    success: bool = True
+    held: bool = False
+    hold: bool = True
+    hold_reason: str = ""
+    safety_status: str = "ok"
+    left_ee_error_mm: float = 0.0
+    right_ee_error_mm: float = 0.0

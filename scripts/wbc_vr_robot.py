@@ -33,13 +33,21 @@ raw/err, shaped command), the closed-loop seed, and per-group joint command/sent
 
 ``--record`` starts automatically on the first engage after VR calibration, matching
 ``scripts/wbc_vr_record.py``'s post-calibration recording gate. It saves an episode in
-the same ``EpisodeRecorder`` schema as ``leader/vr_reader.py`` (so takes are
-interchangeable): ``action``/``obs`` joints plus ``head_left_rgb``/``head_depth``/
-``left_wrist_rgb`` (+ ``intrinsic``/``extrinsic``), and the ``left``/``right`` gripper
-under ``action/gripper`` (leader trigger command) and ``obs/gripper`` (Robotiq FC03
-achieved position). It adds ``torso`` to ``action/joint`` (the WBC commands the torso)
-and uses the shaped base twist for the ``chassis_*`` action. The wrist camera streams
-from ``sensors/wrist_zedm/*`` (needs an external ZED-SDK publisher; see vr_reader).
+the ``EpisodeRecorder`` schema of ``leader/vr_reader.py`` (mostly interchangeable):
+``action``/``obs`` joints plus ``head_left_rgb``/``head_depth``/``left_wrist_rgb`` and the
+``left``/``right`` gripper under ``action/gripper`` (leader trigger command) and
+``obs/gripper`` (Robotiq FC03 achieved position). It adds ``torso`` to ``action/joint``
+(the WBC commands the torso) and uses the shaped base twist for the ``chassis_*`` action;
+with ``--enable base`` it also records the MEASURED wheel-odometry body twist as the
+``obs/joint`` ``chassis_*`` (achieved-velocity counterpart to the action) and the measured
+base pose ``obs/base/pose`` ``(x, y, yaw)`` in the engage-origin world frame.
+
+This deviates from vr_reader's ``obs/images`` to support a MOVING base: the camera
+``intrinsic`` is stored once (``(3, 3)``, constant), and the per-frame ``extrinsic`` is
+NOT stored -- it was base-relative head FK (base-blind) and is recomputed offline as
+``world_t_cam = world_t_base(obs/base/pose) . FK_cam(obs/joint)`` so the colored cloud
+lands in the world frame (see ``scripts/vis_episode.py``). The wrist camera streams from
+``sensors/wrist_zedm/*`` (needs an external ZED-SDK publisher; see vr_reader).
 
 Run in the dexmate conda env (pinocchio + pink + dexcomm + dexcontrol)::
 
@@ -61,12 +69,16 @@ from __future__ import annotations
 import argparse
 import threading
 import time
+from dataclasses import asdict
 from typing import Callable, Optional
 
 import numpy as np
+from dexcomm.codecs import DictDataCodec
 
+from omniteleop.common import get_config
 from omniteleop.common.head_camera import ZED_K
 from omniteleop.common.recorder import EpisodeRecorder
+from omniteleop.common.schemas import WBCFollowerStatus
 from omniteleop.follower.whole_body_ik import (
     HEAD_FRAME,
     LEFT_EE_FRAME,
@@ -109,11 +121,13 @@ DEFAULT_HEAD_PLANAR_POS_DEADBAND = _VR_TELEOP.head_planar_pos_deadband
 DEFAULT_HEAD_PLANAR_YAW_DEADBAND = _VR_TELEOP.head_planar_yaw_deadband
 DEFAULT_BASE_POST_LINEAR_DEADBAND = _VR_TELEOP.base_post_linear_deadband
 DEFAULT_BASE_POST_ANGULAR_DEADBAND = _VR_TELEOP.base_post_angular_deadband
+DEFAULT_STATUS_PUBLISH_RATE = 10.0
+WBC_FOLLOWER_STATUS_TOPIC = "wbc/follower_status"
 
 # Episode recording (--record): vr_reader EpisodeRecorder format so takes are
 # interchangeable with VR-teleop recordings. Default cadence matches vr_reader's
 # record_rate; the default dir is the same raw_data tree the leader writes to.
-DEFAULT_RECORD_RATE = 15.0
+DEFAULT_RECORD_RATE = 10.0
 DEFAULT_SAVE_DIR = "/home/yixuan/omniteleop/Dexmate/data/raw_data"
 
 # Wrist camera (recorded under obs/images/left_wrist_rgb when --record). Like the head
@@ -122,6 +136,41 @@ DEFAULT_SAVE_DIR = "/home/yixuan/omniteleop/Dexmate/data/raw_data"
 # (see leader/vr_reader.py + tests/test_wrist_zedm_depth.py). RGB-only; left eye only.
 _WRIST_SENSOR_ID = "wrist_zedm"
 _WRIST_OBS_KEY = "left_rgb"
+
+
+def _wbc_follower_status_topic() -> str:
+    return get_config().get_topic("wbc_follower_status", WBC_FOLLOWER_STATUS_TOPIC)
+
+
+def _create_status_publisher(source):
+    node = getattr(source, "node", None)
+    if node is None:
+        return None
+    return node.create_publisher(_wbc_follower_status_topic(), encoder=DictDataCodec.encode)
+
+
+def _build_follower_status(
+    vr,
+    result,
+    *,
+    estop: bool,
+    hold: bool,
+    hold_reason: str,
+    timestamp_ns: Optional[int] = None,
+) -> WBCFollowerStatus:
+    """Build the lightweight status frame consumed by the WBC VR leader HUD."""
+    return WBCFollowerStatus(
+        timestamp_ns=int(time.time_ns() if timestamp_ns is None else timestamp_ns),
+        stage=str(getattr(vr, "calib_stage", "static") if vr is not None else "static"),
+        estop=bool(estop),
+        success=bool(result.success),
+        held=bool(result.held),
+        hold=bool(hold),
+        hold_reason=str(hold_reason or ""),
+        safety_status=str(result.safety_status),
+        left_ee_error_mm=float(result.left_ee_error) * 1000.0,
+        right_ee_error_mm=float(result.right_ee_error) * 1000.0,
+    )
 
 # Hardware safety / bring-up defaults (robot-specific; conservative for a first slow
 # bring-up). The shared closed-loop base-control tunables (PD gains, slew, deadband,
@@ -262,6 +311,10 @@ class OdometryThread:
         self._period = 1.0 / rate
         self._lock = threading.Lock()
         self._pose = np.zeros(3)
+        # Latest MEASURED body twist (vx, vy, w) from swerve wheel FK -- the instantaneous
+        # velocity SwerveOdometry integrates into self._pose. Surfaced (drift-free, same
+        # body frame/units as the commanded chassis_* action) for obs/joint recording.
+        self._twist = np.zeros(3)
         # Raw wheel inputs of the last accepted sample, kept for /debug so base jitter
         # can be traced to the sensor (steering quantization / wheel-vel noise) vs the
         # integration. Snapshotted together with the pose under the same lock.
@@ -298,6 +351,7 @@ class OdometryThread:
                         if pose is not None:
                             prev_ts = ts
                             self._pose = pose.copy()
+                            self._twist = self._odo.twist.copy()
                             self._steer = steer.copy()
                             self._wvel = wvel.copy()
                             self._drive_ts = ts
@@ -313,6 +367,18 @@ class OdometryThread:
         """Latest integrated base pose ``(x, y, yaw)`` (copy)."""
         with self._lock:
             return self._pose.copy()
+
+    @property
+    def twist(self) -> np.ndarray:
+        """Latest MEASURED body twist ``(vx, vy, w)`` from swerve wheel FK (copy).
+
+        The instantaneous velocity ``SwerveOdometry`` integrates into :attr:`pose` --
+        drift-free and in the same body frame / units as the commanded ``chassis_*``
+        action, so it is the achieved-velocity obs counterpart. Holds the last integrated
+        value when the wheel stream stalls (see :attr:`age` to detect staleness).
+        """
+        with self._lock:
+            return self._twist.copy()
 
     def snapshot(self) -> dict:
         """Atomic copy of the latest odom state for /debug (pose + age + raw wheels).
@@ -1023,14 +1089,20 @@ class HardwareDriver:
     def _init_recording(self) -> None:
         """Set up the optional vr_reader-format episode recorder (``--record``).
 
-        OFF unless ``--record``. When on, records (while engaged) the same main-HDF5
-        schema as ``leader/vr_reader.py`` so takes are interchangeable, EXCEPT:
+        OFF unless ``--record``. When on, records (while engaged) the ``leader/vr_reader.py``
+        main-HDF5 schema, EXCEPT:
           * ``action/joint`` adds ``torso`` (the WBC commands the torso here too);
           * the base action ``chassis_*`` is the shaped twist actually sent to the
-            chassis (the WBC drives the base; the leader thumbstick is unused here).
+            chassis (the WBC drives the base; the leader thumbstick is unused here);
+          * with ``--enable base``, ``obs/joint`` adds the MEASURED base twist ``chassis_*``
+            (wheel-odometry body twist, achieved-velocity counterpart to the action) and
+            ``obs/base/pose`` adds the measured ``(x, y, yaw)`` base pose in the engage-origin
+            world frame;
+          * ``obs/images`` stores the ``intrinsic`` once (static, constant over a take) and
+            does NOT store the per-frame ``extrinsic`` -- ``world_t_cam`` is recomputed offline
+            from ``obs/base/pose`` + ``obs/joint`` (see ``scripts/vis_episode.py``).
         ``action/gripper`` is the leader trigger command, ``obs/gripper`` the Robotiq FC03
-        achieved position, and ``obs/images`` carries head_left_rgb/head_depth +
-        left_wrist_rgb (+ intrinsic/extrinsic).
+        achieved position, and ``obs/images`` carries head_left_rgb/head_depth/left_wrist_rgb.
         """
         self._record_period = 0.0
         self._next_record_t = 0.0
@@ -1039,9 +1111,16 @@ class HardwareDriver:
         self._await_record_cameras()
         self._record_period = 1.0 / self.args.record_rate
         self._episode = EpisodeRecorder(self.args.save_dir)
+        # Camera intrinsic is constant over a take -> store ONCE (obs/images/intrinsic is
+        # (3,3), not (N,3,3)). The per-frame extrinsic is NOT stored: it was base-relative
+        # head FK (base-blind, wrong once the base drives) and is fully recomputable, so it
+        # is recomputed offline as world_t_cam = world_t_base(obs/base/pose) . FK_cam(obs/
+        # joint) -- see scripts/vis_episode.py -- which lands the cloud in the world frame.
+        self._episode.set_static({"obs": {"images": {"intrinsic": ZED_K.astype(np.float32)}}})
         print(f"[wbc_vr_robot] recording -> {self.args.save_dir} "
               f"(episode_{self._episode.episode_id}, {self.args.record_rate:g}Hz, "
-              "head_left_rgb+head_depth+left_wrist_rgb, +torso action, +gripper obs/action)")
+              "head_left_rgb+head_depth+left_wrist_rgb, +torso action, +gripper obs/action, "
+              "+base pose obs)")
 
     def _grab_head_images(self) -> Optional[tuple[np.ndarray, np.ndarray]]:
         """Poll the head camera -> ``(left_rgb uint8 HxWx3, depth uint16 HxW)`` or None.
@@ -1096,19 +1175,6 @@ class HardwareDriver:
         self._last_wrist_left_rgb = np.ascontiguousarray(wrist, dtype=np.uint8)
         return self._last_wrist_left_rgb
 
-    def _head_extrinsic(self, obs: dict) -> np.ndarray:
-        """``base_t_zed_depth_frame`` (4x4) from the MEASURED joints (vr_reader parity).
-
-        FK the observed torso/arm/head into the WBC model with the planar base left at
-        the origin (``nominal_q``'s neutral base), so the head pose is base-RELATIVE
-        and matches vr_reader's BASE-locked KinHelper extrinsic; recorded next to ZED_K.
-        """
-        q = self.ik.nominal_q()  # neutral planar root => world == base origin
-        for grp, names in self._joint_names.items():
-            for name, val in zip(names, obs[grp], strict=True):
-                q[self.ik._idx_q[name]] = float(val)  # noqa: SLF001
-        return np.asarray(self.ik.frame_pose(HEAD_FRAME, q).homogeneous, dtype=np.float32)
-
     def record_tick(self, result, hold: bool, now: float) -> None:
         """Append one vr_reader-format frame while engaged (no-op unless ``--record``).
 
@@ -1141,8 +1207,8 @@ class HardwareDriver:
         if self._grip_monitors:
             self._poll_gripper_status_step()
 
-        # Measured joints: drive both obs/joint and the extrinsic FK. Validate shapes
-        # aggressively -- a bad readback must abort, never be recorded as-is.
+        # Measured joints -> obs/joint (also the offline FK source for world_t_cam).
+        # Validate shapes aggressively -- a bad readback must abort, never be recorded as-is.
         obs: dict[str, np.ndarray] = {}
         for grp, names in self._joint_names.items():
             meas = np.asarray(self._comp(grp).get_joint_pos(), dtype=np.float32)
@@ -1154,13 +1220,47 @@ class HardwareDriver:
             obs[grp] = meas
 
         base_cmd = self._prev_base_cmd  # shaped twist actually sent to the chassis
+        # obs/joint base = the MEASURED wheel-odometry body twist (achieved-velocity
+        # counterpart to action/joint/chassis_*), recorded only when the base is actuated
+        # (--enable base; otherwise there is no odometry thread). Read once here so all
+        # frames in a take agree on keys -- the enable mask is fixed for the whole run.
+        obs_joint: dict[str, np.ndarray] = {
+            "left_arm": obs["left_arm"],
+            "right_arm": obs["right_arm"],
+            "head": obs["head"],
+            "torso": obs["torso"],
+        }
+        if self._odom is not None:
+            meas_twist = self._odom.twist
+            obs_joint["chassis_vx"] = np.float32(meas_twist[0])
+            obs_joint["chassis_vy"] = np.float32(meas_twist[1])
+            obs_joint["chassis_wz"] = np.float32(meas_twist[2])
         images = {
             "head_left_rgb": head_left_rgb,
             "head_depth": head_depth_u16,
             "left_wrist_rgb": wrist_left_rgb,
-            "intrinsic": ZED_K.astype(np.float32),
-            "extrinsic": self._head_extrinsic(obs),
+            # intrinsic is recorded once via set_static (not per frame); extrinsic is NOT
+            # recorded -- world_t_cam is recomputed offline from obs/base/pose + obs/joint.
         }
+        obs_out: dict = {
+            "joint": obs_joint,
+            # Gripper obs = the Robotiq FC03 achieved position (gPO/255 in [0,1]), refreshed
+            # above at the record cadence; NaN until the monitor first replies (matches
+            # vr_reader's obs/gripper).
+            "gripper": {
+                "left": np.float32(self._last_obs_grip_left),
+                "right": np.float32(self._last_obs_grip_right),
+            },
+            "images": images,
+        }
+        if self._odom is not None:
+            # Measured base pose (x, y, yaw) in the engage-origin world frame (the odom is
+            # zeroed on the engage edge), the pose counterpart to the obs/joint/chassis_*
+            # body twist. Lets the cloud/camera/robot be placed in world frame offline:
+            # world_t_cam = world_t_base(pose) . FK_cam(obs/joint); see scripts/vis_episode.py.
+            # Only present with --enable base (no odom thread otherwise); the enable mask is
+            # fixed for the whole run, so every frame in a take agrees on keys.
+            obs_out["base"] = {"pose": np.asarray(self._odom.pose, dtype=np.float32)}
         frame = {
             "timestamp_ns": np.int64(time.time_ns()),
             "action": {
@@ -1183,22 +1283,7 @@ class HardwareDriver:
                     "right": np.float32(self._last_gripper_cmd_right),
                 },
             },
-            "obs": {
-                "joint": {
-                    "left_arm": obs["left_arm"],
-                    "right_arm": obs["right_arm"],
-                    "head": obs["head"],
-                    "torso": obs["torso"],
-                },
-                # Gripper obs = the Robotiq FC03 achieved position (gPO/255 in [0,1]),
-                # refreshed above at the record cadence; NaN until the monitor first
-                # replies (matches vr_reader's obs/gripper).
-                "gripper": {
-                    "left": np.float32(self._last_obs_grip_left),
-                    "right": np.float32(self._last_obs_grip_right),
-                },
-                "images": images,
-            },
+            "obs": obs_out,
         }
         self._episode.record(frame)
 
@@ -1282,6 +1367,9 @@ def run_loop(
     last_cmd_wall: Optional[float] = None
     prev_estop = True
     source.start()
+    status_pub = None if replay else _create_status_publisher(source)
+    status_period = 1.0 / DEFAULT_STATUS_PUBLISH_RATE
+    last_status_publish = -float("inf")
     t0 = clock()
     last_print = 0.0
     print(f"[wbc_vr_robot] {driver.name} loop @ {args.ik_rate:g}Hz IK "
@@ -1350,6 +1438,16 @@ def run_loop(
         driver.actuate(result, left_gripper, right_gripper, enable, hold, dt)
         if hasattr(driver, "record_tick"):
             driver.record_tick(result, hold, now)
+        if status_pub is not None and now - last_status_publish >= status_period:
+            status = _build_follower_status(
+                vr,
+                result,
+                estop=estop,
+                hold=hold,
+                hold_reason=hold_reason or "",
+            )
+            status_pub.publish(asdict(status))
+            last_status_publish = now
 
         dbg = driver.debug_row(result) if hasattr(driver, "debug_row") else {}
         traj.append(
@@ -1503,8 +1601,9 @@ def main() -> None:
     parser.add_argument("--record", action="store_true",
                         help="record an episode (vr_reader EpisodeRecorder format) while "
                              "engaged: action+obs joints (incl. torso), gripper obs/action, "
-                             "and head_left_rgb/head_depth/left_wrist_rgb (+intrinsic/"
-                             "extrinsic). The wrist camera needs an external ZED-SDK "
+                             "head_left_rgb/head_depth/left_wrist_rgb, a static intrinsic, and "
+                             "(with --enable base) the obs/base/pose used to rebuild "
+                             "world_t_cam offline. The wrist camera needs an external ZED-SDK "
                              "publisher on sensors/wrist_zedm/*. OFF by default.")
     parser.add_argument("--save-dir", default=DEFAULT_SAVE_DIR,
                         help=f"directory for recorded episodes (default {DEFAULT_SAVE_DIR}).")

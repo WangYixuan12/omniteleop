@@ -29,6 +29,25 @@ def _recursive_np_stack(list_of_dicts: list[dict]) -> dict:
     return result
 
 
+def _merge_static(stacked: dict, static: dict) -> None:
+    """In-place merge ``static`` leaves into the per-frame ``stacked`` tree.
+
+    Used for fields stored ONCE (not stacked over frames), e.g. a constant camera
+    intrinsic. A leaf path present in BOTH trees is a ValueError -- a static field
+    must never silently shadow a per-frame stream.
+    """
+    for key, val in static.items():
+        if isinstance(val, dict):
+            sub = stacked.setdefault(key, {})
+            if not isinstance(sub, dict):
+                raise ValueError(f"static key {key!r} collides with a per-frame array")
+            _merge_static(sub, val)
+        else:
+            if key in stacked:
+                raise ValueError(f"static leaf {key!r} collides with a per-frame field")
+            stacked[key] = np.asarray(val)
+
+
 def _count_leaves(d: dict) -> int:
     n = 0
     for v in d.values():
@@ -92,6 +111,7 @@ class EpisodeRecorder:
         self._save_dir = pathlib.Path(save_dir)
         self._save_dir.mkdir(parents=True, exist_ok=True)
         self._frames: list[dict] = []
+        self._static: dict = {}
         self.recording = False
         self.saving = False
         self.save_progress: float = 0.0
@@ -113,6 +133,17 @@ class EpisodeRecorder:
         """Record a frame (VRJointData as dict)."""
         self._frames.append(frame)
 
+    def set_static(self, static: dict) -> None:
+        """Register fields stored ONCE in the episode (not stacked per-frame).
+
+        Use for values constant over a take -- e.g. a fixed camera intrinsic -- so the
+        HDF5 carries a single ``obs/images/intrinsic`` (3, 3) instead of (N, 3, 3). The
+        nested ``static`` tree is merged into the saved tree at its given paths on
+        ``stop()``; a leaf that collides with a per-frame field raises (see
+        :func:`_merge_static`). Replaces any previously-registered static tree.
+        """
+        self._static = static
+
     def stop(self) -> Optional[str]:
         """Stop recording; spawn background thread to save HDF5. Returns the
         target path immediately (file is written asynchronously).
@@ -128,14 +159,15 @@ class EpisodeRecorder:
         self.saving = True
         self.save_progress = 0.0
         self._save_thread = threading.Thread(
-            target=self._save_worker, args=(frames, str(path)), daemon=True
+            target=self._save_worker, args=(frames, str(path), self._static), daemon=True
         )
         self._save_thread.start()
         return str(path)
 
-    def _save_worker(self, frames: list[dict], path: str) -> None:
+    def _save_worker(self, frames: list[dict], path: str, static: dict) -> None:
         try:
             data = _recursive_np_stack(frames)
+            _merge_static(data, static)
 
             def on_progress(p: float) -> None:
                 self.save_progress = p
