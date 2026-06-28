@@ -75,9 +75,9 @@ class VRJointData:
     # Control flags
     estop: bool = True          # Default True (safe) until calibration completes
     exit_requested: bool = False
-    recalibrate: bool = False
-    # Calibration stage: A=head, B=arms preview, C=live teleop
-    calib_stage: str = "A"
+    # Calibration stage published by the leader. wbc_vr_leader uses {static, teleop};
+    # omni-vr/vr_reader uses {static, head, whole_body_alignment, whole_body, resetting}.
+    calib_stage: str = "static"
     left_ee_pose: List[float] = field(default_factory=list)
     right_ee_pose: List[float] = field(default_factory=list)
     # Calibrated headset pose (flattened row-major 4x4) in the robot base frame at

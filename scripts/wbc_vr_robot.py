@@ -11,14 +11,19 @@ To bring this up safely we DON'T jump straight to live teleop. First use
 leader stream lives at the file root, and debug data lives under ``/debug``. This script
 then has two real-robot modes:
 
-  1. ``--replay FILE``   replay that SAPIEN-verified stream, TIME-SCALED (``--speed``,
-                         default 0.25), through the same whole-body IK on the robot.
+  1. ``--replay FILE``   replay that SAPIEN-verified stream, TIME-SCALED (by ``replay_speed``
+                         in ``follower/wbik.yaml``), through the same whole-body IK on the robot.
   2. ``--source live``   subscribe to the live leader and drive the robot in real time
                          (only after the replay path is verified).
 
+All control-loop tunables -- replay speed, IK / command rates, head LPF + planar
+deadbands, base PD gains, base slew / deadband / post-deadband -- come SOLELY from the
+``vr_teleop:`` block of ``follower/wbik.yaml`` (shared with ``scripts/wbc_vr_record.py``),
+so a take recorded/visualized in sim drives the robot identically. They are not CLI flags.
+
 ``--enable`` selects which DOF groups actually actuate (default ``arms,torso,head,base``);
-grippers stay OFF unless ``--grippers`` is given. Unselected groups are still solved by the
-IK but not sent to that actuator.
+the grippers are ALWAYS active, tracking the leader triggers. Unselected groups are still
+solved by the IK but not sent to that actuator.
 
 Both real-robot modes always write a per-tick ``/debug`` HDF5 (auto-named
 ``wbc_debug_<mode>_<timestamp>.hdf5`` next to the replay file, or override with
@@ -29,11 +34,12 @@ raw/err, shaped command), the closed-loop seed, and per-group joint command/sent
 ``--record`` starts automatically on the first engage after VR calibration, matching
 ``scripts/wbc_vr_record.py``'s post-calibration recording gate. It saves an episode in
 the same ``EpisodeRecorder`` schema as ``leader/vr_reader.py`` (so takes are
-interchangeable): ``action``/``obs`` joints plus ``head_left_rgb``/``head_depth`` (+
-``intrinsic``/``extrinsic``). It adds ``torso`` to ``action/joint`` (the WBC commands
-the torso) and uses the shaped base twist for the ``chassis_*`` action. Grippers and
-the wrist camera are NOT recorded (not installed) -- that code is kept in comments to
-restore once the hardware is mounted.
+interchangeable): ``action``/``obs`` joints plus ``head_left_rgb``/``head_depth``/
+``left_wrist_rgb`` (+ ``intrinsic``/``extrinsic``), and the ``left``/``right`` gripper
+under ``action/gripper`` (leader trigger command) and ``obs/gripper`` (Robotiq FC03
+achieved position). It adds ``torso`` to ``action/joint`` (the WBC commands the torso)
+and uses the shaped base twist for the ``chassis_*`` action. The wrist camera streams
+from ``sensors/wrist_zedm/*`` (needs an external ZED-SDK publisher; see vr_reader).
 
 Run in the dexmate conda env (pinocchio + pink + dexcomm + dexcontrol)::
 
@@ -43,11 +49,11 @@ Run in the dexmate conda env (pinocchio + pink + dexcomm + dexcontrol)::
 
     # 2) inspect the saved take in SAPIEN before hardware:
     /home/yixuan/miniforge3/envs/dexmate/bin/python scripts/wbc_vr_record.py \
-        --replay /tmp/demo.hdf5 --speed 0.25 --output /tmp/demo_replay.mp4
+        --replay /tmp/demo.hdf5 --output /tmp/demo_replay.mp4
 
     # 3) replay slowly ON THE ROBOT (after verifying step 2), recording a take:
     /home/yixuan/miniforge3/envs/dexmate/bin/python scripts/wbc_vr_robot.py \
-        --replay /tmp/demo.hdf5 --speed 0.25 --record
+        --replay /tmp/demo.hdf5 --record
 """
 
 from __future__ import annotations
@@ -92,10 +98,13 @@ from omniteleop.wbc_teleop import VRJointSubscriber, VRTeleopConfig
 _VR_TELEOP = VRTeleopConfig.from_yaml()
 DEFAULT_HEAD_LPF_TAU = _VR_TELEOP.head_lpf_tau
 DEFAULT_SPEED = _VR_TELEOP.replay_speed
+DEFAULT_IK_RATE = _VR_TELEOP.ik_rate                # whole-body IK / control loop rate (Hz)
+DEFAULT_CMD_RATE = _VR_TELEOP.cmd_rate              # leader command rate (Hz); 0 disables interp
 DEFAULT_BASE_KP_XY = _VR_TELEOP.base_kp_xy          # closed-loop base PD gains (real-robot values)
 DEFAULT_BASE_KP_YAW = _VR_TELEOP.base_kp_yaw
 DEFAULT_BASE_ACCEL = _VR_TELEOP.base_accel          # m/s^2 base-twist slew (ang = 2x)
 DEFAULT_BASE_DEADBAND = _VR_TELEOP.base_deadband    # m/s base-twist deadband (ang = 2x)
+DEFAULT_BASE_MAX_SPEED = _VR_TELEOP.base_max_speed  # m/s base velocity clamp (ang = 2x)
 DEFAULT_HEAD_PLANAR_POS_DEADBAND = _VR_TELEOP.head_planar_pos_deadband
 DEFAULT_HEAD_PLANAR_YAW_DEADBAND = _VR_TELEOP.head_planar_yaw_deadband
 DEFAULT_BASE_POST_LINEAR_DEADBAND = _VR_TELEOP.base_post_linear_deadband
@@ -107,10 +116,17 @@ DEFAULT_BASE_POST_ANGULAR_DEADBAND = _VR_TELEOP.base_post_angular_deadband
 DEFAULT_RECORD_RATE = 15.0
 DEFAULT_SAVE_DIR = "/home/yixuan/omniteleop/Dexmate/data/raw_data"
 
+# Wrist camera (recorded under obs/images/left_wrist_rgb when --record). Like the head
+# camera it is consumed through the dexcontrol Robot API, but as a multi-stream ZED-M
+# published by a standalone ZED-SDK process on sensors/wrist_zedm/{left_rgb,right_rgb}
+# (see leader/vr_reader.py + tests/test_wrist_zedm_depth.py). RGB-only; left eye only.
+_WRIST_SENSOR_ID = "wrist_zedm"
+_WRIST_OBS_KEY = "left_rgb"
+
 # Hardware safety / bring-up defaults (robot-specific; conservative for a first slow
 # bring-up). The shared closed-loop base-control tunables (PD gains, slew, deadband,
-# post-deadband) come from the vr_teleop: block above; only the low first-bring-up base
-# velocity clamp and the homing/joint-step/watchdog knobs live here.
+# base velocity clamp, post-deadband) come from the vr_teleop: block above; only the
+# homing/joint-step/watchdog knobs live here.
 DEFAULT_MAX_JOINT_STEP = 0.05   # rad/IK-tick clamp on arm/torso/head joint commands
 DEFAULT_SOURCE_TIMEOUT = 0.5    # s without a fresh command / odom sample -> hold
 # rad: measured-vs-nominal gate before the first engage. Sized to tolerate normal
@@ -126,8 +142,8 @@ ARM_HOME_STEP = 0.005 # arm interpolation step when homing straight to nominal
 # wait_time whether or not the joint physically caught up, so lag accumulates and an
 # immediate readback catches the arm mid-flight (the variable residual). This drains it.
 DEFAULT_HOME_SETTLE = 3.0
-DEFAULT_BASE_MAX_SPEED = 0.30   # m/s base velocity clamp (low for first bring-up; ang = 2x)
-# hold the current swerve steering if zero base command < quiet_hold_s seconds, then re-centering the wheels to 0deg. 
+# Hold the current swerve steering if zero base command < quiet_hold_s seconds, then
+# re-center the wheels to 0deg.
 # (set_velocity(0,0,0) -> steering 0)
 DEFAULT_BASE_QUIET_HOLD_S = 1
 _JOINT_STEP_ABORT_TICKS = 25    # consecutive ticks demanding > 2x clamp -> abort
@@ -339,9 +355,10 @@ class HardwareDriver:
     re-anchoring matches the hardware), optionally seeds the IK from the MEASURED state
     each tick (``--closed-loop-q``), clamps per-tick joint steps, and runs the same
     ``base_closed_loop`` PD/shape path the real robot uses in ``drive_box_record.py``.
-    Every actuator is gated by the ``--enable`` mask; grippers stay off unless
-    ``--grippers``. On any hold (e-stop / failed solve / safety hold / stale source or
-    odom) the base is zeroed and joints are frozen.
+    Every joint/base actuator is gated by the ``--enable`` mask; the grippers are always
+    activated and track the leader triggers. On any hold (e-stop / failed solve / safety
+    hold / stale source or odom) the base is zeroed and joints are frozen (the grippers
+    hold their last commanded position).
     """
 
     name = "hardware"
@@ -352,7 +369,11 @@ class HardwareDriver:
         from dexcontrol.robot import Robot  # noqa: PLC0415
 
         from omniteleop.follower import base_closed_loop as base_cl  # noqa: PLC0415
-        from omniteleop.follower.robotiq import build_hande_command, send_activate  # noqa: PLC0415
+        from omniteleop.follower.robotiq import (  # noqa: PLC0415
+            build_hande_command,
+            send_activate,
+            send_ee_pass_through_with_timestamps,
+        )
         from omniteleop.follower.whole_body_ik import (  # noqa: PLC0415
             HEAD_JOINTS,
             LEFT_ARM_JOINTS,
@@ -366,6 +387,7 @@ class HardwareDriver:
         self.enable = enable
         self._base_cl = base_cl
         self._build_hande = build_hande_command
+        self._send_ee_pass_through = send_ee_pass_through_with_timestamps
         # robot component name -> ordered IK joint names (for nominal extraction,
         # measured-q assembly, and command dispatch).
         self._joint_names = {
@@ -393,6 +415,17 @@ class HardwareDriver:
         # intermediates here and debug_row() assembles them after actuation. Touched
         # only by the (single-threaded) follower loop.
         self._dbg: dict = {}
+        # Grippers (always active): cache the last commanded triggers for action/gripper
+        # recording, the FC03 achieved-position obs (gPO/255), and the per-arm status
+        # monitors (set up under --record). Initialized here so close() can tear down even
+        # if init fails partway. The wrist ZED-M left-eye frame is cached so a momentary
+        # publisher drop reuses the last good frame instead of breaking record key shapes.
+        self._last_gripper_cmd_left = 0.0
+        self._last_gripper_cmd_right = 0.0
+        self._last_obs_grip_left = float("nan")
+        self._last_obs_grip_right = float("nan")
+        self._grip_monitors: dict = {}
+        self._last_wrist_left_rgb: Optional[np.ndarray] = None
 
         # Joint convention: with the hardware-matching URDF (wbik.yaml urdf_path:
         # vega_with_robotiq, corrected torso_j2 range + grippers) the WBC joint output
@@ -404,11 +437,14 @@ class HardwareDriver:
         try:
             print("[wbc_vr_robot] connecting to robot hardware ...")
             if args.record:
-                # Recording needs the head camera streaming, so build the Robot with
-                # head_camera enabled (mirrors leader/vr_reader.py). The WRIST camera is
-                # intentionally NOT enabled -- it is not installed; to record it later,
-                # inject/enable a wrist_zedm ZedXCameraConfig here (see vr_reader) and
-                # uncomment the wrist branches in _grab_head_images / record_tick below.
+                # Recording needs the head camera AND the wrist ZED-M streaming, so build
+                # the Robot with both sensors enabled (mirrors leader/vr_reader.py). The
+                # wrist is a multi-stream ZED-M published by a standalone ZED-SDK process on
+                # sensors/wrist_zedm/{left_rgb,right_rgb}; inject an RGB-only config if the
+                # variant lacks it. A ZED-SDK publisher must run for frames to arrive.
+                from dexbot_utils.configs.components.sensors.cameras import (  # noqa: PLC0415
+                    ZedXCameraConfig,
+                )
                 from dexcontrol.core.config import get_robot_config  # noqa: PLC0415
                 configs = get_robot_config()
                 if "head_camera" not in configs.sensors:
@@ -417,6 +453,11 @@ class HardwareDriver:
                         "config has none."
                     )
                 configs.sensors["head_camera"].enabled = True
+                if _WRIST_SENSOR_ID not in configs.sensors:
+                    configs.sensors[_WRIST_SENSOR_ID] = ZedXCameraConfig(
+                        name=_WRIST_SENSOR_ID, enable_rgb=True, enable_depth=False
+                    )
+                configs.sensors[_WRIST_SENSOR_ID].enabled = True
                 self.robot = Robot(configs=configs)
             else:
                 self.robot = Robot()
@@ -427,10 +468,14 @@ class HardwareDriver:
                 for grp, names in self._joint_names.items()
             }
             self._init_recording()
-            if args.grippers:
-                print("[wbc_vr_robot] activating grippers ...")
-                send_activate(self.robot.left_arm)
-                send_activate(self.robot.right_arm)
+            # Grippers are always active (the hardware is mounted): activate both Hand-E
+            # grippers so the per-tick trigger commands move them. Under --record also set
+            # up the FC03 achieved-position monitors for obs/gripper.
+            print("[wbc_vr_robot] activating grippers ...")
+            send_activate(self.robot.left_arm)
+            send_activate(self.robot.right_arm)
+            if args.record:
+                self._init_gripper_monitors()
             if enable["base"]:
                 if not self.has_chassis:
                     raise SystemExit("[wbc_vr_robot] --enable base but the robot has no chassis.")
@@ -748,13 +793,15 @@ class HardwareDriver:
                 sent[grp] = clamped
             self._dbg["sent_joints"] = sent
             self._dbg["clamp_max_over"] = max_over
-            if self.args.grippers:
-                self.robot.left_arm.send_ee_pass_through_message(
-                    self._build_hande(float(np.clip(left_gripper, 0.0, 1.0)))
-                )
-                self.robot.right_arm.send_ee_pass_through_message(
-                    self._build_hande(float(np.clip(right_gripper, 0.0, 1.0)))
-                )
+            # Grippers are always active: command both Hand-E grippers from the leader
+            # triggers and stash the clipped values so record_tick logs them as
+            # action/gripper (this non-hold branch is the only place that records).
+            lg = float(np.clip(left_gripper, 0.0, 1.0))
+            rg = float(np.clip(right_gripper, 0.0, 1.0))
+            self._send_ee_pass_through(self.robot.left_arm, self._build_hande(lg))
+            self._send_ee_pass_through(self.robot.right_arm, self._build_hande(rg))
+            self._last_gripper_cmd_left = lg
+            self._last_gripper_cmd_right = rg
             # Abort if the IK keeps demanding far more than the clamp (runaway / bad target).
             if self.args.max_joint_step > 0 and max_over > 2.0 * self.args.max_joint_step:
                 self._overstep_ticks += 1
@@ -912,6 +959,67 @@ class HardwareDriver:
 
     # -- episode recording (vr_reader EpisodeRecorder format) -------------------
 
+    def _init_gripper_monitors(self) -> None:
+        """Set up the Robotiq FC03 achieved-position monitors for obs/gripper recording.
+
+        Mirrors ``leader/vr_reader.py`` + ``follower/policy_rollout.py``: a synchronous
+        warmup poll seeds ``self._last_obs_grip_{left,right}`` (gPO/255 in [0,1]), then a
+        ``RobotiqStatusMonitor`` per arm queues FC03 status replies on the shared EE
+        pass-through topic -- coexisting with this follower's FC16 gripper writes, which
+        the monitor filters out. Only needed under ``--record`` (obs/gripper).
+        """
+        from omniteleop.follower.robotiq import (  # noqa: PLC0415
+            RobotiqStatusMonitor,
+            poll_gripper_status,
+        )
+        for side, arm in (("left", self.robot.left_arm), ("right", self.robot.right_arm)):
+            warm = poll_gripper_status(arm, function_code=0x03, timeout_s=0.5)
+            if warm is None:
+                print(f"[wbc_vr_robot] WARNING: {side} gripper FC03 warmup failed -- "
+                      f"obs/gripper/{side} records NaN until the monitor catches up "
+                      "(verify enable_ee_pass_through=True).")
+            else:
+                setattr(self, f"_last_obs_grip_{side}", float(warm["actual"]))
+        self._grip_monitors = {
+            "left": RobotiqStatusMonitor(self.robot.left_arm, side="left", function_code=0x03),
+            "right": RobotiqStatusMonitor(self.robot.right_arm, side="right", function_code=0x03),
+        }
+        for monitor in self._grip_monitors.values():
+            monitor.send_status_request()
+
+    def _poll_gripper_status_step(self) -> None:
+        """Drain queued FC03 replies into the obs cache, then re-request (both arms).
+
+        Mirrors vr_reader/policy_rollout. Called at the record cadence from record_tick so
+        ``self._last_obs_grip_{left,right}`` refresh at ~``--record-rate``.
+        """
+        for side, monitor in self._grip_monitors.items():
+            events = monitor.drain_status_events()
+            if events:
+                setattr(self, f"_last_obs_grip_{side}", float(events[-1]["actual"]))
+            monitor.expire_timeouts(0.5)
+            monitor.send_status_request()
+
+    def _await_record_cameras(self) -> None:
+        """Warn (don't fail) if the --record cameras aren't streaming yet.
+
+        head_camera + wrist_zedm are enabled in the --record Robot build. The wrist needs
+        an external ZED-SDK publisher on ``sensors/wrist_zedm/*``; if it isn't up yet,
+        record_tick skips frames until both stream, so warn but continue (it may start
+        before the first engage).
+        """
+        for cam in ("head_camera", _WRIST_SENSOR_ID):
+            if not self.robot.has_sensor(cam):
+                raise SystemExit(
+                    f"[wbc_vr_robot] --record enabled '{cam}' but it is not available on "
+                    "this robot.")
+            sensor = getattr(self.robot.sensors, cam)
+            if hasattr(sensor, "wait_for_active") and not sensor.wait_for_active(timeout=5.0):
+                extra = (f" -- needs a ZED-SDK publisher on sensors/{_WRIST_SENSOR_ID}/*"
+                         if cam == _WRIST_SENSOR_ID else "")
+                print(f"[wbc_vr_robot] WARNING: {cam} not active within 5s; record frames "
+                      f"are skipped until it streams{extra}.")
+
     def _init_recording(self) -> None:
         """Set up the optional vr_reader-format episode recorder (``--record``).
 
@@ -919,19 +1027,21 @@ class HardwareDriver:
         schema as ``leader/vr_reader.py`` so takes are interchangeable, EXCEPT:
           * ``action/joint`` adds ``torso`` (the WBC commands the torso here too);
           * the base action ``chassis_*`` is the shaped twist actually sent to the
-            chassis (the WBC drives the base; the leader thumbstick is unused here);
-          * grippers + the wrist camera are omitted (not installed) -- their code is
-            kept in comments so it can be restored once the hardware is mounted.
+            chassis (the WBC drives the base; the leader thumbstick is unused here).
+        ``action/gripper`` is the leader trigger command, ``obs/gripper`` the Robotiq FC03
+        achieved position, and ``obs/images`` carries head_left_rgb/head_depth +
+        left_wrist_rgb (+ intrinsic/extrinsic).
         """
         self._record_period = 0.0
         self._next_record_t = 0.0
         if not self.args.record:
             return
+        self._await_record_cameras()
         self._record_period = 1.0 / self.args.record_rate
         self._episode = EpisodeRecorder(self.args.save_dir)
         print(f"[wbc_vr_robot] recording -> {self.args.save_dir} "
               f"(episode_{self._episode.episode_id}, {self.args.record_rate:g}Hz, "
-              "head_left_rgb+head_depth +torso action; grippers/wrist OFF)")
+              "head_left_rgb+head_depth+left_wrist_rgb, +torso action, +gripper obs/action)")
 
     def _grab_head_images(self) -> Optional[tuple[np.ndarray, np.ndarray]]:
         """Poll the head camera -> ``(left_rgb uint8 HxWx3, depth uint16 HxW)`` or None.
@@ -959,6 +1069,32 @@ class HardwareDriver:
         # meters -> millimeters, clipped to uint16 (matches vr_reader's head_depth).
         depth_u16 = np.clip(depth * 1000, 0, 65535).astype(np.uint16)
         return np.ascontiguousarray(left_rgb, dtype=np.uint8), depth_u16
+
+    def _grab_wrist_image(self) -> Optional[np.ndarray]:
+        """Poll the wrist ZED-M left eye -> ``left_wrist_rgb`` (uint8 HxWx3) or None.
+
+        Consumes the publisher's frame AS-IS (no crop/resize), like vr_reader: the wrist
+        ZED-SDK publisher (tests/test_wrist_zedm_depth.py) already resized robot-side.
+        Returns None until the first frame arrives; a momentary drop after that reuses the
+        cached last-good frame so the recorded HDF5 keeps consistent keys/shapes. Raises
+        ValueError on a malformed shape so a miswired camera fails loudly.
+        """
+        obs = self.robot.sensors.wrist_zedm.get_obs(obs_keys=[_WRIST_OBS_KEY])
+        wrist = obs.get(_WRIST_OBS_KEY)
+        if wrist is None:  # tolerate a sensor-name-prefixed key (mirrors policy_rollout)
+            for key, val in obs.items():
+                if key.endswith("_" + _WRIST_OBS_KEY):
+                    wrist = val
+                    break
+        if wrist is None:
+            return self._last_wrist_left_rgb  # reuse last good (None until first frame)
+        wrist = np.asarray(wrist)
+        if wrist.ndim != 3 or wrist.shape[2] != 3:
+            raise ValueError(
+                f"[wbc_vr_robot] wrist_zedm {_WRIST_OBS_KEY} shape {wrist.shape} is not (H,W,3)."
+            )
+        self._last_wrist_left_rgb = np.ascontiguousarray(wrist, dtype=np.uint8)
+        return self._last_wrist_left_rgb
 
     def _head_extrinsic(self, obs: dict) -> np.ndarray:
         """``base_t_zed_depth_frame`` (4x4) from the MEASURED joints (vr_reader parity).
@@ -996,6 +1132,14 @@ class HardwareDriver:
         if imgs is None:
             return  # camera still warming up -- skip rather than write inconsistent keys
         head_left_rgb, head_depth_u16 = imgs
+        wrist_left_rgb = self._grab_wrist_image()
+        if wrist_left_rgb is None:
+            return  # wrist publisher not streaming yet -- skip to keep record keys consistent
+
+        # Refresh achieved-gripper obs (FC03) at the record cadence (drains queued replies
+        # into self._last_obs_grip_{left,right}, then re-requests).
+        if self._grip_monitors:
+            self._poll_gripper_status_step()
 
         # Measured joints: drive both obs/joint and the extrinsic FK. Validate shapes
         # aggressively -- a bad readback must abort, never be recorded as-is.
@@ -1013,10 +1157,9 @@ class HardwareDriver:
         images = {
             "head_left_rgb": head_left_rgb,
             "head_depth": head_depth_u16,
+            "left_wrist_rgb": wrist_left_rgb,
             "intrinsic": ZED_K.astype(np.float32),
             "extrinsic": self._head_extrinsic(obs),
-            # Wrist camera not installed -- restore when mounted (see vr_reader):
-            # "left_wrist_rgb": self._last_wrist_left_rgb,
         }
         frame = {
             "timestamp_ns": np.int64(time.time_ns()),
@@ -1033,11 +1176,12 @@ class HardwareDriver:
                     "chassis_vy": np.float32(base_cmd[1]),
                     "chassis_wz": np.float32(base_cmd[2]),
                 },
-                # Grippers not installed -- restore when mounted (vr uses the triggers):
-                # "gripper": {
-                #     "left": np.float32(np.clip(left_gripper, 0.0, 1.0)),
-                #     "right": np.float32(np.clip(right_gripper, 0.0, 1.0)),
-                # },
+                # Gripper action = the clipped leader trigger commanded this tick (stashed
+                # by actuate), matching vr_reader's action/gripper.
+                "gripper": {
+                    "left": np.float32(self._last_gripper_cmd_left),
+                    "right": np.float32(self._last_gripper_cmd_right),
+                },
             },
             "obs": {
                 "joint": {
@@ -1046,11 +1190,13 @@ class HardwareDriver:
                     "head": obs["head"],
                     "torso": obs["torso"],
                 },
-                # Grippers not installed -- restore when mounted (FC03 status poll):
-                # "gripper": {
-                #     "left": obs_grip_left,
-                #     "right": obs_grip_right,
-                # },
+                # Gripper obs = the Robotiq FC03 achieved position (gPO/255 in [0,1]),
+                # refreshed above at the record cadence; NaN until the monitor first
+                # replies (matches vr_reader's obs/gripper).
+                "gripper": {
+                    "left": np.float32(self._last_obs_grip_left),
+                    "right": np.float32(self._last_obs_grip_right),
+                },
                 "images": images,
             },
         }
@@ -1078,6 +1224,12 @@ class HardwareDriver:
                 while self._episode.saving:
                     time.sleep(0.05)
                 print(f"[wbc_vr_robot] episode saved -> {path}")
+        # Best-effort teardown of the FC03 gripper-status subscribers.
+        for monitor in getattr(self, "_grip_monitors", {}).values():
+            try:
+                monitor.close()
+            except Exception:
+                pass
         try:
             if self.robot is not None:
                 self.robot.shutdown()
@@ -1134,7 +1286,7 @@ def run_loop(
     last_print = 0.0
     print(f"[wbc_vr_robot] {driver.name} loop @ {args.ik_rate:g}Hz IK "
           f"({'replay ' + format(args.speed, 'g') + 'x' if replay else 'live'}); "
-          f"enable={[k for k, v in enable.items() if v]} grippers={args.grippers}")
+          f"enable={[k for k, v in enable.items() if v]} grippers=on")
 
     while True:
         now = clock()
@@ -1289,7 +1441,7 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
         "replay_file": str(args.replay) if replay else "",
     }
     print("=" * 72)
-    print(f"[wbc_vr_robot] REAL ROBOT. enabled={enabled} grippers={args.grippers} | "
+    print(f"[wbc_vr_robot] REAL ROBOT. enabled={enabled} grippers=on | "
           f"{'REPLAY ' + format(args.speed, 'g') + 'x' if replay else 'LIVE'} | "
           f"closed_loop_q={args.closed_loop_q} base_max={args.base_max_speed:g}m/s")
     print(f"  filters -> head_lpf={args.head_lpf_tau:g}s, "
@@ -1302,7 +1454,7 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
     print(f"  /debug -> {args.traj_out}")
     if args.record:
         print(f"  recording -> {args.save_dir} @ {args.record_rate:g}Hz while engaged "
-              "(head_left_rgb+head_depth, +torso action; grippers/wrist OFF).")
+              "(head_left_rgb+head_depth+left_wrist_rgb, +torso action, +gripper obs/action).")
     print("=" * 72)
 
     traj = _TrajLog(args.traj_out, meta=meta)
@@ -1335,37 +1487,12 @@ def main() -> None:
                       help="drive the robot from a stream HDF5 written by wbc_vr_record.py.")
     mode.add_argument("--source", choices=("live",), default=None,
                       help="drive from the live leader (default when --replay is omitted).")
-    parser.add_argument("--speed", type=float, default=DEFAULT_SPEED,
-                        help=f"replay speed multiplier (default {DEFAULT_SPEED:g}; <1 = slower).")
     parser.add_argument("--enable", default="arms,torso,head,base",
                         help="comma list of DOF groups to actuate: any of "
                              "arms,torso,head,base (or 'all'/'none'). Default "
                              "'arms,torso,head,base'. Unselected groups are still solved "
-                             "but not sent to that actuator.")
-    parser.add_argument("--grippers", action="store_true",
-                        help="actuate the grippers from the trigger values (OFF by default).")
-    parser.add_argument("--ik-rate", type=float, default=100.0,
-                        help="whole-body IK solve rate in Hz (default 100).")
-    parser.add_argument("--cmd-rate", type=float, default=10.0,
-                        help="leader command rate in Hz used to size the interpolation glide "
-                             "(default 10, matching wbc_vr_leader). 0 disables interpolation. "
-                             f"Replay rejects recorded command gaps above "
-                             f"{DEFAULT_REPLAY_GAP_LIMIT_MULTIPLE:g}x this nominal glide.")
-    parser.add_argument("--head-lpf-tau", type=float, default=DEFAULT_HEAD_LPF_TAU,
-                        help=f"head-target low-pass time constant s (default "
-                             f"{DEFAULT_HEAD_LPF_TAU:g}; 0 disables).")
-    parser.add_argument("--head-planar-pos-deadband", type=float,
-                        default=DEFAULT_HEAD_PLANAR_POS_DEADBAND,
-                        help="radial x/y deadband in meters for the planar head target "
-                             "before IK. This preserves arbitrary movement direction and "
-                             "only holds small headset translation at nominal. "
-                             f"Default {DEFAULT_HEAD_PLANAR_POS_DEADBAND:g}.")
-    parser.add_argument("--head-planar-yaw-deadband", type=float,
-                        default=DEFAULT_HEAD_PLANAR_YAW_DEADBAND,
-                        help="heading-yaw deadband in radians for the head target before "
-                             "IK. Small headset yaw drift is held at nominal; larger turns "
-                             "are preserved. "
-                             f"Default {DEFAULT_HEAD_PLANAR_YAW_DEADBAND:g}.")
+                             "but not sent to that actuator. The grippers are always "
+                             "active (tracking the leader triggers), independent of this mask.")
     parser.add_argument("--namespace", default="",
                         help="Zenoh namespace (must match the leader; default empty).")
     parser.add_argument("--traj-out", default=None,
@@ -1375,14 +1502,15 @@ def main() -> None:
                              "next to the replay file.")
     parser.add_argument("--record", action="store_true",
                         help="record an episode (vr_reader EpisodeRecorder format) while "
-                             "engaged: action+obs joints (incl. torso) and head_left_rgb/"
-                             "head_depth (+intrinsic/extrinsic). Grippers and the wrist "
-                             "camera are NOT recorded (not installed). OFF by default.")
+                             "engaged: action+obs joints (incl. torso), gripper obs/action, "
+                             "and head_left_rgb/head_depth/left_wrist_rgb (+intrinsic/"
+                             "extrinsic). The wrist camera needs an external ZED-SDK "
+                             "publisher on sensors/wrist_zedm/*. OFF by default.")
     parser.add_argument("--save-dir", default=DEFAULT_SAVE_DIR,
                         help=f"directory for recorded episodes (default {DEFAULT_SAVE_DIR}).")
     parser.add_argument("--record-rate", type=float, default=DEFAULT_RECORD_RATE,
                         help=f"episode record cadence in Hz (default {DEFAULT_RECORD_RATE:g}; "
-                             "must be <= --ik-rate).")
+                             "must be <= the IK rate (ik_rate in wbik.yaml)).")
 
     hw = parser.add_argument_group("hardware")
     hw.add_argument("--closed-loop-q", action="store_true",
@@ -1410,61 +1538,44 @@ def main() -> None:
                          f"many seconds (default {DEFAULT_SOURCE_TIMEOUT:g}).")
     hw.add_argument("--drive-state-mode", choices=("ms", "rad"), default="ms",
                     help="swerve wheel_velocity units for odometry (default 'ms').")
-    hw.add_argument("--base-deadband", type=float, default=DEFAULT_BASE_DEADBAND,
-                    help=f"base-twist deadband m/s, ang=2x (default {DEFAULT_BASE_DEADBAND:g}).")
-    hw.add_argument("--base-accel", type=float, default=DEFAULT_BASE_ACCEL,
-                    help=f"base-twist slew m/s^2, ang=2x (default {DEFAULT_BASE_ACCEL:g}).")
-    hw.add_argument("--base-kp-xy", type=float, default=DEFAULT_BASE_KP_XY,
-                    help=f"closed-loop base PD gain, xy error (default {DEFAULT_BASE_KP_XY:g}).")
-    hw.add_argument("--base-kp-yaw", type=float, default=DEFAULT_BASE_KP_YAW,
-                    help=f"closed-loop base PD gain, yaw error (default {DEFAULT_BASE_KP_YAW:g}).")
-    hw.add_argument("--base-max-speed", type=float, default=DEFAULT_BASE_MAX_SPEED,
-                    help=f"base linear velocity clamp m/s, ang=2x (default "
-                         f"{DEFAULT_BASE_MAX_SPEED:g}; conservative for first bring-up).")
     hw.add_argument("--base-quiet-hold-s", type=float, default=DEFAULT_BASE_QUIET_HOLD_S,
                     help="on a quiet (zero) base command, hold the current swerve steering "
                          "(zero drive) for this long before re-centering the wheels to 0deg "
                          f"(default {DEFAULT_BASE_QUIET_HOLD_S:g}; 0 = re-center on every quiet "
                          "tick, the original behavior).")
-    hw.add_argument("--base-post-linear-deadband", type=float,
-                    default=DEFAULT_BASE_POST_LINEAR_DEADBAND,
-                    help="per-axis vx/vy deadband in m/s applied after base deadband/clamp/"
-                         "slew using the same threshold for both linear axes and the "
-                         "pre-slew raw command as the activity reference. "
-                         f"Default {DEFAULT_BASE_POST_LINEAR_DEADBAND:g}.")
-    hw.add_argument("--base-post-angular-deadband", type=float,
-                    default=DEFAULT_BASE_POST_ANGULAR_DEADBAND,
-                    help="per-axis wz deadband in rad/s applied after base deadband/clamp/"
-                         "slew using the pre-slew raw command as the activity reference. "
-                         f"Default {DEFAULT_BASE_POST_ANGULAR_DEADBAND:g}.")
     args = parser.parse_args()
+    # Control-loop tunables sourced SOLELY from wbik.yaml's vr_teleop: block
+    # (VRTeleopConfig, loaded into the DEFAULT_* constants above); no longer
+    # CLI-overridable. Bind them onto args -- the same post-parse mutation the script
+    # already does for --traj-out -- so run_loop / HardwareDriver / the /debug meta read
+    # one namespace and YAML stays the single source. VRTeleopConfig.from_yaml already
+    # validated each value (finite, >= 0, or > 0 for replay_speed/ik_rate).
+    args.speed = DEFAULT_SPEED
+    args.ik_rate = DEFAULT_IK_RATE
+    args.cmd_rate = DEFAULT_CMD_RATE
+    args.head_lpf_tau = DEFAULT_HEAD_LPF_TAU
+    args.head_planar_pos_deadband = DEFAULT_HEAD_PLANAR_POS_DEADBAND
+    args.head_planar_yaw_deadband = DEFAULT_HEAD_PLANAR_YAW_DEADBAND
+    args.base_kp_xy = DEFAULT_BASE_KP_XY
+    args.base_kp_yaw = DEFAULT_BASE_KP_YAW
+    args.base_deadband = DEFAULT_BASE_DEADBAND
+    args.base_accel = DEFAULT_BASE_ACCEL
+    args.base_max_speed = DEFAULT_BASE_MAX_SPEED
+    args.base_post_linear_deadband = DEFAULT_BASE_POST_LINEAR_DEADBAND
+    args.base_post_angular_deadband = DEFAULT_BASE_POST_ANGULAR_DEADBAND
 
-    if args.ik_rate <= 0:
-        parser.error("--ik-rate must be > 0")
-    if args.cmd_rate < 0 or not np.isfinite(args.cmd_rate):
-        parser.error("--cmd-rate must be finite and >= 0")
-    if not np.isfinite(args.speed) or args.speed <= 0:
-        parser.error("--speed must be finite and > 0")
     for flag, val in (("--home-tol", args.home_tol), ("--max-joint-step", args.max_joint_step),
                       ("--home-settle", args.home_settle),
-                      ("--base-deadband", args.base_deadband), ("--base-kp-xy", args.base_kp_xy),
-                      ("--base-kp-yaw", args.base_kp_yaw),
-                      ("--head-lpf-tau", args.head_lpf_tau),
-                      ("--head-planar-pos-deadband", args.head_planar_pos_deadband),
-                      ("--head-planar-yaw-deadband", args.head_planar_yaw_deadband),
-                      ("--base-post-linear-deadband", args.base_post_linear_deadband),
-                      ("--base-post-angular-deadband", args.base_post_angular_deadband),
                       ("--base-quiet-hold-s", args.base_quiet_hold_s)):
         if not np.isfinite(val) or val < 0.0:
             parser.error(f"{flag} must be finite and >= 0")
-    for flag, val in (("--base-accel", args.base_accel),
-                      ("--base-max-speed", args.base_max_speed),
-                      ("--source-timeout", args.source_timeout),
+    for flag, val in (("--source-timeout", args.source_timeout),
                       ("--record-rate", args.record_rate)):
         if not np.isfinite(val) or val <= 0.0:
             parser.error(f"{flag} must be finite and > 0")
     if args.record and args.record_rate > args.ik_rate:
-        parser.error("--record-rate must be <= --ik-rate (cannot record faster than the loop)")
+        parser.error("--record-rate must be <= the IK rate (ik_rate in wbik.yaml; "
+                     "cannot record faster than the loop)")
     try:
         enable = parse_enable_mask(args.enable)
     except ValueError as exc:

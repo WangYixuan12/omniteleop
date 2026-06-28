@@ -5,9 +5,10 @@ The SAPIEN sim follower (``scripts/wbc_vr_record.py``) and the real-robot follow
 (``scripts/wbc_vr_robot.py``) share two things that MUST stay in lock-step, so a take
 recorded and visualized in sim drives the robot the same way it looked:
 
-* :class:`VRTeleopConfig` -- the control-loop tunables (head-target low-pass/deadband,
-  base PD gains, base command slew / post-deadband, replay speed) that shape the
-  low-rate leader command stream before/around the whole-body IK. They live in the
+* :class:`VRTeleopConfig` -- the control-loop tunables (control/command rates,
+  head-target low-pass/deadband, base PD gains, base command slew / clamp / post-deadband,
+  replay speed) that shape the low-rate leader command stream before/around the
+  whole-body IK. They live in the
   ``vr_teleop:`` block of the canonical ``follower/wbik.yaml`` (the single follower
   config file, beside the WBC *solver* tunables) and are loaded here so BOTH followers
   bind identical argparse defaults to them. ``WBCConfig.from_yaml`` ignores that block
@@ -45,9 +46,12 @@ from omniteleop.common.schemas import VRJointData
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("follower") / "wbik.yaml"
 VR_TELEOP_SECTION = "vr_teleop"
 # Fields the followers require to be STRICTLY positive (their argparse validation rejects
-# <= 0): a replay clock speed and a base-twist slew rate of 0 are degenerate. The rest are
-# disable-at-zero tunables (deadbands, the LPF tau, PD gains) and may be 0.
-_STRICTLY_POSITIVE_FIELDS = frozenset({"replay_speed", "base_accel"})
+# <= 0): a replay clock speed, an IK loop rate, a base-twist slew rate, and a base-velocity
+# clamp of 0 are degenerate. The rest are disable-at-zero tunables (deadbands, the LPF tau,
+# PD gains, and cmd_rate -- 0 disables interpolation) and may be 0.
+_STRICTLY_POSITIVE_FIELDS = frozenset(
+    {"replay_speed", "ik_rate", "base_accel", "base_max_speed"}
+)
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,8 @@ class VRTeleopConfig:
     """
 
     replay_speed: float                # replay speed multiplier (<1 = slower)
+    ik_rate: float                     # whole-body IK / control loop rate (Hz)
+    cmd_rate: float                    # leader command rate interpolated up to ik_rate (Hz); 0 disables
     head_lpf_tau: float                # head-target low-pass time constant (s); 0 disables
     head_planar_pos_deadband: float    # radial x/y head-target deadband (m)
     head_planar_yaw_deadband: float    # heading-yaw head-target deadband (rad)
@@ -69,6 +75,7 @@ class VRTeleopConfig:
     base_kp_yaw: float                 # closed-loop base PD gain on yaw error (1/s)
     base_deadband: float               # closed-loop base-twist pre-deadband (m/s; angular = 2x)
     base_accel: float                  # base-twist slew limit (m/s^2; angular = 2x)
+    base_max_speed: float              # base linear-velocity clamp (m/s; angular = 2x)
     base_post_linear_deadband: float   # per-axis vx/vy post-shaping deadband (m/s)
     base_post_angular_deadband: float  # per-axis wz post-shaping deadband (rad/s)
 

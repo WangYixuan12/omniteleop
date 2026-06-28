@@ -10,8 +10,8 @@ controllers. This node:
    track your controller's world motion: controller forward 10 cm -> target forward
    10 cm, independent of headset motion);
 3. **interpolates** the low-rate command stream (the leader publishes at ~10 Hz)
-   up to the ``--rate`` (100 Hz) IK ticks -- position lerped, orientation slerped
-   over ``1/cmd-rate`` per command, like the reference's ``use_interpolation``
+   up to the ``ik_rate`` (100 Hz) IK ticks -- position lerped, orientation slerped
+   over ``1/cmd_rate`` per command, like the reference's ``use_interpolation``
    (deps/rby1-wbc). The EE targets AND the head target ride the same segments, so
    every tracker sees a smooth glide, not 10 Hz staircase jumps;
 4. runs **whole-body IK** to track the EE targets, coordinating the mobile base +
@@ -20,7 +20,7 @@ controllers. This node:
    robot's own **stiff damped-LS head IK** -- ``VegaWholeBodyIK.solve_head``,
    vr_reader's ``head_mode: 'track'`` semantics (head_j2/j3 only) but solved
    against the **live whole-body configuration** with a full step per tick
-   (``head_ik_gain`` >= ``--rate``), so the pan/tilt counter-rotates base yaw and
+   (``head_ik_gain`` >= ``ik_rate``), so the pan/tilt counter-rotates base yaw and
    torso lean within a tick and the camera stays on the operator's gaze (smoothing
    comes from the interpolation, like the arms). There is no WBC head task: the
    joint command is fed to ``ik.solve(head_joints=...)`` so the solver's model
@@ -45,10 +45,11 @@ Run in the dexmate conda env (has sapien + pinocchio + pink + dexcomm)::
 
 This writes one HDF5 file: the replayable ``VRJointData`` stream at the root and
 simulation/debug datasets under ``/debug``. Replay that same stream through SAPIEN before
-running it on the real robot::
+running it on the real robot (replay speed and all control-loop tunables come from
+``follower/wbik.yaml``'s ``vr_teleop:`` block)::
 
     /home/yixuan/miniforge3/envs/dexmate/bin/python scripts/wbc_vr_record.py \
-        --replay /tmp/demo.hdf5 --speed 0.25 --output /tmp/demo_replay.mp4
+        --replay /tmp/demo.hdf5 --output /tmp/demo_replay.mp4
 
 Add ``--no-viewer`` to record headlessly. ``--physics`` actuates the swerve wheel joints
 under SAPIEN physics (``wbc_swerve`` steer+drive; the base pose *emerges* from wheel-ground
@@ -81,10 +82,7 @@ from typing import Optional
 import numpy as np
 
 from omniteleop.common.schemas import VRJointData
-from omniteleop.follower.wbc_sapien_sim import (
-    BASE_VEL_LIMIT,
-    SapienSimRobot,
-)
+from omniteleop.follower.wbc_sapien_sim import SapienSimRobot
 from omniteleop.follower.whole_body_ik import (
     HEAD_FRAME,
     HEAD_JOINTS,
@@ -129,6 +127,13 @@ DEFAULT_BASE_POST_ANGULAR_DEADBAND = _VR_TELEOP.base_post_angular_deadband
 DEFAULT_BASE_KP_XY = _VR_TELEOP.base_kp_xy
 DEFAULT_BASE_KP_YAW = _VR_TELEOP.base_kp_yaw
 DEFAULT_SPEED = _VR_TELEOP.replay_speed
+DEFAULT_RATE = _VR_TELEOP.ik_rate
+DEFAULT_CMD_RATE = _VR_TELEOP.cmd_rate
+# Base linear-velocity clamp (m/s; angular = 2x) on the commanded base twist, shared with
+# the real-robot follower (scripts/wbc_vr_robot.py) so a sim take replays at the same base
+# speed on hardware. This REPLACES the sim backend's BASE_VEL_LIMIT for the COMMAND clamp;
+# wbc_sapien_sim still uses BASE_VEL_LIMIT for its own internal envelope.
+DEFAULT_BASE_MAX_SPEED = _VR_TELEOP.base_max_speed
 
 # Base-twist shaping defaults for base_closed_loop.shape_twist (the angular limit is set to
 # 2x the linear one below). The CLOSED-loop deadband + slew are the shared vr_teleop values
@@ -247,7 +252,7 @@ class DebugLogger:
             ds(tt, "head_pose", col("head_target"), compress=True)
             ds(tt, "head_pose_pre_lpf", col("head_target_pre_lpf"), compress=True)
             tt.attrs["note"] = ("targets actually fed to the IK each tick; head_pose is "
-                                "after --head-lpf-tau filtering and planar deadbanding, and "
+                                "after head_lpf_tau filtering and planar deadbanding, and "
                                 "head_pose_pre_lpf is the interpolated head BEFORE the LPF; "
                                 "L/R are interpolated")
 
@@ -277,13 +282,11 @@ class DebugLogger:
             ds(bg, "pd_err", col("pd_err"))
             ds(bg, "shaped_twist", col("shaped_twist"))
             ds(bg, "hold_base", col("hold_base"))
-            ds(bg, "base_settled", col("base_settled"))
             bg.attrs["note"] = ("pd_twist_out: PD+feed-forward twist before command shaping; "
                                 "raw_twist: what feeds shape_twist; pd_err: "
                                 "solver-minus-measured base-pose error (closed loop, else 0); "
                                 "shaped_twist: post deadband->clamp->slew->post deadband, "
-                                "exactly what set_velocity received; base_settled is retained "
-                                "for schema compatibility and is always false")
+                                "exactly what set_velocity received")
 
             rg = root.create_group("rendered")
             ds(rg, "base_pose", col("meas_base_pose"))
@@ -308,28 +311,15 @@ def main() -> None:
     parser.add_argument("--replay", metavar="FILE",
                         help="replay a stream HDF5 through SAPIEN "
                              "instead of subscribing to the live leader.")
-    parser.add_argument("--speed", type=float, default=DEFAULT_SPEED,
-                        help=f"replay speed multiplier (default {DEFAULT_SPEED:g}; "
-                             "<1 = slower).")
     parser.add_argument("--output", default=None,
                         help="output video path (mp4). Default: --hdf5 with .mp4 "
                              f"extension, or {DEFAULT_WBC_VR_OUTPUT} when --hdf5 is omitted.")
-    parser.add_argument("--rate", type=float, default=100.0,
-                        help="control/record rate in Hz (default: 100).")
-    parser.add_argument("--cmd-rate", type=float, default=10.0,
-                        help="leader command rate in Hz (default: 10, matching "
-                             "wbc_vr_leader's default). Targets are lerp/slerp-"
-                             "interpolated over 1/cmd-rate between commands so the "
-                             "--rate IK sees a smooth glide (the reference's "
-                             "use_interpolation / trajectory_frequency_hz). "
-                             "0 disables interpolation (zero-order hold). Replay rejects "
-                             f"recorded command gaps above "
-                             f"{DEFAULT_REPLAY_GAP_LIMIT_MULTIPLE:g}x this nominal glide.")
     parser.add_argument("--width", type=int, default=960, help="video width (default: 960).")
     parser.add_argument("--height", type=int, default=540, help="video height (default: 540).")
     parser.add_argument("--video-fps", type=float, default=15.0,
                         help="recorded video fps (default: 15; frames are decimated "
-                             "from the higher --rate control loop to real-time).")
+                             "from the higher IK control loop (ik_rate in wbik.yaml) to "
+                             "real-time).")
     parser.add_argument("--no-viewer", action="store_true",
                         help="record headlessly (no SAPIEN window).")
     parser.add_argument("--namespace", default="",
@@ -350,53 +340,6 @@ def main() -> None:
                              "so the base tracks the solver and the EEFs follow the target "
                              "frames; 'open' feeds only the IK base twist, so the measured "
                              "base drifts under shaping / wheel dynamics and the EEFs lag.")
-    parser.add_argument("--base-deadband", type=float, default=None,
-                        help="base-velocity deadband in m/s (ang = 2x). Defaults to "
-                             f"{DEFAULT_CLOSED_BASE_DEADBAND:g} in closed loop and "
-                             f"{DEFAULT_OPEN_BASE_DEADBAND:g} in open loop.")
-    parser.add_argument("--base-accel", type=float, default=None,
-                        help="base-velocity slew limit in m/s^2 (ang = 2x). Defaults to "
-                             f"{DEFAULT_CLOSED_BASE_ACCEL:g} in closed loop and "
-                             f"{DEFAULT_OPEN_BASE_ACCEL:g} in open loop.")
-    parser.add_argument("--base-kp-xy", type=float, default=DEFAULT_BASE_KP_XY,
-                        help="closed-loop proportional gain on planar base-pose error "
-                             f"(1/s; default {DEFAULT_BASE_KP_XY:g}, the real-robot value). "
-                             "Ignored in open loop.")
-    parser.add_argument("--base-kp-yaw", type=float, default=DEFAULT_BASE_KP_YAW,
-                        help="closed-loop proportional gain on base-yaw error "
-                             f"(1/s; default {DEFAULT_BASE_KP_YAW:g}, the real-robot value). "
-                             "Ignored in open loop.")
-    parser.add_argument("--head-lpf-tau", type=float, default=DEFAULT_HEAD_LPF_TAU,
-                        help="first-order low-pass time constant in seconds for the "
-                             "interpolated head target before IK. 0 disables. "
-                             f"Default {DEFAULT_HEAD_LPF_TAU:g}s suppresses headset "
-                             "dither that otherwise resolves into base yaw in "
-                             "head_mode='ik'.")
-    parser.add_argument("--head-planar-pos-deadband", type=float,
-                        default=DEFAULT_HEAD_PLANAR_POS_DEADBAND,
-                        help="radial x/y deadband in meters for the planar head target "
-                             "before IK. This preserves arbitrary movement direction and "
-                             "only holds small headset translation at nominal. "
-                             f"Default {DEFAULT_HEAD_PLANAR_POS_DEADBAND:g}.")
-    parser.add_argument("--head-planar-yaw-deadband", type=float,
-                        default=DEFAULT_HEAD_PLANAR_YAW_DEADBAND,
-                        help="heading-yaw deadband in radians for the head target before "
-                             "IK. Small headset yaw drift is held at nominal; larger turns "
-                             "are preserved. "
-                             f"Default {DEFAULT_HEAD_PLANAR_YAW_DEADBAND:g}.")
-    parser.add_argument("--base-post-linear-deadband", type=float,
-                        default=DEFAULT_BASE_POST_LINEAR_DEADBAND,
-                        help="per-axis vx/vy deadband in m/s applied after base "
-                             "deadband/clamp/slew using the same threshold for both "
-                             "linear axes and the pre-slew raw command as the activity "
-                             "reference. "
-                             f"Default {DEFAULT_BASE_POST_LINEAR_DEADBAND:g}.")
-    parser.add_argument("--base-post-angular-deadband", type=float,
-                        default=DEFAULT_BASE_POST_ANGULAR_DEADBAND,
-                        help="per-axis wz deadband in rad/s applied after base "
-                             "deadband/clamp/slew using the pre-slew raw command as the "
-                             "activity reference. "
-                             f"Default {DEFAULT_BASE_POST_ANGULAR_DEADBAND:g}.")
     parser.add_argument("--hdf5", default=None,
                         help="path for the unified .hdf5 log. In live mode, the replayable "
                              "VRJointData stream is stored at the root and per-tick SAPIEN/"
@@ -409,23 +352,25 @@ def main() -> None:
     args.output, hdf5_path = resolve_record_paths(
         output=args.output, hdf5=args.hdf5, no_hdf5=args.no_hdf5,
     )
+    # Control-loop tunables sourced SOLELY from wbik.yaml's vr_teleop: block
+    # (VRTeleopConfig, loaded into the DEFAULT_* constants above); no longer
+    # CLI-overridable. Bind them onto args -- the same post-parse mutation the script
+    # already does for --output -- so the rest of main() reads one namespace and YAML
+    # stays the single source. VRTeleopConfig.from_yaml already validated each value
+    # (finite, >= 0, or > 0 for replay_speed/ik_rate). The base deadband/accel are NOT
+    # bound here: the closed/open-loop resolution below picks the YAML closed value or
+    # the script-local open value.
+    args.speed = DEFAULT_SPEED
+    args.rate = DEFAULT_RATE
+    args.cmd_rate = DEFAULT_CMD_RATE
+    args.base_kp_xy = DEFAULT_BASE_KP_XY
+    args.base_kp_yaw = DEFAULT_BASE_KP_YAW
+    args.head_lpf_tau = DEFAULT_HEAD_LPF_TAU
+    args.head_planar_pos_deadband = DEFAULT_HEAD_PLANAR_POS_DEADBAND
+    args.head_planar_yaw_deadband = DEFAULT_HEAD_PLANAR_YAW_DEADBAND
+    args.base_post_linear_deadband = DEFAULT_BASE_POST_LINEAR_DEADBAND
+    args.base_post_angular_deadband = DEFAULT_BASE_POST_ANGULAR_DEADBAND
 
-    if args.base_deadband is not None and args.base_deadband < 0.0:
-        parser.error("--base-deadband must be >= 0")
-    if args.base_accel is not None and args.base_accel <= 0.0:
-        parser.error("--base-accel must be > 0")
-    if args.base_kp_xy < 0.0 or args.base_kp_yaw < 0.0:
-        parser.error("--base-kp-xy and --base-kp-yaw must be >= 0")
-    if not np.isfinite(args.head_lpf_tau) or args.head_lpf_tau < 0.0:
-        parser.error("--head-lpf-tau must be finite and >= 0")
-    for flag, val in (
-        ("--head-planar-pos-deadband", args.head_planar_pos_deadband),
-        ("--head-planar-yaw-deadband", args.head_planar_yaw_deadband),
-        ("--base-post-linear-deadband", args.base_post_linear_deadband),
-        ("--base-post-angular-deadband", args.base_post_angular_deadband),
-    ):
-        if not np.isfinite(val) or val < 0.0:
-            parser.error(f"{flag} must be finite and >= 0")
     if args.physics_hz <= 0.0:
         parser.error("--physics-hz must be > 0")
     if args.wheel_friction <= 0.0:
@@ -446,12 +391,6 @@ def main() -> None:
     head0 = _to_mat(ik.frame_pose(HEAD_FRAME))
     print(f"[wbc_vr] model: nq={ik.model.nq} nv={ik.model.nv}")
 
-    if args.rate <= 0:
-        raise ValueError(f"--rate must be > 0, got {args.rate}")
-    if args.cmd_rate < 0 or not np.isfinite(args.cmd_rate):
-        raise ValueError(f"--cmd-rate must be finite and >= 0, got {args.cmd_rate}")
-    if not np.isfinite(args.speed) or args.speed <= 0:
-        parser.error("--speed must be finite and > 0")
     dt = 1.0 / args.rate
 
     base_mode = ("physics (wheels actuated: swerve steer+drive)" if args.physics
@@ -509,28 +448,26 @@ def main() -> None:
               "calibration; left X or Ctrl-C stops and saves.")
 
     closed_loop = args.base_loop == "closed"
-    base_deadband = args.base_deadband
-    if base_deadband is None:
-        base_deadband = (
-            DEFAULT_CLOSED_BASE_DEADBAND if closed_loop else DEFAULT_OPEN_BASE_DEADBAND
-        )
-    base_accel = args.base_accel
-    if base_accel is None:
-        base_accel = DEFAULT_CLOSED_BASE_ACCEL if closed_loop else DEFAULT_OPEN_BASE_ACCEL
+    # Closed loop uses the YAML vr_teleop values (shared with the real robot); open loop
+    # uses the sim-only script-local constants (tighter quiet band, no slew limit).
+    base_deadband = DEFAULT_CLOSED_BASE_DEADBAND if closed_loop else DEFAULT_OPEN_BASE_DEADBAND
+    base_accel = DEFAULT_CLOSED_BASE_ACCEL if closed_loop else DEFAULT_OPEN_BASE_ACCEL
     # Per-axis base-twist shaping (deadband -> velocity clamp -> slew), applied by
     # base_closed_loop.shape_twist exactly as scripts/drive_box_record.py does on the real
     # robot. Angular limits are 2x the linear ones (matching the prior base controller).
     base_deadband_ang = 2.0 * base_deadband
     base_accel_ang = 2.0 * base_accel
-    # Velocity envelope (the clamp the kinematic backend used): direction-preserving inside
-    # pd_twist/shape_twist via base_closed_loop.limit_twist.
-    base_max_lin = base_max_ang = BASE_VEL_LIMIT
+    # Velocity envelope: direction-preserving inside pd_twist/shape_twist via
+    # base_closed_loop.limit_twist. Unified with the real-robot follower (base_max_speed from
+    # wbik.yaml, angular = 2x) so the sim base clamps to the SAME speed as hardware.
+    base_max_lin = DEFAULT_BASE_MAX_SPEED
+    base_max_ang = 2.0 * DEFAULT_BASE_MAX_SPEED
     loop_msg = (f"closed-loop (base_closed_loop PD: kp_xy={args.base_kp_xy:g}, "
                 f"kp_yaw={args.base_kp_yaw:g})" if closed_loop
                 else "open-loop (feed-forward IK base twist only)")
     print(f"[wbc_vr] base control: {loop_msg} -> shape_twist("
           f"deadband {base_deadband:g}/{base_deadband_ang:g}, "
-          f"slew {base_accel:g}/{base_accel_ang:g}, clamp {BASE_VEL_LIMIT:g}) -> "
+          f"slew {base_accel:g}/{base_accel_ang:g}, clamp {base_max_lin:g}/{base_max_ang:g}) -> "
           f"post_deadband {args.base_post_linear_deadband:g}/"
           f"{args.base_post_angular_deadband:g} -> "
           "set_velocity(sequential_steering=False); e-stop / failed solve zeros the base.")
@@ -544,7 +481,7 @@ def main() -> None:
     # seeded at the nominal head FK so the head holds nominal until first published.
     # It rides the same interpolation segments as the EE targets, then passes through
     # a small pose LPF before IK. In head_mode "ik" this keeps headset dither from
-    # resolving directly into base yaw; set --head-lpf-tau 0 to disable.
+    # resolving directly into base yaw; set head_lpf_tau 0 in wbik.yaml to disable.
     head_cmd = head0.copy()
     last_cmd_ns = -1  # leader timestamp of the last command pushed into a segment
     speed = args.speed if replay else 1.0
@@ -596,7 +533,7 @@ def main() -> None:
         base_loop=str(args.base_loop), physics=bool(args.physics),
         base_deadband=float(base_deadband), base_accel=float(base_accel),
         base_kp_xy=float(args.base_kp_xy), base_kp_yaw=float(args.base_kp_yaw),
-        base_vel_limit=float(BASE_VEL_LIMIT),
+        base_max_speed=float(DEFAULT_BASE_MAX_SPEED),
         head_lpf_tau=float(args.head_lpf_tau),
         head_planar_pos_deadband=float(args.head_planar_pos_deadband),
         head_planar_yaw_deadband=float(args.head_planar_yaw_deadband),
@@ -720,7 +657,6 @@ def main() -> None:
             # Defaults so the debug log always has these even on a held tick.
             raw_twist = np.zeros(3)
             pd_err = np.zeros(3)
-            base_settled = False
             pd_twist_out = np.zeros(3)
             if hold_base:
                 shaped_twist = np.zeros(3)
@@ -826,7 +762,6 @@ def main() -> None:
                     pd_twist_out=np.asarray(pd_twist_out, dtype=np.float32),
                     pd_err=np.asarray(pd_err, dtype=np.float32),
                     shaped_twist=np.asarray(shaped_twist, dtype=np.float32),
-                    base_settled=bool(base_settled),
                     meas_base_pose=np.array([bx, by, byaw], dtype=np.float32),
                     ee_L_pos=eep["L"].astype(np.float32),
                     ee_R_pos=eep["R"].astype(np.float32),

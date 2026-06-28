@@ -37,11 +37,12 @@
    The follower either tracks this pose as a WBC head task (``head_mode: 'ik'``) or
    uses its orientation for dedicated pan/tilt head IK (``head_mode: 'track'``).
 
-Commands are published at a low rate (``--rate``, default **10 Hz**); the follower
-lerp/slerp-interpolates each command over ``1/rate`` up to its 100 Hz IK ticks
-(``wbc_vr_record.py --cmd-rate`` must match this rate). This mirrors the reference
-deps/rby1-wbc split: 10 Hz ``trajectory_frequency_hz`` commands, 100 Hz
-``ik_frequency_hz`` with ``use_interpolation: true``.
+Commands are published at a low rate (``cmd_rate`` in ``follower/wbik.yaml``, default
+**10 Hz**); the follower lerp/slerp-interpolates each command over ``1/cmd_rate`` up to
+its 100 Hz IK ticks. The leader publishes at exactly this ``cmd_rate`` (loaded from the
+same file), so leader and follower cannot drift. This mirrors the reference deps/rby1-wbc
+split: 10 Hz ``trajectory_frequency_hz`` commands, 100 Hz ``ik_frequency_hz`` with
+``use_interpolation: true``.
 
 This preserves the ``vr_reader`` controller convention (controller forward 10 cm ->
 target forward 10 cm in the calibrated base frame), with two deliberate changes:
@@ -109,6 +110,13 @@ from omniteleop.follower.whole_body_ik import (
     WBCConfig,
 )
 from omniteleop.leader.communication.webxr_vr_reader import WebXRVRReader
+from omniteleop.wbc_teleop import VRTeleopConfig
+
+# Command publish rate comes SOLELY from follower/wbik.yaml's vr_teleop.cmd_rate (no CLI
+# flag), so the leader publishes at exactly the rate the followers interpolate up from --
+# they cannot drift. The Vega URDF likewise comes from WBCConfig (wbik.yaml urdf_path).
+_VR_TELEOP = VRTeleopConfig.from_yaml()
+DEFAULT_RATE = _VR_TELEOP.cmd_rate  # leader publish rate = follower cmd_rate (Hz)
 
 # Sentinel poses the WebXR reader emits (post-transform, in the robot frame) when a
 # controller is not tracked. Copied from ``vr_reader.INVALID_{LEFT,RIGHT}_POSE`` so
@@ -321,9 +329,7 @@ class WBCVRLeader:
         # posture (NOT the legacy INIT_JOINT constants). At nominal the planar base
         # is at the world origin, so frame_pose() values are already in the base
         # frame, and they match exactly what wbc_vr_record's VegaWholeBodyIK uses.
-        cfg = WBCConfig()
-        if args.urdf:
-            cfg.urdf_path = args.urdf
+        cfg = WBCConfig()  # urdf_path comes from wbik.yaml (no --urdf override)
         ik = VegaWholeBodyIK(cfg)
         ik.reset()
         self.T_base_head = _to_mat(ik.frame_pose(HEAD_FRAME))
@@ -776,18 +782,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--rate", type=float, default=10.0,
-                        help="command publish rate in Hz (default: 10; the follower "
-                             "lerp/slerp-interpolates the commands up to its 100 Hz "
-                             "IK rate -- see wbc_vr_record.py --cmd-rate, which must "
-                             "match this).")
     parser.add_argument("--namespace", default="",
                         help="Zenoh namespace (must match the follower; default empty).")
     parser.add_argument("--host", default="0.0.0.0", help="WebXR bind host (default 0.0.0.0).")
     parser.add_argument("--port", type=int, default=5067, help="WebXR port (default 5067).")
     parser.add_argument("--cert", default=DEFAULT_CERT, help="TLS cert for the WebXR server.")
     parser.add_argument("--key", default=DEFAULT_KEY, help="TLS key for the WebXR server.")
-    parser.add_argument("--urdf", default=None, help="override the Vega URDF path.")
     parser.add_argument("--hold-seconds", type=float, default=1.0,
                         help="right-grip hold time to calibrate/start (default 1.0).")
     parser.add_argument("--mapping", choices=("relative", "absolute"), default="relative",
@@ -818,9 +818,15 @@ def main() -> None:
     parser.add_argument("--ee-capture-seconds", type=float, default=1.5,
                         help="averaging window for --calibrate-ee-offset (default 1.5).")
     args = parser.parse_args()
-
+    # Publish rate comes SOLELY from wbik.yaml's vr_teleop.cmd_rate (the rate the follower
+    # interpolates up from), so leader and follower cannot drift; the URDF comes from
+    # WBCConfig's urdf_path. Neither is a CLI flag. Bind cmd_rate onto args (the established
+    # post-parse pattern).
+    args.rate = DEFAULT_RATE
     if args.rate <= 0:
-        raise ValueError(f"--rate must be > 0, got {args.rate}")
+        raise ValueError(
+            f"wbik.yaml vr_teleop.cmd_rate must be > 0 for the leader, got {args.rate}"
+        )
 
     leader = WBCVRLeader(args)
     if args.calibrate_ee_offset:

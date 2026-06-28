@@ -144,6 +144,8 @@ python /home/yixuan/omniteleop/scripts/misc/check_eef_pos.py # robot.right_arm.g
 
 # WBC
 
+See [PIPELINE_WBC](./PIPELINE_WBC.md).
+
 ```bash
 python /home/yixuan/omniteleop/scripts/inspect_joints_sapien.py
 
@@ -168,21 +170,16 @@ python scripts/play_side_by_side_videos.py --video_1 /home/yixuan/Dexmate/wbc/wb
 ```bash
 python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py --calibrate-ee-offset
 
-python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py
-python scripts/wbc_vr_record.py --hdf5 /home/yixuan/Dexmate/wbc/real/test.hdf5 --physics --base-loop closed
-python scripts/wbc_vr_record.py --replay /home/yixuan/Dexmate/wbc/real/teleop_demo.hdf5 --speed 0.5 --output /home/yixuan/Dexmate/wbc/real/teleop_replay.mp4
+(dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py
 
+# python scripts/wbc_vr_record.py --hdf5 /home/yixuan/Dexmate/wbc/real/test.hdf5 --physics --base-loop closed
+# (dexmate) python scripts/wbc_vr_robot.py --replay /home/yixuan/Dexmate/wbc/real/move_sideway.hdf5 --record
 # on lambda machine
-(dexmate) python scripts/wbc_vr_robot.py --replay /home/yixuan/Dexmate/wbc/real/move_straight.hdf5 --speed 0.5 --record
-# base always has PD control from odom 
 # --closed-loop-q once joint readback is confirmed
 
 robot.chassis.set_steering_angle(0.0, wait_time=1.5)
 
 (dexmate) python scripts/wbc_vr_robot.py --record
-# add --grippers to actuate grippers
-
-python scripts/diagnostics/visualize_head_lpf_and_base_chain.py /home/yixuan/Dexmate/wbc/real/test.hdf5 --out /home/yixuan/Dexmate/wbc/real/test.png
 ```
 
 

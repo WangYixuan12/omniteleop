@@ -223,7 +223,13 @@ nominal_posture:
 # local to each script.
 vr_teleop:
   # Replay speed multiplier (<1 = slower). The staged bring-up replays sim takes slowly.
-  replay_speed: 0.5
+  replay_speed: 1.0
+  # Control-loop rates (Hz), shared by BOTH followers. ik_rate: the whole-body IK / control loop rate.
+  # cmd_rate: the leader command rate the low-rate stream is lerp/slerp-interpolated up
+  # from, toward ik_rate; it MUST match wbc_vr_leader.py --rate. 0 disables interpolation
+  # (zero-order hold). Replay rejects recorded command gaps above 5x this nominal glide.
+  ik_rate: 100.0
+  cmd_rate: 10.0
   # Head-target first-order low-pass time constant (s) before IK; suppresses headset dither
   # that would otherwise resolve into base yaw in head_mode "ik". 0 disables.
   head_lpf_tau: 0.2
@@ -239,14 +245,19 @@ vr_teleop:
   # Closed-loop base-twist pre-deadband (m/s; angular = 2x): the quiet band fed into
   # base_closed_loop.shape_twist. Shared by BOTH followers' closed loop -- the sim
   # follower's separate OPEN-loop deadband stays script-local.
-  base_deadband: 0.04
+  base_deadband: 0.02
   # Base-twist slew limit (m/s^2; angular = 2x), applied by base_closed_loop.shape_twist.
   base_accel: 0.4
+  # Base linear-velocity clamp (m/s; angular = 2x) on the commanded base twist, applied
+  # inside base_closed_loop.pd_twist/shape_twist by BOTH followers. Conservative for a first
+  # bring-up; the sim follower clamps to the SAME value so a take replays at the same base
+  # speed on hardware. (The WBC solver's own caps are base_xy_max_vel/base_yaw_max_vel above.)
+  base_max_speed: 0.45
   # Per-axis base-twist post-deadband (linear m/s, angular rad/s) applied AFTER
   # deadband/clamp/slew, using the pre-slew raw command as the activity reference. Its job
   # is now only the post-slew tail-cut at start/stop/axis-switch (clean stops): cross-axis
   # leakage is owned upstream by the WBC single-axis projection (enable_base_single_axis), so
   # the linear band no longer needs the large 0.18 that chopped slow single-axis drives (it
   # zeroed legit forward/strafe commands on 35-150 ticks/take); back to the nominal quiet band.
-  base_post_linear_deadband: 0.04
+  base_post_linear_deadband: 0.02
   base_post_angular_deadband: 0.08
