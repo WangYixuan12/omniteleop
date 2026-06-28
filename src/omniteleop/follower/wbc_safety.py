@@ -116,6 +116,62 @@ def parse_collision_spheres(urdf_path: str) -> Dict[str, List[Tuple[float, np.nd
     return out
 
 
+def _origin_xyz(origin: Optional[ET.Element]) -> np.ndarray:
+    """Return a URDF origin xyz vector, defaulting to zero when absent."""
+    xyz = origin.get("xyz") if origin is not None else "0 0 0"
+    return np.array([float(v) for v in xyz.split()], dtype=float)
+
+
+def parse_mesh_origins(urdf_path: str) -> Dict[str, np.ndarray]:
+    """Parse one mesh origin per link from a URDF.
+
+    Collision meshes are preferred. If a link has no collision mesh, the first visual
+    mesh is used instead. This is useful for collision-sphere URDFs: their collision
+    elements are spheres, but they keep the source mesh in a visual element.
+    """
+    root = ET.parse(urdf_path).getroot()
+    out: Dict[str, np.ndarray] = {}
+    for link in root.findall("link"):
+        link_name = link.get("name")
+        if not link_name:
+            continue
+        for tag in ("collision", "visual"):
+            for geom_parent in link.findall(tag):
+                if geom_parent.find("geometry/mesh") is None:
+                    continue
+                out[link_name] = _origin_xyz(geom_parent.find("origin"))
+                break
+            if link_name in out:
+                break
+    return out
+
+
+def collision_sphere_mesh_origin_offsets(
+    robot_urdf_path: str,
+    collision_spheres_urdf_path: str,
+    *,
+    atol: float = 1e-12,
+) -> Dict[str, np.ndarray]:
+    """Per-link offsets that map a sphere URDF into the robot URDF mesh convention.
+
+    The Dexmate collision-sphere URDF can be generated from a URDF whose mesh origins
+    differ from the hardware URDF loaded by WBC. Pinocchio attaches those spheres to
+    the WBC robot model by link name, so any mesh-origin convention difference must be
+    applied to the sphere placements before self-collision distances are computed.
+    """
+    robot_mesh_origins = parse_mesh_origins(robot_urdf_path)
+    sphere_source_mesh_origins = parse_mesh_origins(collision_spheres_urdf_path)
+    offsets: Dict[str, np.ndarray] = {}
+    for link_name, source_origin in sphere_source_mesh_origins.items():
+        robot_origin = robot_mesh_origins.get(link_name)
+        if robot_origin is None:
+            continue
+        offset = robot_origin - source_origin
+        if float(np.linalg.norm(offset)) > atol:
+            offsets[link_name] = offset
+    return offsets
+
+
 def cross_group_index_pairs(group_of: List[Optional[str]]) -> List[Tuple[int, int]]:
     """All cross-group ``(i, j)`` index pairs given each item's group label.
 

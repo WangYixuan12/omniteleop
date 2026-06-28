@@ -86,8 +86,12 @@ class Args:
     """Depth estimation algorithm (only used when --enable-depth). NEURAL is
     best quality but heaviest."""
 
-    rate: int = 30
-    """Camera fps."""
+    rate: int = 15
+    """Camera fps. The ZED Mini at HD720 only supports a discrete set
+    (15/30/60); any other value silently rounds DOWN to the nearest supported
+    rate (e.g. 20 -> 15). Default 15 matches the downstream record cadence
+    (wbc_vr_robot 10 Hz, vr_reader 15 Hz). Bump to 30 only if grab latency,
+    not bandwidth, is the limiter."""
 
     depth_min: float = 0.3
     """Minimum depth in metres."""
@@ -95,14 +99,14 @@ class Args:
     depth_max: float = 6.0
     """Maximum depth in metres."""
 
-    resize_h: int = 120
+    resize_h: int = 240
     """Output height: each stream is resized to (resize_h, resize_w) before
     publishing so only the small frame crosses WiFi. Set both resize_h and
     resize_w to 0 to publish the raw capture resolution. NOTE: HD720 is 16:9
     (1280x720); resizing to a non-16:9 target (e.g. 120x160) stretches the
     image — crop first if you need the original aspect ratio."""
 
-    resize_w: int = 160
+    resize_w: int = 320
     """Output width (see resize_h)."""
 
     verify: bool = False

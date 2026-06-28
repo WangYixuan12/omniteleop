@@ -152,7 +152,7 @@ self_collision_floor: 0.01
 # Build-time SRDF-style filter: drop cross-group sphere pairs closer than this at the
 # nominal posture (the by-design shoulder-in-torso overlaps), so the barrier starts
 # feasible. No RBY1 counterpart -- its hand-curated geom groups never form such pairs.
-nominal_pair_keep_dist: 0.02
+nominal_pair_keep_dist: 0.04 # run scripts/diagnostics/browse_collision_pairs_sapien.py to visualize
 # pink-only: the barrier constrains the N closest pairs per solve (QP rows). No RBY1
 # counterpart -- mink constrains every pair within its detection distance. 120 is the
 # smallest value with zero candidate floor breaches across clap/cross/torso scenarios

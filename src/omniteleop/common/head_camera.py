@@ -25,13 +25,12 @@ import numpy as np
 #   * scripts/drive_box_record.py — records ZED_K alongside the head frames.
 # Change them HERE and every consumer follows.
 #
-# Currently set to the FULL SVGA frame — cropping and downscaling are DISABLED
-# (crop spans the whole 960x600 frame; resize is a no-op to the same size, so
-# ZED_K == HEAD_BASE_K). To re-enable the manipulation-ROI crop, restore:
+# Currently set to the FULL SVGA frame (no ROI crop) then downscaled to 320x240 (WxH).
+# To re-enable the manipulation-ROI crop, restore:
 #     HEAD_CROP_TBLR = (300, 600, 375, 775)   # 300x400 ROI
-#     HEAD_RESIZE_HW = (120, 160)
-HEAD_CROP_TBLR: tuple[int, int, int, int] = (0, 600, 0, 960)  # (300, 600, 375, 775) 
-HEAD_RESIZE_HW: tuple[int, int] = (120, 160) # does not affect pose tracking that uses (600, 960) original
+#     HEAD_RESIZE_HW = (240, 320)
+HEAD_CROP_TBLR: tuple[int, int, int, int] = (0, 600, 0, 960)  # (300, 600, 375, 775)
+HEAD_RESIZE_HW: tuple[int, int] = (240, 320)  # (H, W); does not affect pose tracking on the raw SVGA (600, 960)
 
 # Intrinsics of the raw SVGA head frame (960x600), pre-crop.
 HEAD_BASE_K = np.array(

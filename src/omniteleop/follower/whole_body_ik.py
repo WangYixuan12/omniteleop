@@ -156,6 +156,24 @@ def _support_polygon_from_model(model: pin.Model) -> np.ndarray:
     return pts[ConvexHull(pts).vertices]  # ConvexHull orders 2D vertices CCW
 
 
+def _apply_collision_sphere_mesh_origin_offsets(
+    robot_urdf_path: str,
+    collision_spheres_urdf_path: str,
+    sphere_model: pin.GeometryModel,
+) -> None:
+    """Translate sphere placements when their source URDF mesh origins differ."""
+    offsets = wbc_safety.collision_sphere_mesh_origin_offsets(
+        robot_urdf_path, collision_spheres_urdf_path
+    )
+    if not offsets:
+        return
+    for geom in sphere_model.geometryObjects:
+        link_name = geom.name.rsplit("_", 1)[0]
+        offset = offsets.get(link_name)
+        if offset is not None:
+            geom.placement.translation += offset
+
+
 def _signed_dist_to_convex_polygon(point: np.ndarray, polygon: np.ndarray) -> float:
     """Signed distance (m) from ``point`` to a CCW convex ``polygon`` boundary.
 
@@ -543,6 +561,9 @@ class VegaWholeBodyIK:
                 sphere_full = pin.buildGeomFromUrdf(
                     model_full, cfg.collision_spheres_urdf, pin.GeometryType.COLLISION
                 )
+                _apply_collision_sphere_mesh_origin_offsets(
+                    urdf, cfg.collision_spheres_urdf, sphere_full
+                )
             except Exception as exc:  # missing URDF / no hpp-fcl: disable, warn
                 _warnings.warn(
                     f"self-collision avoidance disabled (could not load "
@@ -810,14 +831,16 @@ class VegaWholeBodyIK:
             )
             self.barriers = [self.collision_barrier]
 
-        # Reactive hold gate for self-collision only. Tip-over (CoM-over-base) is now
-        # enforced proactively inside the QP (_add_com_over_base_inequality), so the
-        # gate's CoM branch is disabled here -- unlike the Mink backend, which still
-        # relies on the gate for both.
+        # Reactive hold gate. Tip-over (CoM-over-base) is enforced proactively by the
+        # QP inequality (_add_com_over_base_inequality); the gate's CoM branch
+        # (enable_com=True) stays on as a reactive backstop that reverts any step whose
+        # CoM margin still crosses com_safety_margin. Self-collision is gated here too
+        # (the barrier is a soft QP cost, not a hard constraint). The Mink backend, by
+        # contrast, has no QP inequality and relies on the gate alone for both.
         self._gate = SafetyGate(
             self_collision_floor=cfg.self_collision_floor,
             self_collision_warn=cfg.self_collision_safe_dist,
-            enable_com=False,
+            enable_com=True,
             enable_collision=self._collision_enabled,
         )
 
@@ -1128,10 +1151,10 @@ class VegaWholeBodyIK:
 
         self.configuration.integrate_inplace(velocity, dt)
 
-        # Reactive self-collision gate (tip-over is enforced by the QP inequality
-        # above, so it is not re-checked here). The self-collision metric is base-frame
-        # (base-pose invariant), so a collision hold freezes only the joints (planar
-        # base nq=4, nv=3) and lets the base keep tracking; a QP failure freezes all.
+        # Reactive safety gate: self-collision plus a CoM-over-base backstop layered on
+        # the proactive QP inequality above (enable_com=True), re-checked here on the
+        # integrated step. A gate hold freezes the joints (planar base nq=4, nv=3) and
+        # lets the base keep tracking; only a QP failure (not success) freezes all.
         margin = self.stability_margin(self.configuration.q)
         self_dist = self._min_self_distance()
         status = self._gate.check(margin, self_dist)
@@ -1270,14 +1293,14 @@ class VegaWholeBodyIK:
         displacement ``v_prev·dt``, weighted per axis by ``base_velocity_smoothing_cost``
         (vx, vy, wz)::
 
-            0.5 * Σ_k cost_k² (Δbase_k − v_prev_k·dt)²
+            0.5 * Σ_k cost_k² (Δbase_k - v_prev_k·dt)²
 
         Unlike ``base_position_cost`` (which damps the base toward ZERO velocity and so
         resists every base motion, a wanted straight drive included), this is zero for any
         STEADY twist and penalizes only frame-to-frame reversals/jumps -- the leader-noise
-        lateral whip the operator cannot avoid. Mapping ``0.5‖cost·(Δq[:3] − v_prev·dt)‖²``
+        lateral whip the operator cannot avoid. Mapping ``0.5‖cost·(Δq[:3] - v_prev·dt)‖²``
         into the qpsolvers objective ``0.5 Δqᵀ P Δq + qᵀ Δq`` touches only the planar
-        root's diagonal: ``P_kk += cost_k²`` and ``q_k += −cost_k²·v_prev_k·dt`` for the
+        root's diagonal: ``P_kk += cost_k²`` and ``q_k += -cost_k²·v_prev_k·dt`` for the
         three base DOFs, so the head/torso equality and CoM inequality rows are untouched
         and P stays PSD (the added diagonal is non-negative).
 

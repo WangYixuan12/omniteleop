@@ -96,9 +96,12 @@ class Args:
     """ZED capture resolution. SVGA (960x600) is the SDK floor for ZED X Mini;
     the crop coordinates below assume SVGA."""
 
-    rate: int = 30
-    """Camera fps. Default 30; set 15 to match vr_reader record_rate if WiFi
-    uplink or command latency becomes the bottleneck."""
+    rate: int = 15
+    """Camera fps. The ZED X Mini at SVGA only supports a discrete set
+    (15/30/60/120); any other value silently rounds DOWN to the nearest
+    supported rate (e.g. 20 -> 15). Default 15 matches the downstream record
+    cadence (wbc_vr_robot 10 Hz, vr_reader 15 Hz) and minimises head-camera
+    bandwidth. Bump to 30 only if grab latency, not bandwidth, is the limiter."""
 
     depth_mode: DepthMode = "NEURAL"
 
