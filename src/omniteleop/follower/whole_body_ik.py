@@ -342,6 +342,14 @@ class WBCConfig:
     # residual ever biases the solve.
     head_position_cost: float = _DEFAULTS["head_position_cost"]
     head_orientation_cost: Sequence[float] = tuple(_DEFAULTS["head_orientation_cost"])
+    # WORLD-frame head-position soft objective (head_mode "ik" only), the gravity-aligned
+    # alternative to the LOCAL-axis head_position_cost above. Per-axis (x, y, z) weights in
+    # true world/gravity axes, added directly to the QP like com_over_base_pos_cost (a pink
+    # FrameTask cannot express this -- its position axes are the head's pitched optical
+    # frame). [x, y, 0] tracks world head x/y (keeps base-following) while freeing world-z so
+    # the torso can extend to reach a high EE target. (0, 0, 0) disables it. See
+    # _add_head_world_position_objective and wbik.yaml.
+    head_world_position_cost: Sequence[float] = tuple(_DEFAULTS["head_world_position_cost"])
 
     # Torso-top x anchor -- the Vega port of the *intent* of the reference's hard
     # torso equality rows (_add_torso_velocity_equalities: torso_0/4/5 pinned and
@@ -660,6 +668,10 @@ class VegaWholeBodyIK:
         # Self-collision pairs (after _idx_q, since the nominal filter needs it).
         self._collision_enabled = False
         self.collision_sphere_data = None
+        # Scratch collision data for self_collision_distance() -- a side-effect-free
+        # distance probe at an arbitrary q (e.g. homing waypoints), allocated lazily so
+        # the live gate/barrier collision_data is never disturbed.
+        self._probe_collision_data = None
         if self.collision_sphere_model is not None:
             self._setup_collision_pairs()
 
@@ -812,6 +824,19 @@ class VegaWholeBodyIK:
         )
         if self._head_mode == "ik":
             self.tasks.append(self.head_task)
+        # WORLD-frame head-position soft objective weights (x, y, z), added to the QP in
+        # solve() via _add_head_world_position_objective (head_mode "ik"). Validated once
+        # here, mirroring base_velocity_smoothing_cost. All-zero (default) disables it.
+        self._head_world_position_cost = np.asarray(
+            cfg.head_world_position_cost, dtype=float
+        )
+        if self._head_world_position_cost.shape != (3,) or not np.all(
+            np.isfinite(self._head_world_position_cost)
+        ) or np.any(self._head_world_position_cost < 0.0):
+            raise ValueError(
+                "head_world_position_cost must be 3 finite, non-negative values "
+                f"(x, y, z); got {cfg.head_world_position_cost!r}"
+            )
 
         self.config_limit = ConfigurationLimit(self.model)
         self.velocity_limit = VelocityLimit(self.model)
@@ -937,6 +962,45 @@ class VegaWholeBodyIK:
         n = len(self.configuration.collision_model.collisionPairs)
         if n == 0:
             return float("inf")
+        return float(min(cd.distanceResults[k].min_distance for k in range(n)))
+
+    def self_collision_distance(self, q: np.ndarray) -> float:
+        """Closest cross-group self-collision distance (m) at an ARBITRARY config ``q``.
+
+        Side-effect-free counterpart to :meth:`_min_self_distance` (which reads the live
+        solver Configuration): builds a throwaway Configuration over the same
+        collision-sphere model and kept cross-group pairs to evaluate ``q`` without
+        touching the solver's configuration, barrier, or gate state. Use it to vet a
+        candidate posture before commanding it -- e.g. each homing waypoint in
+        ``scripts/wbc_vr_robot.py`` -- against ``self_collision_floor``. Returns ``inf``
+        when collision avoidance is disabled (no sphere model / no kept pairs).
+
+        The distance is invariant to the planar base DOFs (``q[:4]``), so only the joint
+        entries of ``q`` matter; the base block may be left at neutral.
+        """
+        if not self._collision_enabled:
+            return float("inf")
+        q = np.asarray(q, dtype=float)
+        if q.shape != (self.model.nq,):
+            raise ValueError(
+                f"q has shape {q.shape}, expected ({self.model.nq},)"
+            )
+        if not np.all(np.isfinite(q)):
+            raise ValueError("q contains non-finite values")
+        sm = self.collision_sphere_model
+        if self._probe_collision_data is None:
+            self._probe_collision_data = sm.createData()
+        # Configuration copies `data` (copy_data defaults True) and computes the
+        # collision-pair distances into the dedicated probe buffer on construction, so
+        # neither self.data nor the live collision_data is mutated.
+        Configuration(
+            self.model, self.data, q,
+            collision_model=sm, collision_data=self._probe_collision_data,
+        )
+        n = len(sm.collisionPairs)
+        if n == 0:
+            return float("inf")
+        cd = self._probe_collision_data
         return float(min(cd.distanceResults[k].min_distance for k in range(n)))
 
     @property
@@ -1133,6 +1197,7 @@ class VegaWholeBodyIK:
                 problem.b = np.zeros(len(self._head_idx_v))
             self._add_torso_top_x_equality(problem, dt)
             self._add_com_over_base_terms(problem)
+            self._add_head_world_position_objective(problem)
             self._add_base_velocity_smoothing(problem, dt)
             result = qpsolvers.solve_problem(problem, solver=self.config.solver)
             if not result.found or result.x is None:
@@ -1434,6 +1499,44 @@ class VegaWholeBodyIK:
         weighted_jac = c * jac_base
         problem.P = problem.P + weighted_jac.T @ weighted_jac
         problem.q = problem.q + (c * c) * (jac_base.T @ err)
+
+    def _add_head_world_position_objective(self, problem: qpsolvers.Problem) -> None:
+        """Soft head-translation objective in WORLD (gravity-aligned) axes (head_mode "ik").
+
+        The gravity-aligned counterpart to the head FrameTask's position term. A pink
+        FrameTask weights position along the head frame's OWN axes, but ``zed_depth_frame``
+        is pitched ~45 deg down, so a ``[c, c, 0]`` mask there frees the optical axis -- not
+        world-vertical -- and leaks fore/aft into the freed axis. This term instead
+        penalizes the head origin's WORLD x/y/z error with independent per-axis weights
+        ``head_world_position_cost``, so ``[c, c, 0]`` tracks world x/y (preserving the
+        base-following ``head_mode: "ik"`` exists for) while leaving world-z free -- the
+        torso can extend to a high EE target without a head-z term fighting it.
+
+        Implemented directly on the QP (not a pink task) exactly like
+        :meth:`_add_com_over_base_soft_objective`: with the head's world-aligned
+        translational Jacobian ``J`` and error ``e = head_world_xyz - target_xyz``, each
+        active axis contributes ``||c_k (J_k Δq + e_k)||^2`` -> ``P += (cJ)^T (cJ)``,
+        ``q += c^2 J^T e``. The target is the head FrameTask's own target (set each solve),
+        so orientation (still tracked by the FrameTask) and position stay consistent.
+        """
+        if self._head_mode != "ik":
+            return
+        costs = self._head_world_position_cost
+        active = costs > 0.0
+        if not np.any(active):
+            return
+        fk = self.configuration.get_transform_frame_to_world(HEAD_FRAME)
+        target = self.head_task.transform_target_to_world  # pin.SE3, set in solve()/reset()
+        # World-aligned translational Jacobian: get_frame_jacobian is LOCAL (see solve_head),
+        # so rotate its linear block into the world frame (R @ J_local[:3]).
+        jac_local = self.configuration.get_frame_jacobian(HEAD_FRAME)
+        jac_world = fk.rotation @ jac_local[:3, :]              # 3 x nv
+        err = fk.translation - target.translation              # (3,) world: current - target
+        j = jac_world[active]                                  # (k, nv)
+        c = costs[active]                                      # (k,)
+        weighted = c[:, None] * j                             # (k, nv)
+        problem.P = problem.P + weighted.T @ weighted
+        problem.q = problem.q + j.T @ ((c * c) * err[active])
 
     def _add_com_over_base_inequality(
         self, problem: qpsolvers.Problem, err: np.ndarray, jac_base: np.ndarray

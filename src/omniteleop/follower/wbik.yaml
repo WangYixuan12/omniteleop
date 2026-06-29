@@ -91,7 +91,7 @@ head_mode: "ik"
 # head_pos_cost / head_ori_cost (10000). Roll about the camera forward axis is
 # unactuatable (planar-yaw base + pitch torso + pan/tilt head); the QP just leaves it
 # as residual (RBY1 keeps roll weighted too) -- zero the roll axis only if it biases.
-head_position_cost: 10000.0
+head_position_cost: 0.0
 head_orientation_cost: [10000.0, 10000.0, 10000.0]
 # WORLD-frame head-position objective (head_mode "ik" only), the gravity-aligned
 # alternative to head_position_cost. A pink FrameTask weights position in the head's
@@ -105,7 +105,7 @@ head_orientation_cost: [10000.0, 10000.0, 10000.0]
 # To switch a run to the gravity-aligned scheme set head_position_cost: 0.0 here and
 # head_world_position_cost: [10000.0, 10000.0, 0.0] (optionally a small z like 200 as a
 # camera-height comfort prior, NOT an EE-peer 10000).
-head_world_position_cost: [0.0, 0.0, 0.0]
+head_world_position_cost: [10000.0, 10000.0, 0.0]
 
 # --- Torso-top x anchor (hard QP equality) ----------------------------------------------------
 # RBY1's hard torso equality rows (torso_3 == -(torso_1 + torso_2) keeps its arm/head mount from pitching
@@ -158,7 +158,7 @@ enable_collision_avoidance: true
 collision_spheres_urdf: "/home/yixuan/miniforge3/envs/dexmate/lib/python3.12/site-packages/dexmate_urdf/robots/humanoid/vega_1/vega_1_collision_spheres.collision.urdf"
 # CBF separation target (m): the barrier asymptotically forbids cross-group sphere
 # pairs closer than this. 
-self_collision_safe_dist: 0.02
+self_collision_safe_dist: 0.02 # will give ~0.04m in real robot, should be enough
 # Reactive hard floor (m): a step below this distance that is also *worsening* is
 # held (joints freeze; the base may keep moving).
 self_collision_floor: 0.01

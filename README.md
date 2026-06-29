@@ -170,7 +170,7 @@ python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py --calibrate-ee-offset
 
 (dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py
 
-# python scripts/wbc_vr_record.py --hdf5 /home/yixuan/Dexmate/wbc/real/test.hdf5 --physics --base-loop closed
+# python scripts/wbc_vr_record.py --hdf5 /home/yixuan/Dexmate/tmp/test.hdf5 --physics --base-loop closed
 # (dexmate) python scripts/wbc_vr_robot.py --replay /home/yixuan/Dexmate/wbc/real/move_sideway.hdf5 --record
 # on lambda machine
 # --closed-loop-q once joint readback is confirmed
