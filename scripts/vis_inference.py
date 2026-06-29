@@ -501,7 +501,7 @@ def main() -> None:
         help="Path to episode HDF5 file (current raw teleop layout).",
     )
     parser.add_argument(
-        "--voxel", type=float, default=0.008, help="Voxel size for PCD downsample (m)"
+        "--voxel", type=float, default=0.012, help="Voxel size for PCD downsample (m)"
     )
     parser.add_argument(
         "--marker-radius",

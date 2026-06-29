@@ -85,7 +85,6 @@ from omniteleop.common.schemas import VRJointData
 from omniteleop.follower.wbc_sapien_sim import SapienSimRobot
 from omniteleop.follower.whole_body_ik import (
     HEAD_FRAME,
-    HEAD_JOINTS,
     LEFT_EE_FRAME,
     RIGHT_EE_FRAME,
     VegaWholeBodyIK,
@@ -152,16 +151,6 @@ def _orientation_marker_pose(orientation_pose: np.ndarray, anchor_pose) -> np.nd
     out[:3, :3] = np.asarray(orientation_pose, dtype=float)[:3, :3]
     out[:3, 3] = _to_mat(anchor_pose)[:3, 3]
     return out
-
-
-def _pin_head_mode_ik_joints(ik: VegaWholeBodyIK) -> None:
-    """Pin head_j1/head_j2 in head_mode "ik", leaving head_j3 for camera tilt."""
-    pin_names = ("head_j1", "head_j2")
-    idx_by_name = dict(zip(HEAD_JOINTS, ik._head_idx_v, strict=True))  # noqa: SLF001
-    rows = np.zeros((len(pin_names), ik.model.nv))
-    for row, name in enumerate(pin_names):
-        rows[row, idx_by_name[name]] = 1.0
-    ik._head_j1_pin_A = rows  # noqa: SLF001
 
 
 def _record_stream_frame_after_calibration(
@@ -377,14 +366,13 @@ def main() -> None:
         parser.error("--wheel-friction must be > 0")
 
     cfg = WBCConfig()
-    ik = VegaWholeBodyIK(cfg)
-    if cfg.head_mode == "ik":
-        _pin_head_mode_ik_joints(ik)
+    ik = VegaWholeBodyIK(cfg)  # head_mode "ik": pins cfg.head_ik_pinned_joints (wbik.yaml)
     left_frame, right_frame = LEFT_EE_FRAME, RIGHT_EE_FRAME
     print(f"[wbc_vr] safety: collision_avoidance={ik.collision_enabled}  "
           f"com_safety={cfg.enable_com_safety} (margin {cfg.com_safety_margin * 100:.0f}cm)")
     if cfg.head_mode == "ik":
-        print("[wbc_vr] head IK pin: head_j1/head_j2 fixed; head_j3 tilt free.")
+        print(f"[wbc_vr] head IK pin (wbik.yaml): {list(cfg.head_ik_pinned_joints)} fixed; "
+              "other head DOFs tracked.")
     ik.reset()
     left0 = _to_mat(ik.frame_pose(left_frame))
     right0 = _to_mat(ik.frame_pose(right_frame))

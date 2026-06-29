@@ -395,7 +395,7 @@ def main() -> None:
         "fallback), and a debug/latency.png is written.",
     )
     parser.add_argument(
-        "--voxel", type=float, default=0.008, help="Voxel size for PCD downsample (m)"
+        "--voxel", type=float, default=0.012, help="Voxel size for PCD downsample (m)"
     )
     parser.add_argument(
         "--save",

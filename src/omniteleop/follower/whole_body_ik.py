@@ -329,10 +329,10 @@ class WBCConfig:
     # (solve(head_joints=...)) and pinned out of the QP. "ik": the head DOFs become
     # whole-body QP variables and a head FrameTask tracks the headset pose
     # (solve(head_target=...)), so base + torso + head co-track it -- the base follows
-    # head turn/translation and is anchored when the head is still. In BOTH modes
-    # head_j1 (pan) is fixed (dq_head_j1 = 0): "track" pins all head DOFs, "ik" pins
-    # only j1 and leaves j2/j3 as IK DOFs -- so head yaw always resolves through the
-    # base (turn-follow) rather than the neck. NOTE this is a WBCConfig/wbik.yaml
+    # head turn/translation and is anchored when the head is still. "track" pins ALL head
+    # DOFs; "ik" pins the subset in head_ik_pinned_joints (default head_j1/head_j2) and
+    # leaves the rest (default head_j3) as IK DOFs -- so head yaw/pitch resolve through the
+    # base/body (turn-follow) rather than the neck. NOTE this is a WBCConfig/wbik.yaml
     # field, distinct from vr_robot_controller's unrelated head_mode (track/fixed).
     head_mode: str = _DEFAULTS["head_mode"]
     # Head FrameTask weights for head_mode "ik" (ignored in "track"). Follow rby1
@@ -350,6 +350,13 @@ class WBCConfig:
     # the torso can extend to reach a high EE target. (0, 0, 0) disables it. See
     # _add_head_world_position_objective and wbik.yaml.
     head_world_position_cost: Sequence[float] = tuple(_DEFAULTS["head_world_position_cost"])
+    # Head DOFs pinned out of the whole-body QP in head_mode "ik" (dq = 0), by joint name
+    # (a subset of HEAD_JOINTS = head_j1/head_j2/head_j3). The unlisted head joints stay IK
+    # DOFs tracked by the head FrameTask. Loaded from wbik.yaml so BOTH VR followers (sim
+    # wbc_vr_record.py + real wbc_vr_robot.py) pin the SAME head joints just by constructing
+    # VegaWholeBodyIK(cfg). Default head_j1/head_j2 (yaw + pitch follow the body, head_j3
+    # tilt free). Ignored in head_mode "track" (which pins every head DOF). Empty pins none.
+    head_ik_pinned_joints: Sequence[str] = tuple(_DEFAULTS["head_ik_pinned_joints"])
 
     # Torso-top x anchor -- the Vega port of the *intent* of the reference's hard
     # torso equality rows (_add_torso_velocity_equalities: torso_0/4/5 pinned and
@@ -646,12 +653,21 @@ class VegaWholeBodyIK:
         self._head_pin_A = np.zeros((len(self._head_idx_v), self.model.nv))
         for row, idx_v in enumerate(self._head_idx_v):
             self._head_pin_A[row, idx_v] = 1.0
-        # head_mode "ik": the head is a whole-body IK DOF, but this equality matrix
-        # pins selected head DOFs. By default it pins head_j1; callers such as
-        # wbc_vr_record.py may replace it with multiple rows to pin head_j1/head_j2
-        # together, forcing yaw follow through the base while leaving camera tilt free.
-        self._head_j1_pin_A = np.zeros((1, self.model.nv))
-        self._head_j1_pin_A[0, self._head_idx_v[0]] = 1.0
+        # head_mode "ik": the head is a whole-body IK DOF, but this equality matrix pins
+        # the head DOFs named in cfg.head_ik_pinned_joints (wbik.yaml; default
+        # head_j1/head_j2) out of the QP -- forcing their motion through the base/body while
+        # leaving the unlisted head joints (default head_j3) as free IK DOFs. Built from the
+        # config so both VR followers pin identically; one row per pinned joint.
+        idx_v_by_head = dict(zip(HEAD_JOINTS, self._head_idx_v, strict=True))
+        pinned = list(cfg.head_ik_pinned_joints)
+        unknown_pin = [n for n in pinned if n not in idx_v_by_head]
+        if unknown_pin:
+            raise ValueError(
+                f"head_ik_pinned_joints {unknown_pin} are not head joints {HEAD_JOINTS}"
+            )
+        self._head_j1_pin_A = np.zeros((len(pinned), self.model.nv))
+        for row, name in enumerate(pinned):
+            self._head_j1_pin_A[row, idx_v_by_head[name]] = 1.0
 
         # Torso-top x anchor: resolve the anchored frame; the anchor value itself
         # (the mount's base-frame x at the config nominal posture) is set in reset().
@@ -1228,10 +1244,11 @@ class VegaWholeBodyIK:
             # at the config nominal, so EE load cannot lean the upper body fore-aft
             # over the base (the base drives instead).
             if self._head_mode == "ik":
-                # Head is an IK DOF (tracked by head_task), but selected head joints are
-                # pinned. The recorder replaces the default one-row pin with a two-row
-                # head_j1/head_j2 pin so yaw resolves through the base and head_j3 keeps
-                # camera tilt authority. The torso-top anchor stacks onto these rows.
+                # Head is an IK DOF (tracked by head_task), but the head joints named in
+                # cfg.head_ik_pinned_joints (wbik.yaml; default head_j1/head_j2) are pinned
+                # -- one row per joint, built in __init__ -- so their motion resolves through
+                # the base/body while the unlisted head joints (default head_j3) keep IK
+                # authority (e.g. camera tilt). The torso-top anchor stacks onto these rows.
                 problem.A = self._head_j1_pin_A
                 problem.b = np.zeros(problem.A.shape[0])
             else:

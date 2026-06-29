@@ -106,6 +106,17 @@ head_orientation_cost: [10000.0, 10000.0, 10000.0]
 # head_world_position_cost: [10000.0, 10000.0, 0.0] (optionally a small z like 200 as a
 # camera-height comfort prior, NOT an EE-peer 10000).
 head_world_position_cost: [10000.0, 10000.0, 0.0]
+# Head DOFs pinned out of the whole-body QP in head_mode "ik" (dq = 0 each tick), as a
+# list of head joint names drawn from head_j1/head_j2/head_j3. The head joints NOT listed
+# stay whole-body IK DOFs tracked by the head FrameTask. head_j1 (pan) is pinned so an
+# operator head yaw resolves through the BASE (turn-follow) instead of the neck; head_j2
+# is pinned too so head pitch follows the body rather than the neck, leaving head_j3 free
+# for camera tilt authority. BOTH VR followers -- the SAPIEN sim follower
+# (scripts/wbc_vr_record.py) and the real-robot follower (scripts/wbc_vr_robot.py) -- load
+# this list via WBCConfig/VegaWholeBodyIK, so sim and hardware pin the SAME head DOFs and a
+# sim-verified take replays identically. Ignored in head_mode "track" (which pins ALL head
+# DOFs). [] pins nothing (every head joint becomes an IK DOF).
+head_ik_pinned_joints: ["head_j1", "head_j2"]
 
 # --- Torso-top x anchor (hard QP equality) ----------------------------------------------------
 # RBY1's hard torso equality rows (torso_3 == -(torso_1 + torso_2) keeps its arm/head mount from pitching
@@ -165,7 +176,7 @@ self_collision_floor: 0.01
 # Build-time SRDF-style filter: drop cross-group sphere pairs closer than this at the
 # nominal posture (the by-design shoulder-in-torso overlaps), so the barrier starts
 # feasible. No RBY1 counterpart -- its hand-curated geom groups never form such pairs.
-nominal_pair_keep_dist: 0.04 # run scripts/diagnostics/browse_collision_pairs_sapien.py to visualize
+nominal_pair_keep_dist: 0.06 # run scripts/diagnostics/browse_collision_pairs_sapien.py to visualize
 # pink-only: the barrier constrains the N closest pairs per solve (QP rows). No RBY1
 # counterpart -- mink constrains every pair within its detection distance. 120 is the
 # smallest value with zero candidate floor breaches across clap/cross/torso scenarios

@@ -24,8 +24,8 @@ so a take recorded/visualized in sim drives the robot identically. They are not 
 Pass ``--debug-dir DIR`` to write a per-tick ``/debug`` HDF5 (auto-named
 ``wbc_debug_<mode>_<timestamp>.hdf5`` under ``DIR``): the base PD chain (odom pose +
 raw wheels, IK base pose/twist, PD raw/err, shaped command), the closed-loop seed, and
-per-group joint command/sent/measured -- enough to diff a ``--closed-loop-q`` run against
-an open-loop one. OFF by default.
+per-group joint command/sent/measured -- enough to diff a ``--closed-loop-base`` run
+against an open-loop-base one. OFF by default.
 
 ``--record`` starts automatically on the first engage after VR calibration, matching
 ``scripts/wbc_vr_record.py``'s post-calibration recording gate. It saves an episode in
@@ -239,7 +239,7 @@ class _TrajLog:
 
         ``/debug`` holds every per-tick column (scalars, gzipped vectors, fixed-width
         strings) plus run metadata in its attrs, so each file self-describes which run
-        produced it (e.g. ``closed_loop_q``). Columns absent this run (no driver) are
+        produced it (e.g. ``closed_loop_base``). Columns absent this run (no driver) are
         skipped rather than erroring.
         """
         if not self.path or not self._rows:
@@ -404,9 +404,10 @@ class HardwareDriver:
     """Drive the real Vega (``dexcontrol.robot.Robot``) from the IK result.
 
     Homes to the WBC nominal posture before the first engage (so the IK's nominal
-    re-anchoring matches the hardware), optionally seeds the IK from the MEASURED state
-    each tick (``--closed-loop-q``), clamps per-tick joint steps, and runs the same
-    ``base_closed_loop`` PD/shape path the real robot uses in ``drive_box_record.py``.
+    re-anchoring matches the hardware), optionally closes the base loop by seeding the IK
+    planar root from MEASURED odometry each tick (``--closed-loop-base``), clamps per-tick
+    joint steps, and runs the same ``base_closed_loop`` PD/shape path the real robot uses
+    in ``drive_box_record.py``.
     Every joint/base actuator is gated by the ``--enable`` mask; the grippers are always
     activated and track the leader triggers. On any hold (e-stop / failed solve / safety
     hold / stale source or odom) the base is zeroed and joints are frozen (the grippers
@@ -702,33 +703,48 @@ class HardwareDriver:
         return out
 
     def measured_q(self, ik) -> Optional[np.ndarray]:
-        """Assemble the measured config for ``solve(current_q=)`` (``--closed-loop-q``).
+        """Seed the IK planar root from measured odometry (``--closed-loop-base``).
 
-        Returns None (open-loop) unless ``--closed-loop-q`` is set; also falls back to
-        open-loop for any tick whose joint readback has an unexpected shape, so a bad
-        sample can never inject a malformed seed. By default this overlays measured
-        body joints only and leaves the solver's planar root on its internally
-        integrated reference; odometry remains feedback for the base PD. Open-loop does
-        NOT read the joints here (that readback would sit in the pre-solve critical path
-        and perturb the very timing the open-loop run is the baseline for); debug_row()
-        reads them after actuation instead.
+        Returns the IK's current config with ONLY the planar root ``q[0:4]`` overwritten
+        by the MEASURED base pose ``(x, y, cos yaw, sin yaw)`` from the odometry thread,
+        so ``solve()``'s arm QP is anchored to where the base ACTUALLY is. The open-loop
+        alternative integrates the base root purely from the QP, which runs AHEAD of the
+        PD-tracked real base during a turn; the arms, solved against that ahead base, then
+        trail the WORLD EE targets -- the "arms lag behind to the left on a right turn"
+        symptom. Closing the base loop drops that reconstructed world EE lag from ~100mm
+        p95 / ~300mm peak to ~15/25mm in a closed-loop kinematic sim, without adding arm
+        jitter (the base then truly tracks the command, so the standing error stays small).
+
+        Body joints are deliberately NOT overlaid with their measured values: doing so
+        re-injected the arm position-loop tracking lag (measured arms trail their own
+        commands) into the solve, which both INCREASED the world EE lag and chattered the
+        arm command. The IK's own integrated body state is smoother and lower-lag because
+        the arms are position-controlled and track their commands well.
+
+        Returns None (fully open-loop) when ``--closed-loop-base`` is off, when there is no
+        odometry thread (``--enable`` without ``base``), or when the odom sample is
+        malformed -- so a bad pose can never inject a degenerate planar root. (Replay and
+        live both build the odom thread under ``--enable base``, so closure applies to
+        both.) The measured body-joint readback for /debug happens post-actuation in
+        debug_row(), off the pre-solve critical path.
         """
-        if not self.args.closed_loop_q:
-            self._dbg["meas_joints"] = None        # debug_row reads post-actuation
+        self._dbg["meas_joints"] = None            # debug_row reads body joints post-actuation
+        if not self.args.closed_loop_base or self._odom is None:
             self._dbg["seed_q"] = None
             self._dbg["closed_loop_active"] = False
             return None
 
-        meas = self._read_measured_joints()
-        self._dbg["meas_joints"] = meas
-        if any(meas[grp] is None for grp in self._joint_names):
-            self._dbg["seed_q"] = None             # bad readback -> open-loop this tick
+        pose = np.asarray(self._odom.pose, dtype=float)
+        if pose.shape != (3,) or not np.all(np.isfinite(pose)):
+            self._dbg["seed_q"] = None             # bad odom -> open-loop this tick
             self._dbg["closed_loop_active"] = False
             return None
+        # Planar-root layout (pin.JointModelPlanar, first joint): q[0:2]=(x, y),
+        # q[2:4]=(cos yaw, sin yaw). ik.q is a copy, so this does not mutate the solver
+        # state -- solve(current_q=) re-seeds it through Configuration.update.
         q = ik.q
-        for grp, names in self._joint_names.items():
-            for name, val in zip(names, meas[grp], strict=True):
-                q[ik._idx_q[name]] = float(val)  # noqa: SLF001
+        x, y, yaw = float(pose[0]), float(pose[1]), float(pose[2])
+        q[0], q[1], q[2], q[3] = x, y, np.cos(yaw), np.sin(yaw)
         self._dbg["seed_q"] = q.copy()
         self._dbg["closed_loop_active"] = True
         return q
@@ -1238,7 +1254,13 @@ class HardwareDriver:
 
 def _build_ik() -> tuple[VegaWholeBodyIK, WBCConfig]:
     cfg = WBCConfig()
+    # head_mode "ik" pins cfg.head_ik_pinned_joints (wbik.yaml; default head_j1/head_j2)
+    # out of the QP -- VegaWholeBodyIK builds the pin from the config, so this real-robot
+    # follower and the sim follower (wbc_vr_record.py) fix the SAME head DOFs.
     ik = VegaWholeBodyIK(cfg)
+    if cfg.head_mode == "ik":
+        print(f"[wbc_vr_robot] head IK pin (wbik.yaml): {list(cfg.head_ik_pinned_joints)} "
+              "fixed; other head DOFs tracked.")
     ik.reset()
     return ik, cfg
 
@@ -1428,12 +1450,12 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
         import os  # noqa: PLC0415
 
         os.makedirs(args.debug_dir, exist_ok=True)
-        run_mode = "closedloopq" if args.closed_loop_q else "openloop"
+        run_mode = "closedbase" if args.closed_loop_base else "openloop"
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         debug_path = os.path.join(args.debug_dir, f"wbc_debug_{run_mode}_{stamp}.hdf5")
         meta = {
             "mode": "replay" if replay else "live",
-            "closed_loop_q": bool(args.closed_loop_q),
+            "closed_loop_base": bool(args.closed_loop_base),
             "speed": float(args.speed) if replay else 1.0,
             "ik_rate": float(args.ik_rate),
             "cmd_rate": float(args.cmd_rate),
@@ -1458,7 +1480,7 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
     print("=" * 72)
     print(f"[wbc_vr_robot] REAL ROBOT. enabled={enabled} grippers=on | "
           f"{'REPLAY ' + format(args.speed, 'g') + 'x' if replay else 'LIVE'} | "
-          f"closed_loop_q={args.closed_loop_q} base_max={args.base_max_speed:g}m/s")
+          f"closed_loop_base={args.closed_loop_base} base_max={args.base_max_speed:g}m/s")
     print(f"  filters -> head_lpf={args.head_lpf_tau:g}s, "
           f"head_planar_deadband={args.head_planar_pos_deadband:g}m/"
           f"{args.head_planar_yaw_deadband:g}rad, "
@@ -1528,12 +1550,14 @@ def main() -> None:
                              "must be <= the IK rate (ik_rate in wbik.yaml)).")
 
     hw = parser.add_argument_group("hardware")
-    hw.add_argument("--closed-loop-q", action="store_true",
-                    help="seed the IK body joints from the MEASURED robot config each tick "
-                         "(solve(current_q=)), while keeping the solver's internally "
-                         "integrated base root. Default OFF (open-loop), matching the "
-                         "SAPIEN replay path and avoiding joint-readback convention bugs; "
-                         "enable once readback conventions are confirmed.")
+    hw.add_argument("--closed-loop-base", action="store_true",
+                    help="close the base loop: seed the IK planar root from MEASURED "
+                         "odometry each tick (solve(current_q=)) so the arms solve against "
+                         "where the base ACTUALLY is. Open-loop (default) integrates the "
+                         "base root from the QP, which leads the PD-tracked real base during "
+                         "a turn and makes the arms trail the world EE targets. Body joints "
+                         "are NOT overlaid (that re-injected arm tracking lag + jitter). "
+                         "Needs --enable base; no-op without an odometry thread.")
     hw.add_argument("--home-tol", type=float, default=DEFAULT_HOME_TOL,
                     help=f"max measured-vs-nominal joint error (rad) to pass the homing gate "
                          f"(default {DEFAULT_HOME_TOL:g}). Tolerates position-control "
