@@ -177,7 +177,7 @@ python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py --calibrate-ee-offset
 
 robot.chassis.set_steering_angle(0.0, wait_time=1.5)
 
-(dexmate) python scripts/wbc_vr_robot.py --record
+(dexmate) python scripts/wbc_vr_robot.py --record --debug-dir /home/yixuan/Dexmate/data/raw_data_debug
 
 python /home/yixuan/omniteleop/scripts/vis_episode.py --hdf5 /home/yixuan/Dexmate/data/raw_data/episode_0.hdf5
 ```

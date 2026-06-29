@@ -668,6 +668,12 @@ class VegaWholeBodyIK:
         # Self-collision pairs (after _idx_q, since the nominal filter needs it).
         self._collision_enabled = False
         self.collision_sphere_data = None
+        # Vectorized all-sphere reactive-gate distance: pair index arrays + per-geometry
+        # radii, set by _setup_collision_pairs when every geometry is a sphere. None =>
+        # _min_self_distance falls back to the exact coal per-pair read.
+        self._sc_pair_i: Optional[np.ndarray] = None
+        self._sc_pair_j: Optional[np.ndarray] = None
+        self._sc_radius: Optional[np.ndarray] = None
         # Scratch collision data for self_collision_distance() -- a side-effect-free
         # distance probe at an arbitrary q (e.g. homing waypoints), allocated lazily so
         # the live gate/barrier collision_data is never disturbed.
@@ -711,6 +717,26 @@ class VegaWholeBodyIK:
             sm.addCollisionPair(pin.CollisionPair(i, j))
         self.collision_sphere_data = sm.createData()
         self._collision_enabled = len(sm.collisionPairs) > 0
+
+        # Precompute the vectorized self-collision distance arrays. The Dexmate sphere
+        # model is all spheres, so the signed clearance of pair (i, j) is exactly
+        # ||c_i - c_j|| - r_i - r_j (coal's sphere narrowphase). Caching the pair index
+        # arrays + per-geometry radii lets _min_self_distance be one numpy reduction over
+        # oMg instead of a ~2900-element Python loop over coal DistanceResults. If any
+        # geometry is not a sphere, leave these None -> _min_self_distance uses coal.
+        if self._collision_enabled and all(
+            type(g.geometry).__name__ == "Sphere" for g in sm.geometryObjects
+        ):
+            pairs = sm.collisionPairs
+            self._sc_pair_i = np.fromiter(
+                (p.first for p in pairs), dtype=np.intp, count=len(pairs)
+            )
+            self._sc_pair_j = np.fromiter(
+                (p.second for p in pairs), dtype=np.intp, count=len(pairs)
+            )
+            self._sc_radius = np.array(
+                [float(g.geometry.radius) for g in sm.geometryObjects], dtype=float
+            )
 
     def _resolve_com_centroid(self) -> None:
         """Resolve the tip-over centroid proxy from ``cfg.com_centroid``.
@@ -955,6 +981,15 @@ class VegaWholeBodyIK:
 
         Reads the live ``Configuration`` collision data (refreshed on every
         ``integrate``/``update``); ``inf`` when collision avoidance is disabled.
+
+        The Dexmate sphere model is all spheres, so the signed clearance of pair
+        ``(i, j)`` is exactly ``||c_i - c_j|| - r_i - r_j`` -- coal's sphere narrowphase.
+        We reduce it as one vectorized numpy pass over the SAME ``oMg`` centres and pair
+        set coal uses (bit-identical; see
+        ``tests/test_wbc_safety.py::test_min_self_distance_matches_coal``) rather than a
+        ~2900-element Python loop over ``distanceResults`` (~1.2 ms -> ~30 us/tick). Falls
+        back to the exact coal read if any geometry is not a sphere (``_sc_radius`` None)
+        or the cached pair count ever disagrees with the live model.
         """
         if not self._collision_enabled:
             return float("inf")
@@ -962,6 +997,13 @@ class VegaWholeBodyIK:
         n = len(self.configuration.collision_model.collisionPairs)
         if n == 0:
             return float("inf")
+        if self._sc_radius is not None and self._sc_pair_i.shape[0] == n:
+            centers = np.asarray([cd.oMg[i].translation for i in range(len(cd.oMg))])
+            diff = centers[self._sc_pair_i] - centers[self._sc_pair_j]
+            d = np.sqrt(np.einsum("ij,ij->i", diff, diff)) - (
+                self._sc_radius[self._sc_pair_i] + self._sc_radius[self._sc_pair_j]
+            )
+            return float(d.min())
         return float(min(cd.distanceResults[k].min_distance for k in range(n)))
 
     def self_collision_distance(self, q: np.ndarray) -> float:

@@ -6,10 +6,14 @@ prev/next/jump navigation.
 
 Two episode layouts are supported via ``--deploy``:
 
-* default (teleop / ``raw_data`` layout, written by ``leader/vr_reader.py``)::
+* default (teleop / ``raw_data`` layout, written by ``leader/vr_reader.py`` or
+  ``scripts/wbc_vr_robot.py``)::
 
-      obs/images/{head_left_rgb, head_depth, left_wrist_rgb, intrinsic, extrinsic}
-      obs/joint/{torso, left_arm, right_arm, head}
+      obs/images/{head_left_rgb, head_depth, left_wrist_rgb}
+      obs/images/intrinsic   (3, 3) static (wbc_vr_robot) or (N, 3, 3)
+      obs/images/extrinsic   optional base_t_cam; recomputed by FK when absent
+      obs/joint/{torso, left_arm, right_arm, head[, chassis_*]}
+      obs/base/pose          optional (N, 3) = (x, y, yaw), present with a moving base
       obs/gripper/{left, right}
       action/joint/{left_arm, right_arm, head, chassis_*}
       action/gripper/{left, right}
@@ -41,6 +45,14 @@ Two episode layouts are supported via ``--deploy``:
   hardcoded ZED intrinsics / FK camera extrinsics (a single shared matrix is
   broadcast over frames). A ``debug/latency.png`` is written from the ``time``
   group.
+
+When ``obs/base/pose`` is present (``wbc_vr_robot.py --enable base``), the head-camera
+extrinsic (``world_t_cam = world_t_base · base_t_cam``), robot meshes, colored point
+cloud, and EEF markers are all composed with the per-frame ``world_t_base``, so a *driven*
+episode renders in a fixed world frame (the base pose at engage): static scene geometry
+stays put while the robot drives through it. Each frame is still rendered on its own (the
+cloud is replaced, not accumulated). Episodes without ``obs/base/pose`` fall back to
+identity -> base-relative rendering (unchanged).
 
 EEF markers represent the *future* trajectory from each frame onwards (obs blue,
 action red), so the point cloud shrinks one point at a time from the start as
@@ -259,6 +271,60 @@ def eef9_to_pos_R(eef9: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if np.all(np.isfinite(eef9[i])):
             Rm[i] = gram_schmidt_6d_to_R(eef9[i, 3:9])
     return pos, Rm
+
+
+def lift_base_pose_se3(pose_xyyaw: np.ndarray) -> np.ndarray:
+    """Lift planar base poses ``(N, 3) = (x, y, yaw)`` to ``(N, 4, 4)`` ``world_t_base``.
+
+    The mobile base is planar (z = 0); yaw is a right-handed rotation about world +z,
+    matching the body convention of the recorded ``obs/joint/chassis_*`` twist
+    (+x forward, +y left). Camera height enters later via ``base_t_cam`` FK, not here.
+    """
+    pose = np.asarray(pose_xyyaw, dtype=np.float64)
+    if pose.ndim != 2 or pose.shape[1] != 3:
+        raise ValueError(f"expected (N, 3) base pose (x, y, yaw), got shape {pose.shape}")
+    n = pose.shape[0]
+    T = np.tile(np.eye(4, dtype=np.float64), (n, 1, 1))
+    c, s = np.cos(pose[:, 2]), np.sin(pose[:, 2])
+    T[:, 0, 0], T[:, 0, 1] = c, -s
+    T[:, 1, 0], T[:, 1, 1] = s, c
+    T[:, 0, 3] = pose[:, 0]
+    T[:, 1, 3] = pose[:, 1]
+    return T
+
+
+def load_world_t_base(obs_group: dict, num_frames: int) -> np.ndarray:
+    """Per-frame ``world_t_base`` ``(N, 4, 4)`` from ``obs/base/pose``; identity if absent.
+
+    Episodes recorded with a moving base (``scripts/wbc_vr_robot.py --enable base``) carry
+    ``obs/base/pose`` ``(N, 3) = (x, y, yaw)`` in the engage-origin world frame. Without it
+    (deploy rollouts, legacy teleop) the base is treated as fixed at the world origin
+    (identity) -> base-relative rendering, i.e. unchanged behavior.
+    """
+    base_group = obs_group.get("base") if isinstance(obs_group, dict) else None
+    if not isinstance(base_group, dict) or "pose" not in base_group:
+        return np.tile(np.eye(4, dtype=np.float64), (num_frames, 1, 1))
+    pose = np.asarray(base_group["pose"], dtype=np.float64)
+    if pose.shape != (num_frames, 3):
+        raise ValueError(
+            f"obs/base/pose shape {pose.shape} != ({num_frames}, 3) = (x, y, yaw)"
+        )
+    return lift_base_pose_se3(pose)
+
+
+def transform_points_se3(T: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Apply per-frame SE(3) ``T`` ``(N, 4, 4)`` to points ``pts`` ``(N, 3)``.
+
+    Non-finite point rows propagate to NaN (the renderer skips them).
+    """
+    pts = np.asarray(pts, dtype=np.float64)
+    return np.einsum("nij,nj->ni", T[:, :3, :3], pts) + T[:, :3, 3]
+
+
+def transform_rots_se3(T: np.ndarray, Rm: np.ndarray) -> np.ndarray:
+    """Apply the per-frame rotation of ``T`` ``(N, 4, 4)`` to rotations ``Rm`` ``(N, 3, 3)``."""
+    Rm = np.asarray(Rm, dtype=np.float64)
+    return np.einsum("nij,njk->nik", T[:, :3, :3], Rm)
 
 
 def load_deploy_position_condition(
@@ -487,6 +553,14 @@ def main() -> None:
                 [cam_link_idx],
             )[0]
 
+    # ── world frame: compose obs/base/pose so the cloud, robot, and EEF markers
+    #    render in a fixed WORLD frame as the base drives. The extrinsic above is
+    #    base-RELATIVE (base_t_cam, saved or FK); world_t_cam = world_t_base · base_t_cam.
+    #    No obs/base/pose (deploy rollouts, legacy teleop) -> identity, i.e. unchanged
+    #    base-relative rendering. ────────────────────────────────────────────────
+    world_t_base = load_world_t_base(data["obs"], N)
+    extrinsics = world_t_base @ extrinsics  # base_t_cam -> world_t_cam
+
     # ── EEF obs (blue) / action (red) markers ────────────────────────────────
     # markers: list of (entity_path, color, pos (N,3), R (N,3,3)). The future
     # trajectory tail is logged per frame as Points3D(pos[idx:]); the current
@@ -519,6 +593,19 @@ def main() -> None:
         markers.append(("world/eef_obs/right", _OBS_COLOR, obs_pos[1], obs_R[1]))
         markers.append(("world/eef_action/left", _ACTION_COLOR, act_pos[0], act_R[0]))
         markers.append(("world/eef_action/right", _ACTION_COLOR, act_pos[1], act_R[1]))
+
+    # Lift EEF markers (built base-relative for teleop / in the recorded eef frame for
+    # deploy) into the world frame with the same per-frame world_t_base (identity when
+    # obs/base/pose is absent, so deploy/legacy episodes are unchanged).
+    markers = [
+        (
+            path,
+            color,
+            transform_points_se3(world_t_base, pos),
+            transform_rots_se3(world_t_base, Rm),
+        )
+        for path, color, pos, Rm in markers
+    ]
 
     robot_mesh_gen = RobotMeshGenerator("vega_no_effector")
 
@@ -684,8 +771,9 @@ def main() -> None:
         link_tf = robot_mesh_gen.compute_fk_from_link_names(
             qpos, robot_link_names, in_obj_frame=True
         )
+        wtb = world_t_base[idx]  # base-relative link poses -> world frame (identity if no base)
         for name in robot_link_names:
-            tf = link_tf[name]
+            tf = wtb @ link_tf[name]
             rr.log(
                 f"world/robot/{name}",
                 rr.Transform3D(translation=tf[:3, 3], mat3x3=tf[:3, :3]),

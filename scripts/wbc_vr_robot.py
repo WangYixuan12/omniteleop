@@ -6,10 +6,10 @@ to the leader's Cartesian ``L_ee``/``R_ee``/head TARGET poses, interpolate the l
 command stream up to the IK rate, run ``VegaWholeBodyIK`` -- but driving the REAL Vega
 hardware (``dexcontrol.robot.Robot``) instead of a simulator.
 
-To bring this up safely we DON'T jump straight to live teleop. First use
-``scripts/wbc_vr_record.py`` to visualize in SAPIEN and save one HDF5 file: the replayable
-leader stream lives at the file root, and debug data lives under ``/debug``. This script
-then has two real-robot modes:
+We do NOT use low-level APIs like `set_motion_state`, `set_steering_angle`, `set_wheel_velocity` directly, which can command opposed
+steering/velocity and damage the wheel motors. Route base motion through `set_velocity`.
+
+Two real-robot modes:
 
   1. ``--replay FILE``   replay that SAPIEN-verified stream, TIME-SCALED (by ``replay_speed``
                          in ``follower/wbik.yaml``), through the same whole-body IK on the robot.
@@ -21,15 +21,11 @@ deadbands, base PD gains, base slew / deadband / post-deadband -- come SOLELY fr
 ``vr_teleop:`` block of ``follower/wbik.yaml`` (shared with ``scripts/wbc_vr_record.py``),
 so a take recorded/visualized in sim drives the robot identically. They are not CLI flags.
 
-``--enable`` selects which DOF groups actually actuate (default ``arms,torso,head,base``);
-the grippers are ALWAYS active, tracking the leader triggers. Unselected groups are still
-solved by the IK but not sent to that actuator.
-
-Both real-robot modes always write a per-tick ``/debug`` HDF5 (auto-named
-``wbc_debug_<mode>_<timestamp>.hdf5`` next to the replay file, or override with
-``--traj-out``): the base PD chain (odom pose + raw wheels, IK base pose/twist, PD
-raw/err, shaped command), the closed-loop seed, and per-group joint command/sent/measured
--- enough to diff a ``--closed-loop-q`` run against an open-loop one.
+Pass ``--debug-dir DIR`` to write a per-tick ``/debug`` HDF5 (auto-named
+``wbc_debug_<mode>_<timestamp>.hdf5`` under ``DIR``): the base PD chain (odom pose +
+raw wheels, IK base pose/twist, PD raw/err, shaped command), the closed-loop seed, and
+per-group joint command/sent/measured -- enough to diff a ``--closed-loop-q`` run against
+an open-loop one. OFF by default.
 
 ``--record`` starts automatically on the first engage after VR calibration, matching
 ``scripts/wbc_vr_record.py``'s post-calibration recording gate. It saves an episode in
@@ -49,19 +45,7 @@ NOT stored -- it was base-relative head FK (base-blind) and is recomputed offlin
 lands in the world frame (see ``scripts/vis_episode.py``). The wrist camera streams from
 ``sensors/wrist_zedm/*`` (needs an external ZED-SDK publisher; see vr_reader).
 
-Run in the dexmate conda env (pinocchio + pink + dexcomm + dexcontrol)::
-
-    # 1) record and visualize in SAPIEN (no real robot):
-    /home/yixuan/miniforge3/envs/dexmate/bin/python scripts/wbc_vr_record.py \
-        --hdf5 /tmp/demo.hdf5
-
-    # 2) inspect the saved take in SAPIEN before hardware:
-    /home/yixuan/miniforge3/envs/dexmate/bin/python scripts/wbc_vr_record.py \
-        --replay /tmp/demo.hdf5 --output /tmp/demo_replay.mp4
-
-    # 3) replay slowly ON THE ROBOT (after verifying step 2), recording a take:
-    /home/yixuan/miniforge3/envs/dexmate/bin/python scripts/wbc_vr_robot.py \
-        --replay /tmp/demo.hdf5 --record
+Run in the dexmate conda env (pinocchio + pink + dexcomm + dexcontrol)
 """
 
 from __future__ import annotations
@@ -208,8 +192,9 @@ class _TrajLog:
         self._rows: list[dict] = []
 
     def append(self, **fields) -> None:
-        """Record one IK tick."""
-        self._rows.append(fields)
+        """Record one IK tick (no-op when no output path is set)."""
+        if self.path is not None:
+            self._rows.append(fields)
 
     def __len__(self) -> int:
         return len(self._rows)
@@ -1269,7 +1254,7 @@ def run_loop(
     clock: Callable[[], float],
     realtime: bool,
     enable: dict,
-    traj: _TrajLog,
+    traj: Optional[_TrajLog] = None,
 ) -> None:
     """Drive the IK from ``source`` (live or replay), dispatching actuation to ``driver``.
 
@@ -1378,22 +1363,23 @@ def run_loop(
             status_pub.publish(asdict(status))
             last_status_publish = now
 
-        dbg = driver.debug_row(result) if hasattr(driver, "debug_row") else {}
-        traj.append(
-            t=t, cmd_ns=int(last_cmd_ns), estop=bool(estop),
-            success=bool(result.success), held=bool(result.held),
-            hold=bool(hold), hold_reason=hold_reason or "",
-            left_ee_error=float(result.left_ee_error),
-            right_ee_error=float(result.right_ee_error),
-            stability_margin=float(result.stability_margin),
-            safety_status=str(result.safety_status),
-            q=np.asarray(result.q, dtype=np.float32),
-            base_pose=np.asarray(result.base_pose, dtype=np.float32),
-            left_target=left_target.astype(np.float32),
-            right_target=right_target.astype(np.float32),
-            head_target=head_target.astype(np.float32),
-            **dbg,
-        )
+        if traj is not None:
+            dbg = driver.debug_row(result) if hasattr(driver, "debug_row") else {}
+            traj.append(
+                t=t, cmd_ns=int(last_cmd_ns), estop=bool(estop),
+                success=bool(result.success), held=bool(result.held),
+                hold=bool(hold), hold_reason=hold_reason or "",
+                left_ee_error=float(result.left_ee_error),
+                right_ee_error=float(result.right_ee_error),
+                stability_margin=float(result.stability_margin),
+                safety_status=str(result.safety_status),
+                q=np.asarray(result.q, dtype=np.float32),
+                base_pose=np.asarray(result.base_pose, dtype=np.float32),
+                left_target=left_target.astype(np.float32),
+                right_target=right_target.astype(np.float32),
+                head_target=head_target.astype(np.float32),
+                **dbg,
+            )
 
         if t - last_print >= 0.5:
             last_print = t
@@ -1435,38 +1421,40 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
         print(f"[wbc_vr_robot] live on '{source.topic}'. Ctrl-C to stop.")
 
     enabled = [k for k, v in enable.items() if v]
-    # Always capture a /debug HDF5 (auto-named per mode so the with/without
-    # --closed-loop-q runs land in two distinct files next to the replay source).
-    if args.traj_out is None:
+    debug_path: Optional[str] = None
+    traj: Optional[_TrajLog] = None
+    if args.debug_dir is not None:
         import datetime  # noqa: PLC0415
         import os  # noqa: PLC0415
+
+        os.makedirs(args.debug_dir, exist_ok=True)
         run_mode = "closedloopq" if args.closed_loop_q else "openloop"
-        base_dir = os.path.dirname(os.path.abspath(args.replay)) if replay else os.getcwd()
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.traj_out = os.path.join(base_dir, f"wbc_debug_{run_mode}_{stamp}.hdf5")
-    meta = {
-        "mode": "replay" if replay else "live",
-        "closed_loop_q": bool(args.closed_loop_q),
-        "speed": float(args.speed) if replay else 1.0,
-        "ik_rate": float(args.ik_rate),
-        "cmd_rate": float(args.cmd_rate),
-        "enable": ",".join(enabled),
-        "urdf": cfg.urdf_path.rsplit("/", 1)[-1],
-        "base_kp_xy": float(args.base_kp_xy),
-        "base_kp_yaw": float(args.base_kp_yaw),
-        "base_deadband": float(args.base_deadband),
-        "base_accel": float(args.base_accel),
-        "base_max_speed": float(args.base_max_speed),
-        "base_quiet_hold_s": float(args.base_quiet_hold_s),
-        "source_timeout": float(args.source_timeout),
-        "max_joint_step": float(args.max_joint_step),
-        "head_lpf_tau": float(args.head_lpf_tau),
-        "head_planar_pos_deadband": float(args.head_planar_pos_deadband),
-        "head_planar_yaw_deadband": float(args.head_planar_yaw_deadband),
-        "base_post_linear_deadband": float(args.base_post_linear_deadband),
-        "base_post_angular_deadband": float(args.base_post_angular_deadband),
-        "replay_file": str(args.replay) if replay else "",
-    }
+        debug_path = os.path.join(args.debug_dir, f"wbc_debug_{run_mode}_{stamp}.hdf5")
+        meta = {
+            "mode": "replay" if replay else "live",
+            "closed_loop_q": bool(args.closed_loop_q),
+            "speed": float(args.speed) if replay else 1.0,
+            "ik_rate": float(args.ik_rate),
+            "cmd_rate": float(args.cmd_rate),
+            "enable": ",".join(enabled),
+            "urdf": cfg.urdf_path.rsplit("/", 1)[-1],
+            "base_kp_xy": float(args.base_kp_xy),
+            "base_kp_yaw": float(args.base_kp_yaw),
+            "base_deadband": float(args.base_deadband),
+            "base_accel": float(args.base_accel),
+            "base_max_speed": float(args.base_max_speed),
+            "base_quiet_hold_s": float(args.base_quiet_hold_s),
+            "source_timeout": float(args.source_timeout),
+            "max_joint_step": float(args.max_joint_step),
+            "head_lpf_tau": float(args.head_lpf_tau),
+            "head_planar_pos_deadband": float(args.head_planar_pos_deadband),
+            "head_planar_yaw_deadband": float(args.head_planar_yaw_deadband),
+            "base_post_linear_deadband": float(args.base_post_linear_deadband),
+            "base_post_angular_deadband": float(args.base_post_angular_deadband),
+            "replay_file": str(args.replay) if replay else "",
+        }
+        traj = _TrajLog(debug_path, meta=meta)
     print("=" * 72)
     print(f"[wbc_vr_robot] REAL ROBOT. enabled={enabled} grippers=on | "
           f"{'REPLAY ' + format(args.speed, 'g') + 'x' if replay else 'LIVE'} | "
@@ -1478,13 +1466,13 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
           f"{args.base_post_angular_deadband:g}rad/s")
     print(f"  joints -> dexcontrol 1:1 (urdf {cfg.urdf_path.rsplit('/', 1)[-1]}). "
           "Robot homes to nominal, then moves. KEEP CLEAR. Ctrl-C aborts (zeros base).")
-    print(f"  /debug -> {args.traj_out}")
+    if debug_path is not None:
+        print(f"  /debug -> {debug_path}")
     if args.record:
         print(f"  recording -> {args.save_dir} @ {args.record_rate:g}Hz while engaged "
               "(head_left_rgb+head_depth+left_wrist_rgb, +torso action, +gripper obs/action).")
     print("=" * 72)
 
-    traj = _TrajLog(args.traj_out, meta=meta)
     driver = None
     try:
         # Construct INSIDE the try so a HardwareDriver init failure (e.g. failed homing
@@ -1499,10 +1487,10 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
             source.close()
         if driver is not None:
             driver.close()
-        print(f"\n[wbc_vr_robot] summary: {traj.summary()}")
-        if args.traj_out:
+        if traj is not None:
+            print(f"\n[wbc_vr_robot] summary: {traj.summary()}")
             traj.write()
-            print(f"[wbc_vr_robot] /debug log -> {args.traj_out} ({len(traj)} ticks)")
+            print(f"[wbc_vr_robot] /debug log -> {debug_path} ({len(traj)} ticks)")
 
 
 def main() -> None:
@@ -1517,16 +1505,15 @@ def main() -> None:
     parser.add_argument("--enable", default="arms,torso,head,base",
                         help="comma list of DOF groups to actuate: any of "
                              "arms,torso,head,base (or 'all'/'none'). Default "
-                             "'arms,torso,head,base'. Unselected groups are still solved "
+                             "'arms,torso,head,base'. Unselected groups are still solved by IK"
                              "but not sent to that actuator. The grippers are always "
                              "active (tracking the leader triggers), independent of this mask.")
     parser.add_argument("--namespace", default="",
                         help="Zenoh namespace (must match the leader; default empty).")
-    parser.add_argument("--traj-out", default=None,
-                        help="write the per-tick /debug log (base PD chain, odom + raw "
-                             "wheels, closed-loop seed, joint cmd/sent/measured) to this "
-                             ".hdf5. Default: auto-named wbc_debug_<mode>_<timestamp>.hdf5 "
-                             "next to the replay file.")
+    parser.add_argument("--debug-dir", dest="debug_dir", default=None,
+                        help="write per-tick /debug HDF5 logs (base PD chain, odom + raw "
+                             "wheels, closed-loop seed, joint cmd/sent/measured) under this "
+                             "directory as wbc_debug_<mode>_<timestamp>.hdf5. OFF by default.")
     parser.add_argument("--record", action="store_true",
                         help="record an episode (vr_reader EpisodeRecorder format) while "
                              "engaged: action+obs joints (incl. torso), gripper obs/action, "
@@ -1575,7 +1562,7 @@ def main() -> None:
     # Control-loop tunables sourced SOLELY from wbik.yaml's vr_teleop: block
     # (VRTeleopConfig, loaded into the DEFAULT_* constants above); no longer
     # CLI-overridable. Bind them onto args -- the same post-parse mutation the script
-    # already does for --traj-out -- so run_loop / HardwareDriver / the /debug meta read
+    # already does for --debug-dir -- so run_loop / HardwareDriver / the /debug meta read
     # one namespace and YAML stays the single source. VRTeleopConfig.from_yaml already
     # validated each value (finite, >= 0, or > 0 for replay_speed/ik_rate).
     args.speed = DEFAULT_SPEED
