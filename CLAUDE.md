@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Implement
 - Refer to /home/yixuan/omniteleop/dexcontrol (also in conda env dexmate) to understand, but do not touch it.
 - Validate all input dimensions aggressively. Raise ValueError on any mismatch. Never use placeholder/dummy data (zeros, None, etc.) to make code "run".
-- Implement functions one at a time. Write a visualization script (e.g., rendering point clouds, displaying images, or inspecting tensor statistics) to empirically verify the output. Let me confirm the transformation is correct before we proceed.
+- Implement functions one at a time. Empirically verify the output (e.g. rendering point clouds, displaying images, or inspecting tensor statistics). Let me confirm the transformation is correct before we proceed.
 - Prefer small, incremental contributions over sweeping refactors.
 
 ### Verify

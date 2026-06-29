@@ -28,7 +28,7 @@ lm_damping_base: 1.0e-6
 # leaves any steady twist unpenalized and resists only frame-to-frame reversals/jumps. It
 # exists because teleop EE targets carry inevitable leader-side noise that the redundant QP
 # would otherwise resolve into a laterally whipping base. Lower than base_position_cost.
-base_velocity_smoothing_cost: [0.0, 0.0, 0.0] # disabled
+base_velocity_smoothing_cost: [0.0, 0.0, 4000.0] # wz on: penalize frame-to-frame base-yaw reversals (head-yaw-driven wheel jitter); steady turns unpenalized
 
 # --- Posture regularization toward the nominal posture ------------------------------------
 # Per-group PostureTask cost: resolves redundancy by pulling joints toward
@@ -93,6 +93,19 @@ head_mode: "ik"
 # as residual (RBY1 keeps roll weighted too) -- zero the roll axis only if it biases.
 head_position_cost: 10000.0
 head_orientation_cost: [10000.0, 10000.0, 10000.0]
+# WORLD-frame head-position objective (head_mode "ik" only), the gravity-aligned
+# alternative to head_position_cost. A pink FrameTask weights position in the head's
+# own LOCAL axes, but zed_depth_frame is pitched ~45 deg down, so a [x,y,0] mask there
+# would free the optical axis, NOT world-vertical (and would corrupt fore/aft anchoring).
+# This is a SOFT least-squares term added directly to the QP (like com_over_base) on the
+# head's WORLD-aligned translation, so [x, y, z] are true gravity axes: track world x/y
+# (preserves base-following) and free world-z so the torso can straighten to a high EE
+# target without the head-z term fighting it (the operator's standing height is fixed, so
+# head-z carries no teleop intent). [0, 0, 0] disables it (use head_position_cost instead).
+# To switch a run to the gravity-aligned scheme set head_position_cost: 0.0 here and
+# head_world_position_cost: [10000.0, 10000.0, 0.0] (optionally a small z like 200 as a
+# camera-height comfort prior, NOT an EE-peer 10000).
+head_world_position_cost: [0.0, 0.0, 0.0]
 
 # --- Torso-top x anchor (hard QP equality) ----------------------------------------------------
 # RBY1's hard torso equality rows (torso_3 == -(torso_1 + torso_2) keeps its arm/head mount from pitching
@@ -232,12 +245,12 @@ vr_teleop:
   cmd_rate: 10.0
   # Head-target first-order low-pass time constant (s) before IK; suppresses headset dither
   # that would otherwise resolve into base yaw in head_mode "ik". 0 disables.
-  head_lpf_tau: 0.2
+  head_lpf_tau: 0.35
   # Planar head-target deadband: radial x/y (m) and heading-yaw (rad) held at the nominal
   # anchor so small headset drift does not wake the base, while larger motion passes through
   # (direction-preserving).
   head_planar_pos_deadband: 0.04
-  head_planar_yaw_deadband: 0.12
+  head_planar_yaw_deadband: 0.30 # 0.12/0.20
   # Closed-loop base PD gains on the (solver base pose - measured base pose) error -- the
   # real-robot values, shared with scripts/drive_box_record.py's base controller.
   base_kp_xy: 1.0
@@ -260,4 +273,4 @@ vr_teleop:
   # the linear band no longer needs the large 0.18 that chopped slow single-axis drives (it
   # zeroed legit forward/strafe commands on 35-150 ticks/take); back to the nominal quiet band.
   base_post_linear_deadband: 0.02
-  base_post_angular_deadband: 0.08
+  base_post_angular_deadband: 0.12
