@@ -90,6 +90,7 @@ from omniteleop.wbc_record import (
     DEFAULT_REPLAY_GAP_LIMIT_MULTIPLE,
     ReplaySource,
 )
+from omniteleop.wbc_robot_home import home_to_nominal
 from omniteleop.wbc_robot_util import base_quiet_dispatch, parse_enable_mask
 from omniteleop.wbc_stream import (
     HeadTargetLowPassFilter,
@@ -548,7 +549,7 @@ class HardwareDriver:
                 self._wait_chassis()
                 self._odom = OdometryThread(self.robot, drive_state_mode=args.drive_state_mode)
                 self._odom.start()
-            self._home_to_nominal()
+            home_to_nominal(self, arm_home_step=ARM_HOME_STEP)
         except BaseException:
             # Tear down partially-initialized hardware (odom thread, robot, base) before
             # propagating, so a homing-gate abort can't leak a running base/odom/robot.
@@ -683,78 +684,6 @@ class HardwareDriver:
                 return
             time.sleep(0.05)
         raise SystemExit(f"[wbc_vr_robot] no chassis state within {timeout:.0f}s.")
-
-    def _interp_joint(self, grp: str, waypoints: list, step: float = 0.01) -> None:
-        comp = self._comp(grp)
-        cur = np.asarray(comp.get_joint_pos(), dtype=float)
-        for wp in waypoints:
-            wp = np.asarray(wp, dtype=float)
-            n = max(1, int(np.max(np.abs(wp - cur)) / step))
-            for i in range(n):
-                q = cur + (wp - cur) * (i + 1) / n
-                comp.set_joint_pos(q.tolist(), wait_time=0.1, exit_on_reach=True)
-            cur = wp
-
-    def _home_to_nominal(self) -> None:
-        # Only home the ENABLED groups (a disabled group is not actuated, so moving it
-        # would be surprising); the IK still models disabled groups at nominal, so they
-        # are ASSUMED already there -- a limited-test caveat for partial --enable.
-        on = {"torso": self.enable["torso"], "left_arm": self.enable["arms"],
-              "right_arm": self.enable["arms"], "head": self.enable["head"]}
-        nom = {grp: self._to_hw(grp, self._nominal[grp]) for grp in self._joint_names}
-        homing = [g for g in self._joint_names if on[g]]
-        skipped = [g for g in self._joint_names if not on[g]]
-        print(f"[wbc_vr_robot] homing to WBC nominal (move clear; watch the robot). "
-              f"homing={homing}" + (f"; assuming-at-nominal={skipped}" if skipped else ""))
-        if on["torso"]:
-            self._interp_joint("torso", [nom["torso"]])
-        # Drive arms straight to nominal (no SAFE_* waypoint). Use a finer step so the
-        # direct path is traversed slowly -- there is no intermediate safe pose, so the
-        # slow glide lets the operator watch and Ctrl-C if it tracks toward a collision.
-        if on["left_arm"]:
-            self._interp_joint("left_arm", [nom["left_arm"]], step=ARM_HOME_STEP)
-        if on["right_arm"]:
-            self._interp_joint("right_arm", [nom["right_arm"]], step=ARM_HOME_STEP)
-        if on["head"]:
-            self._interp_joint("head", [nom["head"]])
-        # Settle each enabled group at nominal: the stepped ramp can outrun the arm (each
-        # dexcontrol substep returns after its wait_time whether or not the joint caught
-        # up, so lag accumulates), so block here until the MEASURED joints are within
-        # --home-tol (dexcontrol's reached-check uses the same max-abs metric as the gate
-        # below) or --home-settle elapses -- draining the lag before the gate snapshot.
-        if self.args.home_settle > 0:
-            for grp in self._joint_names:
-                if on[grp]:
-                    self._comp(grp).set_joint_pos(
-                        nom[grp].tolist(), wait_time=self.args.home_settle,
-                        exit_on_reach=True,
-                        exit_on_reach_kwargs={"tolerance": self.args.home_tol},
-                    )
-        bad = []
-        for grp in self._joint_names:
-            if not on[grp]:
-                continue
-            meas = np.asarray(self._comp(grp).get_joint_pos(), dtype=float)
-            err = float(np.max(np.abs(meas - nom[grp])))
-            if err > self.args.home_tol:
-                bad.append(f"{grp} {err:.3f}rad")
-        if bad:
-            raise SystemExit(
-                "[wbc_vr_robot] homing gate FAILED (measured vs WBC nominal): "
-                + ", ".join(bad) + f" > --home-tol {self.args.home_tol}. Aborting before engage."
-            )
-        print("[wbc_vr_robot] homing gate OK: enabled groups are at WBC nominal.")
-        # Center the swerve wheels to straight before engage (only if the base is
-        # actuated). _compute_wheel_control maps zero velocity to steering 0, so the
-        # run-loop's pre-engage holds already command steering->0 each tick, but with no
-        # settle window; do it explicitly here so the steer joints are physically straight
-        # (and given time to converge) before any base twist, instead of swinging from a
-        # stale angle on the first engaged set_velocity. set_steering_angle commands the
-        # steer joints to 0 with zero wheel velocity; wait_time holds the command so they
-        # converge (--home-settle, repeated for ~max(wait_time-1, 0)s; 0 = single shot).
-        if self.enable["base"] and self.has_chassis:
-            print("[wbc_vr_robot] centering wheels to straight (steering -> 0) ...")
-            self.robot.chassis.set_steering_angle(0.0, wait_time=self.args.home_settle)
 
     def engage_reset(self, ik, left0, right0, head0) -> None:
         """Zero the odometry origin in lock-step with the IK reset at engage."""
