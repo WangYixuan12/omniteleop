@@ -179,7 +179,7 @@ DEFAULT_HOME_SETTLE = 3.0
 # Hold the current swerve steering if zero base command < quiet_hold_s seconds, then
 # re-center the wheels to 0deg.
 # (set_velocity(0,0,0) -> steering 0)
-DEFAULT_BASE_QUIET_HOLD_S = 1
+DEFAULT_BASE_QUIET_HOLD_S = 5
 _JOINT_STEP_ABORT_TICKS = 25    # consecutive ticks demanding > 2x clamp -> abort
 
 

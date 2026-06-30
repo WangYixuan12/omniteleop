@@ -7,19 +7,18 @@
    yaw+translation transform for wrist/EEF target positions;
 3. each frame publishes the **Cartesian L_ee / R_ee target poses** on the
    ``vr/joints`` topic (``VRJointData``), exactly the field ``wbc_vr_record.py``
-   consumes to drive its whole-body IK (base + torso + arms). Two mappings (``--mapping``):
+   consumes to drive its whole-body IK (base + torso + arms). The EEF target is:
 
-       relative (default)  POSITION is incremental from the robot's nominal EE position,
-                           so teleop ENGAGES WITH NO arm lunge; ORIENTATION tracks the
-                           controller absolutely (same as ``absolute``), which keeps big
-                           wrist rotations out of the arm's joint limits:
-                               t = nominal_ee_pos + R_yaw @ (vr_now_pos - vr_calib_pos)
-                               R = R_yaw @ vr_now_rot
-                           (A fully relative orientation was tried but contorts the wrist
-                           on large rolls -- scripts/diagnostics/decompose_rel_contortion.py.)
-       absolute            left_ee_pose = robot_base_t_vr_base_eef @ vr_left_controller
-                           (the controller's absolute pose); snaps the EEFs to wherever
-                           the hands are at calibration -- the original behavior;
+       POSITION     yaw-only HEAD-RELATIVE (see ``_bprime_pos``): the hand rides the
+                    robot's live head-yaw frame, so a head+hands turn keeps the hands
+                    CENTERED in the camera (the base/camera yaw follows the head) while a
+                    head-only look-around leaves them PLANTED in the room. A startup blend
+                    ramps from the nominal EE at engage so the arm does not lunge.
+       ORIENTATION  R = R_yaw @ vr_now_rot @ C: tracks the controller absolutely (so big
+                    wrist rotations stay out of the arm's joint limits), with a constant
+                    per-side tool-mount offset ``C`` (``--calibrate-ee-offset``). A fully
+                    relative orientation was tried but contorts the wrist on large rolls
+                    (scripts/diagnostics/decompose_rel_contortion.py).
 4. each ``teleop`` frame also publishes the **calibrated headset pose**
 
        head_ee_pose[:3, :3] = R_yaw @ vr_headset[:3, :3] @ C_head
@@ -509,6 +508,49 @@ class WBCHeadsetHUD:
             self.quest.set_frame_vis("img", base64.b64encode(buf).decode())
 
 
+class _VRLog:
+    """Collect per-tick RAW VR poses (headset + both controllers) and the mapped
+    targets, then write them to an HDF5 on teardown (``--debug-vr``).
+
+    Diagnostic only: lets us measure the operator's hand pose RELATIVE TO the headset
+    directly from the raw Quest stream -- the one thing the follower-side targets cannot
+    show cleanly, because the leader maps the head (absolute) and the hands (relative to
+    nominal) differently. ``raw_*`` are the untouched Quest poses (room frame); ``map_*``
+    are the published targets, kept alongside so the mapping itself can be reproduced.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._rows: list[dict] = []
+
+    def append(self, **fields) -> None:
+        self._rows.append(fields)
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def write(self) -> None:
+        if not self._rows:
+            return
+        import h5py  # noqa: PLC0415 -- optional dep, only needed at teardown
+
+        rows = self._rows
+        col = lambda k: np.asarray([r[k] for r in rows])
+        with h5py.File(self.path, "w") as f:
+            g = f.create_group("vr")
+            g.attrs["schema"] = "wbc_vr_leader_raw/v1"
+            g.attrs["n_frames"] = len(rows)
+            g.create_dataset("t", data=col("t"))
+            g.create_dataset(
+                "stage",
+                data=np.array([str(r["stage"]).encode()[:16] for r in rows], dtype="S16"),
+            )
+            for key in ("raw_head", "raw_left", "raw_right",
+                        "map_head", "map_left", "map_right"):
+                g.create_dataset(key, data=col(key).astype(np.float32),
+                                 compression="gzip", compression_opts=4)
+
+
 class WBCVRLeader:
     """Reads Quest poses, calibrates once, and streams Cartesian EEF targets."""
 
@@ -519,7 +561,16 @@ class WBCVRLeader:
         self.stick_max_vy = args.stick_max_vy
         self.stick_max_wz = args.stick_max_wz
         self.stick_deadzone = args.stick_deadzone
-        self.mapping = args.mapping
+        # EEF target POSITION is yaw-only HEAD-RELATIVE (see _bprime_pos): the hand rides
+        # the robot's live head-yaw frame, so a head+hands turn keeps the hands centered in
+        # the camera (the base/camera yaw follows the head) while a head-only look-around
+        # leaves them planted in the room. A startup blend (_hf_blend_dur) ramps from the
+        # nominal EE at engage so the arm does not lunge. Verified offline + on hardware
+        # (scripts/diagnostics/analyze_vr_hand_rel_head.py).
+        self._hf_offset_left = np.zeros(3)
+        self._hf_offset_right = np.zeros(3)
+        self._hf_engage_t: Optional[float] = None
+        self._hf_blend_dur = 0.5  # s, nominal -> B' engage ramp (transient, decays to zero)
         # Per-side constant controller->gripper orientation offset C, right-multiplied in
         # _eef_target (R = R_yaw @ vr_controller_R @ C). Identity unless --calibrate-ee-offset
         # wrote a file: identity makes the gripper inherit the controller's raw axis
@@ -588,15 +639,24 @@ class WBCVRLeader:
         # (-45 deg down-look). None until _calibrate. See _map_head_target.
         self._head_ori_offset: Optional[np.ndarray] = None
         self.robot_base_t_vr_base_eef: Optional[np.ndarray] = None
-        # Controller poses captured at calibration. Relative mapping references their
-        # POSITION so the first streamed target sits at the nominal EE position (no lunge).
-        self._vr_left0: Optional[np.ndarray] = None
-        self._vr_right0: Optional[np.ndarray] = None
         self.last_left_target: Optional[np.ndarray] = None
         self.last_right_target: Optional[np.ndarray] = None
         self._trigger_start: Optional[float] = None
         self._prev_x = False
         self.running = False
+
+        # Optional RAW-VR diagnostic log (--debug-vr DIR): per-tick raw headset +
+        # controller poses (and the mapped targets) -> HDF5 on teardown. OFF by default.
+        self._vrlog: Optional[_VRLog] = None
+        debug_vr = getattr(args, "debug_vr", None)
+        if debug_vr:
+            import datetime  # noqa: PLC0415
+            import os  # noqa: PLC0415
+
+            os.makedirs(debug_vr, exist_ok=True)
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._vrlog = _VRLog(os.path.join(debug_vr, f"vr_raw_{stamp}.hdf5"))
+            print(f"[wbc_vr_leader] RAW-VR debug log -> {self._vrlog.path}")
 
     # -- helpers ----------------------------------------------------------------
 
@@ -691,94 +751,121 @@ class WBCVRLeader:
         out[:3, 3] = (r_yaw @ vr_head)[:3, 3]
         return out
 
-    def _capture_eef_anchors(self, vr_left: np.ndarray, vr_right: np.ndarray) -> None:
-        """Snapshot the controller poses at calibration, used by relative mapping.
+    def _bprime_pos(
+        self, side: str, vr_now: np.ndarray, vr_head: np.ndarray, head_target: np.ndarray
+    ) -> np.ndarray:
+        """Yaw-only head-relative hand POSITION (base frame) -- the EEF target position map.
 
-        Relative mapping anchors each EEF target's POSITION at the robot's nominal EE
-        position and adds the controller's translation *relative* to these captured
-        poses, so the first streamed target sits at the nominal position (the arm does
-        not lunge to the operator's hands at engage). Orientation tracks the controller
-        absolutely and so does not use these anchors. Always captured -- absolute mapping
-        just ignores them -- so ``--mapping`` is uniform to reason about.
+        Transfers the operator's hand-position-relative-to-head onto the robot's LIVE
+        head-yaw frame, using only the head GRAVITY YAW (``_heading_yaw``), not its
+        downward-pitched optical pose::
+
+            x_yaw     = Rz(-yaw_room) @ (vr_now_pos - vr_head_pos)   # hand rel head, yaw frame
+            pos_base  = head_target_pos + Rz(yaw_base) @ x_yaw
+
+        For a head+hands turn (hand rigid relative to head) ``x_yaw`` is constant, so the
+        hand stays fixed in the head-yaw frame and rides the base yaw -> CENTERED in the
+        camera. For a head-only look-around (hand fixed in the room) ``x_yaw`` counter-
+        rotates with the head, so ``pos_base`` stays world-fixed -> PLANTED. Using the
+        FULL head pose instead (``head_target @ inv(vr_head) @ vr_now``) re-introduces the
+        camera pitch/relabel and swings the arm with the gaze, which is why only the yaw is
+        transferred (verified offline, scripts/diagnostics/analyze_vr_hand_rel_head.py).
         """
-        vr_left = np.asarray(vr_left, dtype=float)
-        vr_right = np.asarray(vr_right, dtype=float)
-        if vr_left.shape != (4, 4) or vr_right.shape != (4, 4):
-            raise ValueError(
-                f"controller anchor poses must be (4, 4); got "
-                f"{vr_left.shape} and {vr_right.shape}"
-            )
-        self._vr_left0 = vr_left.copy()
-        self._vr_right0 = vr_right.copy()
+        nominal_ee = self._nominal_left if side == "left" else self._nominal_right
+        yaw_room = _heading_yaw(vr_head)
+        yaw_base = _heading_yaw(head_target)
+        x_yaw = _rotz(-yaw_room) @ (vr_now[:3, 3] - vr_head[:3, 3])
+        return head_target[:3, 3] + _rotz(yaw_base) @ x_yaw
 
-    def _eef_target(self, side: str, vr_now: np.ndarray) -> np.ndarray:
-        """Map one controller pose to its base-frame EEF target per ``--mapping``.
+    def _capture_head_frame_anchors(
+        self, vr_left: np.ndarray, vr_right: np.ndarray, vr_head: np.ndarray,
+        head_target: np.ndarray, now: float,
+    ) -> None:
+        """Capture the engage state: the per-side offset ``B'(t0) - nominal_ee`` and the
+        engage time for the startup blend.
 
-        ``side`` (``"left"``/``"right"``) selects the per-arm nominal EE pose and
-        calibration anchor. Only the relative branch reads them, so absolute mode never
-        touches any calibration-anchor state.
+        ``_bprime_pos`` is absolute-style (it places the hand at the operator's actual
+        hand-rel-head pose), so at engage it sits ~10-20 cm off ``nominal_ee``. A CONSTANT
+        anchor to nominal would re-break one of the two behaviors (a world-frame constant
+        sweeps in the rotating camera; a head-frame constant swings on look-around -- both
+        verified offline), so instead the offset is ramped to zero over ``_hf_blend_dur``
+        in ``_eef_target``: a transient that decays, leaving the steady map exactly B'.
+        """
+        self._hf_offset_left = (
+            self._bprime_pos("left", vr_left, vr_head, head_target) - self._nominal_left[:3, 3]
+        )
+        self._hf_offset_right = (
+            self._bprime_pos("right", vr_right, vr_head, head_target) - self._nominal_right[:3, 3]
+        )
+        self._hf_engage_t = now
 
-        ``absolute``: rigid room->base map of the controller's *absolute* pose, so the
-        target snaps to wherever the hand is at calibration -- a large first-frame jump.
+    def _eef_target(self, side: str, vr_now: np.ndarray, *,
+                    vr_head: Optional[np.ndarray] = None,
+                    head_target: Optional[np.ndarray] = None,
+                    now: float = 0.0) -> np.ndarray:
+        """Map one controller pose to its base-frame EEF target.
 
-        ``relative`` (default): track the controller's POSITION incrementally from the
-        robot's nominal EE position -- so teleop engages with NO position lunge (the fix
-        for the first-frame arm teleport) -- while the ORIENTATION tracks the controller
-        ABSOLUTELY, exactly as ``absolute`` does::
+        ``side`` (``"left"``/``"right"``) selects the per-arm nominal EE pose and engage
+        offset. Requires valid head geometry (``vr_head`` + ``head_target``).
 
-            pos = nominal_ee_pos + R_yaw @ (vr_now_pos - vr0_pos)
-            rot = R_yaw @ vr_now_rot            # == (robot_base_t_vr_base_eef @ vr_now)[:3, :3]
+        POSITION is yaw-only head-relative (``_bprime_pos``): the hand rides the robot's
+        live head-yaw frame, so a head+hands turn keeps the hands centered in the camera
+        while a head-only look-around leaves them planted. ``_bprime_pos`` is absolute-style
+        (it places the hand at the operator's actual hand-rel-head pose), so at engage it
+        sits ~10-20 cm off ``nominal_ee``; the per-side engage offset ``_hf_offset_*`` is
+        ramped to zero over ``_hf_blend_dur`` so the arm does not lunge (a transient that
+        decays, leaving the steady map exactly B').
 
-        where ``R_yaw = robot_base_t_vr_base_eef[:3, :3]``. Position rides the gravity-
-        aligned room yaw (a horizontal hand move stays horizontal) and starts at nominal.
-        Orientation is byte-identical to ``absolute``: it tracks the operator's actual hand
-        orientation -- which they servo by sight -- so a large wrist rotation does NOT drive
-        the arm into joint limits.
+        ORIENTATION is ``R_yaw @ vr_now_rot @ C`` (``R_yaw = robot_base_t_vr_base_eef``):
+        it tracks the operator's actual hand orientation -- which they servo by sight -- so
+        a large wrist rotation does NOT drive the arm into joint limits. A purely relative
+        orientation (``nominal_ee_rot @ vr0_rot.T @ vr_now_rot``) was tried first but
+        contorts the wrist on big rolls (scripts/diagnostics/decompose_rel_contortion.py).
 
-        A purely relative orientation (``nominal_ee_rot @ vr0_rot.T @ vr_now_rot``) was
-        tried first: it has no orientation jump at engage, but it re-anchors the rotation at
-        the nominal gripper and sweeps it through the operator's *full* rotation from there,
-        which contorts the wrist into its limits on big rolls -- verified on real logs in
-        ``scripts/diagnostics/decompose_rel_contortion.py``. The only engage discontinuity
-        here is a small IN-PLACE wrist alignment to the controller's orientation (a slerp,
-        not an arm swing); the follower interpolates it over one command tick.
-
-        A fixed per-side offset ``C`` (``self._ee_offset_left``/``_right``; identity unless
-        ``--calibrate-ee-offset`` wrote a file) is right-multiplied onto the orientation
-        (``... @ vr_now_rot @ C``). It is a constant body-frame re-labeling of the controller
-        axes onto the gripper, so the operator's neutral grip reads as the nominal
-        ``L_ee``/``R_ee`` frame (x:down, y:left, z:forward) instead of the controller's raw
-        convention, while a controller rotation still rotates the gripper about the matching
-        axes. Being CONSTANT it preserves the absolute (non-contorting) property; recomputing
+        The fixed per-side offset ``C`` (``self._ee_offset_left``/``_right``; identity unless
+        ``--calibrate-ee-offset`` wrote a file) is right-multiplied onto the orientation. It
+        is a constant body-frame re-labeling of the controller axes onto the gripper, so the
+        operator's neutral grip reads as the nominal ``L_ee``/``R_ee`` frame (x:down, y:left,
+        z:forward). Being CONSTANT it preserves the non-contorting property; recomputing
         ``C`` from the engage pose each frame would instead reproduce the rejected relative
         orientation (deviation tied to rotation-since-engage).
         """
+        if vr_head is None or head_target is None:
+            raise ValueError("_eef_target requires vr_head and head_target")
         # Fixed controller->gripper "tool-mount" offset (identity unless calibrated).
         ee_offset = getattr(self, f"_ee_offset_{side}", None)
         if ee_offset is None:
             ee_offset = np.eye(3)
-        if self.mapping == "absolute":
-            out = self.robot_base_t_vr_base_eef @ vr_now
-            out[:3, :3] = out[:3, :3] @ ee_offset
-            return out
-        # vr0 is the calibration anchor; relative mapping needs its POSITION (the
-        # orientation tracks the controller absolutely, like absolute mode).
-        vr0 = self._vr_left0 if side == "left" else self._vr_right0
-        nominal_ee = self._nominal_left if side == "left" else self._nominal_right
-        assert vr0 is not None, "relative mapping requires calibration anchors"
-        rot_yaw = self.robot_base_t_vr_base_eef[:3, :3]
+        # POSITION: yaw-only head-relative (_bprime_pos), with the per-side engage offset
+        # ramped to zero over _hf_blend_dur so the arm does not lunge at engage.
+        off = self._hf_offset_left if side == "left" else self._hf_offset_right
+        blend = 1.0 if self._hf_engage_t is None else float(
+            np.clip((now - self._hf_engage_t) / self._hf_blend_dur, 0.0, 1.0)
+        )
         out = np.eye(4)
-        out[:3, 3] = nominal_ee[:3, 3] + rot_yaw @ (vr_now[:3, 3] - vr0[:3, 3])
-        out[:3, :3] = rot_yaw @ vr_now[:3, :3] @ ee_offset
+        out[:3, 3] = self._bprime_pos(side, vr_now, vr_head, head_target) - (1.0 - blend) * off
+        out[:3, :3] = self.robot_base_t_vr_base_eef[:3, :3] @ vr_now[:3, :3] @ ee_offset
         return out
 
-    def _map_targets(self, vr_l: np.ndarray, vr_r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Map controller poses to base-frame EEF targets, holding last-good if untracked."""
+    def _map_targets(self, vr_l: np.ndarray, vr_r: np.ndarray, *,
+                     vr_head: Optional[np.ndarray] = None,
+                     head_target: Optional[np.ndarray] = None,
+                     now: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+        """Map controller poses to base-frame EEF targets, holding last-good if untracked.
+
+        The hand POSITION rides the live head-yaw frame, so on a head-tracking loss
+        (``head_target`` None) hold the last-good hand targets rather than updating them
+        from a stale/invalid head (Codex review).
+        """
         assert self.robot_base_t_vr_base_eef is not None
+        if head_target is None:
+            return self.last_left_target, self.last_right_target
         if _is_tracked(vr_l, INVALID_LEFT_POSE):
-            self.last_left_target = self._eef_target("left", vr_l)
+            self.last_left_target = self._eef_target(
+                "left", vr_l, vr_head=vr_head, head_target=head_target, now=now)
         if _is_tracked(vr_r, INVALID_RIGHT_POSE):
-            self.last_right_target = self._eef_target("right", vr_r)
+            self.last_right_target = self._eef_target(
+                "right", vr_r, vr_head=vr_head, head_target=head_target, now=now)
         return self.last_left_target, self.last_right_target
 
     def _publish(
@@ -881,29 +968,50 @@ class WBCVRLeader:
                                   "tracked to calibrate — hold them in view and retry.")
                         else:
                             self._calibrate(transforms["head"])
-                            self._capture_eef_anchors(vr_l, vr_r)
-                            self._map_targets(vr_l, vr_r)  # seed last-good targets
+                            # head_target must be ready BEFORE mapping hands: the hand
+                            # position rides the live head-yaw frame.
+                            head_target = self._map_head_target(transforms["head"])
+                            self._capture_head_frame_anchors(
+                                vr_l, vr_r, transforms["head"], head_target, now)
+                            self._map_targets(  # seed last-good targets (starts at nominal)
+                                vr_l, vr_r, vr_head=transforms["head"],
+                                head_target=head_target, now=now)
                             self.stage = "teleop"
                             d = self.last_left_target[:3, 3] - self._nominal_left[:3, 3]
-                            print(f"\n[wbc_vr_leader] calibrated ({self.mapping}) -> teleop. "
+                            print(f"\n[wbc_vr_leader] calibrated -> teleop. "
                                   f"L target pos offset from nominal = "
                                   f"[{d[0]:+.3f} {d[1]:+.3f} {d[2]:+.3f}] m")
                     self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
                 else:  # teleop
-                    left_target, right_target = self._map_targets(vr_l, vr_r)
-                    # Hold-last-good on a malformed/NaN headset frame: publish an empty
-                    # head target so the follower keeps its previous head command rather
-                    # than receiving (and rejecting) a NaN pose.
+                    # Head target FIRST: the hands are mapped relative to the live head-yaw
+                    # frame, so they need head_target this tick. Hold-last-good on a
+                    # malformed/NaN headset frame -> empty head target (the follower keeps
+                    # its previous head command rather than rejecting a NaN pose), and
+                    # _map_targets then also holds the last-good hands.
                     head_target = (
                         self._map_head_target(transforms["head"])
                         if _is_valid_pose(transforms["head"]) else None
                     )
+                    left_target, right_target = self._map_targets(
+                        vr_l, vr_r, vr_head=transforms["head"],
+                        head_target=head_target, now=now)
                     chassis = self._thumbstick_to_chassis(transforms)
                     self._publish(
                         left_target, right_target, head_target,
                         transforms["left_index_trigger"], transforms["right_index_trigger"],
                         chassis,
                     )
+                    if self._vrlog is not None:
+                        nanmat = np.full((4, 4), np.nan)
+                        self._vrlog.append(
+                            t=now - t0, stage=self.stage,
+                            raw_head=np.asarray(transforms["head"], dtype=float),
+                            raw_left=np.asarray(vr_l, dtype=float),
+                            raw_right=np.asarray(vr_r, dtype=float),
+                            map_head=head_target if head_target is not None else nanmat,
+                            map_left=left_target if left_target is not None else nanmat,
+                            map_right=right_target if right_target is not None else nanmat,
+                        )
 
                 if self._hud is not None and now - last_hud >= self._hud_period:
                     status, status_age_s = self._follower_status_snapshot()
@@ -937,6 +1045,10 @@ class WBCVRLeader:
             self.running = False
             self.quest.close()
             self.node.shutdown()
+            if self._vrlog is not None and len(self._vrlog) > 0:
+                self._vrlog.write()
+                print(f"[wbc_vr_leader] RAW-VR log -> {self._vrlog.path} "
+                      f"({len(self._vrlog)} frames)")
             print("\n[wbc_vr_leader] stopped.")
 
     # -- calibration helper -----------------------------------------------------
@@ -1062,14 +1174,6 @@ def main() -> None:
     parser.add_argument("--key", default=DEFAULT_KEY, help="TLS key for the WebXR server.")
     parser.add_argument("--hold-seconds", type=float, default=1.0,
                         help="right-grip hold time to calibrate/start (default 1.0).")
-    parser.add_argument("--mapping", choices=("relative", "absolute"), default="relative",
-                        help="EEF target mapping at calibration. 'relative' (default) tracks "
-                             "controller POSITION incrementally from the robot's nominal EE "
-                             "position (teleop engages with NO arm lunge) while ORIENTATION "
-                             "tracks the controller absolutely (so big wrist rotations stay out "
-                             "of the arm's joint limits). 'absolute' maps the controller's "
-                             "absolute pose through the room calibration, snapping the EEFs to "
-                             "wherever your hands are at calibration -- the original behavior.")
     parser.add_argument("--stick-max-vx", type=float, default=0.3)
     parser.add_argument("--stick-max-vy", type=float, default=0.2)
     parser.add_argument("--stick-max-wz", type=float, default=0.5)
@@ -1101,6 +1205,11 @@ def main() -> None:
                              "write it to --ee-offset-file, and exit (does not stream targets).")
     parser.add_argument("--ee-capture-seconds", type=float, default=1.5,
                         help="averaging window for --calibrate-ee-offset (default 1.5).")
+    parser.add_argument("--debug-vr", dest="debug_vr", default=None,
+                        help="write a per-tick RAW-VR diagnostic HDF5 (raw headset + both "
+                             "controller poses, plus the mapped targets) under this directory "
+                             "as vr_raw_<timestamp>.hdf5. Lets us measure hand-relative-to-head "
+                             "motion directly from the Quest stream. OFF by default.")
     args = parser.parse_args()
     # Publish rate comes SOLELY from wbik.yaml's vr_teleop.cmd_rate (the rate the follower
     # interpolates up from), so leader and follower cannot drift; the URDF comes from
