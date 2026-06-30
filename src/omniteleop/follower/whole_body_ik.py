@@ -51,6 +51,7 @@ except ImportError:  # pragma: no cover - compatibility with older Pinocchio sta
 
 from omniteleop.follower import wbc_safety
 from omniteleop.follower.base_closed_loop import project_planar_twist_single_axis
+from omniteleop.follower.fast_self_collision_barrier import FastSelfCollisionBarrier
 from omniteleop.follower.wbc_safety import SafetyGate, collision_group
 
 # --- Canonical config (single source of truth) ---------------------------------
@@ -884,18 +885,31 @@ class VegaWholeBodyIK:
         self.velocity_limit = VelocityLimit(self.model)
         self.limits = [self.config_limit, self.velocity_limit]
 
-        # Proactive self-collision barrier (closest n pairs become QP rows).
+        # Proactive self-collision barrier (closest n pairs become QP rows). When the
+        # collision model is all spheres (the same condition that arms the vectorized
+        # gate metric, _sc_radius is not None), use FastSelfCollisionBarrier: it
+        # reproduces pink's SelfCollisionBarrier (h, J) -- hence the exact QP -- from
+        # closed-form sphere math instead of coal's per-pair narrowphase read, cutting
+        # the barrier build ~11x (the bulk of the tick). Validated bit-for-bit in
+        # tests/test_fast_self_collision_barrier.py. Falls back to stock pink for any
+        # non-sphere model.
         self.collision_barrier = None
         self.barriers = None
         if self._collision_enabled and SelfCollisionBarrier is not None:
             n_pairs = len(self.collision_sphere_model.collisionPairs)
             dim = max(1, min(cfg.n_collision_pairs, n_pairs))
-            self.collision_barrier = SelfCollisionBarrier(
+            barrier_kwargs = dict(
                 n_collision_pairs=dim,
                 gain=cfg.collision_barrier_gain,
                 safe_displacement_gain=cfg.collision_safe_displacement_gain,
                 d_min=cfg.self_collision_safe_dist,
             )
+            if self._sc_radius is not None:
+                self.collision_barrier = FastSelfCollisionBarrier(
+                    self.collision_sphere_model, **barrier_kwargs
+                )
+            else:
+                self.collision_barrier = SelfCollisionBarrier(**barrier_kwargs)
             self.barriers = [self.collision_barrier]
 
         # Reactive hold gate. Tip-over (CoM-over-base) is enforced proactively by the

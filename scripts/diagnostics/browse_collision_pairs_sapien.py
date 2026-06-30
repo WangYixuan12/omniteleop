@@ -24,6 +24,17 @@ Useful non-viewer check::
 
     /home/yixuan/miniforge3/envs/dexmate/bin/python \
         scripts/diagnostics/browse_collision_pairs_sapien.py --list-only --top 20
+
+Live teleop mode (``--interactive``): instead of one frozen posture, subscribe to the
+EEF/head targets ``scripts/wbc_vr_leader.py`` publishes on ``vr/joints``, run the same
+whole-body IK the follower runs, and animate the robot + collision spheres in SAPIEN as
+you teleoperate -- the closest cross-group pair stays gold and its clearance prints
+live. Start this first, then run the leader in another shell and grip-hold to engage::
+
+    /home/yixuan/miniforge3/envs/dexmate/bin/python \
+        scripts/diagnostics/browse_collision_pairs_sapien.py --interactive
+    # ... and in another shell:
+    /home/yixuan/miniforge3/envs/dexmate/bin/python scripts/wbc_vr_leader.py
 """
 
 from __future__ import annotations
@@ -37,7 +48,14 @@ import numpy as np
 
 from omniteleop.follower import wbc_safety
 from omniteleop.follower.sapien_env import prepare_sapien_render_env
-from omniteleop.follower.whole_body_ik import VegaWholeBodyIK, WBCConfig
+from omniteleop.follower.whole_body_ik import (
+    BASE_FRAME,
+    HEAD_FRAME,
+    LEFT_EE_FRAME,
+    RIGHT_EE_FRAME,
+    VegaWholeBodyIK,
+    WBCConfig,
+)
 
 _GROUP_COLOR = {
     "body": [0.45, 0.45, 0.45, 0.18],
@@ -474,6 +492,193 @@ def _viewer_loop(sapien, scene, viewer, highlighter: PairHighlighter, pairs: lis
         viewer.close()
 
 
+def _se3_mat(pose) -> np.ndarray:
+    """4x4 matrix from a ``pin.SE3`` (``.homogeneous``) or a 4x4 array."""
+    return np.asarray(pose.homogeneous if hasattr(pose, "homogeneous") else pose, dtype=float)
+
+
+def _live_centers(ik: VegaWholeBodyIK) -> np.ndarray:
+    """World centers (N, 3) of every collision sphere at the current configuration.
+
+    Reads the live ``Configuration`` collision data, refreshed on every solve's
+    ``integrate``/``update`` (the same ``oMg`` coal/_min_self_distance read).
+    """
+    sd = ik.collision_sphere_data
+    return np.asarray([sd.oMg[k].translation for k in range(len(sd.oMg))], dtype=float)
+
+
+def _set_robot_pose(robot, sapien, ik: VegaWholeBodyIK, base_z: float) -> None:
+    """Place the SAPIEN robot at the solved planar base pose + actuated joints.
+
+    The mobile base is a pinocchio planar root joint (not a SAPIEN active joint, since
+    the URDF is loaded ``fix_root_link=True``), so the chassis pose is applied with
+    ``set_root_pose`` and the arm/torso/head joints with ``set_qpos`` -- mirroring
+    ``wbc_sapien_sim.SapienSimRobot``.
+    """
+    base = _se3_mat(ik.frame_pose(BASE_FRAME))
+    yaw = float(np.arctan2(base[1, 0], base[0, 0]))
+    half = yaw / 2.0
+    robot.set_root_pose(
+        sapien.Pose(p=[base[0, 3], base[1, 3], base_z],
+                    q=[float(np.cos(half)), 0.0, 0.0, float(np.sin(half))])
+    )
+    robot.set_qpos(_sapien_qpos(robot, ik, ik.configuration.q))
+
+
+def _run_interactive(ik: VegaWholeBodyIK, args: argparse.Namespace) -> None:
+    """Live-visualize the collision model while ``wbc_vr_leader.py`` teleoperates.
+
+    Subscribes to the leader's ``vr/joints`` EEF/head targets and runs the SAME
+    whole-body IK the follower (``wbc_vr_record.py``) runs, then each frame moves the
+    SAPIEN robot and every collision sphere onto the solved configuration. The closest
+    cross-group pair is highlighted in gold and its signed clearance is printed, so you
+    can watch the self-collision margin shrink as you teleoperate. This is open-loop /
+    kinematic: no real robot or wheel dynamics, just the WBC's commanded configuration
+    -- the one its own collision model reasons about.
+
+    Run the leader in another shell and grip-hold to engage::
+
+        /home/yixuan/miniforge3/envs/dexmate/bin/python scripts/wbc_vr_leader.py
+    """
+    if args.origin_comparison:
+        raise SystemExit("--interactive cannot be combined with --origin-comparison")
+    # Lazy heavy deps (dexcomm/zenoh + the shared control-loop helpers): keep the
+    # read-only --list-only / static-browse paths free of the teleop stack.
+    from omniteleop.wbc_stream import (  # noqa: PLC0415
+        HeadTargetLowPassFilter,
+        HeadTargetPlanarDeadbandFilter,
+        TargetInterpolator,
+        vr_to_ee_targets,
+        vr_to_head_target,
+    )
+    from omniteleop.wbc_teleop import VRJointSubscriber, VRTeleopConfig  # noqa: PLC0415
+
+    cfg = ik.config
+    teleop = VRTeleopConfig.from_yaml()
+    base_dur = 1.0 / teleop.cmd_rate if teleop.cmd_rate > 0 else 0.0
+
+    # Nominal EE/head poses seed the interpolator/filters (the targets held until the
+    # leader engages), exactly as the follower seeds them.
+    left0 = _se3_mat(ik.frame_pose(LEFT_EE_FRAME))
+    right0 = _se3_mat(ik.frame_pose(RIGHT_EE_FRAME))
+    head0 = _se3_mat(ik.frame_pose(HEAD_FRAME))
+
+    spheres, _pairs = _collect_spheres_and_pairs(ik)
+    sapien, scene, viewer, robot, sphere_actors = _build_scene(ik, ik.configuration.q, spheres, args)
+    base_z = float(robot.get_root_pose().p[2])
+
+    sm = ik.collision_sphere_model
+    pair_i = np.array([int(p.first) for p in sm.collisionPairs])
+    pair_j = np.array([int(p.second) for p in sm.collisionPairs])
+    radii = np.array([float(g.geometry.radius) for g in sm.geometryObjects])
+
+    sub = VRJointSubscriber(namespace=args.namespace, name="browse_collision_interactive")
+    sub.start()
+
+    interp = TargetInterpolator(base_dur, left0, right0, head0)
+    head_lpf = HeadTargetLowPassFilter(teleop.head_lpf_tau, head0)
+    head_db = HeadTargetPlanarDeadbandFilter(
+        head0,
+        position_deadband=teleop.head_planar_pos_deadband,
+        yaw_deadband=teleop.head_planar_yaw_deadband,
+    )
+    left_cmd, right_cmd, head_cmd = left0.copy(), right0.copy(), head0.copy()
+    last_cmd_ns = -1
+    prev_estop = True
+
+    safe = float(cfg.self_collision_safe_dist)
+    print(f"\n[interactive] subscribed to '{sub.topic}' (namespace={args.namespace!r}). "
+          f"Run scripts/wbc_vr_leader.py and grip-hold to teleoperate.")
+    print(f"[interactive] safe_dist={safe * 100:.1f}cm. Closest pair is gold; "
+          "press Q/Esc or close the window to quit.")
+
+    highlight: list = []
+    last_solve = time.perf_counter()
+    last_print = 0.0
+    dt_render = 1.0 / args.rate if args.rate > 0 else 0.0
+    try:
+        while not viewer.closed:
+            now = time.perf_counter()
+            # Real elapsed time drives the open-loop integration (clamped against stalls),
+            # so the model advances at the wall-clock rate the viewer actually renders.
+            dt = float(np.clip(now - last_solve, 1e-4, 0.1))
+            last_solve = now
+            if _key_down(viewer, "q", "esc", "escape"):
+                break
+
+            vr = sub.latest
+            estop = bool(vr.estop) if vr is not None else True
+            if prev_estop and not estop:  # leader (re)calibrated: re-anchor to nominal
+                ik.reset()
+                interp.reset(left0, right0, head0)
+                head_lpf.reset(head0)
+                head_db.reset(head0)
+                left_cmd, right_cmd, head_cmd = left0.copy(), right0.copy(), head0.copy()
+                last_cmd_ns = -1
+            prev_estop = estop
+
+            left_cmd, right_cmd = vr_to_ee_targets(vr, left_cmd, right_cmd)
+            head_cmd = vr_to_head_target(vr, head_cmd)
+            if (vr is not None and vr.timestamp_ns != last_cmd_ns
+                    and vr.left_ee_pose and vr.right_ee_pose):
+                last_cmd_ns = vr.timestamp_ns
+                interp.push(left_cmd, right_cmd, head_cmd, now=now, duration=base_dur)
+            left_target, right_target, head_target_interp = interp.at(now)
+            head_target = head_db.filter(head_lpf.filter(head_target_interp, dt))
+
+            # Hold the nominal posture while the leader is static/e-stopped; solve only
+            # once it engages (mirrors the follower's hold-on-estop behavior).
+            if not estop:
+                if cfg.head_mode == "ik":
+                    ik.solve(left_target, right_target, dt, head_target=head_target)
+                else:
+                    head_joints = ik.solve_head(head_target, dt)
+                    ik.solve(left_target, right_target, dt, head_joints=head_joints)
+
+            # Move the rendered robot + every sphere onto the solved configuration.
+            centers = _live_centers(ik)
+            _set_robot_pose(robot, sapien, ik, base_z)
+            for k, actor in enumerate(sphere_actors):
+                actor.set_pose(sapien.Pose(p=list(centers[k])))
+
+            # Closest cross-group pair (vectorized coal sphere narrowphase over the same
+            # centers/pairs the WBC uses), highlighted in gold + a connecting line.
+            diff = centers[pair_i] - centers[pair_j]
+            dist = np.sqrt(np.einsum("ij,ij->i", diff, diff)) - (radii[pair_i] + radii[pair_j])
+            kmin = int(np.argmin(dist))
+            mind = float(dist[kmin])
+            gi, gj = int(pair_i[kmin]), int(pair_j[kmin])
+            for actor in highlight:
+                actor.remove_from_scene()
+            highlight = []
+            for g in (gi, gj):
+                gold = _make_sphere_actor(scene, sapien, float(radii[g]), _GOLD)
+                gold.set_pose(sapien.Pose(p=list(centers[g])))
+                highlight.append(gold)
+            highlight.append(_make_segment_actor(scene, sapien, centers[gi], centers[gj], _LINE))
+
+            if now - last_print >= 0.2:
+                last_print = now
+                a, b = spheres[gi], spheres[gj]
+                flag = " !! BELOW SAFE" if mind < safe else ""
+                stage = "teleop" if not estop else "static"
+                print(f"[{stage:6s}] min self-dist {mind * 100:+6.2f}cm{flag}  "
+                      f"{a.name} ({a.group}) <-> {b.name} ({b.group})        ",
+                      end="\r", flush=True)
+
+            scene.update_render()
+            viewer.render()
+            sleep = dt_render - (time.perf_counter() - now)
+            if sleep > 0:
+                time.sleep(sleep)
+    finally:
+        for actor in highlight:
+            actor.remove_from_scene()
+        sub.close()
+        viewer.close()
+        print("\n[interactive] stopped.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -490,19 +695,36 @@ def main() -> None:
     parser.add_argument("--top", type=int, default=20, help="rows printed by --list-only.")
     parser.add_argument("--list-only", action="store_true",
                         help="print sorted pairs and exit without opening SAPIEN.")
+    parser.add_argument("--interactive", action="store_true",
+                        help="live mode: subscribe to wbc_vr_leader.py's vr/joints targets, "
+                             "run the follower's whole-body IK, and animate the robot + "
+                             "collision spheres in SAPIEN while you teleoperate (the closest "
+                             "pair stays highlighted in gold). Ignores the static q sources "
+                             "(--q-from-hdf5 / --worst-from-hdf5); incompatible with "
+                             "--origin-comparison / --list-only.")
+    parser.add_argument("--namespace", default="",
+                        help="Zenoh namespace for --interactive (must match the leader; "
+                             "default empty).")
     parser.add_argument("--no-all-spheres", action="store_true",
                         help="only draw the current highlighted pair, not every sphere.")
     parser.add_argument("--origin-comparison", action="store_true",
                         help="overlay raw pre-correction sphere centers from the sphere URDF "
                              "against the corrected WBC centers.")
-    parser.add_argument("--rate", type=float, default=60.0, help="viewer render rate in Hz.")
+    parser.add_argument("--rate", type=float, default=100.0, help="viewer render rate in Hz.")
     parser.add_argument("--ground-z", type=float, default=-0.08)
     parser.add_argument("--camera-xyz", type=float, nargs=3, default=[2.2, -1.4, 1.45])
     parser.add_argument("--camera-yaw", type=float, default=2.55)
     parser.add_argument("--camera-pitch", type=float, default=-0.42)
     args = parser.parse_args()
 
+    if args.interactive and args.list_only:
+        parser.error("--interactive and --list-only are mutually exclusive")
+
     ik = VegaWholeBodyIK(WBCConfig())
+    if args.interactive:
+        ik.reset()  # nominal start; the teleop stream then drives the configuration live
+        _run_interactive(ik, args)
+        return
     q, label = _load_q(args, ik)
     if q.shape != (ik.model.nq,):
         raise ValueError(f"q has shape {q.shape}, expected ({ik.model.nq},)")
