@@ -6,8 +6,9 @@ to the leader's Cartesian ``L_ee``/``R_ee``/head TARGET poses, interpolate the l
 command stream up to the IK rate, run ``VegaWholeBodyIK`` -- but driving the REAL Vega
 hardware (``dexcontrol.robot.Robot``) instead of a simulator.
 
-We do NOT use low-level APIs like `set_motion_state`, `set_steering_angle`, `set_wheel_velocity` directly, which can command opposed
-steering/velocity and damage the wheel motors. Route base motion through `set_velocity`.
+We do NOT use low-level APIs like `set_motion_state`, `set_steering_angle`, or
+`set_wheel_velocity` directly, which can command opposed steering/velocity and damage
+the wheel motors. Route base motion through `set_velocity`.
 
 Two real-robot modes:
 
@@ -681,13 +682,20 @@ class HardwareDriver:
         self._base_quiet_elapsed = 0.0
         for grp in self._prev_cmd:
             self._prev_cmd[grp] = None
-        # Begin the episode on the FIRST engage; a re-engage (live, after an e-stop)
-        # continues the SAME take -- held frames are simply skipped -- so we only
-        # re-anchor the record cadence rather than restarting (which would wipe frames).
-        if self._episode is not None:
-            if not self._episode.recording:
-                self._episode.start()
+        # If an episode is already active, re-anchor the cadence on re-engage. A fresh
+        # episode starts only once the leader reaches calib_stage="teleop"; the optional
+        # reference-alignment stage can actuate the robot without recording frames.
+        if self._episode is not None and self._episode.recording:
             self._next_record_t = 0.0
+
+    def start_recording_if_teleop(self, vr) -> None:
+        """Start episode recording once the leader leaves any pre-record align stage."""
+        if self._episode is None or self._episode.recording:
+            return
+        if vr is None or str(getattr(vr, "calib_stage", "")) != "teleop":
+            return
+        self._episode.start()
+        self._next_record_t = 0.0
 
     def _read_measured_joints(self) -> dict:
         """Cached readback of every group's measured joints (``get_joint_pos``).
@@ -1372,6 +1380,8 @@ def run_loop(
         left_gripper = vr.left_gripper if vr is not None else 0.0
         right_gripper = vr.right_gripper if vr is not None else 0.0
         driver.actuate(result, left_gripper, right_gripper, enable, hold, dt)
+        if hasattr(driver, "start_recording_if_teleop"):
+            driver.start_recording_if_teleop(vr)
         if hasattr(driver, "record_tick"):
             driver.record_tick(result, hold, now)
         if status_pub is not None and now - last_status_publish >= status_period:

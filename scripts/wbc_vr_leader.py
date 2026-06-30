@@ -89,14 +89,12 @@ Controls (mirrors ``vr_reader``):
 from __future__ import annotations
 
 import argparse
-import base64
 import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
-import cv2
 import numpy as np
 import yaml
 from dexcomm import Node
@@ -112,7 +110,21 @@ from omniteleop.follower.whole_body_ik import (
     VegaWholeBodyIK,
     WBCConfig,
 )
+from omniteleop.leader import wbc_headset_hud as _wbc_headset_hud
 from omniteleop.leader.communication.webxr_vr_reader import WebXRVRReader
+from omniteleop.leader.wbc_headset_hud import (
+    _DEFAULT_HUD_CAMERAS,
+    HandAlignmentStatus,
+    WBCHeadsetHUD,
+)
+from omniteleop.leader.wbc_reference_alignment import (
+    REFERENCE_ALIGN_POS_TOL_MM,
+    REFERENCE_ALIGN_ROT_TOL_DEG,
+    REFERENCE_ALIGN_STABLE_S,
+    ReferenceAlignmentGate,
+    load_reference_ee_poses,
+    optional_reference_path,
+)
 from omniteleop.wbc_teleop import VRTeleopConfig
 
 # Command publish rate comes SOLELY from follower/wbik.yaml's vr_teleop.cmd_rate (no CLI
@@ -137,19 +149,8 @@ _TRIGGER_PRESS = 0.7  # right grip value counted as a press
 _TRACK_ATOL = 1e-6  # tolerance for matching the untracked sentinel poses
 DEFAULT_HEADSET_HUD_RATE = 10.0
 WBC_FOLLOWER_STATUS_TOPIC = "wbc/follower_status"
-
-CameraStream = str
-_DEFAULT_HUD_CAMERAS: list[CameraStream] = ["head_left_rgb", "left_wrist_rgb"]
-_HEAD_STREAM_TO_OBS_KEY: dict[CameraStream, str] = {
-    "head_left_rgb": "left_rgb",
-    "head_right_rgb": "right_rgb",
-    "head_depth": "depth",
-}
-_WRIST_STREAM_TO_OBS_KEY: dict[CameraStream, str] = {
-    "left_wrist_rgb": "left_rgb",
-    "right_wrist_rgb": "right_rgb",
-}
-_WRIST_SENSOR_ID = "wrist_zedm"
+_follower_status_overlay_lines = _wbc_headset_hud.follower_status_overlay_lines
+_follower_status_overlay_color = _wbc_headset_hud.follower_status_overlay_color
 
 # Default file storing the per-side controller->gripper orientation offset (see
 # WBCVRLeader._eef_target / --calibrate-ee-offset). Version-controlled with the repo so a
@@ -308,209 +309,8 @@ def _describe_axes(rot: np.ndarray) -> str:
     return ", ".join(out)
 
 
-def _wbc_follower_status_topic() -> str:
-    return get_config().get_topic("wbc_follower_status", WBC_FOLLOWER_STATUS_TOPIC)
-
-
-def _follower_status_overlay_lines(
-    status: Optional[WBCFollowerStatus],
-    status_age_s: Optional[float],
-    *,
-    stale_after_s: float = 1.0,
-) -> list[str]:
-    """Human-readable follower lines for the headset HUD."""
-    if status is None:
-        return ["Follower: no status"]
-
-    lines = []
-    if status.hold_reason:
-        lines.append(f"Follower: HOLD:{status.hold_reason}")
-    elif status.estop or status.hold:
-        lines.append(f"Follower: hold({status.stage})")
-    if status_age_s is not None and status_age_s > stale_after_s:
-        lines.append(f"WARNING: follower status stale {status_age_s:.1f}s")
-    if not status.success:
-        lines.append("WARNING: IK solve failed")
-    # safety_status is "ok" while the CoM stays clear of its support-polygon margin
-    # (and self-collision warn distance). The follower's SafetyGate only emits a non-ok
-    # string once a metric crosses into the danger band -- "WARN: ..." near the limit,
-    # "HELD: ..." once it reverts the step -- and that string already carries the CoM
-    # margin in cm. So we surface it only when dangerous; that is the operator's only
-    # stability readout (the always-on margin line was dropped as redundant).
-    safety = str(status.safety_status or "")
-    if safety and safety.lower() != "ok":
-        lines.append(safety)
-    lines.append(
-        f"err L/R={status.left_ee_error_mm:.0f}/{status.right_ee_error_mm:.0f}mm"
-    )
-    return lines
-
-
-def _follower_status_overlay_color(line: str) -> tuple[int, int, int]:
-    """BGR color for a follower HUD line (red for operator alerts)."""
-    if (
-        line.startswith("WARNING")
-        or line.startswith("WARN:")
-        or line.startswith("HELD:")
-    ):
-        return (0, 0, 255)
-    return (255, 255, 255)
-
-
-class WBCHeadsetHUD:
-    """Poll robot camera streams and push a composed HUD frame to the Quest browser."""
-
-    def __init__(self, quest: WebXRVRReader, cameras: list[CameraStream]) -> None:
-        self.quest = quest
-        self.cameras = list(dict.fromkeys(cameras or _DEFAULT_HUD_CAMERAS))
-        self._head_keys = [
-            _HEAD_STREAM_TO_OBS_KEY[c] for c in self.cameras if c in _HEAD_STREAM_TO_OBS_KEY
-        ]
-        self._wrist_keys = [
-            _WRIST_STREAM_TO_OBS_KEY[c] for c in self.cameras if c in _WRIST_STREAM_TO_OBS_KEY
-        ]
-        self._last_head_imgs: dict[str, np.ndarray] = {}
-        self._last_wrist_imgs: dict[str, np.ndarray] = {}
-        self._last_camera_warn_t = 0.0
-        self._cam_robot = None
-
-        try:
-            from dexbot_utils.configs.components.sensors.cameras import (  # noqa: PLC0415
-                ZedXCameraConfig,
-            )
-            from dexcontrol.core.config import get_robot_config  # noqa: PLC0415
-            from dexcontrol.robot import Robot as _Robot  # noqa: PLC0415
-
-            configs = get_robot_config()
-            if self._head_keys:
-                if "head_camera" in configs.sensors:
-                    configs.sensors["head_camera"].enabled = True
-                else:
-                    print("[wbc_vr_leader] WARNING: headset HUD requested head_camera "
-                          "but the robot config has no head_camera sensor.")
-                    self._head_keys = []
-
-            if self._wrist_keys and _WRIST_SENSOR_ID not in configs.sensors:
-                configs.sensors[_WRIST_SENSOR_ID] = ZedXCameraConfig(
-                    name=_WRIST_SENSOR_ID,
-                    enable_rgb=True,
-                    enable_depth=False,
-                )
-            if _WRIST_SENSOR_ID in configs.sensors:
-                configs.sensors[_WRIST_SENSOR_ID].enabled = bool(self._wrist_keys)
-
-            if self._head_keys or self._wrist_keys:
-                self._cam_robot = _Robot(configs=configs)
-                print(f"[wbc_vr_leader] headset HUD cameras={self.cameras}")
-        except Exception as exc:  # pragma: no cover - hardware/config dependent
-            print(f"[wbc_vr_leader] WARNING: headset HUD cameras unavailable: {exc}")
-            self._head_keys = []
-            self._wrist_keys = []
-            self._cam_robot = None
-
-    def _warn_camera_poll(self, exc: Exception) -> None:
-        now = time.monotonic()
-        if now - self._last_camera_warn_t < 5.0:
-            return
-        self._last_camera_warn_t = now
-        print(f"[wbc_vr_leader] WARNING: headset HUD camera poll failed: {exc}")
-
-    def _poll_cameras(self) -> None:
-        if self._cam_robot is None:
-            return
-        try:
-            if self._head_keys:
-                obs = self._cam_robot.sensors.head_camera.get_obs(obs_keys=self._head_keys)
-                for key in self._head_keys:
-                    frame = obs.get(key)
-                    if frame is not None:
-                        self._last_head_imgs[key] = np.asarray(frame)
-            if self._wrist_keys and hasattr(self._cam_robot.sensors, _WRIST_SENSOR_ID):
-                wrist = getattr(self._cam_robot.sensors, _WRIST_SENSOR_ID)
-                obs = wrist.get_obs(obs_keys=self._wrist_keys)
-                for key in self._wrist_keys:
-                    frame = obs.get(key)
-                    if frame is None:
-                        for obs_key, obs_val in obs.items():
-                            if str(obs_key).endswith(key):
-                                frame = obs_val
-                                break
-                    if frame is not None:
-                        self._last_wrist_imgs[key] = np.asarray(frame)
-        except Exception as exc:  # pragma: no cover - hardware dependent
-            self._warn_camera_poll(exc)
-
-    def _render_tile(self, stream: CameraStream) -> Optional[np.ndarray]:
-        if stream in _HEAD_STREAM_TO_OBS_KEY:
-            key = _HEAD_STREAM_TO_OBS_KEY[stream]
-            img = self._last_head_imgs.get(key)
-        else:
-            key = _WRIST_STREAM_TO_OBS_KEY[stream]
-            img = self._last_wrist_imgs.get(key)
-        if img is None:
-            return None
-
-        if key == "depth":
-            finite = img[np.isfinite(img) & (img > 0)]
-            if len(finite) == 0:
-                normalized = np.zeros(img.shape[:2], dtype=np.uint8)
-            else:
-                mn, mx = finite.min(), np.percentile(finite, 95)
-                normalized = np.clip((img - mn) / (mx - mn + 1e-6) * 255, 0, 255).astype(
-                    np.uint8
-                )
-            return cv2.resize(cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO), (320, 180))
-
-        if img.ndim != 3 or img.shape[2] != 3:
-            return None
-        return cv2.resize(img[:, :, ::-1], (320, 180))
-
-    @staticmethod
-    def _draw_line(img: np.ndarray, text: str, y: int, color: tuple[int, int, int]) -> None:
-        if len(text) > 108:
-            text = text[:105] + "..."
-        cv2.putText(
-            img,
-            text,
-            (8, y),
-            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-            fontScale=0.4,
-            thickness=1,
-            color=color,
-        )
-
-    def poll_and_send(
-        self,
-        *,
-        stage: str,
-        status: Optional[WBCFollowerStatus],
-        status_age_s: Optional[float],
-    ) -> None:
-        """Refresh camera caches, compose the HUD frame, and send it to WebXR."""
-        self._poll_cameras()
-        tiles: list[np.ndarray] = []
-        for stream in self.cameras:
-            if stream == "head_depth":
-                continue  # match vr_reader.py: depth is recordable, not part of the HUD preview.
-            tile = self._render_tile(stream)
-            if tile is not None:
-                tiles.append(tile)
-        vis_img = np.concatenate(tiles, axis=1) if tiles else np.zeros((180, 320, 3), np.uint8)
-
-        self._draw_line(vis_img, f"Stage: {stage}", 22, (0, 255, 255))
-        for i, line in enumerate(_follower_status_overlay_lines(status, status_age_s)):
-            self._draw_line(
-                vis_img, line, 44 + 18 * i, _follower_status_overlay_color(line)
-            )
-
-        ok, buf = cv2.imencode(".jpg", vis_img, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        if ok:
-            self.quest.set_frame_vis("img", base64.b64encode(buf).decode())
-
-
 class _VRLog:
-    """Collect per-tick RAW VR poses (headset + both controllers) and the mapped
-    targets, then write them to an HDF5 on teardown (``--debug-vr``).
+    """Collect per-tick RAW VR poses and mapped targets.
 
     Diagnostic only: lets us measure the operator's hand pose RELATIVE TO the headset
     directly from the raw Quest stream -- the one thing the follower-side targets cannot
@@ -618,6 +418,22 @@ class WBCVRLeader:
         # Nominal EE poses (base frame) — only used to report the calibration delta.
         self._nominal_left = _to_mat(ik.frame_pose(LEFT_EE_FRAME))
         self._nominal_right = _to_mat(ik.frame_pose(RIGHT_EE_FRAME))
+        self._align_reference_path = optional_reference_path(
+            getattr(args, "align_reference", None)
+        )
+        self._align_gate: Optional[ReferenceAlignmentGate] = None
+        self._last_alignment_status: Optional[HandAlignmentStatus] = None
+        if self._align_reference_path is not None:
+            ref = load_reference_ee_poses(self._align_reference_path, ik)
+            assert ref is not None
+            self._align_gate = ReferenceAlignmentGate(*ref)
+            print(
+                "[wbc_vr_leader] alignment reference loaded from "
+                f"{self._align_reference_path} "
+                f"(pos_tol={REFERENCE_ALIGN_POS_TOL_MM:g}mm, "
+                f"rot_tol={REFERENCE_ALIGN_ROT_TOL_DEG:g}deg, "
+                f"stable={REFERENCE_ALIGN_STABLE_S:g}s)."
+            )
         del ik  # solver no longer needed; we stream Cartesian EE + head targets
         # (The head IK itself runs follower-side -- VegaWholeBodyIK.solve_head against
         # the live whole-body configuration; this leader maps the headset through
@@ -675,6 +491,13 @@ class WBCVRLeader:
             received_t = self._follower_status_t
         age = None if received_t is None else time.perf_counter() - received_t
         return status, age
+
+    def _send_stop_hud(self) -> None:
+        """Show a final stop state in the headset HUD after the stop frame is published."""
+        if self._hud is None:
+            return
+        status, status_age_s = self._follower_status_snapshot()
+        self._hud.poll_and_send(stage="stop", status=status, status_age_s=status_age_s)
 
     def _trigger_held(self, transforms) -> bool:
         """True once the right grip trigger is continuously held for hold_seconds."""
@@ -771,7 +594,6 @@ class WBCVRLeader:
         camera pitch/relabel and swings the arm with the gaze, which is why only the yaw is
         transferred (verified offline, scripts/diagnostics/analyze_vr_hand_rel_head.py).
         """
-        nominal_ee = self._nominal_left if side == "left" else self._nominal_right
         yaw_room = _heading_yaw(vr_head)
         yaw_base = _heading_yaw(head_target)
         x_yaw = _rotz(-yaw_room) @ (vr_now[:3, 3] - vr_head[:3, 3])
@@ -781,8 +603,7 @@ class WBCVRLeader:
         self, vr_left: np.ndarray, vr_right: np.ndarray, vr_head: np.ndarray,
         head_target: np.ndarray, now: float,
     ) -> None:
-        """Capture the engage state: the per-side offset ``B'(t0) - nominal_ee`` and the
-        engage time for the startup blend.
+        """Capture the engage state for the startup blend.
 
         ``_bprime_pos`` is absolute-style (it places the hand at the operator's actual
         hand-rel-head pose), so at engage it sits ~10-20 cm off ``nominal_ee``. A CONSTANT
@@ -948,10 +769,7 @@ class WBCVRLeader:
                     # emit is dropped and the operator never sees the updated stage.
                     self.stage = "stopped"
                     if self._hud is not None:
-                        status, status_age_s = self._follower_status_snapshot()
-                        self._hud.poll_and_send(
-                            stage=self.stage, status=status, status_age_s=status_age_s
-                        )
+                        self._send_stop_hud()
                         time.sleep(0.2)
                     break
                 self._prev_x = x_now
@@ -976,13 +794,47 @@ class WBCVRLeader:
                             self._map_targets(  # seed last-good targets (starts at nominal)
                                 vr_l, vr_r, vr_head=transforms["head"],
                                 head_target=head_target, now=now)
-                            self.stage = "teleop"
                             d = self.last_left_target[:3, 3] - self._nominal_left[:3, 3]
-                            print(f"\n[wbc_vr_leader] calibrated -> teleop. "
-                                  f"L target pos offset from nominal = "
-                                  f"[{d[0]:+.3f} {d[1]:+.3f} {d[2]:+.3f}] m")
-                    self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
-                else:  # teleop
+                            if self._align_gate is not None:
+                                self.stage = "align"
+                                self._align_gate.reset()
+                                self._last_alignment_status = (
+                                    self._align_gate.status(
+                                        self.last_left_target, self.last_right_target, now=now
+                                    )
+                                )
+                                print(f"\n[wbc_vr_leader] calibrated -> align. "
+                                      f"L target pos offset from nominal = "
+                                      f"[{d[0]:+.3f} {d[1]:+.3f} {d[2]:+.3f}] m")
+                            else:
+                                self.stage = "teleop"
+                                print(f"\n[wbc_vr_leader] calibrated -> teleop. "
+                                      f"L target pos offset from nominal = "
+                                      f"[{d[0]:+.3f} {d[1]:+.3f} {d[2]:+.3f}] m")
+                    if self.stage == "static":
+                        self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
+                elif self.stage == "align":
+                    head_target = (
+                        self._map_head_target(transforms["head"])
+                        if _is_valid_pose(transforms["head"]) else None
+                    )
+                    left_target, right_target = self._map_targets(
+                        vr_l, vr_r, vr_head=transforms["head"],
+                        head_target=head_target, now=now)
+                    assert self._align_gate is not None
+                    alignment = self._align_gate.status(
+                        left_target, right_target, now=now
+                    )
+                    self._last_alignment_status = alignment
+                    if alignment is not None and alignment.ready:
+                        self.stage = "teleop"
+                        print("\n[wbc_vr_leader] reference aligned -> teleop.")
+                    self._publish(
+                        left_target, right_target, head_target,
+                        transforms["left_index_trigger"], transforms["right_index_trigger"],
+                        self._thumbstick_to_chassis(transforms),
+                    )
+                elif self.stage == "teleop":
                     # Head target FIRST: the hands are mapped relative to the live head-yaw
                     # frame, so they need head_target this tick. Hold-last-good on a
                     # malformed/NaN headset frame -> empty head target (the follower keeps
@@ -1019,16 +871,19 @@ class WBCVRLeader:
                         stage=self.stage,
                         status=status,
                         status_age_s=status_age_s,
+                        alignment=(
+                            self._last_alignment_status if self.stage == "align" else None
+                        ),
                     )
                     last_hud = now
 
                 t = now - t0
                 if t - last_print >= 0.5:
                     last_print = t
-                    if self.stage == "teleop" and self.last_left_target is not None:
+                    if self.stage in ("align", "teleop") and self.last_left_target is not None:
                         lp = self.last_left_target[:3, 3]
                         rp = self.last_right_target[:3, 3]
-                        print(f"t={t:6.1f}s  teleop  "
+                        print(f"t={t:6.1f}s  {self.stage:6s}  "
                               f"L=[{lp[0]:+.3f} {lp[1]:+.3f} {lp[2]:+.3f}]  "
                               f"R=[{rp[0]:+.3f} {rp[1]:+.3f} {rp[2]:+.3f}] (base frame)",
                               end="\r")
@@ -1193,6 +1048,13 @@ def main() -> None:
                         help="camera streams to read for the headset HUD. RGB streams are "
                              "shown side-by-side; head_depth is ignored in the preview to "
                              "match vr_reader.py.")
+    parser.add_argument("--align-reference", default=None,
+                        help="optional raw-data episode HDF5 whose last obs/joint frame "
+                             "defines the reference L/R EEF pose. When set, the leader "
+                             "enters an align stage after calibration and only switches to "
+                             "teleop after the current hand targets match that reference "
+                             "within the fixed reference-alignment tolerances. Omit or "
+                             "pass 'None' to disable.")
     parser.add_argument("--ee-offset-file", default=DEFAULT_EE_OFFSET_FILE,
                         help="YAML of per-side controller->gripper orientation offsets (scipy "
                              "[x,y,z,w] quats). Auto-loaded at startup; missing -> identity (raw "

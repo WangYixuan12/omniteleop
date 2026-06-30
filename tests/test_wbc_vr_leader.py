@@ -5,7 +5,10 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import h5py
 import numpy as np
+
+from omniteleop.leader import wbc_reference_alignment as ref_align
 
 
 def _load_wbc_vr_leader():
@@ -253,6 +256,114 @@ def test_save_load_ee_offsets_round_trip(tmp_path):
     rl, rr = leader_mod._load_ee_offsets(path)
     np.testing.assert_allclose(rl, cl, atol=1e-9)
     np.testing.assert_allclose(rr, cr, atol=1e-9)
+
+
+def test_align_reference_none_disables_reference_loading():
+    assert ref_align.load_reference_ee_poses(None) is None
+    assert ref_align.load_reference_ee_poses("None") is None
+
+
+def test_load_reference_ee_poses_reconstructs_last_obs_frame_by_default(tmp_path):
+    leader_mod = _load_wbc_vr_leader()
+    ik = leader_mod.VegaWholeBodyIK(leader_mod.WBCConfig())
+    q_first = ik.nominal_q()
+    q_first[ik._idx_q["torso_j1"]] = -0.3
+    q_first[ik._idx_q["L_arm_j1"]] = -0.4
+    q_first[ik._idx_q["R_arm_j1"]] = 0.35
+    q_first[ik._idx_q["head_j3"]] = -0.2
+    q_last = ik.nominal_q()
+    q_last[ik._idx_q["torso_j1"]] = 0.1
+    q_last[ik._idx_q["L_arm_j1"]] = 0.2
+    q_last[ik._idx_q["R_arm_j1"]] = -0.2
+    q_last[ik._idx_q["head_j3"]] = 0.15
+    path = tmp_path / "episode_0.hdf5"
+    with h5py.File(path, "w") as f:
+        obs = f.create_group("obs")
+        joint = obs.create_group("joint")
+        joint.create_dataset(
+            "torso",
+            data=np.array(
+                [
+                    [q_first[ik._idx_q[n]] for n in ref_align.TORSO_JOINTS],
+                    [q_last[ik._idx_q[n]] for n in ref_align.TORSO_JOINTS],
+                ]
+            ),
+        )
+        joint.create_dataset(
+            "left_arm",
+            data=np.array(
+                [
+                    [q_first[ik._idx_q[n]] for n in ref_align.LEFT_ARM_JOINTS],
+                    [q_last[ik._idx_q[n]] for n in ref_align.LEFT_ARM_JOINTS],
+                ]
+            ),
+        )
+        joint.create_dataset(
+            "right_arm",
+            data=np.array(
+                [
+                    [q_first[ik._idx_q[n]] for n in ref_align.RIGHT_ARM_JOINTS],
+                    [q_last[ik._idx_q[n]] for n in ref_align.RIGHT_ARM_JOINTS],
+                ]
+            ),
+        )
+        joint.create_dataset(
+            "head",
+            data=np.array(
+                [
+                    [q_first[ik._idx_q[n]] for n in ref_align.HEAD_JOINTS],
+                    [q_last[ik._idx_q[n]] for n in ref_align.HEAD_JOINTS],
+                ]
+            ),
+        )
+        obs.create_group("base").create_dataset(
+            "pose", data=np.array([[-0.04, 0.03, -0.2], [0.05, -0.02, 0.1]])
+        )
+    q_last[0] = 0.05
+    q_last[1] = -0.02
+    q_last[2] = np.cos(0.1)
+    q_last[3] = np.sin(0.1)
+
+    ref = ref_align.load_reference_ee_poses(str(path), ik)
+
+    assert ref is not None
+    left_ref, right_ref = ref
+    np.testing.assert_allclose(
+        left_ref,
+        leader_mod._to_mat(ik.frame_pose(leader_mod.LEFT_EE_FRAME, q_last)),
+    )
+    np.testing.assert_allclose(
+        right_ref,
+        leader_mod._to_mat(ik.frame_pose(leader_mod.RIGHT_EE_FRAME, q_last)),
+    )
+
+
+def test_reference_alignment_requires_stable_window():
+    leader_mod = _load_wbc_vr_leader()
+    ref_left = _pose(np.eye(3), np.array([0.4, 0.2, 1.0]))
+    ref_right = _pose(np.eye(3), np.array([0.4, -0.2, 1.0]))
+    gate = ref_align.ReferenceAlignmentGate(ref_left, ref_right)
+
+    first = gate.status(ref_left.copy(), ref_right.copy(), now=10.0)
+    assert first is not None
+    assert first.left_ok and first.right_ok
+    assert first.stable_s == 0.0
+    assert not first.ready
+
+    ready = gate.status(
+        ref_left.copy(),
+        ref_right.copy(),
+        now=10.0 + leader_mod.REFERENCE_ALIGN_STABLE_S,
+    )
+    assert ready is not None
+    assert ready.ready
+
+    off_left = ref_left.copy()
+    off_left[0, 3] += (leader_mod.REFERENCE_ALIGN_POS_TOL_MM + 1.0) / 1000.0
+    off = gate.status(off_left, ref_right.copy(), now=11.0)
+    assert off is not None
+    assert not off.left_ok
+    assert off.stable_s == 0.0
 
 
 def test_follower_status_overlay_lines_show_hold_and_safety_warning():
