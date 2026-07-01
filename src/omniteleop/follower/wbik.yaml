@@ -168,11 +168,12 @@ damping: 1.0e-6
 enable_collision_avoidance: true
 collision_spheres_urdf: "/home/yixuan/miniforge3/envs/dexmate/lib/python3.12/site-packages/dexmate_urdf/robots/humanoid/vega_1/vega_1_collision_spheres.collision.urdf"
 # CBF separation target (m): the barrier asymptotically forbids cross-group sphere
-# pairs closer than this. 
+# pairs closer than this. QP SelfCollisionBarrier's d_min
 self_collision_safe_dist: 0.02 # will give ~0.04m in real robot, should be enough
 # Reactive hard floor (m): a step below this distance that is also *worsening* is
 # held (joints freeze; the base may keep moving).
 self_collision_floor: 0.01
+self_collision_warn_dist: 0.03 # only for HUD warning, not for QP
 # Build-time SRDF-style filter: drop cross-group sphere pairs closer than this at the
 # nominal posture (the by-design shoulder-in-torso overlaps), so the barrier starts
 # feasible. No RBY1 counterpart -- its hand-curated geom groups never form such pairs.

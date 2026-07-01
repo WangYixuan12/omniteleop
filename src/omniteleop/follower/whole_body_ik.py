@@ -406,6 +406,10 @@ class WBCConfig:
     collision_spheres_urdf: str = _DEFAULTS["collision_spheres_urdf"]
     self_collision_safe_dist: float = _DEFAULTS["self_collision_safe_dist"]
     self_collision_floor: float = _DEFAULTS["self_collision_floor"]
+    # Reactive WARN distance (m) for the gate/HUD only. Decoupled from the barrier's
+    # security distance (self_collision_safe_dist).
+    # Set above safe_dist to surface the approach as a warning (no hold added).
+    self_collision_warn_dist: float = _DEFAULTS["self_collision_warn_dist"]
     nominal_pair_keep_dist: float = _DEFAULTS["nominal_pair_keep_dist"]
     n_collision_pairs: int = _DEFAULTS["n_collision_pairs"]
     collision_barrier_gain: float = _DEFAULTS["collision_barrier_gain"]
@@ -920,7 +924,7 @@ class VegaWholeBodyIK:
         # contrast, has no QP inequality and relies on the gate alone for both.
         self._gate = SafetyGate(
             self_collision_floor=cfg.self_collision_floor,
-            self_collision_warn=cfg.self_collision_safe_dist,
+            self_collision_warn=cfg.self_collision_warn_dist,
             enable_com=True,
             enable_collision=self._collision_enabled,
         )

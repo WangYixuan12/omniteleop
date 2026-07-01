@@ -1,0 +1,8 @@
+# Controller -> gripper orientation offset: a fixed body-frame 'tool-mount'
+# re-labeling captured by `wbc_vr_leader.py --calibrate-ee-offset`. Applied as
+#   R_target = R_yaw @ vr_controller_R @ C   (per side)
+# so the operator's NEUTRAL grip maps to the nominal L_ee/R_ee frame
+# (x:down, y:left, z:forward). Quaternions are scipy [x, y, z, w]. Delete this
+# file (or set a side to [0, 0, 0, 1]) to fall back to the raw controller frame.
+{left: [-0.013452821349798012, 0.31281978208359595, 0.5758289447653638, 0.7552375996369021],
+  right: [-0.018331078469526408, 0.3585270777216979, -0.5618002302532573, 0.7453206071147306]}

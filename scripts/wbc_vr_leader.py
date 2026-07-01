@@ -155,6 +155,14 @@ _follower_status_overlay_color = _wbc_headset_hud.follower_status_overlay_color
 # Default file storing the per-side controller->gripper orientation offset (see
 # WBCVRLeader._eef_target / --calibrate-ee-offset). Version-controlled with the repo so a
 # dataset's mapping convention is reproducible; absent -> identity (raw controller frame).
+# Why this must persist (the old vr_reader pipeline needed no file): the old follower
+# (vr_robot_controller.py:330, 362) just replays joint angles -- set_joint_pos(
+# vr.left_arm_pos) -- because the leader runs IK, so the convention gap never leaves the
+# leader's live calibration. The new leader instead publishes Cartesian EE pose targets
+# (left_ee_pose/right_ee_pose) for the follower's WBC to solve. The orientation must
+# already be in the robot's gripper convention before it's published -- and because that
+# orientation is absolute, the convention has to come from somewhere persistent:
+# ee_offset.yaml.
 DEFAULT_EE_OFFSET_FILE = str(
     Path(__file__).resolve().parents[1] / "src" / "omniteleop" / "leader" / "ee_offset.yaml"
 )

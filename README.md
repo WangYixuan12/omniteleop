@@ -168,14 +168,16 @@ python scripts/play_side_by_side_videos.py --video_1 /home/yixuan/Dexmate/wbc/wb
 ```
 
 ```bash
-(dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py  --align-reference /home/yixuan/Dexmate/data/raw_data/episode_0.hdf5 
+(dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py --calibrate-ee-offset
+# one-time calibration, save src/omniteleop/leader/ee_offset.yaml for future auto load
+(dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py 
+# generate reference episode_0.hdf5 for future --align-reference
+(dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py --align-reference /home/yixuan/Dexmate/data/raw_data/episode_0.hdf5 
 
 # python scripts/wbc_vr_record.py --hdf5 /home/yixuan/Dexmate/tmp/test.hdf5 --physics --base-loop closed
 # (dexmate) python scripts/wbc_vr_robot.py --replay /home/yixuan/Dexmate/wbc/real/move_sideway.hdf5 --record
 # on lambda machine
 # --closed-loop-base to seed the IK base from odometry (arms solve from the real base; fixes turn lag)
-
-robot.chassis.set_steering_angle(0.0, wait_time=1.5)
 
 (dexmate) python scripts/wbc_vr_robot.py --record --debug-dir /home/yixuan/Dexmate/data/raw_data_debug
 
@@ -186,24 +188,40 @@ robot.chassis.set_steering_angle(0.0, wait_time=1.5)
 
 # Debug
 
+### Arm joint out of limit
+
 ```bash
-arm joint out of limit:
 # on dexmate machine
 python dexcontrol/examples/advanced_examples/disable_arm_motors.py disable --side right --joint-idx 6 --release-brake
-lift eef up
+# lift eef up
 python dexcontrol/examples/advanced_examples/disable_arm_motors.py brake --side right --joints 6 --no-enable
 python dexcontrol/examples/troubleshooting/clear_error.py
+```
 
-arm dead
-ipython
-  import numpy as np
-  q = robot.right_arm.get_joint_pos().copy(); q[5] = 0.3   # j6 -> +0.3
-  robot.right_arm.set_joint_pos(q.tolist(), wait_time=2.0, exit_on_reach=True)
+### Arm dead
+
+```python
+# ipython
+import numpy as np
+q = robot.right_arm.get_joint_pos().copy(); q[5] = 0.3   # j6 -> +0.3
+robot.right_arm.set_joint_pos(q.tolist(), wait_time=2.0, exit_on_reach=True)
+```
+
+```bash
 # if dead
 python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py get --side both
 python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py set --side right --enable
+```
 
-collision
+### Collision
+
+```bash
 python /home/yixuan/omniteleop/scripts/diagnostics/browse_collision_pairs_sapien.py # --interactive , run with wbc_vr_leader
+```
+
+### Wheel steering
+
+```python
+robot.chassis.set_steering_angle(0.0, wait_time=1.5)
 ```
 

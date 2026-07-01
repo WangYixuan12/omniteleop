@@ -110,6 +110,25 @@ def follower_status_overlay_color(line: str) -> tuple[int, int, int]:
     return _WHITE
 
 
+def collision_banner(status: Optional[WBCFollowerStatus]) -> Optional[HUDOverlayLine]:
+    """Prominent self-collision banner (text + color), or None when clear.
+
+    Reads the follower's already-published ``safety_status`` -- no new data path and
+    no added latency: the follower keys "self-collision" into that string each IK tick
+    (wbc_safety), the leader forwards the status here, and we only decide how to draw
+    it. Red + "HOLD" once the step was frozen (``held`` / a ``HELD:`` reason); yellow
+    while the hands are merely approaching the collision floor (``WARN:``).
+    """
+    if status is None:
+        return None
+    reason = str(status.safety_status or "")
+    if "collision" not in reason.lower():
+        return None
+    if status.held or reason.startswith("HELD"):
+        return HUDOverlayLine("SELF-COLLISION - HOLD", _RED)
+    return HUDOverlayLine("SELF-COLLISION NEAR", _YELLOW)
+
+
 def _hand_within_tolerance(
     delta_mm: np.ndarray,
     rot_deg: float,
@@ -323,6 +342,23 @@ class WBCHeadsetHUD:
             color=color,
         )
 
+    @staticmethod
+    def _draw_banner(img: np.ndarray, text: str, color: tuple[int, int, int]) -> None:
+        """Draw a large, width-fitted alert banner across the bottom of the HUD frame."""
+        h, w = img.shape[:2]
+        thickness = 2
+        scale = 1.1
+        (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        if tw > w - 8:  # shrink to fit narrow single-tile frames
+            scale *= (w - 8) / tw
+            (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        x = max((w - tw) // 2, 4)
+        y = h - 10
+        cv2.rectangle(img, (0, y - th - 8), (w, y + base + 4), (0, 0, 0), thickness=-1)
+        cv2.putText(
+            img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness
+        )
+
     def poll_and_send(
         self,
         *,
@@ -351,6 +387,12 @@ class WBCHeadsetHUD:
         for line in alignment_overlay_lines(alignment):
             self._draw_line(vis_img, line.text, y, line.color)
             y += 18
+
+        # Prominent self-collision alert, drawn last so it sits on top. Uses the
+        # follower status already polled above -- no extra data path, no added latency.
+        banner = collision_banner(status)
+        if banner is not None:
+            self._draw_banner(vis_img, banner.text, banner.color)
 
         ok, buf = cv2.imencode(".jpg", vis_img, [cv2.IMWRITE_JPEG_QUALITY, 60])
         if ok:
