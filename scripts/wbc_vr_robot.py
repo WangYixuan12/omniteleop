@@ -23,7 +23,8 @@ deadbands, base PD gains, base slew / deadband / post-deadband -- come SOLELY fr
 so a take recorded/visualized in sim drives the robot identically. They are not CLI flags.
 
 Pass ``--debug-dir DIR`` to write a per-tick ``/debug`` HDF5 (auto-named
-``wbc_debug_<mode>_<timestamp>.hdf5`` under ``DIR``): the base PD chain (odom pose +
+``episode_<N>_debug.hdf5`` under ``DIR``, matching ``vr_reader`` / ``vis_teleop_curves``):
+the base PD chain (odom pose +
 raw wheels, IK base pose/twist, PD raw/err, shaped command), the closed-loop seed, and
 per-group joint command/sent/measured -- enough to diff a ``--closed-loop-base`` run
 against an open-loop-base one. OFF by default.
@@ -62,7 +63,7 @@ from dexcomm.codecs import DictDataCodec
 
 from omniteleop.common import get_config
 from omniteleop.common.head_camera import ZED_K
-from omniteleop.common.recorder import EpisodeRecorder
+from omniteleop.common.recorder import EpisodeRecorder, peek_next_episode_id
 from omniteleop.common.schemas import WBCFollowerStatus
 from omniteleop.follower.whole_body_ik import (
     HEAD_FRAME,
@@ -472,14 +473,21 @@ class HardwareDriver:
         # Grippers (always active): cache the last commanded triggers for action/gripper
         # recording, the FC03 achieved-position obs (gPO/255), and the per-arm status
         # monitors (set up under --record). Initialized here so close() can tear down even
-        # if init fails partway. The wrist ZED-M left-eye frame is cached so a momentary
-        # publisher drop reuses the last good frame instead of breaking record key shapes.
+        # if init fails partway.
         self._last_gripper_cmd_left = 0.0
         self._last_gripper_cmd_right = 0.0
         self._last_obs_grip_left = float("nan")
         self._last_obs_grip_right = float("nan")
         self._grip_monitors: dict = {}
-        self._last_wrist_left_rgb: Optional[np.ndarray] = None
+        # --record frame-freshness guard: the ZED-SDK publishers stream at ~15 fps while we
+        # record at ~10 fps, so EVERY recorded frame must carry a camera frame strictly newer
+        # than the previously recorded one (each head_left_rgb / left_wrist_rgb differs). When
+        # WiFi clogging / an fps drop stalls a publisher below the record rate, get_obs returns
+        # the SAME (or no) frame twice. These hold the publisher timestamp of the last RECORDED
+        # frame per camera (-1 until the first is recorded); record_tick aborts the run the
+        # moment a head/wrist frame is not strictly newer, so a take never records duplicates.
+        self._last_rec_head_ns = -1
+        self._last_rec_wrist_ns = -1
 
         # Joint convention: with the hardware-matching URDF (wbik.yaml urdf_path:
         # vega_with_robotiq, corrected torso_j2 range + grippers) the WBC joint output
@@ -979,11 +987,11 @@ class HardwareDriver:
         for side, arm in (("left", self.robot.left_arm), ("right", self.robot.right_arm)):
             warm = poll_gripper_status(arm, function_code=0x03, timeout_s=0.5)
             if warm is None:
-                print(f"[wbc_vr_robot] WARNING: {side} gripper FC03 warmup failed -- "
-                      f"obs/gripper/{side} records NaN until the monitor catches up "
-                      "(verify enable_ee_pass_through=True).")
-            else:
-                setattr(self, f"_last_obs_grip_{side}", float(warm["actual"]))
+                raise SystemExit(
+                    f"[wbc_vr_robot] {side} gripper FC03 warmup failed -- "
+                    f"obs/gripper/{side} would record NaN until the monitor catches up "
+                    "(verify enable_ee_pass_through=True).")
+            setattr(self, f"_last_obs_grip_{side}", float(warm["actual"]))
         self._grip_monitors = {
             "left": RobotiqStatusMonitor(self.robot.left_arm, side="left", function_code=0x03),
             "right": RobotiqStatusMonitor(self.robot.right_arm, side="right", function_code=0x03),
@@ -1060,19 +1068,52 @@ class HardwareDriver:
               "head_left_rgb+head_depth+left_wrist_rgb, +torso action, +gripper obs/action, "
               "+base pose obs)")
 
-    def _grab_head_images(self) -> Optional[tuple[np.ndarray, np.ndarray]]:
-        """Poll the head camera -> ``(left_rgb uint8 HxWx3, depth uint16 HxW)`` or None.
+    @staticmethod
+    def _unwrap_frame(name: str, entry) -> tuple[np.ndarray, int]:
+        """Split a ``get_obs(include_timestamp=True)`` stream entry into ``(array, frame_ns)``.
+
+        The dexcontrol ZED sensor returns ``{"data": arr, "timestamp_ns": int, ...}`` per
+        stream over Zenoh. ``frame_ns`` is the publisher's capture wall-clock, unique per
+        camera frame -- record_tick compares it against the last recorded frame to catch a
+        stalled/clogged publisher. Raises ValueError if the entry lacks a usable frame or a
+        valid timestamp (e.g. an RTC stream, which cannot stamp frames), since the freshness
+        guard must never be silently disabled.
+        """
+        if not isinstance(entry, dict) or "data" not in entry:
+            raise ValueError(
+                f"[wbc_vr_robot] {name} get_obs(include_timestamp=True) returned "
+                f"{type(entry).__name__}; expected a dict with 'data' + 'timestamp_ns' "
+                "(Zenoh transport). The frame-freshness guard needs the publisher timestamp."
+            )
+        ts = entry.get("timestamp_ns")
+        if ts is None or int(ts) <= 0:
+            raise ValueError(
+                f"[wbc_vr_robot] {name} frame has no valid timestamp_ns ({ts!r}); cannot "
+                "verify frame freshness. Ensure the ZED-SDK publisher stamps frames "
+                "(tests/test_head_zedx_depth.py / test_wrist_zedm_depth.py, Zenoh transport)."
+            )
+        return entry["data"], int(ts)
+
+    def _grab_head_images(self) -> Optional[tuple[np.ndarray, np.ndarray, int]]:
+        """Poll the head camera -> ``(left_rgb uint8 HxWx3, depth uint16 HxW, frame_ns)`` or None.
 
         None until both streams have delivered a frame (parity with vr_reader's
-        ``_all_selected_streams_ready`` -- so the saved HDF5 keeps consistent keys and
-        shapes across frames). Raises ValueError on a malformed shape, so a miswired
-        camera fails loudly instead of recording garbage.
+        ``_all_selected_streams_ready`` -- so the saved HDF5 keeps consistent keys and shapes
+        across frames). ``frame_ns`` is the publisher capture timestamp of the ``left_rgb``
+        frame (``include_timestamp=True``); record_tick rejects a stale frame (camera stalled
+        below the record rate). Raises ValueError on a malformed shape or a missing timestamp,
+        so a miswired/legacy camera fails loudly instead of recording garbage or silently
+        skipping the freshness check.
         """
-        obs = self.robot.sensors.head_camera.get_obs(obs_keys=["left_rgb", "depth"])
-        left_rgb = obs.get("left_rgb")
-        depth = obs.get("depth")
-        if left_rgb is None or depth is None:
+        obs = self.robot.sensors.head_camera.get_obs(
+            obs_keys=["left_rgb", "depth"], include_timestamp=True
+        )
+        left_entry = obs.get("left_rgb")
+        depth_entry = obs.get("depth")
+        if left_entry is None or depth_entry is None:
             return None
+        left_rgb, frame_ns = self._unwrap_frame("head_camera left_rgb", left_entry)
+        depth, _ = self._unwrap_frame("head_camera depth", depth_entry)
         left_rgb = np.asarray(left_rgb)
         depth = np.asarray(depth)
         if left_rgb.ndim != 3 or left_rgb.shape[2] != 3:
@@ -1085,33 +1126,37 @@ class HardwareDriver:
             )
         # meters -> millimeters, clipped to uint16 (matches vr_reader's head_depth).
         depth_u16 = np.clip(depth * 1000, 0, 65535).astype(np.uint16)
-        return np.ascontiguousarray(left_rgb, dtype=np.uint8), depth_u16
+        return np.ascontiguousarray(left_rgb, dtype=np.uint8), depth_u16, frame_ns
 
-    def _grab_wrist_image(self) -> Optional[np.ndarray]:
-        """Poll the wrist ZED-M left eye -> ``left_wrist_rgb`` (uint8 HxWx3) or None.
+    def _grab_wrist_image(self) -> Optional[tuple[np.ndarray, int]]:
+        """Poll the wrist ZED-M left eye -> ``(left_wrist_rgb uint8 HxWx3, frame_ns)`` or None.
 
         Consumes the publisher's frame AS-IS (no crop/resize), like vr_reader: the wrist
         ZED-SDK publisher (tests/test_wrist_zedm_depth.py) already resized robot-side.
-        Returns None until the first frame arrives; a momentary drop after that reuses the
-        cached last-good frame so the recorded HDF5 keeps consistent keys/shapes. Raises
-        ValueError on a malformed shape so a miswired camera fails loudly.
+        Returns None until a frame arrives. ``frame_ns`` is the publisher capture timestamp
+        (``include_timestamp=True``); record_tick rejects a stale frame (publisher stalled
+        below the record rate). A momentary drop is deliberately NOT papered over with a
+        cached frame -- a duplicate wrist image in the take is exactly what the freshness
+        guard must catch. Raises ValueError on a malformed shape or a missing timestamp.
         """
-        obs = self.robot.sensors.wrist_zedm.get_obs(obs_keys=[_WRIST_OBS_KEY])
-        wrist = obs.get(_WRIST_OBS_KEY)
-        if wrist is None:  # tolerate a sensor-name-prefixed key (mirrors policy_rollout)
+        obs = self.robot.sensors.wrist_zedm.get_obs(
+            obs_keys=[_WRIST_OBS_KEY], include_timestamp=True
+        )
+        entry = obs.get(_WRIST_OBS_KEY)
+        if entry is None:  # tolerate a sensor-name-prefixed key (mirrors policy_rollout)
             for key, val in obs.items():
                 if key.endswith("_" + _WRIST_OBS_KEY):
-                    wrist = val
+                    entry = val
                     break
-        if wrist is None:
-            return self._last_wrist_left_rgb  # reuse last good (None until first frame)
+        if entry is None:
+            return None  # publisher delivered no frame this poll
+        wrist, frame_ns = self._unwrap_frame(f"wrist_zedm {_WRIST_OBS_KEY}", entry)
         wrist = np.asarray(wrist)
         if wrist.ndim != 3 or wrist.shape[2] != 3:
             raise ValueError(
                 f"[wbc_vr_robot] wrist_zedm {_WRIST_OBS_KEY} shape {wrist.shape} is not (H,W,3)."
             )
-        self._last_wrist_left_rgb = np.ascontiguousarray(wrist, dtype=np.uint8)
-        return self._last_wrist_left_rgb
+        return np.ascontiguousarray(wrist, dtype=np.uint8), frame_ns
 
     def record_tick(self, result, hold: bool, now: float) -> None:
         """Append one vr_reader-format frame while engaged (no-op unless ``--record``).
@@ -1133,12 +1178,41 @@ class HardwareDriver:
             self._next_record_t = now + self._record_period
 
         imgs = self._grab_head_images()
-        if imgs is None:
+        wrist = self._grab_wrist_image()
+        # Before the first recorded frame the cameras may still be warming up (the leader can
+        # reach teleop before a publisher is fully up): tolerate a missing stream and skip
+        # this tick, matching vr_reader. Once recording is underway a MISSING frame means a
+        # publisher stalled below the record rate -- abort immediately rather than skip (a
+        # skip would silently drop the take's cadence) or reuse a stale frame.
+        recording_started = self._last_rec_head_ns >= 0
+        if imgs is None or wrist is None:
+            if recording_started:
+                raise RuntimeError(
+                    "[wbc_vr_robot] --record: a camera delivered no new frame "
+                    f"(head={'ok' if imgs is not None else 'MISSING'}, "
+                    f"wrist={'ok' if wrist is not None else 'MISSING'}) -- the publisher "
+                    "stalled below the record rate (WiFi clog / camera fps drop). Aborting "
+                    "so the take never records duplicate frames."
+                )
             return  # camera still warming up -- skip rather than write inconsistent keys
-        head_left_rgb, head_depth_u16 = imgs
-        wrist_left_rgb = self._grab_wrist_image()
-        if wrist_left_rgb is None:
-            return  # wrist publisher not streaming yet -- skip to keep record keys consistent
+        head_left_rgb, head_depth_u16, head_ns = imgs
+        wrist_left_rgb, wrist_ns = wrist
+        # Freshness guard: ~15 fps camera vs ~10 fps record means every recorded frame must
+        # carry a strictly newer publisher timestamp than the last recorded one. A non-newer
+        # frame is a stalled/clogged publisher repeating its last frame (get_obs re-returns
+        # the cached latest) -> abort immediately so duplicate images never enter the take.
+        if recording_started and (
+            head_ns <= self._last_rec_head_ns or wrist_ns <= self._last_rec_wrist_ns
+        ):
+            raise RuntimeError(
+                "[wbc_vr_robot] --record: stale camera frame (publisher not delivering new "
+                f"frames at the record rate; WiFi clog / fps drop) -- head Δ="
+                f"{head_ns - self._last_rec_head_ns} ns, wrist Δ="
+                f"{wrist_ns - self._last_rec_wrist_ns} ns (need both > 0). Aborting so the "
+                "take never records duplicate frames."
+            )
+        self._last_rec_head_ns = head_ns
+        self._last_rec_wrist_ns = wrist_ns
 
         # Refresh achieved-gripper obs (FC03) at the record cadence (drains queued replies
         # into self._last_obs_grip_{left,right}, then re-requests).
@@ -1456,14 +1530,18 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
     debug_path: Optional[str] = None
     traj: Optional[_TrajLog] = None
     if args.debug_dir is not None:
-        import datetime  # noqa: PLC0415
         import os  # noqa: PLC0415
 
         os.makedirs(args.debug_dir, exist_ok=True)
-        run_mode = "closedbase" if args.closed_loop_base else "openloop"
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        debug_path = os.path.join(args.debug_dir, f"wbc_debug_{run_mode}_{stamp}.hdf5")
+        # Match vr_reader's DebugEpisodeRecorder naming. When --record is also on,
+        # peek save_dir so episode_<N>_debug.hdf5 pairs with episode_<N>.hdf5.
+        if args.record:
+            episode_id = peek_next_episode_id(args.save_dir)
+        else:
+            episode_id = peek_next_episode_id(args.debug_dir, suffix="_debug")
+        debug_path = os.path.join(args.debug_dir, f"episode_{episode_id}_debug.hdf5")
         meta = {
+            "episode_id": int(episode_id),
             "mode": "replay" if replay else "live",
             "closed_loop_base": bool(args.closed_loop_base),
             "speed": float(args.speed) if replay else 1.0,
@@ -1545,7 +1623,8 @@ def main() -> None:
     parser.add_argument("--debug-dir", dest="debug_dir", default=None,
                         help="write per-tick /debug HDF5 logs (base PD chain, odom + raw "
                              "wheels, closed-loop seed, joint cmd/sent/measured) under this "
-                             "directory as wbc_debug_<mode>_<timestamp>.hdf5. OFF by default.")
+                             "directory as episode_<N>_debug.hdf5 (same id as --record "
+                             "episodes when both are set). OFF by default.")
     parser.add_argument("--record", action="store_true",
                         help="record an episode (vr_reader EpisodeRecorder format) while "
                              "engaged: action+obs joints (incl. torso), gripper obs/action, "

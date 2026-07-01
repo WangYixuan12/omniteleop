@@ -132,16 +132,6 @@ python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixu
 # rerun, transmission latency plot under debug/
 ```
 
-
-
-## Misc (/home/yixuan/omniteleop/scripts/misc)
-
-```bash
-python /home/yixuan/omniteleop/scripts/misc/check_eef_pos.py # robot.right_arm.get_joint_pos() first, and the run this to calculate eef from joint 
-```
-
-
-
 # WBC
 
 See [PIPELINE_WBC](./PIPELINE_WBC.md).
@@ -213,6 +203,12 @@ python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py get -
 python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py set --side right --enable
 ```
 
+
+### Arm joint to eef
+```bash
+python /home/yixuan/omniteleop/scripts/misc/check_eef_pos.py # robot.right_arm.get_joint_pos() first, and the run this to calculate eef from joint 
+```
+
 ### Collision
 
 ```bash
@@ -224,4 +220,3 @@ python /home/yixuan/omniteleop/scripts/diagnostics/browse_collision_pairs_sapien
 ```python
 robot.chassis.set_steering_angle(0.0, wait_time=1.5)
 ```
-

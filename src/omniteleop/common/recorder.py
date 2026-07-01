@@ -102,10 +102,25 @@ def _progress_bar(p: float, width: int = 15) -> str:
     return "[" + "#" * filled + "-" * (width - filled) + f"] {p * 100:3.0f}%"
 
 
+def peek_next_episode_id(save_dir: str, *, suffix: str = "") -> int:
+    """Return the episode id the next ``episode_<N>{suffix}.hdf5`` in ``save_dir`` would use.
+
+    ``suffix`` is inserted before ``.hdf5`` (e.g. ``"_debug"`` -> ``episode_<N>_debug.hdf5``).
+    """
+    save_path = pathlib.Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+    pattern = f"episode_*{suffix}.hdf5"
+    id_re = re.compile(rf"episode_(\d+){re.escape(suffix)}\.hdf5$")
+    existing_ids = (
+        int(match.group(1))
+        for p in save_path.glob(pattern)
+        if (match := id_re.fullmatch(p.name)) is not None
+    )
+    return max(existing_ids, default=-1) + 1
+
+
 class EpisodeRecorder:
     """Accumulates per-frame data and saves to HDF5 on stop()."""
-
-    _ID_RE = re.compile(r"episode_(\d+)\.hdf5$")
 
     def __init__(self, save_dir: str) -> None:
         self._save_dir = pathlib.Path(save_dir)
@@ -116,12 +131,7 @@ class EpisodeRecorder:
         self.saving = False
         self.save_progress: float = 0.0
         self._save_thread: Optional[threading.Thread] = None
-        existing_ids = (
-            int(match.group(1))
-            for p in self._save_dir.glob("episode_*.hdf5")
-            if (match := self._ID_RE.fullmatch(p.name)) is not None
-        )
-        self.episode_id = max(existing_ids, default=-1) + 1
+        self.episode_id = peek_next_episode_id(save_dir)
 
     def start(self) -> None:
         """Start a new episode recording."""

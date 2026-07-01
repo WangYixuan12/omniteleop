@@ -679,6 +679,9 @@ def main() -> None:
             rrb.Vertical(*side_panels),
             column_shares=[2, 1],
         ),
+        # Default the "frame" sequence timeline to 10 fps playback (viewer
+        # otherwise defaults to 30); still adjustable from the time panel.
+        rrb.TimePanel(timeline="frame", fps=10),
         collapse_panels=True,
     )
     rr.send_blueprint(blueprint, make_active=True, make_default=True)
