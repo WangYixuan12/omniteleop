@@ -179,9 +179,9 @@ function renderCameras(pose) {
     // Panel height is fixed; width follows the received image's aspect ratio
     // (camAspect, captured in _decodeCamTex) so vr_reader._camera_poll can change
     // the preview (depth tile, RGB tiles, montage width) without re-stretching
-    // here. Falls back to 16:9 for the first frame before any decode lands.
-    const camPanelH = 0.27;
-    const camPanelW = camPanelH * (camAspect.img || (16 / 9));
+    // here. Falls back to the default 2-tile 4:3 montage (8:3) before any decode lands.
+    const camPanelH = 0.55;
+    const camPanelW = camPanelH * (camAspect.img || (8 / 3));
     if (camTex.img)  drawQuad(proj, _eyeView, 0.0, -0.3, -1.2, camPanelW, camPanelH, camTex.img);
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);

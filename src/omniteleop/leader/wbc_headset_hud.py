@@ -8,6 +8,7 @@ the leader/recorder flow; this module only formats and draws the operator feedba
 from __future__ import annotations
 
 import base64
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -34,6 +35,18 @@ _WHITE = (255, 255, 255)
 _RED = (0, 0, 255)
 _YELLOW = (0, 255, 255)
 _GREEN = (0, 255, 0)
+
+# Camera-tile geometry for the composed HUD frame. The published RGB/depth streams are
+# 4:3 (head SVGA 960x600 -> 640x480; wrist HD720 -> 640x480), so each tile is rendered
+# at 4:3 (_TILE_W:_TILE_H) to MATCH the source and not stretch it -- a 16:9 tile squashed
+# the 4:3 frame horizontally. At _HUD_SCALE=2 the tile equals the published 640x480 (1:1,
+# no resample); raising _HUD_SCALE upsamples + scales the text overlay together. The
+# APPARENT size of the panel in the headset is set separately by ``camPanelH`` in
+# ``web/vr_client.html`` (its width auto-follows the streamed aspect); this constant only
+# controls the streamed image resolution.
+_HUD_SCALE = 2.0
+_TILE_W = round(320 * _HUD_SCALE)
+_TILE_H = round(240 * _HUD_SCALE)
 
 
 @dataclass(frozen=True)
@@ -235,6 +248,16 @@ class WBCHeadsetHUD:
         self._last_camera_warn_t = 0.0
         self._cam_robot = None
 
+        # Background render loop state. poll_and_send (camera get_obs + JPEG encode) runs on
+        # this thread so it NEVER blocks the caller's teleop command loop; the control loop
+        # only pushes cheap overlay state via update_state(). start()/stop() manage the
+        # thread (see wbc_vr_leader.run()).
+        self._state_lock = threading.Lock()
+        self._latest_state: Optional[dict] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._period = float("inf")
+
         try:
             from dexbot_utils.configs.components.sensors.cameras import (  # noqa: PLC0415
                 ZedXCameraConfig,
@@ -277,6 +300,65 @@ class WBCHeadsetHUD:
             return
         self._last_camera_warn_t = now
         print(f"[wbc_vr_leader] WARNING: headset HUD camera poll failed: {exc}")
+
+    # -- background render loop (keeps the HUD off the teleop control path) ------
+
+    def start(self, rate: float) -> None:
+        """Start the background HUD loop at ``rate`` Hz (idempotent).
+
+        The heavy work -- camera ``get_obs`` (a blocking network read) plus ``cv2`` resize
+        and JPEG encode -- runs on this thread, OFF the caller's teleop command loop, so the
+        HUD adds no latency to teleoperation. The control loop feeds overlay state cheaply
+        via :meth:`update_state`.
+        """
+        if self._thread is not None:
+            return
+        self._period = 1.0 / rate if rate and rate > 0.0 else float("inf")
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._run_loop, name="wbc_headset_hud", daemon=True
+        )
+        self._thread.start()
+
+    def update_state(
+        self,
+        *,
+        stage: str,
+        status: Optional[WBCFollowerStatus],
+        status_age_s: Optional[float],
+        alignment: Optional[HandAlignmentStatus] = None,
+    ) -> None:
+        """Store the latest overlay state for the background loop (control-loop safe).
+
+        Only takes a lock and stores references -- no camera or JPEG work -- so it costs
+        microseconds and never stalls the command loop that calls it.
+        """
+        with self._state_lock:
+            self._latest_state = {
+                "stage": stage,
+                "status": status,
+                "status_age_s": status_age_s,
+                "alignment": alignment,
+            }
+
+    def _run_loop(self) -> None:
+        while self._running:
+            t0 = time.perf_counter()
+            with self._state_lock:
+                state = self._latest_state
+            if state is not None:
+                self.poll_and_send(**state)
+            sleep = self._period - (time.perf_counter() - t0)
+            if sleep > 0.0:
+                time.sleep(sleep)
+
+    def stop(self) -> None:
+        """Stop the background loop and join the thread (idempotent)."""
+        self._running = False
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
 
     def _poll_cameras(self) -> None:
         if self._cam_robot is None:
@@ -322,23 +404,27 @@ class WBCHeadsetHUD:
                 normalized = np.clip((img - mn) / (mx - mn + 1e-6) * 255, 0, 255).astype(
                     np.uint8
                 )
-            return cv2.resize(cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO), (320, 180))
+            return cv2.resize(
+                cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO), (_TILE_W, _TILE_H)
+            )
 
         if img.ndim != 3 or img.shape[2] != 3:
             return None
-        return cv2.resize(img[:, :, ::-1], (320, 180))
+        return cv2.resize(img[:, :, ::-1], (_TILE_W, _TILE_H))
 
     @staticmethod
     def _draw_line(img: np.ndarray, text: str, y: int, color: tuple[int, int, int]) -> None:
+        # Char capacity is aspect-invariant: the font scales with the tile width, so a
+        # line that fit at _HUD_SCALE=1 still fits after scaling. Keep the 108 cap.
         if len(text) > 108:
             text = text[:105] + "..."
         cv2.putText(
             img,
             text,
-            (8, y),
+            (round(8 * _HUD_SCALE), y),
             fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-            fontScale=0.4,
-            thickness=1,
+            fontScale=0.4 * _HUD_SCALE,
+            thickness=max(1, round(_HUD_SCALE)),
             color=color,
         )
 
@@ -346,15 +432,16 @@ class WBCHeadsetHUD:
     def _draw_banner(img: np.ndarray, text: str, color: tuple[int, int, int]) -> None:
         """Draw a large, width-fitted alert banner across the bottom of the HUD frame."""
         h, w = img.shape[:2]
-        thickness = 2
-        scale = 1.1
+        thickness = max(1, round(2 * _HUD_SCALE))
+        scale = 1.1 * _HUD_SCALE
+        pad = round(8 * _HUD_SCALE)
         (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-        if tw > w - 8:  # shrink to fit narrow single-tile frames
-            scale *= (w - 8) / tw
+        if tw > w - pad:  # shrink to fit narrow single-tile frames
+            scale *= (w - pad) / tw
             (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
-        x = max((w - tw) // 2, 4)
-        y = h - 10
-        cv2.rectangle(img, (0, y - th - 8), (w, y + base + 4), (0, 0, 0), thickness=-1)
+        x = max((w - tw) // 2, round(4 * _HUD_SCALE))
+        y = h - round(10 * _HUD_SCALE)
+        cv2.rectangle(img, (0, y - th - pad), (w, y + base + round(4 * _HUD_SCALE)), (0, 0, 0), thickness=-1)
         cv2.putText(
             img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness
         )
@@ -376,17 +463,21 @@ class WBCHeadsetHUD:
             tile = self._render_tile(stream)
             if tile is not None:
                 tiles.append(tile)
-        vis_img = np.concatenate(tiles, axis=1) if tiles else np.zeros((180, 320, 3), np.uint8)
+        vis_img = (
+            np.concatenate(tiles, axis=1)
+            if tiles
+            else np.zeros((_TILE_H, _TILE_W, 3), np.uint8)
+        )
 
-        y = 22
+        y = round(22 * _HUD_SCALE)
         self._draw_line(vis_img, f"Stage: {stage}", y, _YELLOW)
-        y += 22
+        y += round(22 * _HUD_SCALE)
         for line in follower_status_overlay_lines(status, status_age_s):
             self._draw_line(vis_img, line, y, follower_status_overlay_color(line))
-            y += 18
+            y += round(18 * _HUD_SCALE)
         for line in alignment_overlay_lines(alignment):
             self._draw_line(vis_img, line.text, y, line.color)
-            y += 18
+            y += round(18 * _HUD_SCALE)
 
         # Prominent self-collision alert, drawn last so it sits on top. Uses the
         # follower status already polled above -- no extra data path, no added latency.

@@ -29,6 +29,7 @@ import numpy as np
 # To re-enable the manipulation-ROI crop, restore:
 #     HEAD_CROP_TBLR = (300, 600, 375, 775)   # 300x400 ROI
 #     HEAD_RESIZE_HW = (240, 320)
+# rerun the test_head_zedx_depth.py publisher after changing these constants.
 HEAD_CROP_TBLR: tuple[int, int, int, int] = (0, 600, 0, 960)  # (300, 600, 375, 775)
 HEAD_RESIZE_HW: tuple[int, int] = (240, 320)  # (H, W); does not affect pose tracking on the raw SVGA (600, 960)
 

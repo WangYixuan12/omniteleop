@@ -455,6 +455,7 @@ class WBCVRLeader:
             WBCHeadsetHUD(self.quest, args.hud_cameras) if args.headset_hud else None
         )
         self._hud_period = 1.0 / float(args.hud_rate) if args.hud_rate > 0.0 else float("inf")
+        self._hud_rate = float(args.hud_rate)
 
         # State
         self.stage = "static"  # "static" (estop) or "teleop"
@@ -504,6 +505,8 @@ class WBCVRLeader:
         """Show a final stop state in the headset HUD after the stop frame is published."""
         if self._hud is None:
             return
+        # Halt the background loop first so this final frame is the last emit (no race).
+        self._hud.stop()
         status, status_age_s = self._follower_status_snapshot()
         self._hud.poll_and_send(stage="stop", status=status, status_age_s=status_age_s)
 
@@ -744,6 +747,11 @@ class WBCVRLeader:
         print("[wbc_vr_leader] Stage static — hold right grip trigger "
               f">= {self.hold_seconds:.0f}s to calibrate and start streaming targets.")
 
+        # Run the camera HUD on its own thread so its get_obs + JPEG encode never block this
+        # command loop; below we only hand it fresh overlay state via update_state().
+        if self._hud is not None:
+            self._hud.start(self._hud_rate)
+
         dt = 1.0 / self.rate
         last_print = 0.0
         last_hud = -float("inf")
@@ -875,7 +883,9 @@ class WBCVRLeader:
 
                 if self._hud is not None and now - last_hud >= self._hud_period:
                     status, status_age_s = self._follower_status_snapshot()
-                    self._hud.poll_and_send(
+                    # Cheap hand-off (lock + store); the HUD thread does the camera poll +
+                    # JPEG encode + emit on its own, so this never stalls the command loop.
+                    self._hud.update_state(
                         stage=self.stage,
                         status=status,
                         status_age_s=status_age_s,
@@ -906,6 +916,8 @@ class WBCVRLeader:
             pass
         finally:
             self.running = False
+            if self._hud is not None:
+                self._hud.stop()  # stop HUD emits before the Quest server loop closes
             self.quest.close()
             self.node.shutdown()
             if self._vrlog is not None and len(self._vrlog) > 0:

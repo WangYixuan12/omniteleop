@@ -44,6 +44,10 @@ python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending c
 
 > Run head before wrist may cause resolution error
 
+> Head and wrist: 240x320. Increasing to 640x480 under wbc_vr_robot's --record-rate (10 Hz) leads to stale frame due to bandwidth-throttled. Bump only after confirming sustained fps with --verify. 
+>
+> Try decreasing _HUD_SCALE, HUD rate (--hud-rate, 10 Hz) and JPEG quality (60 in poll_and_send) in future.
+
 3.1 test wrist camera via  ZED SDK (do not run dexsensor): 
 
 ```python
@@ -132,6 +136,8 @@ python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixu
 # rerun, transmission latency plot under debug/
 ```
 
+
+
 # WBC
 
 See [PIPELINE_WBC](./PIPELINE_WBC.md).
@@ -178,6 +184,8 @@ python scripts/play_side_by_side_videos.py --video_1 /home/yixuan/Dexmate/wbc/wb
 
 # Debug
 
+
+
 ### Arm joint out of limit
 
 ```bash
@@ -187,6 +195,8 @@ python dexcontrol/examples/advanced_examples/disable_arm_motors.py disable --sid
 python dexcontrol/examples/advanced_examples/disable_arm_motors.py brake --side right --joints 6 --no-enable
 python dexcontrol/examples/troubleshooting/clear_error.py
 ```
+
+
 
 ### Arm dead
 
@@ -204,10 +214,14 @@ python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py set -
 ```
 
 
+
 ### Arm joint to eef
+
 ```bash
 python /home/yixuan/omniteleop/scripts/misc/check_eef_pos.py # robot.right_arm.get_joint_pos() first, and the run this to calculate eef from joint 
 ```
+
+
 
 ### Collision
 
@@ -215,8 +229,11 @@ python /home/yixuan/omniteleop/scripts/misc/check_eef_pos.py # robot.right_arm.g
 python /home/yixuan/omniteleop/scripts/diagnostics/browse_collision_pairs_sapien.py # --interactive , run with wbc_vr_leader
 ```
 
+
+
 ### Wheel steering
 
 ```python
 robot.chassis.set_steering_angle(0.0, wait_time=1.5)
 ```
+

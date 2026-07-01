@@ -54,7 +54,7 @@ from dexcomm import Node
 from dexcomm.codecs import DepthImageCodec, JsonDataCodec, RGBImageCodec
 from loguru import logger
 
-Resolution = Literal["HD720", "HD1080", "HD2K", "VGA"]
+Resolution = Literal["HD720", "HD1080", "HD2K", "VGA"] # 2208 × 1242, 1920 × 1080, 1280 × 720, 672 × 376
 DepthMode = Literal["NEURAL", "NEURAL_LIGHT", "ULTRA", "QUALITY", "PERFORMANCE"]
 
 
@@ -102,9 +102,9 @@ class Args:
     resize_h: int = 240
     """Output height: each stream is resized to (resize_h, resize_w) before
     publishing so only the small frame crosses WiFi. Set both resize_h and
-    resize_w to 0 to publish the raw capture resolution. NOTE: HD720 is 16:9
-    (1280x720); resizing to a non-16:9 target (e.g. 120x160) stretches the
-    image — crop first if you need the original aspect ratio."""
+    resize_w to 0 to publish the raw capture resolution. NOTE: wrist HD720 is
+    16:9 (1280x720), so resizing to 4:3 stretches the wrist image — crop first if
+    you need the original aspect ratio."""
 
     resize_w: int = 320
     """Output width (see resize_h)."""
