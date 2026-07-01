@@ -164,6 +164,7 @@ python scripts/play_side_by_side_videos.py --video_1 /home/yixuan/Dexmate/wbc/wb
 ```
 
 ```bash
+# All on lambda machine
 (dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py --calibrate-ee-offset
 # one-time calibration, save src/omniteleop/leader/ee_offset.yaml for future auto load
 (dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py 
@@ -172,8 +173,6 @@ python scripts/play_side_by_side_videos.py --video_1 /home/yixuan/Dexmate/wbc/wb
 
 # python scripts/wbc_vr_record.py --hdf5 /home/yixuan/Dexmate/tmp/test.hdf5 --physics --base-loop closed
 # (dexmate) python scripts/wbc_vr_robot.py --replay /home/yixuan/Dexmate/wbc/real/move_sideway.hdf5 --record
-# on lambda machine
-# --closed-loop-base to seed the IK base from odometry (arms solve from the real base; fixes turn lag)
 
 (dexmate) python scripts/wbc_vr_robot.py --record --debug-dir /home/yixuan/Dexmate/data/raw_data_debug
 

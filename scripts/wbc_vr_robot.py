@@ -25,9 +25,8 @@ so a take recorded/visualized in sim drives the robot identically. They are not 
 Pass ``--debug-dir DIR`` to write a per-tick ``/debug`` HDF5 (auto-named
 ``episode_<N>_debug.hdf5`` under ``DIR``, matching ``vr_reader`` / ``vis_teleop_curves``):
 the base PD chain (odom pose +
-raw wheels, IK base pose/twist, PD raw/err, shaped command), the closed-loop seed, and
-per-group joint command/sent/measured -- enough to diff a ``--closed-loop-base`` run
-against an open-loop-base one. OFF by default.
+raw wheels, IK base pose/twist, PD raw/err, shaped command), plus per-group joint
+command/sent/measured -- enough to inspect commanded vs measured motion. OFF by default.
 
 ``--record`` starts automatically on the first engage after VR calibration, matching
 ``scripts/wbc_vr_record.py``'s post-calibration recording gate. It saves an episode in
@@ -222,12 +221,12 @@ class _TrajLog:
 
     # Per-tick scalar columns, gzipped vector columns, and fixed-width string columns.
     _SCALAR_KEYS = (
-        "t", "cmd_ns", "estop", "success", "held", "hold", "closed_loop_active",
-        "left_ee_error", "right_ee_error", "stability_margin", "clamp_max_over",
+        "t", "cmd_ns", "estop", "success", "held", "hold", "left_ee_error",
+        "right_ee_error", "stability_margin", "clamp_max_over",
         "odom_age", "odom_drive_ts_ns",
     )
     _VECTOR_KEYS = (
-        "q", "seed_q", "base_pose", "base_twist", "base_pd_raw", "base_pd_err",
+        "q", "base_pose", "base_twist", "base_pd_raw", "base_pd_err",
         "base_cmd", "odom_pose", "odom_steer", "odom_wvel",
         "left_target", "right_target", "head_target",
         "cmd_torso", "cmd_left_arm", "cmd_right_arm", "cmd_head",
@@ -240,8 +239,7 @@ class _TrajLog:
         """Write the collected ticks under a ``/debug`` group (if a path is set).
 
         ``/debug`` holds every per-tick column (scalars, gzipped vectors, fixed-width
-        strings) plus run metadata in its attrs, so each file self-describes which run
-        produced it (e.g. ``closed_loop_base``). Columns absent this run (no driver) are
+        strings) plus run metadata in its attrs. Columns absent this run (no driver) are
         skipped rather than erroring.
         """
         if not self.path or not self._rows:
@@ -406,10 +404,8 @@ class HardwareDriver:
     """Drive the real Vega (``dexcontrol.robot.Robot``) from the IK result.
 
     Homes to the WBC nominal posture before the first engage (so the IK's nominal
-    re-anchoring matches the hardware), optionally closes the base loop by seeding the IK
-    planar root from MEASURED odometry each tick (``--closed-loop-base``), clamps per-tick
-    joint steps, and runs the same ``base_closed_loop`` PD/shape path the real robot uses
-    in ``drive_box_record.py``.
+    re-anchoring matches the hardware), clamps per-tick joint steps, and runs the same
+    ``base_closed_loop`` PD/shape path the real robot uses in ``drive_box_record.py``.
     Every joint/base actuator is gated by the ``--enable`` mask; the grippers are always
     activated and track the leader triggers. On any hold (e-stop / failed solve / safety
     hold / stale source or odom) the base is zeroed and joints are frozen (the grippers
@@ -718,53 +714,6 @@ class HardwareDriver:
             out[grp] = m if (m.shape == (len(names),) and np.all(np.isfinite(m))) else None
         return out
 
-    def measured_q(self, ik) -> Optional[np.ndarray]:
-        """Seed the IK planar root from measured odometry (``--closed-loop-base``).
-
-        Returns the IK's current config with ONLY the planar root ``q[0:4]`` overwritten
-        by the MEASURED base pose ``(x, y, cos yaw, sin yaw)`` from the odometry thread,
-        so ``solve()``'s arm QP is anchored to where the base ACTUALLY is. The open-loop
-        alternative integrates the base root purely from the QP, which runs AHEAD of the
-        PD-tracked real base during a turn; the arms, solved against that ahead base, then
-        trail the WORLD EE targets -- the "arms lag behind to the left on a right turn"
-        symptom. Closing the base loop drops that reconstructed world EE lag from ~100mm
-        p95 / ~300mm peak to ~15/25mm in a closed-loop kinematic sim, without adding arm
-        jitter (the base then truly tracks the command, so the standing error stays small).
-
-        Body joints are deliberately NOT overlaid with their measured values: doing so
-        re-injected the arm position-loop tracking lag (measured arms trail their own
-        commands) into the solve, which both INCREASED the world EE lag and chattered the
-        arm command. The IK's own integrated body state is smoother and lower-lag because
-        the arms are position-controlled and track their commands well.
-
-        Returns None (fully open-loop) when ``--closed-loop-base`` is off, when there is no
-        odometry thread (``--enable`` without ``base``), or when the odom sample is
-        malformed -- so a bad pose can never inject a degenerate planar root. (Replay and
-        live both build the odom thread under ``--enable base``, so closure applies to
-        both.) The measured body-joint readback for /debug happens post-actuation in
-        debug_row(), off the pre-solve critical path.
-        """
-        self._dbg["meas_joints"] = None            # debug_row reads body joints post-actuation
-        if not self.args.closed_loop_base or self._odom is None:
-            self._dbg["seed_q"] = None
-            self._dbg["closed_loop_active"] = False
-            return None
-
-        pose = np.asarray(self._odom.pose, dtype=float)
-        if pose.shape != (3,) or not np.all(np.isfinite(pose)):
-            self._dbg["seed_q"] = None             # bad odom -> open-loop this tick
-            self._dbg["closed_loop_active"] = False
-            return None
-        # Planar-root layout (pin.JointModelPlanar, first joint): q[0:2]=(x, y),
-        # q[2:4]=(cos yaw, sin yaw). ik.q is a copy, so this does not mutate the solver
-        # state -- solve(current_q=) re-seeds it through Configuration.update.
-        q = ik.q
-        x, y, yaw = float(pose[0]), float(pose[1]), float(pose[2])
-        q[0], q[1], q[2], q[3] = x, y, np.cos(yaw), np.sin(yaw)
-        self._dbg["seed_q"] = q.copy()
-        self._dbg["closed_loop_active"] = True
-        return q
-
     def extra_hold(self, now, last_cmd_wall, estop) -> Optional[str]:
         """Hold (beyond e-stop/solve/safety) until a fresh command, or on stale stream/odom."""
         from omniteleop.wbc_robot_util import compute_hold_reason  # noqa: PLC0415
@@ -934,7 +883,6 @@ class HardwareDriver:
         (held ticks, base disabled) become NaN so every column keeps a consistent shape.
         """
         d = self._dbg
-        nq = self.ik.model.nq
         widths = {"torso": 3, "left_arm": 7, "right_arm": 7, "head": 3}
 
         def vec(value, n):
@@ -949,8 +897,6 @@ class HardwareDriver:
             meas = self._read_measured_joints()
         odom = d.get("odom")
         row = {
-            "closed_loop_active": bool(d.get("closed_loop_active", False)),
-            "seed_q": vec(d.get("seed_q"), nq),
             "base_twist": np.asarray(result.base_twist, dtype=np.float32),
             "base_pd_raw": vec(d.get("base_pd_raw"), 3),
             "base_pd_err": vec(d.get("base_pd_err"), 3),
@@ -1440,14 +1386,11 @@ def run_loop(
         left_target, right_target, head_target = interp.at(now)
         head_target = head_lpf.filter(head_target, dt)
         head_target = head_planar_deadband.filter(head_target)
-        measured_q = driver.measured_q(ik)
         if cfg.head_mode == "ik":
-            result = ik.solve(left_target, right_target, dt,
-                              head_target=head_target, current_q=measured_q)
+            result = ik.solve(left_target, right_target, dt, head_target=head_target)
         else:
             head_joints = ik.solve_head(head_target, dt)
-            result = ik.solve(left_target, right_target, dt,
-                              head_joints=head_joints, current_q=measured_q)
+            result = ik.solve(left_target, right_target, dt, head_joints=head_joints)
 
         hold_reason = driver.extra_hold(now, last_cmd_wall, estop)
         hold = estop or (not result.success) or result.held or (hold_reason is not None)
@@ -1543,7 +1486,6 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
         meta = {
             "episode_id": int(episode_id),
             "mode": "replay" if replay else "live",
-            "closed_loop_base": bool(args.closed_loop_base),
             "speed": float(args.speed) if replay else 1.0,
             "ik_rate": float(args.ik_rate),
             "cmd_rate": float(args.cmd_rate),
@@ -1568,7 +1510,7 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
     print("=" * 72)
     print(f"[wbc_vr_robot] REAL ROBOT. enabled={enabled} grippers=on | "
           f"{'REPLAY ' + format(args.speed, 'g') + 'x' if replay else 'LIVE'} | "
-          f"closed_loop_base={args.closed_loop_base} base_max={args.base_max_speed:g}m/s")
+          f"base_max={args.base_max_speed:g}m/s")
     print(f"  filters -> head_lpf={args.head_lpf_tau:g}s, "
           f"head_planar_deadband={args.head_planar_pos_deadband:g}m/"
           f"{args.head_planar_yaw_deadband:g}rad, "
@@ -1622,7 +1564,7 @@ def main() -> None:
                         help="Zenoh namespace (must match the leader; default empty).")
     parser.add_argument("--debug-dir", dest="debug_dir", default=None,
                         help="write per-tick /debug HDF5 logs (base PD chain, odom + raw "
-                             "wheels, closed-loop seed, joint cmd/sent/measured) under this "
+                             "wheels, joint cmd/sent/measured) under this "
                              "directory as episode_<N>_debug.hdf5 (same id as --record "
                              "episodes when both are set). OFF by default.")
     parser.add_argument("--record", action="store_true",
@@ -1639,14 +1581,6 @@ def main() -> None:
                              "must be <= the IK rate (ik_rate in wbik.yaml)).")
 
     hw = parser.add_argument_group("hardware")
-    hw.add_argument("--closed-loop-base", action="store_true",
-                    help="close the base loop: seed the IK planar root from MEASURED "
-                         "odometry each tick (solve(current_q=)) so the arms solve against "
-                         "where the base ACTUALLY is. Open-loop (default) integrates the "
-                         "base root from the QP, which leads the PD-tracked real base during "
-                         "a turn and makes the arms trail the world EE targets. Body joints "
-                         "are NOT overlaid (that re-injected arm tracking lag + jitter). "
-                         "Needs --enable base; no-op without an odometry thread.")
     hw.add_argument("--home-tol", type=float, default=DEFAULT_HOME_TOL,
                     help=f"max measured-vs-nominal joint error (rad) to pass the homing gate "
                          f"(default {DEFAULT_HOME_TOL:g}). Tolerates position-control "
