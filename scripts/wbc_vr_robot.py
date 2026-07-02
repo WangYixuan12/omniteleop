@@ -35,9 +35,18 @@ the ``EpisodeRecorder`` schema of ``leader/vr_reader.py`` (mostly interchangeabl
 ``left``/``right`` gripper under ``action/gripper`` (leader trigger command) and
 ``obs/gripper`` (Robotiq FC03 achieved position). It adds ``torso`` to ``action/joint``
 (the WBC commands the torso) and uses the shaped base twist for the ``chassis_*`` action;
-with ``--enable base`` it also records the MEASURED wheel-odometry body twist as the
-``obs/joint`` ``chassis_*`` (achieved-velocity counterpart to the action) and the measured
-base pose ``obs/base/pose`` ``(x, y, yaw)`` in the engage-origin world frame.
+``action/joint/*`` records the POST-CLAMP joint commands actually sent to hardware
+(``_dbg['sent_joints']``), not the raw WBC result. Recording requires the FULL
+``--enable torso,arms,head,base`` mask: it records the MEASURED wheel-odometry body twist
+as the ``obs/joint`` ``chassis_*`` (achieved-velocity counterpart to the action) and the
+measured base pose ``obs/base/pose`` ``(x, y, yaw)`` in the engage-origin world frame.
+
+For the 10 Hz mobile policy (PLAN.md) each frame also records the WORLD-frame targets
+given VERBATIM to ``ik.solve()`` this tick: ``action/eef/{left,right}`` and
+``action/head`` (the head target post LPF/planar-deadband), each ``(4, 4)`` float32,
+plus ``action/base/pose`` = the solver's commanded base pose ``result.base_pose``
+(not a policy field; free to record and lets offline analysis derive base-frame
+variants and IK-world vs odom-world tracking error).
 
 This deviates from vr_reader's ``obs/images`` to support a MOVING base: the camera
 ``intrinsic`` is stored once (``(3, 3)``, constant), and the per-frame ``extrinsic`` is
@@ -436,6 +445,17 @@ class HardwareDriver:
         self.ik = ik
         self.cfg = cfg
         self.enable = enable
+        # A policy take needs post-clamp sent joints for EVERY group (action/joint/*)
+        # and odometry (obs/base/pose anchors the world-frame action targets), so
+        # --record only makes sense with the full actuation mask. Fail fast here,
+        # before any hardware connection, not on the first recorded frame.
+        if args.record:
+            missing = [g for g in ("torso", "arms", "head", "base") if not enable.get(g)]
+            if missing:
+                raise SystemExit(
+                    "[wbc_vr_robot] --record requires --enable torso,arms,head,base; "
+                    f"missing: {', '.join(missing)}"
+                )
         self._base_cl = base_cl
         self._build_hande = build_hande_command
         self._send_ee_pass_through = send_ee_pass_through_with_timestamps
@@ -1104,12 +1124,27 @@ class HardwareDriver:
             )
         return np.ascontiguousarray(wrist, dtype=np.uint8), frame_ns
 
-    def record_tick(self, result, hold: bool, now: float) -> None:
+    def record_tick(
+        self,
+        result,
+        hold: bool,
+        now: float,
+        left_target: np.ndarray,
+        right_target: np.ndarray,
+        head_target: np.ndarray,
+    ) -> None:
         """Append one vr_reader-format frame while engaged (no-op unless ``--record``).
 
         Throttled to ``--record-rate``; skips while ``hold`` (e-stop / failed solve /
         safety hold / stale source) so only live teleop is recorded. Must run AFTER
-        :meth:`actuate` so ``self._prev_base_cmd`` holds this tick's chassis command.
+        :meth:`actuate` so ``self._prev_base_cmd`` holds this tick's chassis command and
+        ``self._dbg['sent_joints']`` holds this tick's post-clamp joint commands.
+
+        ``left_target`` / ``right_target`` / ``head_target`` are the WORLD-frame
+        (engage-origin) 4x4 targets given to ``ik.solve()`` this tick -- the head
+        target post LPF/planar-deadband -- recorded VERBATIM as ``action/eef/*`` and
+        ``action/head``: the 10 Hz policy action (PLAN.md Conventions). Offline
+        porting must never recompute or re-anchor them.
         """
         if self._episode is None or not self._episode.recording or hold:
             return
@@ -1122,6 +1157,64 @@ class HardwareDriver:
         self._next_record_t += self._record_period
         if now > self._next_record_t:
             self._next_record_t = now + self._record_period
+
+        # Policy-action inputs: validate BEFORE touching cameras so a structurally
+        # broken take (wrong enable mask / bad targets) aborts on the first frame.
+        sent_joints = self._dbg.get("sent_joints") if hasattr(self, "_dbg") else None
+        if not isinstance(sent_joints, dict):
+            raise RuntimeError(
+                "[wbc_vr_robot] record_tick requires post-clamp _dbg['sent_joints'] "
+                "(actuate() must run before record_tick on a non-hold tick)"
+            )
+        left_target = np.asarray(left_target, dtype=np.float64)
+        right_target = np.asarray(right_target, dtype=np.float64)
+        head_target = np.asarray(head_target, dtype=np.float64)
+        if (
+            left_target.shape != (4, 4)
+            or right_target.shape != (4, 4)
+            or head_target.shape != (4, 4)
+        ):
+            raise RuntimeError(
+                "[wbc_vr_robot] record_tick expected 4x4 policy targets, got "
+                f"left={left_target.shape}, right={right_target.shape}, "
+                f"head={head_target.shape}"
+            )
+        if (
+            not np.all(np.isfinite(left_target))
+            or not np.all(np.isfinite(right_target))
+            or not np.all(np.isfinite(head_target))
+        ):
+            raise RuntimeError("[wbc_vr_robot] record_tick received a non-finite policy target")
+        if self._odom is None:
+            raise RuntimeError(
+                "[wbc_vr_robot] record_tick requires odometry (--enable base): "
+                "obs/base/pose anchors the world-frame policy action targets"
+            )
+        base_pose_cmd = np.asarray(result.base_pose, dtype=np.float32)
+        if base_pose_cmd.shape != (3,) or not np.all(np.isfinite(base_pose_cmd)):
+            raise RuntimeError(
+                f"[wbc_vr_robot] record_tick result.base_pose {base_pose_cmd!r} is not a "
+                "finite (3,) pose"
+            )
+
+        def action_joint(name: str, shape: tuple[int, ...]) -> np.ndarray:
+            """Post-clamp sent command for group ``name`` this tick (action/joint)."""
+            if name not in sent_joints:
+                raise RuntimeError(
+                    f"[wbc_vr_robot] record_tick missing post-clamp sent_joints[{name!r}] "
+                    "-- recording requires the group in --enable"
+                )
+            arr = np.asarray(sent_joints[name], dtype=np.float32)
+            if arr.shape != shape:
+                raise RuntimeError(
+                    f"[wbc_vr_robot] record_tick sent_joints[{name!r}] has shape "
+                    f"{arr.shape}, expected {shape}"
+                )
+            if not np.all(np.isfinite(arr)):
+                raise RuntimeError(
+                    f"[wbc_vr_robot] record_tick sent_joints[{name!r}] is non-finite"
+                )
+            return arr
 
         imgs = self._grab_head_images()
         wrist = self._grab_wrist_image()
@@ -1223,11 +1316,13 @@ class HardwareDriver:
             "timestamp_ns": np.int64(time.time_ns()),
             "action": {
                 "joint": {
-                    # torso added vs vr_reader: the WBC commands the torso here.
-                    "torso": np.asarray(result.torso, dtype=np.float32),
-                    "left_arm": np.asarray(result.left_arm, dtype=np.float32),
-                    "right_arm": np.asarray(result.right_arm, dtype=np.float32),
-                    "head": np.asarray(result.head, dtype=np.float32),
+                    # torso added vs vr_reader: the WBC commands the torso here. Every
+                    # group records the POST-CLAMP command actually sent to hardware
+                    # (actuate's _dbg['sent_joints']), not the raw WBC result.
+                    "torso": action_joint("torso", (3,)),
+                    "left_arm": action_joint("left_arm", (7,)),
+                    "right_arm": action_joint("right_arm", (7,)),
+                    "head": action_joint("head", (3,)),
                     # Base action = the shaped twist sent to the chassis (the WBC drives
                     # the base; the leader thumbstick chassis_* is unused here).
                     "chassis_vx": np.float32(base_cmd[0]),
@@ -1240,6 +1335,18 @@ class HardwareDriver:
                     "left": np.float32(self._last_gripper_cmd_left),
                     "right": np.float32(self._last_gripper_cmd_right),
                 },
+                # 10 Hz policy action: the EXACT world-frame targets given to ik.solve()
+                # this tick (head post LPF/planar-deadband), stored verbatim -- offline
+                # porting must never recompute or re-anchor them (PLAN.md Conventions).
+                "eef": {
+                    "left": left_target.astype(np.float32),
+                    "right": right_target.astype(np.float32),
+                },
+                "head": head_target.astype(np.float32),
+                # Solver's commanded base pose in the same engage-origin world as
+                # obs/base/pose. NOT a policy field: free to record, and lets offline
+                # analysis derive base-frame variants and IK-vs-odom tracking error.
+                "base": {"pose": base_pose_cmd},
             },
             "obs": obs_out,
         }
@@ -1400,7 +1507,14 @@ def run_loop(
         if hasattr(driver, "start_recording_if_teleop"):
             driver.start_recording_if_teleop(vr)
         if hasattr(driver, "record_tick"):
-            driver.record_tick(result, hold, now)
+            driver.record_tick(
+                result,
+                hold,
+                now,
+                left_target=left_target,
+                right_target=right_target,
+                head_target=head_target,
+            )
         if status_pub is not None and now - last_status_publish >= status_period:
             status = _build_follower_status(
                 vr,

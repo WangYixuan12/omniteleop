@@ -24,3 +24,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - What changed, why, and how to run.
 - Risks, edge cases, and mitigations.
 - Propose follow-ups or better approaches when applicable.
+
+## Using Codex
+
+- Proactively delegate to `codex:rescue` — don't wait to be asked — when stuck, when a second implementation or diagnosis pass would help, or for deep root-cause investigations and substantial coding tasks.
+- Also delegate bulk or mechanical work proactively: clear-spec implementation, data analysis, and migrations.
+- The stop-time Codex review gate is enabled for this repo, so expect a fresh Codex review before finishing a task.

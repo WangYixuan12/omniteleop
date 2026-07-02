@@ -10,7 +10,7 @@ Two episode layouts are supported via ``--deploy``:
   ``scripts/wbc_vr_robot.py``)::
 
       obs/images/{head_left_rgb, head_depth, left_wrist_rgb}
-      obs/images/intrinsic   (3, 3) static (wbc_vr_robot) or (N, 3, 3)
+      obs/images/intrinsic   (3, 3) static (wbc_vr_robot) or (N, 3, 3) -- REQUIRED
       obs/images/extrinsic   optional base_t_cam; recomputed by FK when absent
       obs/joint/{torso, left_arm, right_arm, head[, chassis_*]}
       obs/base/pose          optional (N, 3) = (x, y, yaw), present with a moving base
@@ -40,11 +40,12 @@ Two episode layouts are supported via ``--deploy``:
   active 6-D [before_xyz, after_xyz] condition as text plus 3D before/after
   markers and a 2D overlay projected onto ``head_left_rgb``.
   Torso/head joints aren't recorded, so they're held at ``INIT_*`` for
-  robot-mesh FK. The saved ``obs/images/{intrinsic, extrinsic}`` calibration is
-  required in this mode -- the script errors out rather than falling back to
-  hardcoded ZED intrinsics / FK camera extrinsics (a single shared matrix is
-  broadcast over frames). A ``debug/latency.png`` is written from the ``time``
-  group.
+  robot-mesh FK. ``obs/images/intrinsic`` is REQUIRED in BOTH modes (no
+  hardcoded-ZED fallback -- the old default only matched a full raw SVGA frame
+  and mis-scaled cropped/resized recordings); ``--deploy`` additionally requires
+  the saved ``obs/images/extrinsic`` (no FK camera-extrinsic fallback). A single
+  shared matrix is broadcast over frames. A ``debug/latency.png`` is written from
+  the ``time`` group.
 
 When ``obs/base/pose`` is present (``wbc_vr_robot.py --enable base``), the head-camera
 extrinsic (``world_t_cam = world_t_base · base_t_cam``), robot meshes, colored point
@@ -472,29 +473,25 @@ def main() -> None:
     if position_condition is not None:
         print("Position condition: plotting obs/position_condition stage/mask/condition_6d")
 
-    # ── intrinsics: deploy requires the saved matrix (no fallback); teleop
-    #    falls back to hardcoded ZED when absent. ──────────────────────────────
-    if "intrinsic" in img_group:
-        K_all = np.array(img_group["intrinsic"], dtype=np.float64)
-        if K_all.shape == (3, 3):  # single shared matrix → broadcast over frames
-            K_all = np.repeat(K_all[None], N, axis=0)
-        if K_all.shape != (N, 3, 3):
-            raise ValueError(
-                f"obs/images/intrinsic shape {K_all.shape} is not (3, 3) or ({N}, 3, 3)"
-            )
-        print(f"Using saved obs/images/intrinsic {K_all.shape}")
-    elif args.deploy:
+    # ── intrinsics: the saved matrix is REQUIRED in both modes. There is no
+    #    hardcoded fallback -- the old default was the raw SVGA K, which only
+    #    matches a full 960x600 frame and would silently mis-scale the point
+    #    cloud / 2D projections for any cropped or resized recording. ───────────
+    if "intrinsic" not in img_group:
         raise KeyError(
-            f"obs/images/intrinsic missing in --deploy episode {args.hdf5!r}; "
-            "refusing to fall back to hardcoded ZED intrinsics "
-            f"(obs/images has: {list(img_group)})"
+            f"obs/images/intrinsic missing in episode {args.hdf5!r}; refusing to fall "
+            "back to hardcoded ZED intrinsics (they only match a full raw SVGA frame and "
+            "mis-scale cropped/resized recordings). Re-record with a recorder that stamps "
+            f"obs/images/intrinsic (obs/images has: {list(img_group)})"
         )
-    else:
-        fx = fy = 770.1868 / 2.0
-        cx = 990.2711 / 2.0
-        cy = 637.7721 / 2.0
-        K_single = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-        K_all = np.repeat(K_single[None], N, axis=0)
+    K_all = np.array(img_group["intrinsic"], dtype=np.float64)
+    if K_all.shape == (3, 3):  # single shared matrix → broadcast over frames
+        K_all = np.repeat(K_all[None], N, axis=0)
+    if K_all.shape != (N, 3, 3):
+        raise ValueError(
+            f"obs/images/intrinsic shape {K_all.shape} is not (3, 3) or ({N}, 3, 3)"
+        )
+    print(f"Using saved obs/images/intrinsic {K_all.shape}")
 
     # ── kinematics helper (camera extrinsic fallback + EEF via FK) ───────────
     kin = KinHelper("vega_no_effector")
