@@ -29,4 +29,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Proactively delegate to `codex:rescue` — don't wait to be asked — when stuck, when a second implementation or diagnosis pass would help, or for deep root-cause investigations and substantial coding tasks.
 - Also delegate bulk or mechanical work proactively: clear-spec implementation, data analysis, and migrations.
-- The stop-time Codex review gate is enabled for this repo, so expect a fresh Codex review before finishing a task.
+- Use your own judgment on when a Codex review adds value (e.g. non-trivial or risky changes) and invoke `/codex:review` then.

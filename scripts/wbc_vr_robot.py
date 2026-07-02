@@ -6,7 +6,7 @@ to the leader's Cartesian ``L_ee``/``R_ee``/head TARGET poses, interpolate the l
 command stream up to the IK rate, run ``VegaWholeBodyIK`` -- but driving the REAL Vega
 hardware (``dexcontrol.robot.Robot``) instead of a simulator.
 
-We do NOT use low-level APIs like `set_motion_state`, `set_steering_angle`, or
+AVOID using low-level APIs like `set_motion_state`, `set_steering_angle`, or
 `set_wheel_velocity` directly, which can command opposed steering/velocity and damage
 the wheel motors. Route base motion through `set_velocity`.
 

@@ -167,8 +167,8 @@ Current implemented schema:
   --raw-dir /home/yixuan/Dexmate/data/raw_data \
   --root /home/yixuan/Dexmate/data/processed_wbc \
   --repo-id dexmate_wbc_eef_head \
-  --resize-h 240 \
-  --resize-w 320
+  --resize-h 120 \
+  --resize-w 160
 ```
 
 Visualize the ported dataset: `observation.state` (base-frame EEF/head FK composed to world via the odometry base pose, matching the calib sidecar), world-frame `action` targets.
@@ -187,7 +187,7 @@ The checkpoint must report `observation.state` dim `32`, `action` dim `29`, imag
 (dexmate_lerobot) lerobot-train \
   --policy.type=diffusion --policy.device=cuda --policy.push_to_hub=false \
   --policy.horizon=16 --policy.n_action_steps=8 --policy.use_relative_actions=false \
-  '--policy.input_features={"observation.images.head_rgb": {"type": "VISUAL", "shape": [3, 240, 320]}, "observation.images.wrist_rgb": {"type": "VISUAL", "shape": [3, 240, 320]}, "observation.state": {"type": "STATE", "shape": [32]}}' \
+  '--policy.input_features={"observation.images.head_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.images.wrist_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.state": {"type": "STATE", "shape": [32]}}' \
   '--policy.normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "MIN_MAX", "ACTION": "MIN_MAX"}' \
   '--policy.skip_normalization_dims={"observation.state": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28], "action": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28]}' \
   --dataset.repo_id=dexmate_wbc_eef_head \
