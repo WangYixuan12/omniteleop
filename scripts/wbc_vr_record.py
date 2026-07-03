@@ -125,6 +125,7 @@ DEFAULT_BASE_POST_ANGULAR_DEADBAND = _VR_TELEOP.base_post_angular_deadband
 # the module-load interpolation test can stub the heavy follower package.
 DEFAULT_BASE_KP_XY = _VR_TELEOP.base_kp_xy
 DEFAULT_BASE_KP_YAW = _VR_TELEOP.base_kp_yaw
+DEFAULT_BASE_YAW_HOLD_IN_XY = _VR_TELEOP.base_yaw_hold_in_xy
 DEFAULT_SPEED = _VR_TELEOP.replay_speed
 DEFAULT_RATE = _VR_TELEOP.ik_rate
 DEFAULT_CMD_RATE = _VR_TELEOP.cmd_rate
@@ -150,6 +151,19 @@ def _orientation_marker_pose(orientation_pose: np.ndarray, anchor_pose) -> np.nd
     out = np.eye(4)
     out[:3, :3] = np.asarray(orientation_pose, dtype=float)[:3, :3]
     out[:3, 3] = _to_mat(anchor_pose)[:3, 3]
+    return out
+
+
+def _mask_base_twist_for_dofs(
+    cfg: WBCConfig,
+    twist: np.ndarray,
+    *,
+    allow_yaw_hold: bool = False,
+) -> np.ndarray:
+    """Apply the WBC base-DOF policy to a downstream chassis twist."""
+    out = np.asarray(twist, dtype=np.float64).copy()
+    if cfg.base_dofs == "xy" and not allow_yaw_hold:
+        out[2] = 0.0
     return out
 
 
@@ -354,6 +368,7 @@ def main() -> None:
     args.cmd_rate = DEFAULT_CMD_RATE
     args.base_kp_xy = DEFAULT_BASE_KP_XY
     args.base_kp_yaw = DEFAULT_BASE_KP_YAW
+    args.base_yaw_hold_in_xy = DEFAULT_BASE_YAW_HOLD_IN_XY
     args.head_lpf_tau = DEFAULT_HEAD_LPF_TAU
     args.head_planar_pos_deadband = DEFAULT_HEAD_PLANAR_POS_DEADBAND
     args.head_planar_yaw_deadband = DEFAULT_HEAD_PLANAR_YAW_DEADBAND
@@ -451,7 +466,8 @@ def main() -> None:
     base_max_lin = DEFAULT_BASE_MAX_SPEED
     base_max_ang = 2.0 * DEFAULT_BASE_MAX_SPEED
     loop_msg = (f"closed-loop (base_closed_loop PD: kp_xy={args.base_kp_xy:g}, "
-                f"kp_yaw={args.base_kp_yaw:g})" if closed_loop
+                f"kp_yaw={args.base_kp_yaw:g}, "
+                f"yaw_hold_xy={bool(args.base_yaw_hold_in_xy)})" if closed_loop
                 else "open-loop (feed-forward IK base twist only)")
     print(f"[wbc_vr] base control: {loop_msg} -> shape_twist("
           f"deadband {base_deadband:g}/{base_deadband_ang:g}, "
@@ -521,6 +537,7 @@ def main() -> None:
         base_loop=str(args.base_loop), physics=bool(args.physics),
         base_deadband=float(base_deadband), base_accel=float(base_accel),
         base_kp_xy=float(args.base_kp_xy), base_kp_yaw=float(args.base_kp_yaw),
+        base_yaw_hold_in_xy=bool(args.base_yaw_hold_in_xy),
         base_max_speed=float(DEFAULT_BASE_MAX_SPEED),
         head_lpf_tau=float(args.head_lpf_tau),
         head_planar_pos_deadband=float(args.head_planar_pos_deadband),
@@ -651,6 +668,11 @@ def main() -> None:
                 prev_cmd = np.zeros(3)
                 base_axis = None
             else:
+                allow_yaw_hold = (
+                    closed_loop
+                    and cfg.base_dofs == "xy"
+                    and bool(args.base_yaw_hold_in_xy)
+                )
                 if closed_loop:
                     raw_twist, pd_err = base_cl.pd_twist(
                         result.base_pose, result.base_twist, robot.base_pose,
@@ -659,6 +681,11 @@ def main() -> None:
                     )
                 else:
                     raw_twist = np.asarray(result.base_twist, dtype=np.float64)
+                raw_twist = _mask_base_twist_for_dofs(
+                    cfg,
+                    raw_twist,
+                    allow_yaw_hold=allow_yaw_hold,
+                )
                 # Snapshot the PD/FF twist before shaping and the single-axis mask.
                 pd_twist_out = np.asarray(raw_twist, dtype=np.float64).copy()
                 # Shape (deadband -> velocity clamp -> slew) the FULL multi-axis command and
@@ -686,17 +713,34 @@ def main() -> None:
                     linear_deadband=args.base_post_linear_deadband,
                     angular_deadband=args.base_post_angular_deadband,
                 )
+                shaped_twist = _mask_base_twist_for_dofs(
+                    cfg,
+                    shaped_twist,
+                    allow_yaw_hold=allow_yaw_hold,
+                )
                 prev_cmd = shaped_twist  # slew anchor stays multi-axis (every axis warm)
-                # Mask the shaped command to ONE pure chassis motion (the SAME selector the WBC
-                # applies to its solve output) so the kept axis carries its full slewed
-                # magnitude. Open loop: the WBC twist is already single-axis, so ~idempotent.
+                # Mask the shaped command to ONE pure chassis motion (the SAME selector the
+                # WBC applies to its solve output) so the kept axis carries its full slewed
+                # magnitude. In xy mode, optional yaw-hold feedback remains in that selector,
+                # so the final chassis command is still single-axis. Open loop: the WBC twist
+                # is already single-axis, so ~idempotent.
                 if cfg.enable_base_single_axis:
-                    shaped_twist, base_axis = base_cl.project_planar_twist_single_axis(
+                    shaped_twist, base_axis = (
+                        base_cl.project_planar_twist_single_axis_for_base_dofs(
+                            shaped_twist,
+                            base_dofs=cfg.base_dofs,
+                            allow_yaw_hold=allow_yaw_hold,
+                            xy_max_vel=cfg.base_xy_max_vel,
+                            yaw_max_vel=cfg.base_yaw_max_vel,
+                            deadband=cfg.base_single_axis_deadband,
+                            hysteresis_ratio=cfg.base_single_axis_hysteresis_ratio,
+                            prev_axis=base_axis,
+                        )
+                    )
+                    shaped_twist = _mask_base_twist_for_dofs(
+                        cfg,
                         shaped_twist,
-                        xy_max_vel=cfg.base_xy_max_vel, yaw_max_vel=cfg.base_yaw_max_vel,
-                        deadband=cfg.base_single_axis_deadband,
-                        hysteresis_ratio=cfg.base_single_axis_hysteresis_ratio,
-                        prev_axis=base_axis,
+                        allow_yaw_hold=allow_yaw_hold,
                     )
             robot.chassis.set_velocity(
                 vx=float(shaped_twist[0]), vy=float(shaped_twist[1]),

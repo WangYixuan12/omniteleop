@@ -101,6 +101,7 @@ LEFT_GRIPPER_FRAME = "L_robotiq"
 RIGHT_GRIPPER_FRAME = "R_robotiq"
 HEAD_FRAME = "zed_depth_frame"
 BASE_FRAME = "base"
+BASE_DOF_MODES = ("xy_yaw", "xy")
 # Torso-top x anchor frame: "arm_center" is the fixed mount at the top of torso_l3
 # (torso_j3 is the link's lower joint; head_j1 attaches right next to it), carrying
 # both arms and the head chain. The QP holds its base-frame x at the value it has at
@@ -250,6 +251,11 @@ class WBCConfig:
     base_velocity_smoothing_cost: Sequence[float] = tuple(
         _DEFAULTS["base_velocity_smoothing_cost"]
     )
+
+    # Planar base DOF policy. "xy_yaw" leaves the full planar root available
+    # (x, y, yaw). "xy" hard-pins the WBC yaw tangent DOF to zero, so the solver may
+    # translate the base but cannot rotate it to satisfy EE/head tasks.
+    base_dofs: str = _DEFAULTS["base_dofs"]
 
     # Single-axis base motion (one pure chassis motion per tick). The QP resolves
     # leader/EE-target noise into small simultaneous vx/vy/wz, so a "drive straight" leans
@@ -523,6 +529,10 @@ class VegaWholeBodyIK:
             raise ValueError(
                 f"head_mode must be 'track' or 'ik', got {self.config.head_mode!r}"
             )
+        if self.config.base_dofs not in BASE_DOF_MODES:
+            raise ValueError(
+                f"base_dofs must be one of {BASE_DOF_MODES}, got {self.config.base_dofs!r}"
+            )
         self._head_mode = self.config.head_mode
         self._build_model()
         self._build_tasks_and_limits()
@@ -623,6 +633,13 @@ class VegaWholeBodyIK:
         self.model.velocityLimit[0] = cfg.base_xy_max_vel
         self.model.velocityLimit[1] = cfg.base_xy_max_vel
         self.model.velocityLimit[2] = cfg.base_yaw_max_vel
+        self._base_dof_mask = np.ones(3, dtype=bool)
+        if cfg.base_dofs == "xy":
+            self._base_dof_mask[2] = False
+        disabled_base = np.flatnonzero(~self._base_dof_mask)
+        self._base_dof_pin_A = np.zeros((len(disabled_base), self.model.nv))
+        for row, idx_v in enumerate(disabled_base):
+            self._base_dof_pin_A[row, idx_v] = 1.0
         # Global velocity headroom (reference's velocity_limit_scale): scale every
         # limit -- base and URDF joint limits alike -- before VelocityLimit reads them.
         self.model.velocityLimit *= cfg.velocity_limit_scale
@@ -1272,6 +1289,7 @@ class VegaWholeBodyIK:
             else:
                 problem.A = self._head_pin_A
                 problem.b = np.zeros(len(self._head_idx_v))
+            self._add_base_dof_equalities(problem)
             self._add_torso_top_x_equality(problem, dt)
             self._add_com_over_base_terms(problem)
             self._add_head_world_position_objective(problem)
@@ -1283,6 +1301,8 @@ class VegaWholeBodyIK:
         except Exception:  # infeasible QP / barrier / limit hit: hold the current pose
             velocity = np.zeros(self.model.nv)
             success = False
+
+        velocity = self._apply_base_dof_mask(velocity)
 
         # Constrain the chassis to ONE pure motion (forward XOR strafe XOR turn), zeroing
         # the non-dominant base axes BEFORE integration so the solver's own base pose and
@@ -1312,6 +1332,7 @@ class VegaWholeBodyIK:
                 velocity = velocity.copy()
                 velocity[3:] = 0.0                           # zero joint vel, keep base twist
             self_dist = self._min_self_distance()
+        velocity = self._apply_base_dof_mask(velocity)
 
         # Remember the base twist actually committed this tick (post-hold, so a frozen or
         # base-only-hold tick anchors smoothing on what the chassis really did) for the
@@ -1425,6 +1446,25 @@ class VegaWholeBodyIK:
         problem.A = np.vstack([problem.A, row[None, :]])
         problem.b = np.hstack([problem.b, [delta]])
 
+    def _add_base_dof_equalities(self, problem: qpsolvers.Problem) -> None:
+        """Stack base-DOF lock rows such as ``dq_yaw = 0`` onto the QP."""
+        if self._base_dof_pin_A.shape[0] == 0:
+            return
+        problem.A = np.vstack([problem.A, self._base_dof_pin_A])
+        problem.b = np.hstack([problem.b, np.zeros(self._base_dof_pin_A.shape[0])])
+
+    def _apply_base_dof_mask(self, velocity: np.ndarray) -> np.ndarray:
+        """Zero disabled planar-root velocity components in a full ``nv`` vector."""
+        out = np.asarray(velocity, dtype=float).copy()
+        out[:3] = self._mask_base_twist(out[:3])
+        return out
+
+    def _mask_base_twist(self, twist: np.ndarray) -> np.ndarray:
+        """Zero disabled planar base axes in a ``(vx, vy, wz)`` twist."""
+        out = np.asarray(twist, dtype=float).copy()
+        out[~self._base_dof_mask] = 0.0
+        return out
+
     def _add_base_velocity_smoothing(
         self, problem: qpsolvers.Problem, dt: float
     ) -> None:
@@ -1456,6 +1496,8 @@ class VegaWholeBodyIK:
             return
         v_prev = self._prev_base_velocity
         for k in range(3):  # planar root tangent DOFs: vx, vy, wz
+            if not self._base_dof_mask[k]:
+                continue
             c2 = float(cost[k]) ** 2
             if c2 <= 0.0:
                 continue
@@ -1488,14 +1530,19 @@ class VegaWholeBodyIK:
         wheel commands are also single-axis.
         """
         out = velocity.copy()
+        base = self._mask_base_twist(out[:3])
+        prev_axis = self._base_single_axis_idx
+        if prev_axis is not None and not self._base_dof_mask[prev_axis]:
+            prev_axis = None
         out[:3], self._base_single_axis_idx = project_planar_twist_single_axis(
-            out[:3],
+            base,
             xy_max_vel=self.config.base_xy_max_vel,
             yaw_max_vel=self.config.base_yaw_max_vel,
             deadband=self.config.base_single_axis_deadband,
             hysteresis_ratio=self.config.base_single_axis_hysteresis_ratio,
-            prev_axis=self._base_single_axis_idx,
+            prev_axis=prev_axis,
         )
+        out[:3] = self._mask_base_twist(out[:3])
         return out
 
     def _centroid_over_base(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

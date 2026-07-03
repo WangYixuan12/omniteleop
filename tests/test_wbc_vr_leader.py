@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import h5py
 import numpy as np
+import pytest
 
 from omniteleop.leader import wbc_reference_alignment as ref_align
 
@@ -258,6 +260,20 @@ def test_save_load_ee_offsets_round_trip(tmp_path):
     np.testing.assert_allclose(rr, cr, atol=1e-9)
 
 
+@pytest.mark.parametrize("flag", ["--base-dofs", "--wbc-base-dofs"])
+def test_base_dofs_cli_flag_is_rejected(monkeypatch, flag):
+    leader_mod = _load_wbc_vr_leader()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["wbc_vr_leader.py", flag, "xy", "--no-headset-hud"],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        leader_mod.main()
+    assert exc.value.code == 2
+
+
 def test_align_reference_none_disables_reference_loading():
     assert ref_align.load_reference_ee_poses(None) is None
     assert ref_align.load_reference_ee_poses("None") is None
@@ -439,6 +455,9 @@ def test_stop_hud_forces_stage_stop_on_left_x():
     calls = []
 
     class FakeHUD:
+        def stop(self):
+            calls.append({"stopped": True})
+
         def poll_and_send(self, **kwargs):
             calls.append(kwargs)
 
@@ -448,7 +467,10 @@ def test_stop_hud_forces_stage_stop_on_left_x():
 
     leader_mod.WBCVRLeader._send_stop_hud(leader)
 
-    assert calls == [{"stage": "stop", "status": status, "status_age_s": 0.1}]
+    assert calls == [
+        {"stopped": True},
+        {"stage": "stop", "status": status, "status_age_s": 0.1},
+    ]
 
 
 # -- head-target orientation: gravity-aligned, no yaw -> pitch/roll cone ---------------

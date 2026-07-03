@@ -415,7 +415,7 @@ class WBCVRLeader:
         # posture (NOT the legacy INIT_JOINT constants). At nominal the planar base
         # is at the world origin, so frame_pose() values are already in the base
         # frame, and they match exactly what wbc_vr_record's VegaWholeBodyIK uses.
-        cfg = WBCConfig()  # urdf_path comes from wbik.yaml (no --urdf override)
+        cfg = WBCConfig()  # all WBC tunables come from wbik.yaml (no CLI override)
         ik = VegaWholeBodyIK(cfg)
         ik.reset()
         self.T_base_head = _to_mat(ik.frame_pose(HEAD_FRAME))

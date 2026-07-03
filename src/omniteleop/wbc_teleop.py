@@ -52,6 +52,7 @@ VR_TELEOP_SECTION = "vr_teleop"
 _STRICTLY_POSITIVE_FIELDS = frozenset(
     {"replay_speed", "ik_rate", "base_accel", "base_max_speed"}
 )
+_BOOLEAN_FIELDS = frozenset({"base_yaw_hold_in_xy"})
 
 
 @dataclass(frozen=True)
@@ -67,12 +68,13 @@ class VRTeleopConfig:
 
     replay_speed: float                # replay speed multiplier (<1 = slower)
     ik_rate: float                     # whole-body IK / control loop rate (Hz)
-    cmd_rate: float                    # leader command rate interpolated up to ik_rate (Hz); 0 disables
+    cmd_rate: float                    # leader command rate (Hz), interpolated to ik_rate
     head_lpf_tau: float                # head-target low-pass time constant (s); 0 disables
     head_planar_pos_deadband: float    # radial x/y head-target deadband (m)
     head_planar_yaw_deadband: float    # heading-yaw head-target deadband (rad)
     base_kp_xy: float                  # closed-loop base PD gain on planar pose error (1/s)
     base_kp_yaw: float                 # closed-loop base PD gain on yaw error (1/s)
+    base_yaw_hold_in_xy: bool          # allow yaw feedback when WBC base_dofs hard-locks yaw
     base_deadband: float               # closed-loop base-twist pre-deadband (m/s; angular = 2x)
     base_accel: float                  # base-twist slew limit (m/s^2; angular = 2x)
     base_max_speed: float              # base linear-velocity clamp (m/s; angular = 2x)
@@ -86,8 +88,8 @@ class VRTeleopConfig:
         Every field must be present (the YAML is the single source of truth, no silent
         defaults); unknown keys in the block raise (typo guard). Each value must be a
         finite number that is ``>= 0`` -- or ``> 0`` for the strictly-positive fields
-        (``replay_speed``, ``base_accel``; see ``_STRICTLY_POSITIVE_FIELDS``) -- mirroring
-        the followers' own argparse validation. All raises are ``ValueError`` carrying the
+        (``replay_speed``, ``base_accel``; see ``_STRICTLY_POSITIVE_FIELDS``) -- except
+        the explicit boolean fields. All raises are ``ValueError`` carrying the
         ``vr_teleop.<field>`` context (never a bare ``float()`` ``TypeError``).
         """
         cfg_path = DEFAULT_CONFIG_PATH if path is None else Path(path)
@@ -108,9 +110,17 @@ class VRTeleopConfig:
         missing = sorted(names - set(block))
         if missing:
             raise ValueError(f"{cfg_path}: missing {VR_TELEOP_SECTION} keys {missing}")
-        values: dict[str, float] = {}
+        values = {}
         for name in names:
             raw = block[name]
+            if name in _BOOLEAN_FIELDS:
+                if not isinstance(raw, bool):
+                    raise ValueError(
+                        f"{cfg_path}: {VR_TELEOP_SECTION}.{name} must be a boolean, "
+                        f"got {raw!r}"
+                    )
+                values[name] = raw
+                continue
             try:
                 value = float(raw)
             except (TypeError, ValueError):

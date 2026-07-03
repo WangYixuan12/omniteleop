@@ -30,6 +30,10 @@ lm_damping_base: 1.0e-6
 # would otherwise resolve into a laterally whipping base. Lower than base_position_cost.
 base_velocity_smoothing_cost: [0.0, 0.0, 4000.0] # wz on: penalize frame-to-frame base-yaw reversals (head-yaw-driven wheel jitter); steady turns unpenalized
 
+# Planar base DOFs available to WBC. "xy_yaw" allows x/y translation and yaw rotation;
+# "xy" hard-locks yaw in the QP so WBC can translate the base but cannot rotate it.
+base_dofs: "xy"
+
 # --- Posture regularization toward the nominal posture ------------------------------------
 # Per-group PostureTask cost: resolves redundancy by pulling joints toward
 # nominal_posture (below) when the EE targets leave slack. Vega intentionally weights
@@ -95,17 +99,19 @@ head_position_cost: 0.0
 head_orientation_cost: [10000.0, 10000.0, 10000.0]
 # WORLD-frame head-position objective (head_mode "ik" only), the gravity-aligned
 # alternative to head_position_cost. A pink FrameTask weights position in the head's
-# own LOCAL axes, but zed_depth_frame is pitched ~45 deg down, so a [x,y,0] mask there
-# would free the optical axis, NOT world-vertical (and would corrupt fore/aft anchoring).
-# This is a SOFT least-squares term added directly to the QP (like com_over_base) on the
-# head's WORLD-aligned translation, so [x, y, z] are true gravity axes: track world x/y
-# (preserves base-following) and free world-z so the torso can straighten to a high EE
-# target without the head-z term fighting it (the operator's standing height is fixed, so
-# head-z carries no teleop intent). [0, 0, 0] disables it (use head_position_cost instead).
-# To switch a run to the gravity-aligned scheme set head_position_cost: 0.0 here and
-# head_world_position_cost: [10000.0, 10000.0, 0.0] (optionally a small z like 200 as a
-# camera-height comfort prior, NOT an EE-peer 10000).
-head_world_position_cost: [10000.0, 10000.0, 0.0]
+# own LOCAL axes, but zed_depth_frame is pitched ~45 deg down, so a per-axis mask there
+# acts on the OPTICAL axes, not true world x/y/z (a [x,y,0] FrameTask mask would free the
+# optical axis and corrupt fore/aft anchoring). This is a SOFT least-squares term added
+# directly to the QP (like com_over_base) on the head's WORLD-aligned translation, so
+# [x, y, z] are true gravity axes. x/y track the headset's world position (this drives the
+# base-following). z tracks the headset HEIGHT: with z ON (below) the camera holds the
+# operator's (fixed) standing head height, so the torso will NOT over-extend to raise the
+# arms -- it trades peak vertical reach for a rock-steady camera height. Set z = 0.0 to FREE
+# world-vertical instead (the torso can straighten to a high EE target, camera rides up with
+# it; ~+0.1 m reach on life_arm.hdf5), or a small z (~200) as a camera-height comfort prior
+# that still yields to genuine higwh reaches. [0, 0, 0] disables the term (use
+# head_position_cost). Verify with scripts/diagnostics/verify_head_z_reach.py.
+head_world_position_cost: [10000.0, 10000.0, 10000.0]
 # Head DOFs pinned out of the whole-body QP in head_mode "ik" (dq = 0 each tick), as a
 # list of head joint names drawn from head_j1/head_j2/head_j3. The head joints NOT listed
 # stay whole-body IK DOFs tracked by the head FrameTask. head_j1 (pan) is pinned so an
@@ -267,6 +273,9 @@ vr_teleop:
   # real-robot values, shared with scripts/drive_box_record.py's base controller.
   base_kp_xy: 1.0
   base_kp_yaw: 1.5
+  # When base_dofs is "xy", WBC yaw stays hard-locked in the QP, but closed-loop odometry
+  # may still command a small wz to hold the robot's measured yaw against wheel/ground drift.
+  base_yaw_hold_in_xy: true
   # Closed-loop base-twist pre-deadband (m/s; angular = 2x): the quiet band fed into
   # base_closed_loop.shape_twist. Shared by BOTH followers' closed loop -- the sim
   # follower's separate OPEN-loop deadband stays script-local.
