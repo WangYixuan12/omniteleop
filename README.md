@@ -28,6 +28,8 @@ pip install omniteleop
 python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending cmd in different curves
 ```
 
+
+
 ## Tabletop Manip
 
 1. sshfs [yixuan@128.59.19.217](mailto:yixuan@128.59.19.217):/home/yixuan/omniteleop /home/dexmate/yixuan/omniteleop_yifan
@@ -102,6 +104,8 @@ python /home/yixuan/omniteleop/scripts/rename_raw_data.py # revise train/val/tes
 python /home/yixuan/omniteleop/scripts/vis_teleop_curves.py --episode-id 0 # (Optional) (Need to save_debug in vr_reader)
 ```
 
+
+
 ## Policy
 
 See [Lerobot README](../lerobot_yifan/README.md).
@@ -128,6 +132,8 @@ python -m omniteleop.follower.policy_rollout \
 python /home/yixuan/omniteleop/scripts/vis_episode.py --deploy --hdf5 /home/yixuan/Dexmate/deploy/dp/dexmate_right_eef_eef_abs_film/checkpoints/last/0/episode_0.hdf5
 # rerun, transmission latency plot under debug/
 ```
+
+
 
 # WBC
 
@@ -215,7 +221,11 @@ Validate the checkpoint OFFLINE before any hardware rollout — run the rollout'
   --max-seconds 120
 ```
 
+
+
 # Debug
+
+
 
 ### Arm joint out of limit
 
@@ -226,6 +236,8 @@ python dexcontrol/examples/advanced_examples/disable_arm_motors.py disable --sid
 python dexcontrol/examples/advanced_examples/disable_arm_motors.py brake --side right --joints 6 --no-enable
 python dexcontrol/examples/troubleshooting/clear_error.py
 ```
+
+
 
 ### Arm dead
 
@@ -242,11 +254,15 @@ python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py get -
 python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py set --side right --enable
 ```
 
+
+
 ### Arm joint to eef
 
 ```bash
 python /home/yixuan/omniteleop/scripts/misc/check_eef_pos.py # robot.right_arm.get_joint_pos() first, and the run this to calculate eef from joint 
 ```
+
+
 
 ### Collision
 
@@ -254,11 +270,17 @@ python /home/yixuan/omniteleop/scripts/misc/check_eef_pos.py # robot.right_arm.g
 python /home/yixuan/omniteleop/scripts/diagnostics/browse_collision_pairs_sapien.py # --interactive , run with wbc_vr_leader
 ```
 
+
+
 ### Wheel steering
 
 ```python
 robot.chassis.set_steering_angle(0.0, wait_time=1.5)
 ```
+
+> Check revised _compute_wheel_control in `[dexcontrol/src/dexcontrol/core/chassis.py](dexcontrol/src/dexcontrol/core/chassis.py)`: take the physically reachable branch when the other's clamp distortion is large, a *marginal clamp is left to the nearest-branch pick.
+
+
 
 ### Replay on real
 
@@ -266,6 +288,8 @@ robot.chassis.set_steering_angle(0.0, wait_time=1.5)
 python scripts/wbc_vr_record.py --hdf5 /home/yixuan/Dexmate/tmp/test.hdf5 --physics --base-loop closed
 python scripts/wbc_vr_robot.py --replay /home/yixuan/Dexmate/wbc/real/move_sideway.hdf5 --record
 ```
+
+
 
 ### Wheel odom
 

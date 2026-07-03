@@ -55,6 +55,16 @@ DEFAULT_WHEEL_RADIUS: float = 0.0861
 # ``resolve_steer_drive``) so both wheels always agree.
 STEER_TIE_TOL: float = 0.35
 
+# A steer solution whose desired angle is past the +/-STEER_LIMIT stop gets clamped, which
+# points the wheel off the commanded heading. When that clamp distortion is LARGE -- the
+# base drives ~45 deg diagonal on a "go straight" issued after the steering wound up near
+# +/-pi (the antipodal branch clamps ~0.79 rad off) -- the OTHER branch is reachable and
+# realizes the heading exactly, so we switch to it. A MARGINAL clamp (a hair past the stop)
+# is left alone: switching would force a ~pi steer slew to shave a fraction of a degree.
+# This cutoff (rad) is the large/marginal boundary; it sits in the empty gap between the
+# ~0.10 rad yaw-wheel clamp and the ~0.79 rad diagonal (verified across single-axis twists).
+CLAMP_DISTORTION_TOL: float = 0.35
+
 
 @dataclass(frozen=True)
 class WheelCommand:
@@ -89,17 +99,27 @@ def resolve_steer_drive(
     steer_limit: float = STEER_LIMIT,
     min_speed: float = 1e-6,
     tie_tol: float = STEER_TIE_TOL,
+    clamp_distortion_tol: float = CLAMP_DISTORTION_TOL,
 ) -> Tuple[float, float, bool]:
     """Pick the steer angle + signed speed for a wheel velocity (dexcontrol convention).
 
-    Returns ``(steer_angle, signed_speed, flipped)``. Ports dexcontrol's
-    ``Chassis._compute_wheel_control``: of the two 180-deg-apart solutions
-    ``(base_angle, +speed)`` and ``(base_angle±pi, -speed)``, take the one nearer
-    ``current_steer`` (the measured joint angle), and on a **tie take the flipped
-    (drive-reversed) solution**. Distances use the *unclamped* angles; only the chosen
-    winner is clamped to ``±steer_limit`` -- clamping before the comparison would make a
-    near-limit angle look spuriously nearer and pick the wrong branch (e.g. straight-back
-    right after a 90 deg leg). A stationary wheel holds its current steer.
+    Returns ``(steer_angle, signed_speed, flipped)``. Of the two 180-deg-apart solutions
+    ``(base_angle, +speed)`` and ``(base_angle±pi, -speed)`` -- the same physical wheel
+    velocity -- we pick a *reachable* one when it matters, else the one nearer
+    ``current_steer`` (smallest steer slew). A stationary wheel holds its current steer.
+
+    **Reachable branch (the diagonal fix).** The two branches are pi apart and the reachable
+    steer arc (``2*steer_limit``) is wider than pi, so at least one branch is always within
+    the stop. The plain "nearest then clamp" rule (old dexcontrol) picks the near-but-out-of
+    range branch when the steering has wound up near ``±pi`` and CLAMPS it -- pointing the
+    wheel up to ~45 deg off the commanded velocity, so a "drive straight" drives the base
+    diagonally. We measure each branch's *clamp distortion* (how far the stop pulls it off
+    the commanded heading) and, when one branch clamps far off while the other is reachable
+    (distortion gap ``> clamp_distortion_tol``), take the reachable branch -- which realizes
+    the heading exactly. A MARGINAL clamp (a hair past the stop, e.g. the yaw wheel ~0.1 rad
+    or a near-limit strafe) is left to the slew rule below, so we never do a ~pi steer slew
+    to shave a fraction of a degree. This matches the fixed
+    ``dexcontrol.core.chassis.Chassis._compute_wheel_control``.
 
     **Tie robustness.** Near the 90 deg ambiguity the two distances are nearly equal, so
     dexcontrol's strict ``<`` would resolve on sub-degree noise -- and the two wheels
@@ -114,16 +134,29 @@ def resolve_steer_drive(
 
     base_angle = -math.atan2(v_wheel[1], v_wheel[0])  # -z steer axis
     flipped_angle = base_angle + math.pi if base_angle < 0 else base_angle - math.pi
-    # Distances on the UNCLAMPED angles; the clamp is applied only to the winner below
-    # (dexcontrol order), else a near-limit angle looks spuriously nearer.
-    d_base = abs(base_angle - current_steer)
-    d_flip = abs(flipped_angle - current_steer)
-    if abs(d_base - d_flip) <= tie_tol:
-        flipped = True              # dexcontrol takes the flipped solution on a tie
+
+    def _clamp(a: float) -> float:
+        return max(-steer_limit, min(steer_limit, a))
+
+    # How far the physical steer stop pulls each branch off the commanded heading.
+    base_distortion = abs(base_angle - _clamp(base_angle))
+    flip_distortion = abs(flipped_angle - _clamp(flipped_angle))
+
+    if base_distortion + clamp_distortion_tol < flip_distortion:
+        flipped = False             # flip clamps far off-heading; base is reachable
+    elif flip_distortion + clamp_distortion_tol < base_distortion:
+        flipped = True              # base clamps far off-heading; flip is reachable
     else:
-        flipped = d_flip < d_base   # otherwise the nearer solution (smallest slew)
+        # Comparable clamp distortion: nearest-branch pick on the UNCLAMPED angles (the
+        # clamp is applied to the winner only), tie -> flipped so both wheels agree.
+        d_base = abs(base_angle - current_steer)
+        d_flip = abs(flipped_angle - current_steer)
+        if abs(d_base - d_flip) <= tie_tol:
+            flipped = True          # dexcontrol takes the flipped solution on a tie
+        else:
+            flipped = d_flip < d_base   # otherwise the nearer solution (smallest slew)
     steer, signed = (flipped_angle, -speed) if flipped else (base_angle, speed)
-    steer = max(-steer_limit, min(steer_limit, steer))  # clamp the winner (dexcontrol)
+    steer = _clamp(steer)           # clamp the winner (dexcontrol)
     return steer, signed, flipped
 
 
