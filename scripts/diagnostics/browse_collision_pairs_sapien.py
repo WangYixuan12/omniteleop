@@ -51,8 +51,12 @@ from omniteleop.follower.sapien_env import prepare_sapien_render_env
 from omniteleop.follower.whole_body_ik import (
     BASE_FRAME,
     HEAD_FRAME,
+    HEAD_JOINTS,
+    LEFT_ARM_JOINTS,
     LEFT_EE_FRAME,
+    RIGHT_ARM_JOINTS,
     RIGHT_EE_FRAME,
+    TORSO_JOINTS,
     VegaWholeBodyIK,
     WBCConfig,
 )
@@ -94,8 +98,54 @@ class PairInfo:
     adjacent: bool
 
 
+# Legacy/raw episode component joint arrays (dexcontrol convention) -> WBC model joints.
+# Widths match the joint-name lists; with the hardware-matching URDF (wbik.yaml
+# vega_with_robotiq) the dexcontrol values map 1:1, so no re-mapping is needed.
+_EPISODE_JOINT_GROUPS = (
+    ("torso", TORSO_JOINTS),
+    ("left_arm", LEFT_ARM_JOINTS),
+    ("right_arm", RIGHT_ARM_JOINTS),
+    ("head", HEAD_JOINTS),
+)
+
+
+def _q_from_episode_joints(f, ik: VegaWholeBodyIK, frame: int) -> tuple[np.ndarray, str]:
+    """Build a WBC ``q`` from one frame of a raw/legacy episode's per-component joints.
+
+    Reads ``obs/joint/{torso,left_arm,right_arm,head}`` (the achieved posture; falls back
+    to ``action/joint/*`` if the obs group is absent) at ``frame`` and writes each value
+    onto the nominal ``q`` by joint name. The planar base is left at the nominal origin:
+    the self-collision geometry is invariant to the base DOFs (``q[:4]``), and keeping the
+    base at the origin keeps the rendered robot mesh aligned with the spheres.
+    """
+    group = "obs/joint" if "obs/joint/torso" in f else "action/joint"
+    if f"{group}/torso" not in f:
+        raise ValueError(
+            "episode has neither obs/joint/torso nor action/joint/torso; "
+            f"available top-level keys: {sorted(f.keys())}"
+        )
+    n = int(f[f"{group}/torso"].shape[0])
+    if not -n <= frame < n:
+        raise ValueError(f"frame {frame} out of range for {n} frames in {group}/*")
+    q = ik.nominal_q()
+    for comp, names in _EPISODE_JOINT_GROUPS:
+        arr = np.asarray(f[f"{group}/{comp}"][frame], dtype=float)
+        if arr.shape != (len(names),):
+            raise ValueError(
+                f"{group}/{comp} frame has shape {arr.shape}, expected ({len(names)},)"
+            )
+        for name, value in zip(names, arr, strict=True):
+            q[ik._idx_q[name]] = float(value)  # noqa: SLF001
+    return q, f"frame {frame % n} of {group} in {f.filename}"
+
+
 def _load_q(args: argparse.Namespace, ik: VegaWholeBodyIK) -> tuple[np.ndarray, str]:
     """Resolve the configuration vector to browse and a human label."""
+    if args.joint_from_hdf5:
+        import h5py  # noqa: PLC0415
+
+        with h5py.File(args.joint_from_hdf5, "r") as f:
+            return _q_from_episode_joints(f, ik, args.frame)
     if args.worst_from_hdf5:
         import h5py  # noqa: PLC0415
 
@@ -684,7 +734,16 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--q-from-hdf5", default=None, help="debug HDF5 to read ik/q from.")
-    parser.add_argument("--frame", type=int, default=0, help="frame index for --q-from-hdf5.")
+    parser.add_argument(
+        "--joint-from-hdf5", "--joint_from_hdf5", dest="joint_from_hdf5", default=None,
+        help="raw/legacy episode HDF5 to read one frame of per-component joints from "
+             "(obs/joint/*, falling back to action/joint/*) and assemble the WBC q, e.g. "
+             "--joint-from-hdf5 /home/yixuan/Dexmate/data/legacy/episode_0.hdf5 --frame -1 "
+             "for the last frame. The planar base is held at the origin (self-collision is "
+             "base-invariant).")
+    parser.add_argument("--frame", type=int, default=0,
+                        help="frame index for --q-from-hdf5 / --joint-from-hdf5 "
+                             "(negative counts from the end, e.g. -1 = last).")
     parser.add_argument(
         "--worst-from-hdf5",
         default=None,

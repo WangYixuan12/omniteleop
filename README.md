@@ -155,7 +155,7 @@ Current implemented schema:
 # one-time calibration, save src/omniteleop/leader/ee_offset.yaml for future auto load
 (dexmate) python scripts/wbc_vr_leader.py
 # generate reference episode_0.hdf5 for future --align-reference
-(dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py --align-reference /home/yixuan/Dexmate/data/raw_data/episode_0.hdf5
+(dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py --align-reference /home/yixuan/Dexmate/data/raw_data/reference.hdf5
 
 # Terminal 2, on robot machine.
 (dexmate) python scripts/wbc_vr_robot.py \
