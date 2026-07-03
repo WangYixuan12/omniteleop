@@ -72,7 +72,7 @@ from dexcomm.codecs import DictDataCodec
 from omniteleop.common import get_config
 from omniteleop.common.head_camera import ZED_K
 from omniteleop.common.recorder import EpisodeRecorder, peek_next_episode_id
-from omniteleop.common.schemas import WBCFollowerStatus
+from omniteleop.common.schemas import WBC_FOLLOWER_STAGE_ABORTED, WBCFollowerStatus
 from omniteleop.follower.whole_body_ik import (
     HEAD_FRAME,
     LEFT_EE_FRAME,
@@ -167,6 +167,39 @@ def _build_follower_status(
         left_ee_error_mm=float(result.left_ee_error) * 1000.0,
         right_ee_error_mm=float(result.right_ee_error) * 1000.0,
     )
+
+def _build_abort_status(reason: str, timestamp_ns: Optional[int] = None) -> WBCFollowerStatus:
+    """Terminal status frame: the follower loop DIED (vs a recoverable hold)."""
+    return WBCFollowerStatus(
+        timestamp_ns=int(time.time_ns() if timestamp_ns is None else timestamp_ns),
+        stage=WBC_FOLLOWER_STAGE_ABORTED,
+        estop=True,
+        success=False,
+        held=True,
+        hold=True,
+        hold_reason=str(reason),
+        safety_status="ABORTED",
+    )
+
+
+def _publish_abort_status(source, exc: BaseException) -> None:
+    """Best-effort final ABORTED frame so the headset HUD banners instead of going stale.
+
+    Runs on the exception path BEFORE ``source.close()`` tears the node down (the leader's
+    subscriber is long-lived, so a fresh publisher on the same topic matches immediately).
+    Must never raise: nothing here may mask the original traceback.
+    """
+    try:
+        pub = _create_status_publisher(source)
+        if pub is None:  # replay source: no node, no leader watching
+            return
+        text = str(exc).strip()
+        reason = text.splitlines()[0][:160] if text else type(exc).__name__
+        pub.publish(asdict(_build_abort_status(reason)))
+        time.sleep(0.25)  # let zenoh flush before teardown closes the session
+    except Exception:
+        pass
+
 
 # Hardware safety / bring-up defaults (robot-specific; conservative for a first slow
 # bring-up). The shared closed-loop base-control tunables (PD gains, slew, deadband,
@@ -1678,6 +1711,12 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
                  realtime=realtime, enable=enable, traj=traj)
     except KeyboardInterrupt:
         print("\n[wbc_vr_robot] interrupted -- stopping.")
+    except Exception as exc:
+        # Tell the leader HUD the follower is DEAD (red banner) before teardown --
+        # otherwise the operator only sees a stale "Stage: teleop" while the robot
+        # freezes (e.g. the --record camera-freshness abort). Then re-raise.
+        _publish_abort_status(source, exc)
+        raise
     finally:
         if hasattr(source, "close"):
             source.close()

@@ -16,7 +16,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from omniteleop.common.schemas import WBCFollowerStatus
+from omniteleop.common.schemas import WBC_FOLLOWER_STAGE_ABORTED, WBCFollowerStatus
 
 CameraStream = str
 _DEFAULT_HUD_CAMERAS: list[CameraStream] = ["head_left_rgb", "left_wrist_rgb"]
@@ -101,7 +101,12 @@ def follower_status_overlay_lines(
         return ["Follower: no status"]
 
     lines = []
-    if status.hold_reason:
+    if status.stage == WBC_FOLLOWER_STAGE_ABORTED:
+        # Terminal frame: the follower process died. hold_reason carries the exception's
+        # first line; this status never refreshes, so the line (and abort_banner) persist.
+        reason = f": {status.hold_reason}" if status.hold_reason else ""
+        lines.append(f"Follower: ABORTED{reason}")
+    elif status.hold_reason:
         lines.append(f"Follower: HOLD:{status.hold_reason}")
     elif status.estop or status.hold:
         lines.append(f"Follower: hold({status.stage})")
@@ -118,9 +123,21 @@ def follower_status_overlay_lines(
 
 def follower_status_overlay_color(line: str) -> tuple[int, int, int]:
     """BGR color for a follower HUD line."""
-    if line.startswith(("WARNING", "WARN:", "HELD:")):
+    if line.startswith(("WARNING", "WARN:", "HELD:", "Follower: ABORTED")):
         return _RED
     return _WHITE
+
+
+def abort_banner(status: Optional[WBCFollowerStatus]) -> Optional[HUDOverlayLine]:
+    """Prominent banner when the follower published its terminal ABORTED frame.
+
+    The frame is sent once from the follower's exception path (wbc_vr_robot), so the
+    leader keeps re-rendering the last received status and the banner persists until
+    the follower is restarted and publishes a live status again.
+    """
+    if status is None or status.stage != WBC_FOLLOWER_STAGE_ABORTED:
+        return None
+    return HUDOverlayLine("FOLLOWER ABORTED - CHECK TERMINAL", _RED)
 
 
 def collision_banner(status: Optional[WBCFollowerStatus]) -> Optional[HUDOverlayLine]:
@@ -479,9 +496,10 @@ class WBCHeadsetHUD:
             self._draw_line(vis_img, line.text, y, line.color)
             y += round(18 * _HUD_SCALE)
 
-        # Prominent self-collision alert, drawn last so it sits on top. Uses the
-        # follower status already polled above -- no extra data path, no added latency.
-        banner = collision_banner(status)
+        # Prominent alert, drawn last so it sits on top. Uses the follower status
+        # already polled above -- no extra data path, no added latency. A follower
+        # abort (terminal, process dead) outranks a live self-collision warning.
+        banner = abort_banner(status) or collision_banner(status)
         if banner is not None:
             self._draw_banner(vis_img, banner.text, banner.color)
 

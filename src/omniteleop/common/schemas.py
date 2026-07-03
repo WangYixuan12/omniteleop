@@ -89,6 +89,13 @@ class VRJointData:
     head_ee_pose: List[float] = field(default_factory=list)
 
 
+# Terminal ``WBCFollowerStatus.stage`` published once by the follower when its control
+# loop dies on an exception (record-abort guards, IK runaway abort, hardware errors).
+# The leader HUD keys a persistent red FOLLOWER ABORTED banner on it; every other stage
+# value mirrors the leader's live calib_stage.
+WBC_FOLLOWER_STAGE_ABORTED = "aborted"
+
+
 @dataclass
 class WBCFollowerStatus:
     """Live whole-body follower status for the VR headset HUD."""
