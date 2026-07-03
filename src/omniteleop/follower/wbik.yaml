@@ -276,14 +276,6 @@ vr_teleop:
   # When base_dofs is "xy", WBC yaw stays hard-locked in the QP, but closed-loop odometry
   # may still command a small wz to hold the robot's measured yaw against wheel/ground drift.
   base_yaw_hold_in_xy: true
-  # Dedicated quiet floor (rad/s) for that xy-mode yaw-hold wz, applied to ALL THREE angular
-  # gates (shape_twist pre-deadband, post-deadband, single-axis floor) but ONLY when yaw-hold
-  # is active (base_dofs "xy" + base_yaw_hold_in_xy). It decouples the yaw axis from the vx/vy
-  # deadbands so a small heading correction reaches the wheels: with kp_yaw=1.5 a floor of
-  # 0.005 rad/s holds heading to ~0.005/1.5 = 0.0033 rad ~= 0.19 deg (vs the ~0.04/0.12 rad/s
-  # general deadbands, which swallow any sub-~1.2 deg yaw-hold and let the base drift). It does
-  # NOT touch xy_yaw mode or the vx/vy axes -- those keep base_deadband / base_post_*_deadband.
-  base_yaw_hold_deadband: 0.005
   # Closed-loop base-twist pre-deadband (m/s; angular = 2x): the quiet band fed into
   # base_closed_loop.shape_twist. Shared by BOTH followers' closed loop -- the sim
   # follower's separate OPEN-loop deadband stays script-local.

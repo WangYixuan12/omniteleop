@@ -156,7 +156,6 @@ def project_planar_twist_single_axis(
     deadband: float,
     hysteresis_ratio: float = 0.0,
     prev_axis: Optional[int] = None,
-    yaw_deadband: Optional[float] = None,
 ) -> tuple[np.ndarray, Optional[int]]:
     """Keep only the dominant planar-twist axis (vx XOR vy XOR wz); zero the others.
 
@@ -164,17 +163,12 @@ def project_planar_twist_single_axis(
     (on the post-PD wheel command) so both pick the active axis with IDENTICAL semantics: the
     dominant axis is the largest ``|component|`` normalized by its velocity cap (``xy_max_vel``
     for vx/vy, ``yaw_max_vel`` for wz) -- so m/s and rad/s compare as a fraction of max speed.
-    Below the per-axis quiet floor (on that normalized scale) the twist is quiet and ALL axes
-    are zeroed (active axis -> ``None``). ``deadband`` is that floor for vx/vy (and, by
-    default, wz too); pass ``yaw_deadband`` to give the wz axis a DISTINCT (typically smaller)
-    floor so a small yaw-hold command can survive projection WITHOUT loosening the vx/vy "is
-    the base meant to move at all" floor -- ``None`` reproduces the original single-floor
-    behavior exactly, so the WBC solver and non-yaw-hold callers are unaffected. A relative
-    ``hysteresis_ratio`` retains ``prev_axis`` unless a different axis beats it by that fraction
-    (and only while ``prev_axis`` itself stays at or above its own floor), so two near-equal
-    axes do not chatter the chassis at the loop rate. Returns ``(projected_twist,
-    active_axis)``; thread ``active_axis`` back in as ``prev_axis`` next tick (reset to ``None``
-    on hold / standstill).
+    Below ``deadband`` (on that normalized scale) the twist is quiet and ALL axes are zeroed
+    (active axis -> ``None``). A relative ``hysteresis_ratio`` retains ``prev_axis`` unless a
+    different axis beats it by that fraction (and only while ``prev_axis`` itself stays at or
+    above ``deadband``), so two near-equal axes do not chatter the chassis at the loop rate.
+    Returns ``(projected_twist, active_axis)``; thread ``active_axis`` back in as ``prev_axis``
+    next tick (reset to ``None`` on hold / standstill).
     """
     out = np.asarray(twist, dtype=np.float64).copy()
     if out.shape != (3,):
@@ -186,25 +180,16 @@ def project_planar_twist_single_axis(
         )
     if not np.isfinite(deadband) or deadband < 0.0:
         raise ValueError(f"deadband must be finite and >= 0, got {deadband}")
-    if yaw_deadband is not None and (not np.isfinite(yaw_deadband) or yaw_deadband < 0.0):
-        raise ValueError(f"yaw_deadband must be finite and >= 0 when set, got {yaw_deadband}")
     if not np.isfinite(hysteresis_ratio) or hysteresis_ratio < 0.0:
         raise ValueError(f"hysteresis_ratio must be finite and >= 0, got {hysteresis_ratio}")
-    # Per-axis quiet floor on the SAME normalized scale as `norm`: vx/vy share `deadband`;
-    # wz uses `yaw_deadband` when given (else `deadband`), so the yaw-hold path can lower the
-    # wz floor alone. `None` => [deadband, deadband, deadband], i.e. the prior behavior.
-    axis_db = np.array(
-        [deadband, deadband, deadband if yaw_deadband is None else yaw_deadband],
-        dtype=np.float64,
-    )
     norm = np.abs(out) / caps
     k = int(np.argmax(norm))
-    if norm[k] < axis_db[k]:
+    if norm[k] < deadband:
         return np.zeros(3), None
     if (
         prev_axis is not None
         and prev_axis != k
-        and norm[prev_axis] >= axis_db[prev_axis]
+        and norm[prev_axis] >= deadband
         and norm[k] < (1.0 + hysteresis_ratio) * norm[prev_axis]
     ):
         k = prev_axis  # the new leader isn't decisively larger: keep the active axis
@@ -241,15 +226,8 @@ def project_planar_twist_single_axis_for_base_dofs(
     deadband: float,
     hysteresis_ratio: float = 0.0,
     prev_axis: Optional[int] = None,
-    yaw_deadband: Optional[float] = None,
 ) -> tuple[np.ndarray, Optional[int]]:
-    """Single-axis project a command after applying the WBC base-DOF policy.
-
-    ``yaw_deadband`` gives the wz axis a distinct quiet floor (see
-    :func:`project_planar_twist_single_axis`); the followers pass it only on the xy-mode
-    yaw-hold path so the small yaw-hold command survives projection while vx/vy keep their
-    floor. ``None`` reproduces the original single-floor behavior.
-    """
+    """Single-axis project a command after applying the WBC base-DOF policy."""
     selector_twist = mask_planar_twist_for_base_dofs(
         twist,
         base_dofs=base_dofs,
@@ -264,7 +242,6 @@ def project_planar_twist_single_axis_for_base_dofs(
         deadband=deadband,
         hysteresis_ratio=hysteresis_ratio,
         prev_axis=prev_axis,
-        yaw_deadband=yaw_deadband,
     )
 
 

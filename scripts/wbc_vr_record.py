@@ -126,7 +126,6 @@ DEFAULT_BASE_POST_ANGULAR_DEADBAND = _VR_TELEOP.base_post_angular_deadband
 DEFAULT_BASE_KP_XY = _VR_TELEOP.base_kp_xy
 DEFAULT_BASE_KP_YAW = _VR_TELEOP.base_kp_yaw
 DEFAULT_BASE_YAW_HOLD_IN_XY = _VR_TELEOP.base_yaw_hold_in_xy
-DEFAULT_BASE_YAW_HOLD_DEADBAND = _VR_TELEOP.base_yaw_hold_deadband
 DEFAULT_SPEED = _VR_TELEOP.replay_speed
 DEFAULT_RATE = _VR_TELEOP.ik_rate
 DEFAULT_CMD_RATE = _VR_TELEOP.cmd_rate
@@ -370,7 +369,6 @@ def main() -> None:
     args.base_kp_xy = DEFAULT_BASE_KP_XY
     args.base_kp_yaw = DEFAULT_BASE_KP_YAW
     args.base_yaw_hold_in_xy = DEFAULT_BASE_YAW_HOLD_IN_XY
-    args.base_yaw_hold_deadband = DEFAULT_BASE_YAW_HOLD_DEADBAND
     args.head_lpf_tau = DEFAULT_HEAD_LPF_TAU
     args.head_planar_pos_deadband = DEFAULT_HEAD_PLANAR_POS_DEADBAND
     args.head_planar_yaw_deadband = DEFAULT_HEAD_PLANAR_YAW_DEADBAND
@@ -469,9 +467,7 @@ def main() -> None:
     base_max_ang = 2.0 * DEFAULT_BASE_MAX_SPEED
     loop_msg = (f"closed-loop (base_closed_loop PD: kp_xy={args.base_kp_xy:g}, "
                 f"kp_yaw={args.base_kp_yaw:g}, "
-                f"yaw_hold_xy={bool(args.base_yaw_hold_in_xy)}"
-                f"{f'@{args.base_yaw_hold_deadband:g}rad/s' if args.base_yaw_hold_in_xy else ''})"
-                if closed_loop
+                f"yaw_hold_xy={bool(args.base_yaw_hold_in_xy)})" if closed_loop
                 else "open-loop (feed-forward IK base twist only)")
     print(f"[wbc_vr] base control: {loop_msg} -> shape_twist("
           f"deadband {base_deadband:g}/{base_deadband_ang:g}, "
@@ -677,14 +673,6 @@ def main() -> None:
                     and cfg.base_dofs == "xy"
                     and bool(args.base_yaw_hold_in_xy)
                 )
-                # xy-mode yaw-hold: dedicated small angular quiet floor on all three gates so a
-                # sub-degree heading correction survives shaping; scoped to allow_yaw_hold so
-                # vx/vy and xy_yaw mode are byte-identical (mirrors scripts/wbc_vr_robot.py).
-                yaw_hold_db = args.base_yaw_hold_deadband if allow_yaw_hold else None
-                tick_deadband_ang = yaw_hold_db if allow_yaw_hold else base_deadband_ang
-                tick_post_deadband_ang = (
-                    yaw_hold_db if allow_yaw_hold else args.base_post_angular_deadband
-                )
                 if closed_loop:
                     raw_twist, pd_err = base_cl.pd_twist(
                         result.base_pose, result.base_twist, robot.base_pose,
@@ -715,7 +703,7 @@ def main() -> None:
                 # off-axis spikes no longer win the projection.
                 shaped_twist = base_cl.shape_twist(
                     raw_twist, prev_cmd, dt,
-                    deadband_lin=base_deadband, deadband_ang=tick_deadband_ang,
+                    deadband_lin=base_deadband, deadband_ang=base_deadband_ang,
                     max_lin_speed=base_max_lin, max_ang_speed=base_max_ang,
                     max_lin_accel=base_accel, max_ang_accel=base_accel_ang,
                 )
@@ -723,7 +711,7 @@ def main() -> None:
                     shaped_twist,
                     reference_twist=raw_twist,
                     linear_deadband=args.base_post_linear_deadband,
-                    angular_deadband=tick_post_deadband_ang,
+                    angular_deadband=args.base_post_angular_deadband,
                 )
                 shaped_twist = _mask_base_twist_for_dofs(
                     cfg,
@@ -747,7 +735,6 @@ def main() -> None:
                             deadband=cfg.base_single_axis_deadband,
                             hysteresis_ratio=cfg.base_single_axis_hysteresis_ratio,
                             prev_axis=base_axis,
-                            yaw_deadband=yaw_hold_db,
                         )
                     )
                     shaped_twist = _mask_base_twist_for_dofs(
