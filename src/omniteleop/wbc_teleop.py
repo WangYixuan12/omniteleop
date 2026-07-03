@@ -75,6 +75,7 @@ class VRTeleopConfig:
     base_kp_xy: float                  # closed-loop base PD gain on planar pose error (1/s)
     base_kp_yaw: float                 # closed-loop base PD gain on yaw error (1/s)
     base_yaw_hold_in_xy: bool          # allow yaw feedback when WBC base_dofs hard-locks yaw
+    base_yaw_hold_deadband: float      # xy-mode yaw-hold wz quiet floor (rad/s); decoupled small angular deadband
     base_deadband: float               # closed-loop base-twist pre-deadband (m/s; angular = 2x)
     base_accel: float                  # base-twist slew limit (m/s^2; angular = 2x)
     base_max_speed: float              # base linear-velocity clamp (m/s; angular = 2x)

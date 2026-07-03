@@ -110,6 +110,7 @@ DEFAULT_CMD_RATE = _VR_TELEOP.cmd_rate              # leader command rate (Hz); 
 DEFAULT_BASE_KP_XY = _VR_TELEOP.base_kp_xy          # closed-loop base PD gains (real-robot values)
 DEFAULT_BASE_KP_YAW = _VR_TELEOP.base_kp_yaw
 DEFAULT_BASE_YAW_HOLD_IN_XY = _VR_TELEOP.base_yaw_hold_in_xy
+DEFAULT_BASE_YAW_HOLD_DEADBAND = _VR_TELEOP.base_yaw_hold_deadband  # xy-mode yaw-hold wz floor (rad/s)
 DEFAULT_BASE_ACCEL = _VR_TELEOP.base_accel          # m/s^2 base-twist slew (ang = 2x)
 DEFAULT_BASE_DEADBAND = _VR_TELEOP.base_deadband    # m/s base-twist deadband (ang = 2x)
 DEFAULT_BASE_MAX_SPEED = _VR_TELEOP.base_max_speed  # m/s base velocity clamp (ang = 2x)
@@ -859,6 +860,14 @@ class HardwareDriver:
         max_lin = self.args.base_max_speed
         max_ang = 2.0 * self.args.base_max_speed
         allow_yaw_hold = self._allow_base_yaw_hold_in_xy()
+        # xy-mode yaw-hold uses a dedicated (small) angular quiet floor on all three gates so a
+        # sub-degree heading correction reaches the wheels; the general angular deadbands
+        # (2*base_deadband pre, base_post_angular_deadband post, base_single_axis_deadband
+        # single-axis) otherwise swallow it. Scoped to allow_yaw_hold => vx/vy and xy_yaw
+        # mode are byte-identical to before.
+        yaw_hold_db = self.args.base_yaw_hold_deadband if allow_yaw_hold else None
+        deadband_ang = yaw_hold_db if allow_yaw_hold else 2.0 * self.args.base_deadband
+        post_deadband_ang = yaw_hold_db if allow_yaw_hold else self.args.base_post_angular_deadband
         raw, err = base_cl.pd_twist(
             result.base_pose, result.base_twist, snap["pose"],
             kp_xy=self.args.base_kp_xy, kp_yaw=self.args.base_kp_yaw,
@@ -880,7 +889,7 @@ class HardwareDriver:
         # that same selector, so the final chassis command is still single-axis.
         cmd = base_cl.shape_twist(
             raw, self._prev_base_shaped, dt,
-            deadband_lin=self.args.base_deadband, deadband_ang=2.0 * self.args.base_deadband,
+            deadband_lin=self.args.base_deadband, deadband_ang=deadband_ang,
             max_lin_speed=max_lin, max_ang_speed=max_ang,
             max_lin_accel=self.args.base_accel, max_ang_accel=2.0 * self.args.base_accel,
         )
@@ -888,7 +897,7 @@ class HardwareDriver:
             cmd,
             reference_twist=raw,
             linear_deadband=self.args.base_post_linear_deadband,
-            angular_deadband=self.args.base_post_angular_deadband,
+            angular_deadband=post_deadband_ang,
         )
         cmd = self._mask_base_twist(cmd, allow_yaw_hold=allow_yaw_hold)
         self._prev_base_shaped = cmd  # slew anchor stays multi-axis (every axis warm)
@@ -901,6 +910,7 @@ class HardwareDriver:
                 deadband=self.cfg.base_single_axis_deadband,
                 hysteresis_ratio=self.cfg.base_single_axis_hysteresis_ratio,
                 prev_axis=self._base_axis,
+                yaw_deadband=yaw_hold_db,
             )
             cmd = self._mask_base_twist(cmd, allow_yaw_hold=allow_yaw_hold)
         self._prev_base_cmd = cmd  # post-projection: the twist actually sent to the chassis
@@ -1669,6 +1679,7 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
             "base_kp_xy": float(args.base_kp_xy),
             "base_kp_yaw": float(args.base_kp_yaw),
             "base_yaw_hold_in_xy": bool(args.base_yaw_hold_in_xy),
+            "base_yaw_hold_deadband": float(args.base_yaw_hold_deadband),
             "base_deadband": float(args.base_deadband),
             "base_accel": float(args.base_accel),
             "base_max_speed": float(args.base_max_speed),
@@ -1687,7 +1698,8 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
     print(f"[wbc_vr_robot] REAL ROBOT. enabled={enabled} grippers=on | "
           f"{'REPLAY ' + format(args.speed, 'g') + 'x' if replay else 'LIVE'} | "
           f"base_max={args.base_max_speed:g}m/s | base_dofs={cfg.base_dofs} | "
-          f"yaw_hold_xy={bool(args.base_yaw_hold_in_xy)}")
+          f"yaw_hold_xy={bool(args.base_yaw_hold_in_xy)}"
+          f"{f'@{args.base_yaw_hold_deadband:g}rad/s' if args.base_yaw_hold_in_xy else ''}")
     print(f"  filters -> head_lpf={args.head_lpf_tau:g}s, "
           f"head_planar_deadband={args.head_planar_pos_deadband:g}m/"
           f"{args.head_planar_yaw_deadband:g}rad, "
@@ -1804,6 +1816,7 @@ def main() -> None:
     args.base_kp_xy = DEFAULT_BASE_KP_XY
     args.base_kp_yaw = DEFAULT_BASE_KP_YAW
     args.base_yaw_hold_in_xy = DEFAULT_BASE_YAW_HOLD_IN_XY
+    args.base_yaw_hold_deadband = DEFAULT_BASE_YAW_HOLD_DEADBAND
     args.base_deadband = DEFAULT_BASE_DEADBAND
     args.base_accel = DEFAULT_BASE_ACCEL
     args.base_max_speed = DEFAULT_BASE_MAX_SPEED
