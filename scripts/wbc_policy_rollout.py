@@ -456,7 +456,6 @@ def main() -> None:
     args.base_kp_xy = mod.DEFAULT_BASE_KP_XY
     args.base_kp_yaw = mod.DEFAULT_BASE_KP_YAW
     args.base_yaw_hold_in_xy = mod.DEFAULT_BASE_YAW_HOLD_IN_XY
-    args.base_yaw_hold_deadband = mod.DEFAULT_BASE_YAW_HOLD_DEADBAND
     args.base_deadband = mod.DEFAULT_BASE_DEADBAND
     args.base_accel = mod.DEFAULT_BASE_ACCEL
     args.base_max_speed = mod.DEFAULT_BASE_MAX_SPEED

@@ -220,10 +220,9 @@ ARM_HOME_STEP = 0.005 # arm interpolation step when homing straight to nominal
 # wait_time whether or not the joint physically caught up, so lag accumulates and an
 # immediate readback catches the arm mid-flight (the variable residual). This drains it.
 DEFAULT_HOME_SETTLE = 3.0
-# Hold the current swerve steering if zero base command < quiet_hold_s seconds, then
-# re-center the wheels to 0deg.
-# (set_velocity(0,0,0) -> steering 0)
-DEFAULT_BASE_QUIET_HOLD_S = 5
+# Hold the current swerve steering on quiet teleop gaps. Negative disables automatic
+# re-centering during the take; explicit safety/stop paths still stop the base.
+DEFAULT_BASE_QUIET_HOLD_S = -1
 _JOINT_STEP_ABORT_TICKS = 25    # consecutive ticks demanding > 2x clamp -> abort
 
 
@@ -1785,9 +1784,10 @@ def main() -> None:
                     help="swerve wheel_velocity units for odometry (default 'ms').")
     hw.add_argument("--base-quiet-hold-s", type=float, default=DEFAULT_BASE_QUIET_HOLD_S,
                     help="on a quiet (zero) base command, hold the current swerve steering "
-                         "(zero drive) for this long before re-centering the wheels to 0deg "
-                         f"(default {DEFAULT_BASE_QUIET_HOLD_S:g}; 0 = re-center on every quiet "
-                         "tick, the original behavior).")
+                         "(zero drive) for this long before re-centering the wheels to 0deg; "
+                         f"negative disables quiet-gap re-centering (default "
+                         f"{DEFAULT_BASE_QUIET_HOLD_S:g}; 0 = re-center on every quiet tick, "
+                         "the original behavior).")
     args = parser.parse_args()
     # Control-loop tunables sourced SOLELY from wbik.yaml's vr_teleop: block
     # (VRTeleopConfig, loaded into the DEFAULT_* constants above); no longer
@@ -1811,10 +1811,11 @@ def main() -> None:
     args.base_post_angular_deadband = DEFAULT_BASE_POST_ANGULAR_DEADBAND
 
     for flag, val in (("--home-tol", args.home_tol), ("--max-joint-step", args.max_joint_step),
-                      ("--home-settle", args.home_settle),
-                      ("--base-quiet-hold-s", args.base_quiet_hold_s)):
+                      ("--home-settle", args.home_settle)):
         if not np.isfinite(val) or val < 0.0:
             parser.error(f"{flag} must be finite and >= 0")
+    if not np.isfinite(args.base_quiet_hold_s):
+        parser.error("--base-quiet-hold-s must be finite")
     for flag, val in (("--source-timeout", args.source_timeout),
                       ("--record-rate", args.record_rate)):
         if not np.isfinite(val) or val <= 0.0:

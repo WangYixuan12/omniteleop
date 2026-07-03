@@ -40,11 +40,13 @@ _GREEN = (0, 255, 0)
 # 4:3 (head SVGA 960x600 -> 640x480; wrist HD720 -> 640x480), so each tile is rendered
 # at 4:3 (_TILE_W:_TILE_H) to MATCH the source and not stretch it -- a 16:9 tile squashed
 # the 4:3 frame horizontally. At _HUD_SCALE=2 the tile equals the published 640x480 (1:1,
-# no resample); raising _HUD_SCALE upsamples + scales the text overlay together. The
-# APPARENT size of the panel in the headset is set separately by ``camPanelH`` in
-# ``web/vr_client.html`` (its width auto-follows the streamed aspect); this constant only
-# controls the streamed image resolution.
-_HUD_SCALE = 2.0
+# no resample); _HUD_SCALE=1 downsamples to 320x240, cutting pixel count (and JPEG
+# encode/transfer cost) to a quarter -- traded for latency, per the README note.
+# Raising _HUD_SCALE upsamples + scales the text overlay together. The APPARENT size of
+# the panel in the headset is set separately by ``camPanelH`` in ``web/vr_client.html``
+# (its width auto-follows the streamed aspect); this constant only controls the
+# streamed image resolution.
+_HUD_SCALE = 1.0
 _TILE_W = round(320 * _HUD_SCALE)
 _TILE_H = round(240 * _HUD_SCALE)
 
@@ -503,6 +505,6 @@ class WBCHeadsetHUD:
         if banner is not None:
             self._draw_banner(vis_img, banner.text, banner.color)
 
-        ok, buf = cv2.imencode(".jpg", vis_img, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        ok, buf = cv2.imencode(".jpg", vis_img, [cv2.IMWRITE_JPEG_QUALITY, 40])
         if ok:
             self.quest.set_frame_vis("img", base64.b64encode(buf).decode())

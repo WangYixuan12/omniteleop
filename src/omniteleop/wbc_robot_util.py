@@ -105,18 +105,19 @@ def base_quiet_dispatch(
     (``set_velocity(0,0,0)`` -> ``_compute_wheel_control`` maps zero speed to steering 0).
     During an active strafe/turn the shaped command dips to zero on brief gaps (leader
     10 Hz updates, pauses, decel), which snaps the wheels lateral->forward and back. To
-    suppress that intra-motion chatter, hold the current steering with zero drive for a
-    short window before re-centering on a genuine rest.
+    suppress that intra-motion chatter, hold the current steering with zero drive. A
+    positive ``quiet_hold_s`` re-centers after that window; a negative value never
+    re-centers during quiet gaps.
 
     Returns ``(action, quiet_elapsed_s)``; thread ``quiet_elapsed_s`` back in next tick:
 
     * ``"drive"``    -- ``max|cmd| > quiet_eps``: command is active, send the twist
       (timer reset to 0).
-    * ``"hold"``     -- quiet and quiet for ``< quiet_hold_s``: hold the current steering,
-      zero drive (caller: ``chassis.set_wheel_velocity(0.0)``).
-    * ``"recenter"`` -- quiet for ``>= quiet_hold_s`` (or ``quiet_hold_s <= 0``): send a
+    * ``"hold"``     -- quiet and quiet for ``< quiet_hold_s``, or ``quiet_hold_s < 0``:
+      hold the current steering, zero drive (caller: ``chassis.set_wheel_velocity(0.0)``).
+    * ``"recenter"`` -- quiet for ``>= quiet_hold_s`` (or ``quiet_hold_s == 0``): send a
       zero twist for a clean straight rest (caller: ``set_velocity(0,0,0)``). The
-      ``<= 0`` case reproduces the original always-re-center behavior.
+      ``0`` case reproduces the original always-re-center behavior.
     """
     cmd = np.asarray(cmd, dtype=float)
     if cmd.shape != (3,):
@@ -130,14 +131,14 @@ def base_quiet_dispatch(
             f"prev_quiet_elapsed_s must be finite and >= 0, got {prev_quiet_elapsed_s}")
     if not np.isfinite(dt) or dt < 0.0:
         raise ValueError(f"dt must be finite and >= 0, got {dt}")
-    if not np.isfinite(quiet_hold_s) or quiet_hold_s < 0.0:
-        raise ValueError(f"quiet_hold_s must be finite and >= 0, got {quiet_hold_s}")
+    if not np.isfinite(quiet_hold_s):
+        raise ValueError(f"quiet_hold_s must be finite, got {quiet_hold_s}")
     if not np.isfinite(quiet_eps) or quiet_eps < 0.0:
         raise ValueError(f"quiet_eps must be finite and >= 0, got {quiet_eps}")
     if float(np.max(np.abs(cmd))) > quiet_eps:
         return "drive", 0.0
     elapsed = float(prev_quiet_elapsed_s) + float(dt)
-    if quiet_hold_s > 0.0 and elapsed < quiet_hold_s:
+    if quiet_hold_s < 0.0 or (quiet_hold_s > 0.0 and elapsed < quiet_hold_s):
         return "hold", elapsed
     return "recenter", elapsed
 

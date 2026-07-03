@@ -111,7 +111,7 @@ head_orientation_cost: [10000.0, 10000.0, 10000.0]
 # it; ~+0.1 m reach on life_arm.hdf5), or a small z (~200) as a camera-height comfort prior
 # that still yields to genuine higwh reaches. [0, 0, 0] disables the term (use
 # head_position_cost). Verify with scripts/diagnostics/verify_head_z_reach.py.
-head_world_position_cost: [10000.0, 10000.0, 10000.0]
+head_world_position_cost: [10000.0, 10000.0, 0.0]
 # Head DOFs pinned out of the whole-body QP in head_mode "ik" (dq = 0 each tick), as a
 # list of head joint names drawn from head_j1/head_j2/head_j3. The head joints NOT listed
 # stay whole-body IK DOFs tracked by the head FrameTask. head_j1 (pan) is pinned so an
@@ -157,7 +157,9 @@ enable_base_single_axis: true
 # Quiet floor on the dominant axis, as a fraction of the base velocity cap: |vx|,|vy| /
 # base_xy_max_vel and |wz| / base_yaw_max_vel compare on this common scale; below it the base
 # is held still (all three zeroed). The solver's "is the base meant to move at all" gate.
-base_single_axis_deadband: 0.04
+# episode_2_debug showed the old 0.04 floor waking many near-threshold steering bursts;
+# 0.06 removes most of those while preserving the deliberate strafe/forward segments.
+base_single_axis_deadband: 0.06
 # Relative hysteresis on the axis choice: retain the previously active axis unless a
 # different axis beats it by this fraction, so two near-equal axes don't chatter the chassis
 # between (say) forward and turn at 100 Hz. 0 disables (pure per-tick argmax).
