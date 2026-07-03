@@ -198,8 +198,11 @@ The checkpoint must report `observation.state` dim `32`, `action` dim `29`, imag
   '--policy.skip_normalization_dims={"observation.state": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28], "action": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28]}' \
   --dataset.repo_id=dexmate_wbc_eef_head \
   --dataset.root=/home/yixuan/Dexmate/data/processed_wbc/dexmate_wbc_eef_head \
+  --dataset.image_transforms.enable=true \
   --batch_size=32 --steps=200000 --save_freq=50000 \
-  --output_dir=/home/yixuan/Dexmate/model/dp/dexmate_wbc_eef_head
+  --output_dir=/home/yixuan/Dexmate/model/dp/dexmate_wbc_eef_head \
+  --wandb.enable=true \
+  --wandb.project=dexmate_wbc_mobile
 ```
 
 Validate the checkpoint OFFLINE before any hardware rollout — run the rollout's exact inference path (`_PolicyBundle.select_action` + `split_policy_action`) over a processed episode and overlay the policy's predicted 29-D world-frame action against the recorded ground-truth action. Rerun shows per-entity (left/right/head) GT (red) vs predicted (magenta) pose + error line, GT/pred EEF reprojected into the head image, gripper series, the base odometry path, and the depth point cloud; matplotlib + stdout report per-entity translation/rotation MAE. Run in `dexmate_lerobot`:

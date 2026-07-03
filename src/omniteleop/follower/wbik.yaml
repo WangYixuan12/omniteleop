@@ -32,7 +32,7 @@ base_velocity_smoothing_cost: [0.0, 0.0, 4000.0] # wz on: penalize frame-to-fram
 
 # Planar base DOFs available to WBC. "xy_yaw" allows x/y translation and yaw rotation;
 # "xy" hard-locks yaw in the QP so WBC can translate the base but cannot rotate it.
-base_dofs: "xy"
+base_dofs: "xy_yaw"
 
 # --- Posture regularization toward the nominal posture ------------------------------------
 # Per-group PostureTask cost: resolves redundancy by pulling joints toward
@@ -183,7 +183,7 @@ self_collision_warn_dist: 0.03 # only for HUD warning, not for QP
 # Build-time SRDF-style filter: drop cross-group sphere pairs closer than this at the
 # nominal posture (the by-design shoulder-in-torso overlaps), so the barrier starts
 # feasible. No RBY1 counterpart -- its hand-curated geom groups never form such pairs.
-nominal_pair_keep_dist: 0.06 # run scripts/diagnostics/browse_collision_pairs_sapien.py to visualize
+nominal_pair_keep_dist: 0.07 # run scripts/diagnostics/browse_collision_pairs_sapien.py to visualize
 # pink-only: the barrier constrains the N closest pairs per solve (QP rows). No RBY1
 # counterpart -- mink constrains every pair within its detection distance. 120 is the
 # smallest value with zero candidate floor breaches across clap/cross/torso scenarios
