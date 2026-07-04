@@ -114,9 +114,11 @@ head_orientation_cost: [10000.0, 10000.0, 10000.0]
 head_world_position_cost: [10000.0, 10000.0, 0.0]
 # Head DOFs pinned out of the whole-body QP in head_mode "ik" (dq = 0 each tick), as a
 # list of head joint names drawn from head_j1/head_j2/head_j3. The head joints NOT listed
-# stay whole-body IK DOFs tracked by the head FrameTask. head_j1 (pan) is pinned so an
-# operator head yaw resolves through the BASE (turn-follow) instead of the neck; head_j2
-# is pinned too so head pitch follows the body rather than the neck, leaving head_j3 free
+# stay whole-body IK DOFs tracked by the head FrameTask. Kinematically (FK-verified on
+# vega_with_robotiq.urdf) head_j1 = NECK PITCH, head_j2 = PAN, head_j3 = TILT. head_j2
+# (pan) is pinned so an operator head yaw resolves through the BASE (turn-follow) instead
+# of the neck; head_j1 (neck pitch) is pinned too so it holds its nominal_posture value
+# (the camera-view knob below) and head pitch follows the body, leaving head_j3 free
 # for camera tilt authority. BOTH VR followers -- the SAPIEN sim follower
 # (scripts/wbc_vr_record.py) and the real-robot follower (scripts/wbc_vr_robot.py) -- load
 # this list via WBCConfig/VegaWholeBodyIK, so sim and hardware pin the SAME head DOFs and a
@@ -234,6 +236,19 @@ nominal_posture:
   torso_j1: 0.78 # 0.5235987755982988    # pi/6
   torso_j2: 1.5707963267948966 # 1.0471975511965976    # pi/3
   torso_j3: 0.0 # 0.39269908169872414   # pi/8
+  # Nominal HEAD camera view (the down-look knob). At this torso posture the
+  # zed_depth_frame inherits the torso pitch and looks ~45.3 deg DOWN with head_j1 = 0,
+  # which keeps the robot base in the camera view. head_j1 is the NECK PITCH joint
+  # (limits [-1.483, 1.483] rad) and maps ~1:1 rad -> view pitch:
+  #   view-down-angle ~= 45.3deg + 57.3deg * head_j1   (-0.3 -> 28.1deg, -0.45 -> ~19deg)
+  # The whole pipeline derives from this single value: the follower HOMES the head here,
+  # head_mode "ik" PINS head_j1 at it, and the leader anchors its calibration (C_head) so
+  # the operator's straight-ahead gaze starts at exactly this view. Raising the view also
+  # improves the operator-yaw->base-yaw pan geometry (the pan axis rides on head_j1, so
+  # less down-pitch = less projected-yaw cone amplification: ~1.38x at 0, ~1.12x at -0.3).
+  # Leave head_j2 (pan) and head_j3 (tilt, the live IK DOF) at 0: biasing head_j3 would
+  # consume operator tilt authority instead.
+  head_j1: -0.3
   L_arm_j1: 0.844    # L_shape 0.064 + torso pitch 0.78
   L_arm_j2: 0.3      # L_shape
   L_arm_j4: -1.556   # L_shape

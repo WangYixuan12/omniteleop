@@ -361,8 +361,11 @@ class WBCConfig:
     # (a subset of HEAD_JOINTS = head_j1/head_j2/head_j3). The unlisted head joints stay IK
     # DOFs tracked by the head FrameTask. Loaded from wbik.yaml so BOTH VR followers (sim
     # wbc_vr_record.py + real wbc_vr_robot.py) pin the SAME head joints just by constructing
-    # VegaWholeBodyIK(cfg). Default head_j1/head_j2 (yaw + pitch follow the body, head_j3
-    # tilt free). Ignored in head_mode "track" (which pins every head DOF). Empty pins none.
+    # VegaWholeBodyIK(cfg). Default head_j1/head_j2 (neck pitch + pan follow the body --
+    # head_j1 = NECK PITCH, head_j2 = PAN, head_j3 = TILT, FK-verified -- so head_j1 holds
+    # its nominal_posture camera-view value and an operator yaw resolves through the base;
+    # head_j3 tilt free). Ignored in head_mode "track" (which pins every head DOF). Empty
+    # pins none.
     head_ik_pinned_joints: Sequence[str] = tuple(_DEFAULTS["head_ik_pinned_joints"])
 
     # Torso-top x anchor -- the Vega port of the *intent* of the reference's hard
@@ -657,6 +660,18 @@ class VegaWholeBodyIK:
             self.model.names[j]: self.model.idx_qs[j]
             for j in range(1, self.model.njoints)
         }
+
+        # Fail fast on nominal_posture typos: nominal_q() applies only the keys present
+        # in the reduced model, so a misspelled joint (e.g. "head_i1") would otherwise
+        # silently no-op -- and the follower would home/anchor to a posture the operator
+        # never configured. Every legitimate key (torso, arms, head) survives the wheel
+        # lock above, so an unknown key is always an error.
+        unknown_nominal = sorted(set(self.config.nominal_posture) - set(self._idx_q))
+        if unknown_nominal:
+            raise ValueError(
+                f"nominal_posture keys {unknown_nominal} are not joints of the reduced "
+                f"model (valid: {sorted(self._idx_q)})"
+            )
 
         # The head is teleoperated by its own damped IK (solve_head -> head_pos
         # command fed back via solve(head_joints=...)) and is never a *whole-body* IK
