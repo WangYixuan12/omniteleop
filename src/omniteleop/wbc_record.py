@@ -37,7 +37,7 @@ _FLOAT_FIELDS = (
     "chassis_vy",
     "chassis_wz",
 )
-_BOOL_FIELDS = ("estop", "exit_requested")
+_BOOL_FIELDS = ("estop", "exit_requested", "home_requested")
 _STAGE_WIDTH = 16
 DEFAULT_REPLAY_GAP_LIMIT_MULTIPLE = 5.0
 DEFAULT_WBC_VR_OUTPUT = "/tmp/wbc_vr.mp4"

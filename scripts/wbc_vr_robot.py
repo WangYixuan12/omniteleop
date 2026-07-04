@@ -618,9 +618,9 @@ class HardwareDriver:
     def stop_all_motion(self) -> None:
         """Immediately stop/hold every actuator this follower may have moved.
 
-        This is the left-X / teardown stop path. It runs before recorder flushing or
-        resource shutdown so a "stop the take" request cannot leave a previous 100 Hz
-        position target in flight while HDF5 saving begins. The base/head/torso expose
+        This is the left-Y teardown and left-X episode-rollover stop path. It runs before
+        recorder flushing or resource shutdown so a stop request cannot leave a previous
+        100 Hz position target in flight while HDF5 saving begins. The base/head/torso expose
         direct ``stop()`` methods; the arms do not, so cancel their previous position
         target by commanding the currently measured joint position.
         """
@@ -752,7 +752,28 @@ class HardwareDriver:
         if vr is None or str(getattr(vr, "calib_stage", "")) != "teleop":
             return
         self._episode.start()
+        self._last_rec_head_ns = -1
+        self._last_rec_wrist_ns = -1
         self._next_record_t = 0.0
+
+    def stop_recording_episode(self) -> None:
+        """Stop and save the active episode without shutting down hardware."""
+        if self._episode is None or not self._episode.recording:
+            return
+        n = self._episode.num_frames()
+        path = self._episode.stop()
+        if path is None:
+            print("\n[wbc_vr_robot] recording: 0 frames -- nothing saved.")
+            return
+        print(f"\n[wbc_vr_robot] saving {n} frames -> {path} ...")
+        while self._episode.saving:
+            time.sleep(0.05)
+        print(f"[wbc_vr_robot] episode saved -> {path}")
+
+    def home_to_nominal(self) -> None:
+        """Run the startup nominal homing routine while the process stays live."""
+        self.stop_all_motion()
+        home_to_nominal(self, arm_home_step=ARM_HOME_STEP)
 
     def _read_measured_joints(self) -> dict:
         """Cached readback of every group's measured joints (``get_joint_pos``).
@@ -1423,16 +1444,7 @@ class HardwareDriver:
         # Flush the episode BEFORE shutting the robot down. EpisodeRecorder saves in a
         # daemon thread, so block here until it finishes -- otherwise process exit could
         # kill the save mid-write.
-        if self._episode is not None and self._episode.recording:
-            n = self._episode.num_frames()
-            path = self._episode.stop()
-            if path is None:
-                print("\n[wbc_vr_robot] recording: 0 frames -- nothing saved.")
-            else:
-                print(f"\n[wbc_vr_robot] saving {n} frames -> {path} ...")
-                while self._episode.saving:
-                    time.sleep(0.05)
-                print(f"[wbc_vr_robot] episode saved -> {path}")
+        self.stop_recording_episode()
         # Best-effort teardown of the FC03 gripper-status subscribers.
         for monitor in getattr(self, "_grip_monitors", {}).values():
             try:
@@ -1494,6 +1506,7 @@ def run_loop(
 
     left_cmd, right_cmd, head_cmd = left0.copy(), right0.copy(), head0.copy()
     last_cmd_ns = -1
+    last_home_request_ns = -1
     last_cmd_wall: Optional[float] = None
     prev_estop = True
     source.start()
@@ -1520,6 +1533,16 @@ def run_loop(
             break
 
         estop = bool(vr.estop) if vr is not None else True
+        if estop and hasattr(driver, "stop_recording_episode"):
+            driver.stop_recording_episode()
+        if (
+            vr is not None
+            and bool(getattr(vr, "home_requested", False))
+            and int(getattr(vr, "timestamp_ns", -1)) != last_home_request_ns
+        ):
+            last_home_request_ns = int(getattr(vr, "timestamp_ns", -1))
+            if hasattr(driver, "home_to_nominal"):
+                driver.home_to_nominal()
         if prev_estop and not estop:
             ik.reset()
             interp.reset(left0, right0, head0)

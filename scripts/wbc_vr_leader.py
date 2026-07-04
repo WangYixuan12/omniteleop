@@ -79,8 +79,10 @@ Run in the dexmate conda env (has pinocchio + pink + dexcomm + aiohttp/socketio)
 Controls (mirrors ``vr_reader``):
   * **hold right grip trigger >= 1 s** in ``static`` -> capture calibration and
     begin streaming targets (``teleop``);
-  * index triggers -> ``left_gripper`` / ``right_gripper`` [0, 1];
-  * **left X button** -> publish an exit request and stop the take (the headset HUD
+  * index triggers -> ``left_gripper`` / ``right_gripper`` [0, 1] in teleop;
+  * **left X button** -> end the current episode and return to ``static`` (estop);
+  * **left index trigger** in ``static`` -> request real-robot homing to nominal;
+  * **left Y button** -> publish an exit request and stop the programs (the headset HUD
     updates to ``Stage: stopped`` after the stop command is sent);
   * left thumbstick -> ``chassis_vx`` / ``chassis_vy``; right thumbstick x ->
     ``chassis_wz`` (published, but unused by ``wbc_vr_record``).
@@ -237,9 +239,9 @@ def _is_tracked(pose: np.ndarray, sentinel: np.ndarray) -> bool:
     return _is_valid_pose(pose) and not np.allclose(pose, sentinel, atol=_TRACK_ATOL)
 
 
-def _left_x_stop_requested(*, x_now: bool, prev_x: bool) -> bool:
-    """True on the rising edge of the left X button."""
-    return bool(x_now and not prev_x)
+def _button_rising_edge(*, now: bool, prev: bool) -> bool:
+    """True on a button rising edge."""
+    return bool(now and not prev)
 
 
 def _project_so3(rot: np.ndarray) -> np.ndarray:
@@ -468,6 +470,8 @@ class WBCVRLeader:
         self.last_right_target: Optional[np.ndarray] = None
         self._trigger_start: Optional[float] = None
         self._prev_x = False
+        self._prev_y = False
+        self._prev_left_trigger_home = False
         self.running = False
 
         # Optional RAW-VR diagnostic log (--debug-vr DIR): per-tick raw headset +
@@ -710,6 +714,7 @@ class WBCVRLeader:
         chassis: tuple[float, float, float],
         *,
         exit_requested: bool = False,
+        home_requested: bool = False,
     ) -> None:
         left_flat = left_target.reshape(-1).tolist() if left_target is not None else []
         right_flat = right_target.reshape(-1).tolist() if right_target is not None else []
@@ -726,6 +731,7 @@ class WBCVRLeader:
             chassis_wz=float(chassis[2]),
             estop=(self.stage == "static"),
             exit_requested=bool(exit_requested),
+            home_requested=bool(home_requested),
             calib_stage=self.stage,
             left_ee_pose=left_flat,
             right_ee_pose=right_flat,
@@ -764,10 +770,17 @@ class WBCVRLeader:
                     time.sleep(dt)
                     continue
 
-                # left X -> publish one final exit frame so recorders can stop/save.
+                # left Y -> publish one final exit frame so followers stop/save/exit.
+                # left X -> end the current episode and return to static/e-stop.
+                # left trigger in static -> request follower homing to nominal.
                 x_now = bool(transforms["left_x_button"])
-                if _left_x_stop_requested(x_now=x_now, prev_x=self._prev_x):
-                    self._prev_x = x_now
+                y_now = bool(transforms["left_y_button"])
+                left_trigger_home_now = (
+                    self.stage == "static"
+                    and float(transforms["left_index_trigger"]) > _TRIGGER_PRESS
+                )
+                if _button_rising_edge(now=y_now, prev=self._prev_y):
+                    self._prev_y = y_now
                     # STOP FIRST: the exit frame is what halts the robot (the follower's
                     # run_loop stops motion the instant it sees vr.exit_requested). Publish
                     # it before any HUD work so nothing below can delay the robot stop.
@@ -777,7 +790,7 @@ class WBCVRLeader:
                         self._thumbstick_to_chassis(transforms),
                         exit_requested=True,
                     )
-                    print("\n[wbc_vr_leader] stop requested (left X).")
+                    print("\n[wbc_vr_leader] terminal stop requested (left Y).")
                     # THEN reflect the stop in the headset HUD. This runs only after the
                     # stop command is already out, so it adds NO latency to stopping the
                     # robot. The brief sleep lets the async camera_frame emit flush to the
@@ -788,7 +801,44 @@ class WBCVRLeader:
                         self._send_stop_hud()
                         time.sleep(0.2)
                     break
+                self._prev_y = y_now
+
+                if _button_rising_edge(now=x_now, prev=self._prev_x):
+                    self._prev_x = x_now
+                    self.stage = "static"
+                    self.robot_base_t_vr_base_eef = None
+                    self._head_ori_offset = None
+                    self.last_left_target = None
+                    self.last_right_target = None
+                    self._trigger_start = None
+                    self._last_alignment_status = None
+                    self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
+                    print("\n[wbc_vr_leader] episode ended -> static.")
+                    continue
                 self._prev_x = x_now
+
+                if _button_rising_edge(
+                    now=left_trigger_home_now,
+                    prev=self._prev_left_trigger_home,
+                ):
+                    self._prev_left_trigger_home = left_trigger_home_now
+                    self._publish(
+                        None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0),
+                        home_requested=True,
+                    )
+                    print("\n[wbc_vr_leader] home requested (left trigger).")
+                    # Hold for one full command period before the loop resumes: the
+                    # follower's subscriber only keeps the single latest VRJointData (no
+                    # queue), and the very next tick below would otherwise immediately
+                    # publish a static idle frame with home_requested=False again -- with
+                    # no delay, that follow-up publish lands within microseconds of this
+                    # one, so the follower's 100Hz loop essentially never observes the
+                    # True pulse before it's overwritten (this was the actual bug: the
+                    # leader printed "home requested" but the robot never moved). Sleeping
+                    # here gives the follower a full cmd period of ticks to see it.
+                    time.sleep(dt)
+                    continue
+                self._prev_left_trigger_home = left_trigger_home_now
 
                 vr_l = transforms["left_wrist"]
                 vr_r = transforms["right_wrist"]

@@ -76,6 +76,7 @@ class VRJointData:
     # Control flags
     estop: bool = True          # Default True (safe) until calibration completes
     exit_requested: bool = False
+    home_requested: bool = False
     # Calibration stage published by the leader. wbc_vr_leader uses {static, teleop};
     # omni-vr/vr_reader uses {static, head, whole_body_alignment, whole_body, resetting}.
     calib_stage: str = "static"
