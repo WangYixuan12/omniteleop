@@ -46,7 +46,7 @@ _GREEN = (0, 255, 0)
 # the panel in the headset is set separately by ``camPanelH`` in ``web/vr_client.html``
 # (its width auto-follows the streamed aspect); this constant only controls the
 # streamed image resolution.
-_HUD_SCALE = 1.0
+_HUD_SCALE = 1.25
 _TILE_W = round(320 * _HUD_SCALE)
 _TILE_H = round(240 * _HUD_SCALE)
 
@@ -61,7 +61,13 @@ class HUDOverlayLine:
 
 @dataclass(frozen=True)
 class HandAlignmentStatus:
-    """Current hand-vs-reference pose error for pre-record alignment prompts."""
+    """Current hand-vs-reference pose error for pre-record alignment prompts.
+
+    When ``head_delta_mm`` is set the operator is ALSO gated on returning the robot's
+    head to its nominal pose (so a recorded episode always starts from the same head
+    look direction as the reference). ``head_delta_mm is None`` means the head is not
+    gated -- ``head_ok`` is then vacuously True and no head line is drawn.
+    """
 
     left_delta_mm: np.ndarray
     right_delta_mm: np.ndarray
@@ -71,6 +77,10 @@ class HandAlignmentStatus:
     rot_tolerance_deg: float
     stable_s: float = 0.0
     stable_required_s: float = 0.0
+    head_delta_mm: Optional[np.ndarray] = None
+    head_rot_deg: Optional[float] = None
+    head_pos_tolerance_mm: float = 0.0
+    head_rot_tolerance_deg: float = 0.0
 
     @property
     def left_ok(self) -> bool:
@@ -87,9 +97,31 @@ class HandAlignmentStatus:
         )
 
     @property
+    def head_gated(self) -> bool:
+        """Whether this status gates the head pose against nominal."""
+        return self.head_delta_mm is not None
+
+    @property
+    def head_ok(self) -> bool:
+        """Whether the head is at nominal within tolerance (True when not gated)."""
+        if self.head_delta_mm is None:
+            return True
+        return _hand_within_tolerance(
+            self.head_delta_mm,
+            self.head_rot_deg,
+            self.head_pos_tolerance_mm,
+            self.head_rot_tolerance_deg,
+        )
+
+    @property
     def ready(self) -> bool:
-        """Whether both hands stayed aligned for the required stable window."""
-        return self.left_ok and self.right_ok and self.stable_s >= self.stable_required_s
+        """Whether hands (and head, if gated) stayed aligned for the stable window."""
+        return (
+            self.left_ok
+            and self.right_ok
+            and self.head_ok
+            and self.stable_s >= self.stable_required_s
+        )
 
 
 def follower_status_overlay_lines(
@@ -219,8 +251,13 @@ def alignment_overlay_lines(alignment: Optional[HandAlignmentStatus]) -> list[HU
     if alignment is None:
         return []
 
+    prompt = (
+        "Align ref: move hands+head to ref"
+        if alignment.head_gated
+        else "Align ref: move hands to reference"
+    )
     lines = [
-        HUDOverlayLine("Align ref: move hands to reference", _YELLOW),
+        HUDOverlayLine(prompt, _YELLOW),
         _hand_alignment_line(
             "L",
             alignment.left_delta_mm,
@@ -236,6 +273,16 @@ def alignment_overlay_lines(alignment: Optional[HandAlignmentStatus]) -> list[HU
             alignment.rot_tolerance_deg,
         ),
     ]
+    if alignment.head_gated:
+        lines.append(
+            _hand_alignment_line(
+                "H",
+                alignment.head_delta_mm,
+                alignment.head_rot_deg,
+                alignment.head_pos_tolerance_mm,
+                alignment.head_rot_tolerance_deg,
+            )
+        )
     if alignment.ready:
         lines.append(HUDOverlayLine("Gate: ready", _GREEN))
     elif alignment.stable_required_s > 0.0:

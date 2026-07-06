@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import threading
 import time
+from collections import deque
 from dataclasses import asdict
 from typing import Callable, Optional
 
@@ -125,6 +126,15 @@ WBC_FOLLOWER_STATUS_TOPIC = "wbc/follower_status"
 # record_rate; the default dir is the same raw_data tree the leader writes to.
 DEFAULT_RECORD_RATE = 10.0
 DEFAULT_SAVE_DIR = "/home/yixuan/omniteleop/Dexmate/data/raw_data"
+# --record stale-frame grace: when a record tick finds no strictly-newer frame from every
+# camera, retry at the IK rate for up to this long before aborting the take. The publishers
+# hold ~15 fps through these stalls (verified against their per-second pub-fps logs), so a
+# non-newer frame means the DELIVERY path hiccupped: a WiFi burst, Zenoh backlog, or this
+# process starving its Zenoh decode threads under solver load (worst while the torso moves).
+# A frame is recorded only once BOTH publisher timestamps advance, so the no-duplicate
+# guarantee is unchanged -- the grace converts a short delivery stall into one late frame
+# instead of a dead take. 0 restores the old abort-on-first-stale-tick behavior.
+DEFAULT_RECORD_STALE_GRACE = 0.20
 
 # Wrist camera (recorded under obs/images/left_wrist_rgb when --record). Like the head
 # camera it is consumed through the dexcontrol Robot API, but as a multi-stream ZED-M
@@ -214,7 +224,7 @@ DEFAULT_SOURCE_TIMEOUT = 0.5    # s without a fresh command / odom sample -> hol
 # engage in a couple of ticks (0.1 rad / 0.05 rad/tick @ 100Hz = ~20ms), so a few
 # degrees here is smoothed away rather than commanded as a jump.
 DEFAULT_HOME_TOL = 0.1
-ARM_HOME_STEP = 0.005 # arm interpolation step when homing straight to nominal
+ARM_HOME_STEP = 0.01  # arm interpolation step when homing straight to nominal
 # s: after the stepped ramp, hold each group at nominal and block until the MEASURED
 # joints converge within --home-tol. The dexcontrol ramp returns after each substep's
 # wait_time whether or not the joint physically caught up, so lag accumulates and an
@@ -227,16 +237,24 @@ _JOINT_STEP_ABORT_TICKS = 25    # consecutive ticks demanding > 2x clamp -> abor
 
 
 class _TrajLog:
-    """Collect per-tick dry-run IK state; summarize and optionally write to HDF5."""
+    """Collect per-tick IK /debug state and flush it to a per-episode HDF5.
 
-    def __init__(self, path: Optional[str], meta: Optional[dict] = None) -> None:
-        self.path = path
-        self.meta = meta or {}
+    Under ``--record`` the follower calls :meth:`flush` each time an ``episode_<N>.hdf5``
+    saves, writing a paired ``episode_<N>_debug.hdf5`` and releasing ``_rows`` -- so RAM
+    stays bounded to one episode instead of growing across a multi-episode session.
+    Without ``--record`` there are no episode boundaries: a single flush runs at teardown.
+    ``debug_dir=None`` disables logging (``append`` is a no-op), so omitting ``--debug-dir``
+    costs nothing per tick.
+    """
+
+    def __init__(self, debug_dir: Optional[str], meta: Optional[dict] = None) -> None:
+        self.debug_dir = debug_dir
+        self.meta = dict(meta or {})
         self._rows: list[dict] = []
 
     def append(self, **fields) -> None:
-        """Record one IK tick (no-op when no output path is set)."""
-        if self.path is not None:
+        """Record one IK tick (no-op when logging is disabled)."""
+        if self.debug_dir is not None:
             self._rows.append(fields)
 
     def __len__(self) -> int:
@@ -277,24 +295,42 @@ class _TrajLog:
     )
     _STR_KEYS = (("safety_status", 96), ("hold_reason", 32), ("base_action", 12))
 
-    def write(self) -> None:
-        """Write the collected ticks under a ``/debug`` group (if a path is set).
+    def flush(self, episode_id: int) -> Optional[str]:
+        """Write buffered ticks to ``episode_<id>_debug.hdf5``, then release the buffer.
+
+        Returns the written path, or ``None`` when logging is disabled or no ticks are
+        buffered (a 0-frame stop, or the trailing idle after the last episode, writes
+        nothing). Clearing ``_rows`` afterward is what bounds memory across a session.
+        """
+        if self.debug_dir is None or not self._rows:
+            return None
+        import os  # noqa: PLC0415
+
+        path = os.path.join(self.debug_dir, f"episode_{int(episode_id)}_debug.hdf5")
+        n = len(self._rows)
+        summary = self.summary()
+        self._write(path, dict(self.meta, episode_id=int(episode_id)))
+        self._rows = []  # release the buffer -> /debug RAM stays bounded to one episode
+        print(f"[wbc_vr_robot] /debug episode_{int(episode_id)} -> {path} "
+              f"({n} ticks) | {summary}")
+        return path
+
+    def _write(self, path: str, meta: dict) -> None:
+        """Serialize the buffered ticks under a ``/debug`` group.
 
         ``/debug`` holds every per-tick column (scalars, gzipped vectors, fixed-width
-        strings) plus run metadata in its attrs. Columns absent this run (no driver) are
+        strings) plus ``meta`` in its attrs. Columns absent this run (no driver) are
         skipped rather than erroring.
         """
-        if not self.path or not self._rows:
-            return
-        import h5py  # noqa: PLC0415 -- optional dep, only needed at teardown
+        import h5py  # noqa: PLC0415 -- optional dep, only needed at flush
 
         rows = self._rows
         col = lambda k: np.asarray([r[k] for r in rows])
-        with h5py.File(self.path, "w") as f:
+        with h5py.File(path, "w") as f:
             g = f.create_group("debug")
             g.attrs["schema"] = "wbc_vr_robot_debug/v1"
             g.attrs["n_frames"] = len(rows)
-            for key, val in self.meta.items():
+            for key, val in meta.items():
                 g.attrs[key] = val
             for key in self._SCALAR_KEYS:
                 if key in rows[0]:
@@ -457,7 +493,7 @@ class HardwareDriver:
     name = "hardware"
 
     def __init__(self, args: argparse.Namespace, ik: VegaWholeBodyIK, cfg: WBCConfig,
-                 enable: dict) -> None:
+                 enable: dict, traj: Optional[_TrajLog] = None) -> None:
         from dexbot_utils import RobotInfo  # noqa: PLC0415 -- hardware-only deps, lazy
         from dexcontrol.robot import Robot  # noqa: PLC0415
 
@@ -503,6 +539,9 @@ class HardwareDriver:
         self.robot = None
         self._odom: Optional[OdometryThread] = None
         self._episode: Optional[EpisodeRecorder] = None
+        # Optional per-tick /debug log (passed by _run_ik_mode when --debug-dir is set).
+        # stop_recording_episode() flushes it once per saved episode so RAM stays bounded.
+        self._traj: Optional[_TrajLog] = traj
         self.has_torso = False
         self.has_chassis = False
         self._prev_base_cmd = np.zeros(3)        # post-projection: twist actually sent
@@ -531,12 +570,20 @@ class HardwareDriver:
         # --record frame-freshness guard: the ZED-SDK publishers stream at ~15 fps while we
         # record at ~10 fps, so EVERY recorded frame must carry a camera frame strictly newer
         # than the previously recorded one (each head_left_rgb / left_wrist_rgb differs). When
-        # WiFi clogging / an fps drop stalls a publisher below the record rate, get_obs returns
-        # the SAME (or no) frame twice. These hold the publisher timestamp of the last RECORDED
-        # frame per camera (-1 until the first is recorded); record_tick aborts the run the
-        # moment a head/wrist frame is not strictly newer, so a take never records duplicates.
+        # the delivery path stalls below the record rate, get_obs returns the SAME (or no)
+        # frame twice. These hold the publisher timestamp of the last RECORDED frame per
+        # camera (-1 until the first is recorded); record_tick retries a non-newer frame at
+        # the IK rate for up to --record-stale-grace, then aborts -- either way a take never
+        # records duplicates.
         self._last_rec_head_ns = -1
         self._last_rec_wrist_ns = -1
+        # Stale-grace state: loop time the current stale streak began (None while fresh),
+        # plus a short per-recorded-frame arrival-age history (local wall clock minus the
+        # publisher capture stamp; spans the robot<->workstation clock offset, so read the
+        # head-vs-wrist split and the trend, not absolutes). Dumped on a stale abort to show
+        # WHICH stream stalled and whether its delivery latency was climbing beforehand.
+        self._stale_since: Optional[float] = None
+        self._frame_age_log: deque[tuple[float, float, float]] = deque(maxlen=64)
 
         # Joint convention: with the hardware-matching URDF (wbik.yaml urdf_path:
         # vega_with_robotiq, corrected torso_j2 range + grippers) the WBC joint output
@@ -757,9 +804,17 @@ class HardwareDriver:
         self._next_record_t = 0.0
 
     def stop_recording_episode(self) -> None:
-        """Stop and save the active episode without shutting down hardware."""
+        """Stop and save the active episode without shutting down hardware.
+
+        When a /debug log is attached (--debug-dir), also flush this episode's paired
+        ``episode_<N>_debug.hdf5`` and release its buffer -- so /debug RAM stays bounded to
+        a single episode across a multi-episode collection session.
+        """
         if self._episode is None or not self._episode.recording:
             return
+        # Capture the id BEFORE stop() (it increments episode_id) so the /debug file pairs
+        # with the episode_<N>.hdf5 written this call.
+        saved_id = getattr(self._episode, "episode_id", None)
         n = self._episode.num_frames()
         path = self._episode.stop()
         if path is None:
@@ -769,6 +824,9 @@ class HardwareDriver:
         while self._episode.saving:
             time.sleep(0.05)
         print(f"[wbc_vr_robot] episode saved -> {path}")
+        traj = getattr(self, "_traj", None)
+        if traj is not None and saved_id is not None:
+            traj.flush(saved_id)
 
     def home_to_nominal(self) -> None:
         """Run the startup nominal homing routine while the process stays live."""
@@ -1098,6 +1156,11 @@ class HardwareDriver:
         """
         self._record_period = 0.0
         self._next_record_t = 0.0
+        self._stale_grace = float(self.args.record_stale_grace)
+        if not np.isfinite(self._stale_grace) or self._stale_grace < 0.0:
+            raise ValueError(
+                f"--record-stale-grace must be finite and >= 0, got {self._stale_grace}"
+            )
         if not self.args.record:
             return
         self._await_record_cameras()
@@ -1204,6 +1267,55 @@ class HardwareDriver:
             )
         return np.ascontiguousarray(wrist, dtype=np.uint8), frame_ns
 
+    def _retry_or_abort_stale(
+        self, now: float, *, head_ns: Optional[int], wrist_ns: Optional[int]
+    ) -> None:
+        """Retry-or-abort for a record tick whose camera frames did not all advance.
+
+        Called mid-take when a stream is missing or its publisher timestamp is not
+        strictly newer than the last recorded frame. Within ``--record-stale-grace`` of
+        the streak's first stale tick the record schedule is pulled back to ``now``, so
+        the IK loop re-polls the cameras on its very next tick (non-blocking: actuation
+        cadence is untouched, and nothing is recorded until every timestamp advances).
+        Past the grace it aborts with a per-camera Δ/age line plus the arrival ages of
+        the recently recorded frames, so the console shows WHICH stream stalled and
+        whether its delivery latency was already climbing.
+        """
+        wall_ns = time.time_ns()
+
+        def diag(name: str, ts: Optional[int], last_ns: int) -> str:
+            if ts is None:
+                return f"{name}=MISSING"
+            return f"{name} Δ={ts - last_ns} ns age={(wall_ns - ts) / 1e6:.0f} ms"
+
+        detail = (f"{diag('head', head_ns, self._last_rec_head_ns)}, "
+                  f"{diag('wrist', wrist_ns, self._last_rec_wrist_ns)}")
+        if self._stale_since is None:
+            self._stale_since = now
+            print(f"\n[wbc_vr_robot] --record: no fresh camera frame at the record tick "
+                  f"({detail}); retrying at the IK rate for up to "
+                  f"{self._stale_grace * 1000.0:.0f} ms.")
+        if now - self._stale_since <= self._stale_grace:
+            # Pull the schedule back so the next IK tick retries immediately; once frames
+            # resume, the throttle re-anchors and the take continues with one late frame.
+            self._next_record_t = now
+            return
+        history = "".join(
+            f"\n    t-{now - t:5.2f}s  head_age={h:7.1f} ms  wrist_age={w:7.1f} ms"
+            for t, h, w in list(self._frame_age_log)[-20:]
+        )
+        raise RuntimeError(
+            "[wbc_vr_robot] --record: stale camera frame for "
+            f"{(now - self._stale_since) * 1000.0:.0f} ms (> --record-stale-grace "
+            f"{self._stale_grace * 1000.0:.0f} ms) -- {detail} (need every Δ > 0). The "
+            "publishers hold their fps through these stalls, so suspect the delivery "
+            "path: WiFi burst, Zenoh backlog, or this process starving its Zenoh decode "
+            "threads under solver load. Aborting so the take never records duplicate "
+            "frames. Arrival ages of the last recorded frames (publisher stamp vs local "
+            "clock; spans the robot NTP offset):"
+            f"{history if history else ' <none recorded yet>'}"
+        )
+
     def record_tick(
         self,
         result,
@@ -1300,36 +1412,42 @@ class HardwareDriver:
         wrist = self._grab_wrist_image()
         # Before the first recorded frame the cameras may still be warming up (the leader can
         # reach teleop before a publisher is fully up): tolerate a missing stream and skip
-        # this tick, matching vr_reader. Once recording is underway a MISSING frame means a
-        # publisher stalled below the record rate -- abort immediately rather than skip (a
-        # skip would silently drop the take's cadence) or reuse a stale frame.
+        # this tick, matching vr_reader.
         recording_started = self._last_rec_head_ns >= 0
-        if imgs is None or wrist is None:
-            if recording_started:
-                raise RuntimeError(
-                    "[wbc_vr_robot] --record: a camera delivered no new frame "
-                    f"(head={'ok' if imgs is not None else 'MISSING'}, "
-                    f"wrist={'ok' if wrist is not None else 'MISSING'}) -- the publisher "
-                    "stalled below the record rate (WiFi clog / camera fps drop). Aborting "
-                    "so the take never records duplicate frames."
-                )
+        if (imgs is None or wrist is None) and not recording_started:
             return  # camera still warming up -- skip rather than write inconsistent keys
-        head_left_rgb, head_depth_u16, head_ns = imgs
-        wrist_left_rgb, wrist_ns = wrist
         # Freshness guard: ~15 fps camera vs ~10 fps record means every recorded frame must
         # carry a strictly newer publisher timestamp than the last recorded one. A non-newer
-        # frame is a stalled/clogged publisher repeating its last frame (get_obs re-returns
-        # the cached latest) -> abort immediately so duplicate images never enter the take.
-        if recording_started and (
-            head_ns <= self._last_rec_head_ns or wrist_ns <= self._last_rec_wrist_ns
+        # (or missing) frame is the delivery path repeating the cached latest -- the
+        # publishers hold their fps through these stalls, so suspect a WiFi burst, Zenoh
+        # backlog, or this process starving its Zenoh decode threads under solver load.
+        # Instead of dying on the first stale tick, retry at the IK rate for up to
+        # --record-stale-grace: nothing is recorded until BOTH timestamps advance, so a take
+        # still never contains duplicates; a short stall costs one late frame, not the take.
+        head_ns = None if imgs is None else imgs[2]
+        wrist_ns = None if wrist is None else wrist[1]
+        if (
+            head_ns is None or wrist_ns is None
+            or head_ns <= self._last_rec_head_ns
+            or wrist_ns <= self._last_rec_wrist_ns
         ):
-            raise RuntimeError(
-                "[wbc_vr_robot] --record: stale camera frame (publisher not delivering new "
-                f"frames at the record rate; WiFi clog / fps drop) -- head Δ="
-                f"{head_ns - self._last_rec_head_ns} ns, wrist Δ="
-                f"{wrist_ns - self._last_rec_wrist_ns} ns (need both > 0). Aborting so the "
-                "take never records duplicate frames."
-            )
+            self._retry_or_abort_stale(now, head_ns=head_ns, wrist_ns=wrist_ns)
+            return
+        if self._stale_since is not None:
+            print(f"\n[wbc_vr_robot] --record: fresh frames resumed after "
+                  f"{(now - self._stale_since) * 1000.0:.0f} ms (head Δ="
+                  f"{head_ns - self._last_rec_head_ns} ns, wrist Δ="
+                  f"{wrist_ns - self._last_rec_wrist_ns} ns).")
+            self._stale_since = None
+        head_left_rgb, head_depth_u16, _ = imgs
+        wrist_left_rgb, _ = wrist
+        # Arrival-age history for the stale-abort diagnostic: local wall clock minus the
+        # publisher capture stamp (spans the robot->workstation clock offset, so compare
+        # head vs wrist and the trend over time, not the absolute value).
+        wall_ns = time.time_ns()
+        self._frame_age_log.append(
+            (now, (wall_ns - head_ns) / 1e6, (wall_ns - wrist_ns) / 1e6)
+        )
         self._last_rec_head_ns = head_ns
         self._last_rec_wrist_ns = wrist_ns
 
@@ -1667,20 +1785,23 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
 
     enabled = [k for k, v in enable.items() if v]
     debug_path: Optional[str] = None
+    debug_start_id = 0
     traj: Optional[_TrajLog] = None
     if args.debug_dir is not None:
         import os  # noqa: PLC0415
 
         os.makedirs(args.debug_dir, exist_ok=True)
-        # Match vr_reader's DebugEpisodeRecorder naming. When --record is also on,
-        # peek save_dir so episode_<N>_debug.hdf5 pairs with episode_<N>.hdf5.
+        # Match vr_reader's DebugEpisodeRecorder naming. With --record, each saved
+        # episode_<N>.hdf5 gets its episode_<N>_debug.hdf5 flushed (buffer freed) as it
+        # saves, keyed by the recorder's ACTUAL id -- so this peek is only the STARTING id
+        # (for the print, and for the single teardown file when --record is off).
         if args.record:
-            episode_id = peek_next_episode_id(args.save_dir)
+            debug_start_id = peek_next_episode_id(args.save_dir)
         else:
-            episode_id = peek_next_episode_id(args.debug_dir, suffix="_debug")
-        debug_path = os.path.join(args.debug_dir, f"episode_{episode_id}_debug.hdf5")
+            debug_start_id = peek_next_episode_id(args.debug_dir, suffix="_debug")
+        debug_path = os.path.join(args.debug_dir, f"episode_{debug_start_id}_debug.hdf5")
         meta = {
-            "episode_id": int(episode_id),
+            "episode_id": int(debug_start_id),
             "mode": "replay" if replay else "live",
             "speed": float(args.speed) if replay else 1.0,
             "ik_rate": float(args.ik_rate),
@@ -1704,7 +1825,7 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
             "base_post_angular_deadband": float(args.base_post_angular_deadband),
             "replay_file": str(args.replay) if replay else "",
         }
-        traj = _TrajLog(debug_path, meta=meta)
+        traj = _TrajLog(args.debug_dir, meta=meta)
     print("=" * 72)
     print(f"[wbc_vr_robot] REAL ROBOT. enabled={enabled} grippers=on | "
           f"{'REPLAY ' + format(args.speed, 'g') + 'x' if replay else 'LIVE'} | "
@@ -1718,7 +1839,11 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
     print(f"  joints -> dexcontrol 1:1 (urdf {cfg.urdf_path.rsplit('/', 1)[-1]}). "
           "Robot homes to nominal, then moves. KEEP CLEAR. Ctrl-C aborts (zeros base).")
     if debug_path is not None:
-        print(f"  /debug -> {debug_path}")
+        if args.record:
+            print(f"  /debug -> {args.debug_dir}/episode_<N>_debug.hdf5 "
+                  "(one per recorded episode; buffer freed as each saves)")
+        else:
+            print(f"  /debug -> {debug_path}")
     if args.record:
         print(f"  recording -> {args.save_dir} @ {args.record_rate:g}Hz while engaged "
               "(head_left_rgb+head_depth+left_wrist_rgb, +torso action, +gripper obs/action).")
@@ -1728,7 +1853,10 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
     try:
         # Construct INSIDE the try so a HardwareDriver init failure (e.g. failed homing
         # gate) still runs the finally cleanup. HardwareDriver.__init__ also self-cleans.
-        driver = HardwareDriver(args, ik, cfg, enable)
+        # Pass the /debug log so stop_recording_episode() flushes a paired
+        # episode_<N>_debug.hdf5 per saved episode (and frees the buffer). None when
+        # --debug-dir is omitted -> logging fully disabled.
+        driver = HardwareDriver(args, ik, cfg, enable, traj=traj)
         run_loop(source, ik, cfg, driver, args, replay=replay, clock=clock,
                  realtime=realtime, enable=enable, traj=traj)
     except KeyboardInterrupt:
@@ -1745,9 +1873,18 @@ def _run_ik_mode(args: argparse.Namespace, enable: dict) -> None:
         if driver is not None:
             driver.close()
         if traj is not None:
-            print(f"\n[wbc_vr_robot] summary: {traj.summary()}")
-            traj.write()
-            print(f"[wbc_vr_robot] /debug log -> {debug_path} ({len(traj)} ticks)")
+            if args.record:
+                # Per-episode logs were flushed as each episode saved (bounded RAM), and
+                # driver.close() above flushed any episode still recording at exit. Only
+                # trailing idle ticks (after the last save, tied to no saved episode)
+                # remain -- dropped rather than written as a phantom episode_<N>_debug.hdf5.
+                if len(traj):
+                    print(f"[wbc_vr_robot] /debug: dropped {len(traj)} trailing idle "
+                          "tick(s) not tied to any saved episode.")
+            else:
+                # No episode boundaries: one /debug log for the whole run.
+                print(f"\n[wbc_vr_robot] summary: {traj.summary()}")
+                traj.flush(debug_start_id)
 
 
 def main() -> None:
@@ -1784,6 +1921,13 @@ def main() -> None:
     parser.add_argument("--record-rate", type=float, default=DEFAULT_RECORD_RATE,
                         help=f"episode record cadence in Hz (default {DEFAULT_RECORD_RATE:g}; "
                              "must be <= the IK rate (ik_rate in wbik.yaml)).")
+    parser.add_argument("--record-stale-grace", type=float,
+                        default=DEFAULT_RECORD_STALE_GRACE,
+                        help="seconds to keep retrying (at the IK rate) when a record tick "
+                             "finds no strictly-newer frame from every camera, before "
+                             f"aborting the take (default {DEFAULT_RECORD_STALE_GRACE:g}; "
+                             "0 aborts on the first stale tick). Rides out short WiFi/Zenoh "
+                             "delivery stalls without ever recording duplicate frames.")
 
     hw = parser.add_argument_group("hardware")
     hw.add_argument("--home-tol", type=float, default=DEFAULT_HOME_TOL,
@@ -1834,7 +1978,8 @@ def main() -> None:
     args.base_post_angular_deadband = DEFAULT_BASE_POST_ANGULAR_DEADBAND
 
     for flag, val in (("--home-tol", args.home_tol), ("--max-joint-step", args.max_joint_step),
-                      ("--home-settle", args.home_settle)):
+                      ("--home-settle", args.home_settle),
+                      ("--record-stale-grace", args.record_stale_grace)):
         if not np.isfinite(val) or val < 0.0:
             parser.error(f"{flag} must be finite and >= 0")
     if not np.isfinite(args.base_quiet_hold_s):

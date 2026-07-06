@@ -53,14 +53,29 @@ STATE_AXES = ACTION_AXES + BASE_AXES
 # (cross-frame subtraction is meaningless otherwise). See PLAN.md / port_wbc_mobile_hdf5.
 STATE_FRAMES = ("base", "world")
 
-# Action dims made RELATIVE under use_relative_actions: the three translations per
-# block only (left 0-2, right 10-12, head 20-22). Everything else stays ABSOLUTE --
-# the 6D rotation columns (an element-wise column subtraction is not a valid rotation
-# delta) and the binary grippers -- mirroring the tabletop eef RELATIVE_EXCLUDE
-# (train_dexmate_diffusion.sh) extended to the head block. Base pose dims 29-31 live
-# in the STATE only (never in the 29-D action), so the relative math never touches them.
-RELATIVE_POSITION_DIMS = [0, 1, 2, 10, 11, 12, 20, 21, 22]
-RELATIVE_EXCLUDE_DIMS = [d for d in range(len(ACTION_AXES)) if d not in set(RELATIVE_POSITION_DIMS)]
+# Dim groups of the 29-D action layout (observation.state[:29] mirrors it),
+# derived from the axis names so they can never drift from ACTION_AXES.
+POSITION_DIMS = [i for i, a in enumerate(ACTION_AXES) if a.rsplit("_", 1)[-1] in ("tx", "ty", "tz")]
+ROTATION_DIMS = [i for i, a in enumerate(ACTION_AXES) if a.rsplit("_", 1)[-1].startswith("r")]
+GRIPPER_DIMS = [i for i, a in enumerate(ACTION_AXES) if a.endswith("_gripper")]
+
+# Under use_relative_actions, translations AND 6-D rotation columns are made
+# relative (LeRobot subtracts observation.state[:29] element-wise, broadcast over
+# the chunk). The column-wise rotation delta is NOT itself a rotation, but it is
+# exactly inverted by AbsoluteActionsProcessorStep -- the same chunk-anchor state
+# is added back BEFORE pos6d_to_mat's Gram-Schmidt -- so decoded rotations are
+# exact. Only the binary grippers stay absolute: the state gripper is a raw FC03
+# reading on a different scale, so subtracting it would corrupt the 0/1 command.
+# Base pose dims 29-31 live in the STATE only (never in the 29-D action).
+RELATIVE_EXCLUDE_DIMS = GRIPPER_DIMS
+
+# Normalization (README step 3): STATE/ACTION use NormalizationMode.QUANTILES
+# (1-99 percentile -> [-1, 1]) on the continuous dims, robust to teleop outliers.
+# The 6-D rotation dims ride RAW via skip_normalization_dims: absolute columns are
+# already unit-bounded, and relative rotation deltas concentrate near 0, where a
+# q01/q99 rescale would blow up low-variance components. Grippers and the state
+# base pose (dims 29-31) stay quantile-normalized.
+SKIP_NORMALIZATION_DIMS = ROTATION_DIMS
 
 
 def mat_to_pos6d(matrix: np.ndarray) -> np.ndarray:

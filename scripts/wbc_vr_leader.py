@@ -120,6 +120,8 @@ from omniteleop.leader.wbc_headset_hud import (
     WBCHeadsetHUD,
 )
 from omniteleop.leader.wbc_reference_alignment import (
+    REFERENCE_ALIGN_HEAD_POS_TOL_MM,
+    REFERENCE_ALIGN_HEAD_ROT_TOL_DEG,
     REFERENCE_ALIGN_POS_TOL_MM,
     REFERENCE_ALIGN_ROT_TOL_DEG,
     REFERENCE_ALIGN_STABLE_S,
@@ -436,12 +438,18 @@ class WBCVRLeader:
         if self._align_reference_path is not None:
             ref = load_reference_ee_poses(self._align_reference_path, ik)
             assert ref is not None
-            self._align_gate = ReferenceAlignmentGate(*ref)
+            # Gate the head against the NOMINAL head pose (self.T_base_head, the WBC nominal
+            # posture head FK in the base frame) so an episode only starts once the operator
+            # has brought the robot's head back to nominal, in addition to the hands matching
+            # the reference EEF poses.
+            self._align_gate = ReferenceAlignmentGate(*ref, head_reference=self.T_base_head)
             print(
                 "[wbc_vr_leader] alignment reference loaded from "
                 f"{self._align_reference_path} "
                 f"(pos_tol={REFERENCE_ALIGN_POS_TOL_MM:g}mm, "
                 f"rot_tol={REFERENCE_ALIGN_ROT_TOL_DEG:g}deg, "
+                f"head_pos_tol={REFERENCE_ALIGN_HEAD_POS_TOL_MM:g}mm, "
+                f"head_rot_tol={REFERENCE_ALIGN_HEAD_ROT_TOL_DEG:g}deg, "
                 f"stable={REFERENCE_ALIGN_STABLE_S:g}s)."
             )
         del ik  # solver no longer needed; we stream Cartesian EE + head targets
@@ -866,7 +874,8 @@ class WBCVRLeader:
                                 self._align_gate.reset()
                                 self._last_alignment_status = (
                                     self._align_gate.status(
-                                        self.last_left_target, self.last_right_target, now=now
+                                        self.last_left_target, self.last_right_target,
+                                        head_target, now=now,
                                     )
                                 )
                                 print(f"\n[wbc_vr_leader] calibrated -> align. "
@@ -889,7 +898,7 @@ class WBCVRLeader:
                         head_target=head_target, now=now)
                     assert self._align_gate is not None
                     alignment = self._align_gate.status(
-                        left_target, right_target, now=now
+                        left_target, right_target, head_target, now=now
                     )
                     self._last_alignment_status = alignment
                     if alignment is not None and alignment.ready:
@@ -1122,8 +1131,9 @@ def main() -> None:
                         help="optional raw-data episode HDF5 whose last obs/joint frame "
                              "defines the reference L/R EEF pose. When set, the leader "
                              "enters an align stage after calibration and only switches to "
-                             "teleop after the current hand targets match that reference "
-                             "within the fixed reference-alignment tolerances. Omit or "
+                             "teleop after the current hand targets match that reference AND "
+                             "the operator has returned the robot's head to its nominal pose, "
+                             "all within the fixed reference-alignment tolerances. Omit or "
                              "pass 'None' to disable.")
     parser.add_argument("--ee-offset-file", default=DEFAULT_EE_OFFSET_FILE,
                         help="YAML of per-side controller->gripper orientation offsets (scipy "

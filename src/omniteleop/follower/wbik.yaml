@@ -248,7 +248,7 @@ nominal_posture:
   # less down-pitch = less projected-yaw cone amplification: ~1.38x at 0, ~1.12x at -0.3).
   # Leave head_j2 (pan) and head_j3 (tilt, the live IK DOF) at 0: biasing head_j3 would
   # consume operator tilt authority instead.
-  head_j1: -0.3
+  head_j1: -0.40
   L_arm_j1: 0.844    # L_shape 0.064 + torso pitch 0.78
   L_arm_j2: 0.3      # L_shape
   L_arm_j4: -1.556   # L_shape
