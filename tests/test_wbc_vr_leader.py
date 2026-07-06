@@ -382,6 +382,53 @@ def test_reference_alignment_requires_stable_window():
     assert off.stable_s == 0.0
 
 
+def test_reference_alignment_gates_head_to_nominal():
+    leader_mod = _load_wbc_vr_leader()
+    ref_left = _pose(np.eye(3), np.array([0.4, 0.2, 1.0]))
+    ref_right = _pose(np.eye(3), np.array([0.4, -0.2, 1.0]))
+    head_ref = _pose(np.eye(3), np.array([0.1, 0.0, 1.5]))
+    gate = ref_align.ReferenceAlignmentGate(ref_left, ref_right, head_reference=head_ref)
+
+    # Hands on the reference but the head yawed/translated away from nominal -> blocked.
+    off_head = _pose(
+        ref_align.Rotation.from_euler("z", 40.0, degrees=True).as_matrix(),
+        head_ref[:3, 3] + np.array([0.2, 0.0, 0.0]),
+    )
+    blocked = gate.status(ref_left.copy(), ref_right.copy(), off_head, now=10.0)
+    assert blocked is not None
+    assert blocked.head_gated
+    assert blocked.left_ok and blocked.right_ok
+    assert not blocked.head_ok
+    assert not blocked.ready
+    assert blocked.stable_s == 0.0
+
+    # Head back at nominal -> starts accruing the stable window, then becomes ready.
+    first = gate.status(ref_left.copy(), ref_right.copy(), head_ref.copy(), now=20.0)
+    assert first is not None
+    assert first.head_ok and not first.ready
+    ready = gate.status(
+        ref_left.copy(), ref_right.copy(), head_ref.copy(),
+        now=20.0 + leader_mod.REFERENCE_ALIGN_STABLE_S,
+    )
+    assert ready is not None
+    assert ready.ready
+
+
+def test_reference_alignment_head_gate_blocks_on_missing_head():
+    ref_left = _pose(np.eye(3), np.array([0.4, 0.2, 1.0]))
+    ref_right = _pose(np.eye(3), np.array([0.4, -0.2, 1.0]))
+    head_ref = _pose(np.eye(3), np.array([0.1, 0.0, 1.5]))
+    gate = ref_align.ReferenceAlignmentGate(ref_left, ref_right, head_reference=head_ref)
+
+    # A gated head that is missing this tick (invalid headset frame) must not pass.
+    status = gate.status(ref_left.copy(), ref_right.copy(), None, now=10.0)
+    assert status is not None
+    assert status.head_gated
+    assert not np.all(np.isfinite(status.head_delta_mm))
+    assert not status.head_ok
+    assert not status.ready
+
+
 def test_follower_status_overlay_lines_show_hold_and_safety_warning():
     """The headset HUD should surface the real follower hold/safety state."""
     leader_mod = _load_wbc_vr_leader()

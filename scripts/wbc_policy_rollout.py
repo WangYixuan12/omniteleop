@@ -45,9 +45,30 @@ SDK). Absolute and relative checkpoints are both supported:
   between in-chunk pops (like ``follower/policy_rollout.py``) so every action
   popped from a diffusion chunk is de-relativized against the state at replan.
 
+Two sources can drive the loop (exactly one of ``--policy-path`` /
+``--replay-episode``): a live policy, or a recorded ``wbc_vr_robot.py --record``
+episode replayed VERBATIM at real time (1x) through the very same
+``TargetInterpolator`` -> ``ik.solve()`` -> ``actuate()`` path. The one replay
+difference: the stateful head LPF/planar-deadband filters are SKIPPED, because
+``action/head`` was recorded post-filter (the exact ``ik.solve()`` input) and
+re-filtering would double-process it. Replay still assembles the full
+observation (cameras + 32-D state) every command tick so its ``policy_io`` log
+diffs directly against a live rollout.
+
+``--align-reference FILE`` (required; pass ``none`` to deliberately skip) makes
+both modes start from the same physical configuration: after engage the robot
+autonomously glides its arms to the reference EEF poses (the leader's
+``load_reference_ee_poses``, head held at nominal), waits until the MEASURED
+poses hold within the leader's alignment tolerances, then blocks on Enter
+before the take actually starts. Recording begins only after that gate.
+
 Usage:
   python scripts/wbc_policy_rollout.py --policy-path /path/to/checkpoint \
+      --align-reference ~/Dexmate/data/raw_data/reference.hdf5 \
       [--auto-start] [--max-seconds 120] [--save-dir ~/Dexmate/data/raw_data_rollout]
+  python scripts/wbc_policy_rollout.py \
+      --replay-episode ~/Dexmate/data/raw_data/episode_0.hdf5 \
+      --align-reference ~/Dexmate/data/raw_data/reference.hdf5
 """
 
 from __future__ import annotations
@@ -55,6 +76,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -64,10 +86,23 @@ from omniteleop.wbc_policy_format import (
     STATE_AXES,
     WBCPolicyFK,
     build_state_vector,
+    mat_to_pos6d,
     pos6d_to_mat,
 )
 
 DEFAULT_ROLLOUT_SAVE_DIR = str(Path("~/Dexmate/data/raw_data_rollout").expanduser())
+DEFAULT_REPLAY_SAVE_DIR = str(Path("~/Dexmate/data/replay_raw_data").expanduser())
+DEFAULT_ALIGN_SECONDS = 3.0
+DEFAULT_ALIGN_TIMEOUT_S = 20.0
+# Recorded inter-frame gaps beyond this get a load-time warning: record_tick skips
+# during holds, so a legit take can gap; replay then holds (stale-source) and glides
+# across the gap -- safe, but the operator should know the take pauses.
+REPLAY_GAP_WARN_S = 0.5
+# Replay frame 0 must start near the robot's current (post-alignment) pose: a
+# distant first target would be commanded as a snap (clamp-limited, but a large
+# IK/base transient). Fail closed instead.
+REPLAY_START_POS_TOL_M = 0.15
+REPLAY_START_ROT_TOL_DEG = 30.0
 
 
 def split_policy_action(action: np.ndarray) -> dict[str, np.ndarray | np.float32]:
@@ -90,6 +125,345 @@ def split_policy_action(action: np.ndarray) -> dict[str, np.ndarray | np.float32
         "left_gripper": np.float32(action[9]),
         "right_gripper": np.float32(action[19]),
     }
+
+
+def encode_replay_action(
+    left: np.ndarray,
+    right: np.ndarray,
+    head: np.ndarray,
+    grip_left,
+    grip_right,
+) -> np.ndarray:
+    """Replayed targets -> the 29-D ``ACTION_AXES`` vector a policy would emit.
+
+    Only for the ``policy_io`` log, so replay and live rollouts are directly
+    diffable; the robot itself is driven from the 4x4 matrices, never from this
+    encoding.
+    """
+    grips = np.asarray([grip_left, grip_right], dtype=np.float32)
+    if not np.all(np.isfinite(grips)):
+        raise ValueError(f"replay gripper commands must be finite, got {grips}")
+    return np.concatenate(
+        [mat_to_pos6d(left), grips[:1], mat_to_pos6d(right), grips[1:2], mat_to_pos6d(head)]
+    ).astype(np.float32)
+
+
+@dataclass(frozen=True)
+class ReplayFrame:
+    """One released replay command: verbatim recorded targets + raw segment gap."""
+
+    index: int
+    left: np.ndarray
+    right: np.ndarray
+    head: np.ndarray
+    grip_left: np.floating
+    grip_right: np.floating
+    segment_duration: float
+
+
+class RecordedEpisodeSource:
+    """Real-time (1x) scheduler over a ``wbc_vr_robot.py --record`` episode.
+
+    Replays the REAL per-episode recorder schema (``action/eef/{left,right}``,
+    ``action/head``, ``action/gripper/{left,right}``, ``timestamp_ns``) --
+    deliberately NOT ``omniteleop.wbc_record.ReplaySource``, which replays the
+    pre-WBC leader-joint stream at scalable speed. Frame ``t`` is released once
+    ``timestamp_ns[t] - timestamp_ns[0]`` REAL seconds have elapsed since
+    :meth:`start`; there is no speed scaling anywhere in this class.
+    ``segment_duration`` is the raw inter-frame timestamp gap, meant for
+    ``TargetInterpolator.push(duration=...)`` so each glide spans the actual
+    recorded inter-command interval (frame 0 has no previous frame: 0.0, an
+    immediate snap -- the per-tick joint clamp bounds any residual step).
+
+    Known, deliberate property (plan.md Task 1): pushing frame ``t`` at its
+    release time and gliding over its trailing gap means ``ik.solve()`` reaches
+    frame ``t`` one segment (~one record period) after its recorded timestamp.
+    The trajectory SHAPE and total pacing are preserved; the whole replay is
+    uniformly late by ~1/record-rate, the same causal lag the interpolator adds
+    to live commands.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        import h5py  # noqa: PLC0415 -- only the replay path needs it
+
+        self.path = str(path)
+        with h5py.File(self.path, "r") as f:
+            left = self._required(f, "action/eef/left")
+            right = self._required(f, "action/eef/right")
+            head = self._required(f, "action/head")
+            grip_left = self._required(f, "action/gripper/left")
+            grip_right = self._required(f, "action/gripper/right")
+            ts = self._required(f, "timestamp_ns")
+
+        if ts.ndim != 1 or ts.shape[0] < 1:
+            raise RuntimeError(f"{self.path}: timestamp_ns must be (T>=1,), got {ts.shape}")
+        if not np.issubdtype(ts.dtype, np.integer):
+            raise RuntimeError(f"{self.path}: timestamp_ns must be integer ns, got {ts.dtype}")
+        n = int(ts.shape[0])
+        if n > 1 and not np.all(np.diff(ts) > 0):
+            raise RuntimeError(f"{self.path}: timestamp_ns must be strictly increasing")
+        for name, mats in (
+            ("action/eef/left", left),
+            ("action/eef/right", right),
+            ("action/head", head),
+        ):
+            if mats.shape != (n, 4, 4):
+                raise RuntimeError(f"{self.path}: {name} must be ({n},4,4), got {mats.shape}")
+            if not np.all(np.isfinite(mats)):
+                raise RuntimeError(f"{self.path}: {name} contains non-finite values")
+            for col in (0, 1):
+                norms = np.linalg.norm(mats[:, :3, col], axis=1)
+                bad = np.where(np.abs(norms - 1.0) > 1e-2)[0]
+                if bad.size:
+                    raise RuntimeError(
+                        f"{self.path}: {name} frame {int(bad[0])} rotation column {col} "
+                        f"has norm {norms[bad[0]]:.4f} (not unit); corrupt recording?"
+                    )
+        for name, grips in (
+            ("action/gripper/left", grip_left),
+            ("action/gripper/right", grip_right),
+        ):
+            if grips.shape != (n,):
+                raise RuntimeError(f"{self.path}: {name} must be ({n},), got {grips.shape}")
+            if not np.all(np.isfinite(grips)):
+                raise RuntimeError(f"{self.path}: {name} contains non-finite values")
+
+        self._left = np.asarray(left, dtype=np.float64)
+        self._right = np.asarray(right, dtype=np.float64)
+        self._head = np.asarray(head, dtype=np.float64)
+        # Raw dtype on purpose: replay must send bit-identical gripper commands.
+        self._grip_left = grip_left
+        self._grip_right = grip_right
+        self._rel_s = (ts - ts[0]).astype(np.float64) / 1e9
+        self._n = n
+        self._wall0: float | None = None
+        self._next = 0
+        if n > 1:
+            gaps = np.diff(self._rel_s)
+            big = gaps > REPLAY_GAP_WARN_S
+            if np.any(big):
+                print(f"[wbc_policy_rollout] WARNING: {self.path} has {int(big.sum())} "
+                      f"recorded gap(s) up to {float(gaps.max()):.2f}s (mid-take holds?); "
+                      "replay will hold, then glide across each gap at its recorded pace")
+
+    def _required(self, f, key: str) -> np.ndarray:
+        if key not in f:
+            raise RuntimeError(
+                f"{self.path}: missing required HDF5 dataset {key} -- replay needs an "
+                "episode recorded by the updated wbc_vr_robot.py --record"
+            )
+        return np.asarray(f[key])
+
+    @property
+    def n_frames(self) -> int:
+        return self._n
+
+    @property
+    def duration_s(self) -> float:
+        return float(self._rel_s[-1])
+
+    @property
+    def released(self) -> int:
+        return self._next
+
+    @property
+    def done(self) -> bool:
+        return self._next >= self._n
+
+    def start(self, now: float) -> None:
+        """Anchor the wall clock; frame 0 is due immediately."""
+        self._wall0 = float(now)
+        self._next = 0
+
+    def advance(self, now: float) -> ReplayFrame | None:
+        """Release the next frame once its recorded time offset has elapsed.
+
+        At most one frame per call (a stalled loop catches up over the next few
+        100 Hz ticks, preserving every recorded waypoint); ``None`` while no
+        frame is due.
+        """
+        if self._wall0 is None:
+            raise RuntimeError("RecordedEpisodeSource.advance() called before start()")
+        if self.done:
+            return None
+        i = self._next
+        if now - self._wall0 < self._rel_s[i]:
+            return None
+        self._next = i + 1
+        return ReplayFrame(
+            index=i,
+            left=self._left[i],
+            right=self._right[i],
+            head=self._head[i],
+            grip_left=self._grip_left[i],
+            grip_right=self._grip_right[i],
+            segment_duration=0.0 if i == 0 else float(self._rel_s[i] - self._rel_s[i - 1]),
+        )
+
+
+def wbc_tick(
+    *,
+    ik,
+    driver,
+    enable: dict,
+    interp,
+    head_lpf,
+    head_deadband,
+    now: float,
+    dt: float,
+    grip_left,
+    grip_right,
+    last_cmd_wall: float | None,
+    live_head_filters: bool,
+    estop: bool = False,
+):
+    """One 100 Hz WBC tick: interpolate -> head shaping -> solve -> actuate -> record.
+
+    ``live_head_filters=False`` is the REPLAY path: ``action/head`` was recorded
+    verbatim POST-LPF/POST-deadband (the exact ``ik.solve()`` input at record
+    time), so re-running the stateful filters would double-process it -- extra
+    first-order lag plus a deadband on an already-shaped signal. Everything
+    else is identical in both modes: the per-tick joint-step clamp, hold logic,
+    and the closed-loop base PD inside ``driver.actuate()`` are hardware safety
+    layers, never target postprocessing, and must not be bypassed.
+    """
+    left_target, right_target, head_target = interp.at(now)
+    if live_head_filters:
+        head_target = head_lpf.filter(head_target, dt)
+        head_target = head_deadband.filter(head_target)
+    result = ik.solve(left_target, right_target, dt, head_target=head_target)
+    hold_reason = driver.extra_hold(now, last_cmd_wall, estop=estop)
+    # compute_hold_reason deliberately returns None on estop (the caller owns that
+    # layer), so estop must be OR'd in here, exactly like the teleop follower.
+    hold = estop or (not result.success) or result.held or (hold_reason is not None)
+    driver.actuate(result, float(grip_left), float(grip_right), enable, hold, dt)
+    if driver._episode is not None:  # noqa: SLF001 -- same recording path as teleop
+        driver.record_tick(result, hold, now, left_target=left_target,
+                           right_target=right_target, head_target=head_target)
+    return result, hold, hold_reason
+
+
+def load_alignment_references(path: str, ik) -> tuple[np.ndarray, np.ndarray]:
+    """Reference L/R EEF poses via the leader's loader (no reimplemented parsing)."""
+    from omniteleop.leader.wbc_reference_alignment import (  # noqa: PLC0415 -- heavy
+        load_reference_ee_poses,
+    )
+
+    ref = load_reference_ee_poses(path, ik)
+    if ref is None:
+        raise RuntimeError(f"alignment reference episode yielded no poses: {path!r}")
+    return ref
+
+
+def _achieved_world_ee_poses(driver, fk: WBCPolicyFK) -> tuple[np.ndarray, np.ndarray]:
+    """Where the arms ACTUALLY are: measured-joint FK composed with odometry."""
+    measured = driver._read_measured_joints()  # noqa: SLF001 -- deliberate reuse
+    for grp in ("torso", "left_arm", "right_arm", "head"):
+        if measured.get(grp) is None:
+            raise RuntimeError(f"measured {grp} joints unavailable; cannot verify alignment")
+    if driver._odom is None:  # noqa: SLF001
+        raise RuntimeError("odometry required to verify alignment in the world frame")
+    q = fk.q_from_raw(
+        measured["torso"], measured["left_arm"], measured["right_arm"], measured["head"],
+        base_xyyaw=np.asarray(driver._odom.pose, dtype=float),  # noqa: SLF001
+    )
+    return fk.frame_pose(fk.left_ee_frame, q), fk.frame_pose(fk.right_ee_frame, q)
+
+
+def run_reference_alignment(
+    *,
+    ik,
+    driver,
+    enable: dict,
+    interp,
+    head_lpf,
+    head_deadband,
+    left_ref: np.ndarray,
+    right_ref: np.ndarray,
+    head_current: np.ndarray,
+    dt: float,
+    read_achieved,
+    align_seconds: float = DEFAULT_ALIGN_SECONDS,
+    timeout_s: float = DEFAULT_ALIGN_TIMEOUT_S,
+    now_fn=time.perf_counter,
+    sleep_fn=time.sleep,
+) -> dict:
+    """Actively glide the arms to the reference EEF poses; return once settled.
+
+    Unlike the leader's passive ``ReferenceAlignmentGate`` (a human drives the
+    targets until they match), the robot drives ITSELF here: one interpolator
+    segment toward ``(left_ref, right_ref)`` over ``align_seconds`` while the
+    head HOLDS ``head_current`` -- the nominal pose captured right after
+    ``ik.reset()``, bit-for-bit the same nominal-head computation the leader
+    gates on, so holding it IS the head alignment. The loop is the standard
+    LIVE 100 Hz tick (head LPF/deadband active; clamp/hold/base-PD safety all
+    inherited). ``last_cmd_wall=now`` because the glide target is internally
+    generated -- there is no external source to go stale; odometry staleness
+    still holds through ``extra_hold``. Converged = both arms' MEASURED world
+    poses within the leader's tolerances for ``REFERENCE_ALIGN_STABLE_S``;
+    raises RuntimeError (hard abort -- the caller's ``finally`` stops motion)
+    if not converged within ``timeout_s``.
+    """
+    from omniteleop.leader.wbc_reference_alignment import (  # noqa: PLC0415 -- heavy
+        REFERENCE_ALIGN_POS_TOL_MM,
+        REFERENCE_ALIGN_ROT_TOL_DEG,
+        REFERENCE_ALIGN_STABLE_S,
+        pose_rotation_error_deg,
+    )
+
+    t_start = now_fn()
+    interp.push(left_ref, right_ref, head_current, now=t_start, duration=align_seconds)
+    stable_since: float | None = None
+    ticks = 0
+    last_print = t_start
+    pos_mm = (float("inf"), float("inf"))
+    rot_deg = (float("inf"), float("inf"))
+    while True:
+        now = now_fn()
+        if now - t_start > timeout_s:
+            raise RuntimeError(
+                f"[wbc_policy_rollout] reference alignment did not converge within "
+                f"{timeout_s:g}s (L {pos_mm[0]:.0f}mm/{rot_deg[0]:.1f}deg, "
+                f"R {pos_mm[1]:.0f}mm/{rot_deg[1]:.1f}deg vs tol "
+                f"{REFERENCE_ALIGN_POS_TOL_MM:g}mm/{REFERENCE_ALIGN_ROT_TOL_DEG:g}deg)"
+            )
+        wbc_tick(ik=ik, driver=driver, enable=enable, interp=interp,
+                 head_lpf=head_lpf, head_deadband=head_deadband, now=now, dt=dt,
+                 grip_left=0.0, grip_right=0.0, last_cmd_wall=now,
+                 live_head_filters=True)
+        ticks += 1
+        left_now, right_now = read_achieved()
+        pos_mm = (
+            float(np.linalg.norm(left_now[:3, 3] - left_ref[:3, 3]) * 1000.0),
+            float(np.linalg.norm(right_now[:3, 3] - right_ref[:3, 3]) * 1000.0),
+        )
+        rot_deg = (
+            pose_rotation_error_deg(left_ref, left_now),
+            pose_rotation_error_deg(right_ref, right_now),
+        )
+        ok = (
+            pos_mm[0] <= REFERENCE_ALIGN_POS_TOL_MM
+            and pos_mm[1] <= REFERENCE_ALIGN_POS_TOL_MM
+            and rot_deg[0] <= REFERENCE_ALIGN_ROT_TOL_DEG
+            and rot_deg[1] <= REFERENCE_ALIGN_ROT_TOL_DEG
+        )
+        if ok:
+            if stable_since is None:
+                stable_since = now
+            if now - stable_since >= REFERENCE_ALIGN_STABLE_S:
+                return {"elapsed": now - t_start, "ticks": ticks,
+                        "pos_err_mm": pos_mm, "rot_err_deg": rot_deg}
+        else:
+            stable_since = None
+        if now - last_print >= 0.5:
+            last_print = now
+            stable_s = 0.0 if stable_since is None else now - stable_since
+            print(f"[wbc_policy_rollout] aligning: L {pos_mm[0]:5.0f}mm/{rot_deg[0]:4.1f}deg "
+                  f"R {pos_mm[1]:5.0f}mm/{rot_deg[1]:4.1f}deg  "
+                  f"stable {stable_s:.1f}/{REFERENCE_ALIGN_STABLE_S:g}s", end="\r")
+        sleep = dt - (now_fn() - now)
+        if sleep > 0:
+            sleep_fn(sleep)
 
 
 def _load_wbc_vr_robot():
@@ -262,8 +636,8 @@ def _run_rollout(args: argparse.Namespace) -> None:
     missing = [g for g in ("torso", "arms", "head", "base") if not enable.get(g)]
     if missing:
         raise SystemExit(
-            f"[wbc_policy_rollout] rollout requires --enable torso,arms,head,base "
-            f"(missing: {', '.join(missing)}): the policy commands the whole body and "
+            f"[wbc_policy_rollout] rollout/replay requires --enable torso,arms,head,base "
+            f"(missing: {', '.join(missing)}): the action commands the whole body and "
             "the state needs odometry"
         )
 
@@ -275,11 +649,22 @@ def _run_rollout(args: argparse.Namespace) -> None:
         )
     print(f"[wbc_policy_rollout] model nq={ik.model.nq} head_mode={cfg.head_mode}")
 
-    print(f"[wbc_policy_rollout] loading policy {args.policy_path} ...")
-    policy = _PolicyBundle(args.policy_path)
-    print(f"[wbc_policy_rollout] policy on {policy.device}; head+"
-          f"{'wrist' if policy.use_wrist else 'no-wrist'} @ {policy.image_hw}; "
-          f"relative={policy.use_relative_actions} state_frame={policy.state_frame}")
+    source: RecordedEpisodeSource | None = None
+    policy: _PolicyBundle | None = None
+    if args.replay_episode:
+        source = RecordedEpisodeSource(args.replay_episode)
+        state_frame = "base"
+        mode = "replay"
+        print(f"[wbc_policy_rollout] replaying {args.replay_episode}: "
+              f"{source.n_frames} frames over {source.duration_s:.1f}s (real-time)")
+    else:
+        mode = "rollout"
+        print(f"[wbc_policy_rollout] loading policy {args.policy_path} ...")
+        policy = _PolicyBundle(args.policy_path)
+        state_frame = policy.state_frame
+        print(f"[wbc_policy_rollout] policy on {policy.device}; head+"
+              f"{'wrist' if policy.use_wrist else 'no-wrist'} @ {policy.image_hw}; "
+              f"relative={policy.use_relative_actions} state_frame={policy.state_frame}")
 
     fk = WBCPolicyFK(ik=ik)  # FK on the live solver's own model
     driver = mod.HardwareDriver(args, ik, cfg, enable)
@@ -299,20 +684,20 @@ def _run_rollout(args: argparse.Namespace) -> None:
         )
 
         if not args.auto_start:
-            input("[wbc_policy_rollout] robot homed. Press Enter to ENGAGE the policy "
+            input(f"[wbc_policy_rollout] robot homed. Press Enter to ENGAGE the {mode} "
                   "(Ctrl-C stops motion at any time) ... ")
 
-        # Engage: identical world-frame re-anchoring to the teleop follower.
+        # Engage: identical world-frame re-anchoring to the teleop follower. The
+        # odometry origin is zeroed HERE, before any alignment glide -- matching
+        # how a recorded episode's world frame was anchored at ITS engage edge
+        # (the leader's align stage also runs after engage, before recording).
         ik.reset()
         interp.reset(left0, right0, head0)
         head_lpf.reset(head0)
         head_deadband.reset(head0)
         driver.engage_reset(ik, left0, right0, head0)
-        policy.reset()
-        if driver._episode is not None:  # noqa: SLF001 -- record like a teleop take
-            driver._episode.start()  # noqa: SLF001
-            driver._next_record_t = 0.0  # noqa: SLF001
-        io_log.start()
+        if policy is not None:
+            policy.reset()
 
         # Wait for the first FC03 gripper replies so the state is finite.
         wait_t0 = time.perf_counter()
@@ -325,15 +710,43 @@ def _run_rollout(args: argparse.Namespace) -> None:
                 raise SystemExit("[wbc_policy_rollout] no FC03 gripper status within 5 s")
             time.sleep(0.05)
 
-        print(f"[wbc_policy_rollout] engaged: policy {args.cmd_rate:g} Hz over "
+        # Reference alignment: glide the arms to the shared start pose, then hand
+        # control to a human Enter-press. Runs BEFORE recording starts, so the
+        # glide is never part of the take (mirrors the leader's align stage).
+        start_left, start_right, start_head = left0, right0, head0
+        if args.align_reference:
+            left_ref, right_ref = load_alignment_references(args.align_reference, ik)
+            print(f"[wbc_policy_rollout] gliding to the reference pose from "
+                  f"{args.align_reference} ...")
+            run_reference_alignment(
+                ik=ik, driver=driver, enable=enable, interp=interp,
+                head_lpf=head_lpf, head_deadband=head_deadband,
+                left_ref=left_ref, right_ref=right_ref, head_current=head0, dt=dt,
+                read_achieved=lambda: _achieved_world_ee_poses(driver, fk),
+            )
+            start_left, start_right = left_ref, right_ref
+            # No 100 Hz ticks run while blocked on Enter: stop/hold everything so
+            # no chassis twist or in-flight position target survives the prompt.
+            driver.stop_all_motion()
+            input(f"\n[wbc_policy_rollout] at reference pose. Press Enter to actually "
+                  f"start the {mode} online ... ")
+
+        if driver._episode is not None:  # noqa: SLF001 -- record like a teleop take
+            driver._episode.start()  # noqa: SLF001
+            driver._next_record_t = 0.0  # noqa: SLF001
+        io_log.start()
+
+        print(f"[wbc_policy_rollout] engaged: {mode} over "
               f"WBC {args.ik_rate:g} Hz; recording -> {args.save_dir}")
         t0 = time.perf_counter()
         now = t0
         next_policy_t = now
+        if source is not None:
+            source.start(t0)
+        replay_end_wall: float | None = None
         last_cmd_wall: float | None = None
         grip_l = np.float32(0.0)
         grip_r = np.float32(0.0)
-        left_target, right_target, head_target = left0, right0, head0
         ticks = 0
         while True:
             now = time.perf_counter()
@@ -341,7 +754,66 @@ def _run_rollout(args: argparse.Namespace) -> None:
                 print(f"\n[wbc_policy_rollout] --max-seconds {args.max_seconds:g} reached.")
                 break
 
-            if now >= next_policy_t:
+            if source is not None:
+                frame = source.advance(now)
+                if frame is not None:
+                    # Same observation assembly as the live branch: exercises the
+                    # full camera/state pipeline during replay and yields a
+                    # policy_io log directly diffable against a live rollout.
+                    head_imgs = driver._grab_head_images()  # noqa: SLF001
+                    driver._grab_wrist_image()  # noqa: SLF001
+                    if head_imgs is None:
+                        raise RuntimeError("head camera delivered no frame at the replay tick")
+                    if frame.index == 0:
+                        # Frame 0 is a snap (duration 0): require it to start near
+                        # the robot's current pose (the aligned reference) so the
+                        # snap is a residual, never a jump. Fail closed otherwise.
+                        from omniteleop.leader.wbc_reference_alignment import (  # noqa: PLC0415
+                            pose_rotation_error_deg,
+                        )
+
+                        for name, tgt, cur in (("left", frame.left, start_left),
+                                               ("right", frame.right, start_right),
+                                               ("head", frame.head, start_head)):
+                            dist = float(np.linalg.norm(tgt[:3, 3] - cur[:3, 3]))
+                            rot = pose_rotation_error_deg(cur, tgt)
+                            if dist > REPLAY_START_POS_TOL_M or rot > REPLAY_START_ROT_TOL_DEG:
+                                raise RuntimeError(
+                                    f"replay frame 0 {name} target is {dist * 1000:.0f} mm / "
+                                    f"{rot:.0f} deg from the current pose (tol "
+                                    f"{REPLAY_START_POS_TOL_M * 1000:.0f} mm / "
+                                    f"{REPLAY_START_ROT_TOL_DEG:g} deg) -- align to "
+                                    "THIS episode's reference before replaying"
+                                )
+                    state = _build_state(driver, fk, state_frame)
+                    interp.push(frame.left, frame.right, frame.head,
+                                now=now, duration=frame.segment_duration)
+                    grip_l, grip_r = frame.grip_left, frame.grip_right
+                    last_cmd_wall = now
+                    io_log.record({
+                        "t": np.float64(now - t0),
+                        "timestamp_ns": np.int64(time.time_ns()),
+                        "state": state,
+                        "action": encode_replay_action(
+                            frame.left, frame.right, frame.head,
+                            frame.grip_left, frame.grip_right),
+                        "target": {
+                            "left": frame.left.astype(np.float32),
+                            "right": frame.right.astype(np.float32),
+                            "head": frame.head.astype(np.float32),
+                        },
+                        "base_pose": np.asarray(driver._odom.pose, np.float32),  # noqa: SLF001
+                        "inference_s": np.float32(0.0),  # no model ran
+                    })
+                    if source.done:
+                        # Let the last glide finish before stopping; at least one
+                        # tick must still run (a 1-frame episode has duration 0).
+                        replay_end_wall = now + max(frame.segment_duration, dt)
+                if replay_end_wall is not None and now >= replay_end_wall:
+                    print(f"\n[wbc_policy_rollout] replay finished: {source.n_frames} "
+                          f"frames in {now - t0:.1f}s.")
+                    break
+            elif now >= next_policy_t:
                 t_inf0 = time.perf_counter()
                 head_imgs = driver._grab_head_images()  # noqa: SLF001
                 wrist = driver._grab_wrist_image()  # noqa: SLF001
@@ -349,7 +821,7 @@ def _run_rollout(args: argparse.Namespace) -> None:
                     raise RuntimeError("head camera delivered no frame at the policy tick")
                 if policy.use_wrist and wrist is None:
                     raise RuntimeError("wrist camera delivered no frame at the policy tick")
-                state = _build_state(driver, fk, policy.state_frame)
+                state = _build_state(driver, fk, state_frame)
                 action = policy.select_action(
                     state, head_imgs[0], None if wrist is None else wrist[0]
                 )
@@ -376,21 +848,21 @@ def _run_rollout(args: argparse.Namespace) -> None:
                 if now > next_policy_t:
                     next_policy_t = now + cmd_period
 
-            left_target, right_target, head_target = interp.at(now)
-            head_target = head_lpf.filter(head_target, dt)
-            head_target = head_deadband.filter(head_target)
-            result = ik.solve(left_target, right_target, dt, head_target=head_target)
-            hold_reason = driver.extra_hold(now, last_cmd_wall, estop=False)
-            hold = (not result.success) or result.held or (hold_reason is not None)
-            driver.actuate(result, float(grip_l), float(grip_r), enable, hold, dt)
-            if driver._episode is not None:  # noqa: SLF001
-                driver.record_tick(result, hold, now, left_target=left_target,
-                                   right_target=right_target, head_target=head_target)
+            # Replay skips the stateful head filters: action/head is already
+            # post-LPF/post-deadband (see wbc_tick's docstring).
+            result, hold, hold_reason = wbc_tick(
+                ik=ik, driver=driver, enable=enable, interp=interp,
+                head_lpf=head_lpf, head_deadband=head_deadband, now=now, dt=dt,
+                grip_left=grip_l, grip_right=grip_r, last_cmd_wall=last_cmd_wall,
+                live_head_filters=(source is None),
+            )
 
             ticks += 1
             if ticks % 50 == 0:
                 state_str = f"HOLD:{hold_reason}" if hold_reason else ("hold" if hold else "run")
-                print(f"t={now - t0:6.1f}s  {state_str:12s} "
+                progress = (f"frame {source.released}/{source.n_frames}  "
+                            if source is not None else "")
+                print(f"t={now - t0:6.1f}s  {state_str:12s} {progress}"
                       f"errL={result.left_ee_error * 1000:5.1f}mm "
                       f"errR={result.right_ee_error * 1000:5.1f}mm  "
                       f"{result.safety_status}", end="\r")
@@ -414,16 +886,28 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--policy-path", required=True,
-                        help="LeRobot checkpoint dir trained on the WBC 32/29 schema.")
+    parser.add_argument("--policy-path", default=None,
+                        help="LeRobot checkpoint dir trained on the WBC 32/29 schema "
+                             "(exactly one of --policy-path / --replay-episode).")
+    parser.add_argument("--replay-episode", default=None,
+                        help="recorded episode_*.hdf5 (wbc_vr_robot.py --record schema) "
+                             "to replay verbatim at real time through the same "
+                             "actuation path (exactly one of --policy-path / "
+                             "--replay-episode).")
+    parser.add_argument("--align-reference", default=None,
+                        help="reference episode HDF5: after engage, glide the arms to "
+                             "its final-frame EEF poses and wait for Enter before the "
+                             "take starts. Required in both modes; pass 'none' to "
+                             "deliberately start from the current pose instead.")
     parser.add_argument("--enable", default="arms,torso,head,base",
                         help="DOF groups to actuate (rollout requires all four; the "
                              "grippers are always active).")
     parser.add_argument("--namespace", default="",
                         help="Zenoh namespace (matches wbc_vr_robot; default empty).")
-    parser.add_argument("--save-dir", default=DEFAULT_ROLLOUT_SAVE_DIR,
-                        help=f"rollout episode + policy_io logs (default "
-                             f"{DEFAULT_ROLLOUT_SAVE_DIR}).")
+    parser.add_argument("--save-dir", default=None,
+                        help=f"episode + policy_io logs (default "
+                             f"{DEFAULT_ROLLOUT_SAVE_DIR} with --policy-path, "
+                             f"{DEFAULT_REPLAY_SAVE_DIR} with --replay-episode).")
     parser.add_argument("--auto-start", action="store_true",
                         help="skip the Enter-to-engage prompt.")
     parser.add_argument("--max-seconds", type=float, default=0.0,
@@ -438,14 +922,29 @@ def main() -> None:
     hw.add_argument("--base-quiet-hold-s", type=float,
                     default=mod.DEFAULT_BASE_QUIET_HOLD_S)
     hw.add_argument("--record-rate", type=float, default=mod.DEFAULT_RECORD_RATE)
+    hw.add_argument("--record-stale-grace", type=float,
+                    default=mod.DEFAULT_RECORD_STALE_GRACE)
     args = parser.parse_args()
 
-    # Rollouts always record (episode + policy IO); the HardwareDriver builds the
-    # cameras only under record=True and the policy needs them anyway.
+    if bool(args.policy_path) == bool(args.replay_episode):
+        parser.error("exactly one of --policy-path / --replay-episode is required")
+    if args.align_reference is None:
+        parser.error("--align-reference is required (pass '--align-reference none' to "
+                     "deliberately start from the current pose)")
+    from omniteleop.leader.wbc_reference_alignment import (  # noqa: PLC0415 -- heavy
+        optional_reference_path,
+    )
+    # 'none'/'null'/'' -> None: alignment explicitly skipped.
+    args.align_reference = optional_reference_path(args.align_reference)
+    if args.save_dir is None:
+        args.save_dir = (DEFAULT_REPLAY_SAVE_DIR if args.replay_episode
+                         else DEFAULT_ROLLOUT_SAVE_DIR)
+
+    # Both modes always record (episode + policy IO); the HardwareDriver builds the
+    # cameras only under record=True and the observation pipeline needs them anyway.
     args.record = True
     args.replay = None
     args.debug_dir = None
-    args.speed = mod.DEFAULT_SPEED
     # Control-loop tunables sourced from wbik.yaml's vr_teleop: block, exactly like
     # wbc_vr_robot.main(): one namespace, YAML stays the single source of truth.
     args.ik_rate = mod.DEFAULT_IK_RATE
