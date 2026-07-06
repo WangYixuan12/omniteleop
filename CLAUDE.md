@@ -8,7 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Think before writing. Inspect relevant files, existing patterns, and comments to match project conventions.
 
 ### Plan
-- Proactively check edge cases. When inputs, specs, or constraints are unclear, pause and ask clarifying questions to confirm intent.
+- Proactively check edge cases. 
+- Proactively ask clarifying questions to confirm intent, until inputs, specs, and constraints are clear. Do not assume anything ambiguous.
 
 ### Implement
 - Refer to /home/yixuan/omniteleop/dexcontrol (also in conda env dexmate) to understand, but do not touch it.
