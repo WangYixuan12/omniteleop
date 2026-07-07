@@ -11,11 +11,11 @@ Drives the real robot from a LeRobot checkpoint trained on the
 
 The action is decoded with NO base composition, ever: ``split_policy_action``
 only rebuilds the three 4x4 poses (Gram-Schmidt on the 6-D rotation) and the
-policy's world targets go straight into the SAME ``TargetInterpolator`` ->
-head LPF/planar deadband -> ``ik.solve(left, right, dt, head_target=...)``
-path the teleop follower runs (``wbc_vr_robot.py``), with
-``WBCConfig(head_mode="ik")`` so camera pan keeps resolving through base yaw
-exactly as in the training data. Engage mirrors teleop: ``ik.reset()`` +
+policy's world targets go straight into the ``TargetInterpolator`` ->
+``ik.solve(left, right, dt, head_target=...)`` path. The learned/replayed head
+target is already the post-LPF/post-deadband solver input recorded in
+``action/head``, so rollout does not filter it a second time. Engage mirrors
+teleop: ``ik.reset()`` +
 ``OdometryThread.reset_origin()`` re-anchor the world frame at the rollout
 start pose.
 
@@ -319,12 +319,13 @@ def wbc_tick(
 ):
     """One 100 Hz WBC tick: interpolate -> head shaping -> solve -> actuate -> record.
 
-    ``live_head_filters=False`` is the REPLAY path: ``action/head`` was recorded
-    verbatim POST-LPF/POST-deadband (the exact ``ik.solve()`` input at record
-    time), so re-running the stateful filters would double-process it -- extra
-    first-order lag plus a deadband on an already-shaped signal. Everything
-    else is identical in both modes: the per-tick joint-step clamp, hold logic,
-    and the closed-loop base PD inside ``driver.actuate()`` are hardware safety
+    ``live_head_filters=False`` is the policy/replay path: ``action/head`` was
+    trained/recorded as the POST-LPF/POST-deadband pose (the exact ``ik.solve()``
+    input), so re-running the stateful filters would double-process it -- extra
+    first-order lag plus a deadband on an already-shaped signal. Alignment still
+    passes ``True`` because it creates a fresh live glide target. Everything else
+    is identical in both modes: the per-tick joint-step clamp, hold logic, and
+    the closed-loop base PD inside ``driver.actuate()`` are hardware safety
     layers, never target postprocessing, and must not be bypassed.
     """
     left_target, right_target, head_target = interp.at(now)
@@ -848,13 +849,13 @@ def _run_rollout(args: argparse.Namespace) -> None:
                 if now > next_policy_t:
                     next_policy_t = now + cmd_period
 
-            # Replay skips the stateful head filters: action/head is already
-            # post-LPF/post-deadband (see wbc_tick's docstring).
+            # Policy/replay head targets skip the stateful filters: action/head is
+            # already post-LPF/post-deadband (see wbc_tick's docstring).
             result, hold, hold_reason = wbc_tick(
                 ik=ik, driver=driver, enable=enable, interp=interp,
                 head_lpf=head_lpf, head_deadband=head_deadband, now=now, dt=dt,
                 grip_left=grip_l, grip_right=grip_r, last_cmd_wall=last_cmd_wall,
-                live_head_filters=(source is None),
+                live_head_filters=False,
             )
 
             ticks += 1

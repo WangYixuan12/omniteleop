@@ -61,6 +61,7 @@ Run in the dexmate conda env (pinocchio + pink + dexcomm + dexcontrol)
 from __future__ import annotations
 
 import argparse
+import ast
 import threading
 import time
 from collections import deque
@@ -755,7 +756,39 @@ class HardwareDriver:
             if not connected:
                 bad.append(f"{name}: disconnected")
             if operation == OperationalStatusEnum.ERROR or error_msg:
-                bad.append(f"{name}: {error_msg or 'operation ERROR'}")
+                hint = ""
+                if isinstance(error_msg, str) and error_msg.startswith("{"):
+                    try:
+                        error_msg = ast.literal_eval(error_msg)
+                    except (SyntaxError, ValueError):
+                        pass
+                if isinstance(error_msg, dict):
+                    names = self._joint_names.get(name, ())
+                    side = {"left_arm": "left", "right_arm": "right"}.get(name)
+                    prefix = {"left_arm": "L_arm_j", "right_arm": "R_arm_j"}.get(name)
+                    remapped = {}
+                    for i, msg in error_msg.items():
+                        key = names[i] if isinstance(i, int) and 0 <= i < len(names) else i
+                        remapped[key] = msg
+                        joint_idx = i if isinstance(i, int) else None
+                        if (
+                            joint_idx is None
+                            and prefix
+                            and isinstance(key, str)
+                            and key.startswith(prefix)
+                        ):
+                            try:
+                                joint_idx = int(key[len(prefix):]) - 1
+                            except ValueError:
+                                pass
+                        if side and joint_idx is not None and 0 <= joint_idx < len(names):
+                            hint = (
+                                "; release brake with: python "
+                                "dexcontrol/examples/advanced_examples/disable_arm_motors.py "
+                                f"disable --side {side} --joint-idx {joint_idx} --release-brake"
+                            )
+                    error_msg = remapped
+                bad.append(f"{name}: {error_msg or 'operation ERROR'}{hint}")
             if name in requested and operation == OperationalStatusEnum.DISABLED:
                 bad.append(f"{name}: disabled but requested by --enable")
             if name in requested and operation == OperationalStatusEnum.CALIBRATING:

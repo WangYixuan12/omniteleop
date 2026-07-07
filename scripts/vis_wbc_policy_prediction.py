@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import sys
 import time
 from pathlib import Path
 
@@ -177,6 +178,7 @@ def _load_rollout_module():
     spec = importlib.util.spec_from_file_location("wbc_policy_rollout_for_vis", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    sys.modules[spec.name] = module  # dataclass string-annotation resolution needs this
     spec.loader.exec_module(module)
     return module
 
