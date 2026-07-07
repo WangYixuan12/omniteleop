@@ -26,12 +26,24 @@ data collection. Every rollout records:
 
   <save-dir>/episode_N.hdf5           the standard recorder schema (action/eef,
                                       action/head = the POLICY world targets)
-  <save-dir>/policy_io/episode_N.hdf5 per policy tick: state/action vectors,
-                                      decoded world targets, base pose, timing
+  <save-dir>/policy_io/episode_N.hdf5 live rollout: ONE record per predicted
+                                      chunk (state, full (n, 29) chunk, schedule
+                                      offsets, timing); replay: one record per
+                                      released command (state/action vectors)
 
-The loop is synchronous: policy inference runs inline at the 10 Hz tick, so a
-slow inference stalls WBC ticks (the joint clamp + interpolator glide absorb
-it; ``--source-timeout`` holds the base if inference stalls badly).
+Inference is asynchronous (ported from deps/rby1-wbc, see plan.md): an
+inference worker thread gathers ``n_obs_steps`` fresh observations at the
+dataset cadence, predicts a WHOLE action chunk every ``--policy-interval``
+seconds, stamps frame k with the wall-clock time ``t_obs + k / dataset_fps``,
+drops frames already unreachable by ``inference_end + --execution-latency``,
+and queues the rest into a ``ScheduledPolicyAction`` buffer. The main 100 Hz
+loop runs a 10 Hz sampler that lerps/slerps the scheduled trajectory at "now"
+and pushes one ``TargetInterpolator`` segment -- so a slow inference never
+stalls a WBC tick. If inference dies or the buffer runs dry, ``last_cmd_wall``
+stops advancing and the existing ``--source-timeout`` watchdog holds the robot.
+Scheduling math lives entirely on the workstation ``perf_counter`` timeline;
+the robot-clock camera ``timestamp_ns`` is used only for same-publisher
+freshness gating (never converted across clocks).
 
 Run in the dexmate_lerobot conda env ON the robot (needs lerobot + the hardware
 SDK). Absolute and relative checkpoints are both supported:
@@ -40,10 +52,10 @@ SDK). Absolute and relative checkpoints are both supported:
   policy emits world-frame targets directly.
 - ``use_relative_actions=true``: observation.state EEF/head must be WORLD-frame
   (port with ``--relative-actions``) because LeRobot's relative step subtracts
-  observation.state[:29] from the world action. The rollout builds world-frame
-  state and pins the RelativeActionsProcessorStep cache to the chunk-anchor state
-  between in-chunk pops (like ``follower/policy_rollout.py``) so every action
-  popped from a diffusion chunk is de-relativized against the state at replan.
+  observation.state[:29] from the world action. Chunk-level inference makes the
+  anchoring trivial: ``predict_chunk`` runs the preprocessor on the replan
+  observation (caching its state) and the postprocessor de-relativizes the WHOLE
+  chunk against that cached anchor in one call -- no queue peeking.
 
 Two sources can drive the loop (exactly one of ``--policy-path`` /
 ``--replay-episode``): a live policy, or a recorded ``wbc_vr_robot.py --record``
@@ -75,8 +87,13 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import itertools
+import threading
 import time
-from dataclasses import dataclass
+import traceback
+from collections import deque
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -89,6 +106,7 @@ from omniteleop.wbc_policy_format import (
     mat_to_pos6d,
     pos6d_to_mat,
 )
+from omniteleop.wbc_stream import _blend_pose  # numpy+scipy only, light import
 
 DEFAULT_ROLLOUT_SAVE_DIR = str(Path("~/Dexmate/data/raw_data_rollout").expanduser())
 DEFAULT_REPLAY_SAVE_DIR = str(Path("~/Dexmate/data/replay_raw_data").expanduser())
@@ -146,6 +164,172 @@ def encode_replay_action(
     return np.concatenate(
         [mat_to_pos6d(left), grips[:1], mat_to_pos6d(right), grips[1:2], mat_to_pos6d(head)]
     ).astype(np.float32)
+
+
+@dataclass(frozen=True)
+class ScheduledPolicyAction:
+    """One chunk frame scheduled for execution at a wall-clock time.
+
+    ``timestamp`` is an interpolation KNOT on the workstation ``perf_counter``
+    timeline (clock domain (a), plan.md Conventions) -- the moment the 10 Hz
+    sampler should command these targets -- not a hard release barrier: the
+    sampler blends between bracketing knots.
+    """
+
+    timestamp: float
+    left: np.ndarray            # (4, 4) world-frame ik.solve target
+    right: np.ndarray           # (4, 4)
+    head: np.ndarray            # (4, 4)
+    grip_left: np.float32
+    grip_right: np.float32
+
+
+def scheduled_actions_from_chunk(
+    chunk: np.ndarray, timestamps: np.ndarray
+) -> list[ScheduledPolicyAction]:
+    """Decode an ``(n, 29)`` action chunk + per-frame wall-clock timestamps.
+
+    Row ``k`` goes through ``split_policy_action`` (the same decode as a single
+    policy action: Gram-Schmidt re-orthonormalization, NO base composition) and
+    is paired with ``timestamps[k]``. Timestamps must be finite and strictly
+    increasing -- they are the synthesized ``t_obs + k * dataset_dt`` schedule.
+    """
+    chunk = np.asarray(chunk, dtype=np.float32)
+    ts = np.asarray(timestamps, dtype=np.float64).reshape(-1)
+    if chunk.ndim != 2 or chunk.shape[0] < 1 or chunk.shape[0] != ts.shape[0]:
+        raise ValueError(
+            f"chunk {chunk.shape} / timestamps {ts.shape}: expected (n>=1, "
+            f"{len(ACTION_AXES)}) with one timestamp per frame"
+        )
+    if not np.all(np.isfinite(ts)) or (ts.size > 1 and not np.all(np.diff(ts) > 0)):
+        raise ValueError("chunk timestamps must be finite and strictly increasing")
+    out: list[ScheduledPolicyAction] = []
+    for k in range(chunk.shape[0]):
+        targets = split_policy_action(chunk[k])
+        out.append(ScheduledPolicyAction(
+            timestamp=float(ts[k]),
+            left=targets["left"], right=targets["right"], head=targets["head"],
+            grip_left=targets["left_gripper"], grip_right=targets["right_gripper"],
+        ))
+    return out
+
+
+def drop_stale_actions(
+    actions: Sequence[ScheduledPolicyAction], cutoff: float
+) -> list[ScheduledPolicyAction]:
+    """Drop chunk frames not strictly after ``cutoff`` (inference end + latency).
+
+    Port of rby1_wbc_policy.py's PD1.2 stale-action handling: a frame whose
+    desired time precedes the soonest achievable execution time would ask the
+    robot to time-travel, so it is DISCARDED -- the chunk is never time-shifted
+    (that would hide latency as a systematic lag). Sorted input means only
+    leading frames drop; an all-stale chunk returns ``[]`` (caller logs it).
+    """
+    if not np.isfinite(cutoff):
+        raise ValueError(f"stale cutoff must be finite, got {cutoff}")
+    return [a for a in actions if a.timestamp > cutoff]
+
+
+def _interpolate_scheduled(
+    prev: ScheduledPolicyAction, future: ScheduledPolicyAction, query_time: float
+) -> ScheduledPolicyAction:
+    """Blend two scheduled actions at ``query_time`` (lerp pos/grip, slerp rot)."""
+    if future.timestamp <= prev.timestamp:
+        return future
+    alpha = float(np.clip(
+        (query_time - prev.timestamp) / (future.timestamp - prev.timestamp), 0.0, 1.0
+    ))
+    return ScheduledPolicyAction(
+        timestamp=float(query_time),
+        left=_blend_pose(prev.left, future.left, alpha),
+        right=_blend_pose(prev.right, future.right, alpha),
+        head=_blend_pose(prev.head, future.head, alpha),
+        grip_left=np.float32((1.0 - alpha) * float(prev.grip_left)
+                             + alpha * float(future.grip_left)),
+        grip_right=np.float32((1.0 - alpha) * float(prev.grip_right)
+                              + alpha * float(future.grip_right)),
+    )
+
+
+class ActionScheduleBuffer:
+    """Thread-safe scheduled-action buffer + sampler (port of rby1_policy.py).
+
+    ``queue()`` (inference thread) lets the newest chunk overwrite overlapping
+    FUTURE entries and trims entries already in the past (``queue_actions``,
+    rby1_policy.py 717-731). ``sample()`` (main thread, 10 Hz) evaluates the
+    scheduled trajectory at a query time: previous/future bracketing knots,
+    positions/grippers lerped, rotations slerped, anchored on the LAST EXECUTED
+    sample for continuity across replans (``_last_executed_action``); before the
+    first knot the first knot passes through verbatim.
+
+    Deliberate deviation from rby1 (plan.md hold semantics): rby1 returns the
+    final scheduled action verbatim FOREVER once the trajectory is exhausted,
+    which keeps ``last_cmd_wall`` fresh and defeats the stale-source watchdog.
+    Here the terminal knot is returned exactly once (so the final waypoint is
+    actually commanded); afterwards ``sample()`` returns ``None``, the caller
+    stops advancing ``last_cmd_wall``, and the untouched ``compute_hold_reason``
+    watchdog holds the robot after ``--source-timeout`` -- covering a dead or
+    stalled inference thread. Behaviorally identical otherwise: the
+    ``TargetInterpolator`` holds its segment end with or without a verbatim
+    re-push.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._buffer: deque[ScheduledPolicyAction] = deque()
+        self._last_executed: ScheduledPolicyAction | None = None
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._buffer)
+
+    def queue(self, actions: Sequence[ScheduledPolicyAction], now: float) -> None:
+        """Queue a chunk: the newest plan wins for the overlapping future."""
+        actions = list(actions)
+        if not actions:
+            raise ValueError("queue() requires at least one scheduled action")
+        ts = [a.timestamp for a in actions]
+        if not all(np.isfinite(t) for t in ts) or any(
+            b <= a for a, b in itertools.pairwise(ts)
+        ):
+            raise ValueError(
+                "scheduled actions must carry finite, strictly increasing timestamps"
+            )
+        with self._lock:
+            while self._buffer and self._buffer[-1].timestamp >= actions[0].timestamp:
+                self._buffer.pop()
+            while self._buffer and self._buffer[0].timestamp < now:
+                self._buffer.popleft()
+            self._buffer.extend(actions)
+
+    def sample(self, query_time: float) -> ScheduledPolicyAction | None:
+        """Scheduled-trajectory value at ``query_time``; ``None`` when idle.
+
+        ``None`` before the first chunk arrives and once the trajectory is
+        exhausted (after the terminal knot has been returned once) -- the caller
+        must then NOT advance ``last_cmd_wall``, arming the source watchdog.
+        The returned action carries ``timestamp=query_time`` and is remembered
+        as the last-executed anchor for the next call.
+        """
+        with self._lock:
+            passed: ScheduledPolicyAction | None = None
+            while self._buffer and self._buffer[0].timestamp <= query_time:
+                passed = self._buffer.popleft()
+            future = self._buffer[0] if self._buffer else None
+            prev = self._last_executed
+            if prev is None or prev.timestamp > query_time:
+                prev = passed
+            if future is None:
+                out = passed  # terminal knot: commanded once, then None -> watchdog
+            elif prev is None:
+                out = future  # before the first knot: command it verbatim (early glide)
+            else:
+                out = _interpolate_scheduled(prev, future, query_time)
+            if out is None:
+                return None
+            executed = replace(out, timestamp=float(query_time))
+            self._last_executed = executed
+            return executed
 
 
 @dataclass(frozen=True)
@@ -477,8 +661,17 @@ def _load_wbc_vr_robot():
     return module
 
 
+@dataclass(frozen=True)
+class PolicyObservation:
+    """One raw (unbatched) policy observation sample."""
+
+    state: np.ndarray               # (32,) float32, frame per the checkpoint
+    head_rgb: np.ndarray            # (H, W, 3) uint8
+    wrist_rgb: np.ndarray | None    # (H, W, 3) uint8; None if the policy has no wrist
+
+
 class _PolicyBundle:
-    """Checkpoint + pre/post processors + observation assembly for the WBC schema."""
+    """Checkpoint + pre/post processors + chunk-level inference for the WBC schema."""
 
     def __init__(self, policy_path: str, device: str | None = None) -> None:
         import torch  # noqa: PLC0415 -- heavy, hardware/GPU path only
@@ -526,36 +719,49 @@ class _PolicyBundle:
         chw = in_feats["observation.images.head_rgb"].shape  # (C, H, W)
         self.image_hw = (int(chw[1]), int(chw[2]))
 
-        # Relative-action chunk anchoring: locate the RelativeActionsProcessorStep so
-        # every action popped from a diffusion chunk is de-relativized against the state
-        # at REPLAN (not the drifting current obs). Mirrors follower/policy_rollout.py.
-        self._relative_step = next(
+        self.n_obs_steps = int(getattr(pcfg, "n_obs_steps", 1))
+        n_action_steps = getattr(pcfg, "n_action_steps", None)
+        if n_action_steps is None:
+            raise ValueError("checkpoint config lacks n_action_steps; cannot chunk")
+        self.n_action_steps = int(n_action_steps)
+        if self.n_obs_steps < 1 or self.n_action_steps < 1:
+            raise ValueError(
+                f"bad checkpoint config: n_obs_steps={self.n_obs_steps} "
+                f"n_action_steps={self.n_action_steps}"
+            )
+        # Diffusion-family policies read observations from internal deques that
+        # predict_action_chunk stacks over n_obs_steps; ACT-family read the batch
+        # directly (single obs step). predict_chunk feeds the queues explicitly.
+        self._uses_obs_queues = hasattr(self.policy, "_queues")
+        if self.n_obs_steps > 1 and not self._uses_obs_queues:
+            raise ValueError(
+                f"policy type {pcfg.type!r} with n_obs_steps={self.n_obs_steps} but no "
+                "observation queues -- chunk-level inference unsupported"
+            )
+
+        # Relative checkpoints need the enabled RelativeActionsProcessorStep: the
+        # preprocessor caches the replan observation's state and the postprocessor
+        # de-relativizes the WHOLE (1, n, 29) chunk against it (broadcast add-back,
+        # empirically exact). No per-pop cache pinning / queue peeking remains.
+        relative_step = next(
             (s for s in self.pre.steps if isinstance(s, RelativeActionsProcessorStep)),
             None,
         )
-        self._chunk_anchor_active = (
-            self._relative_step is not None and self._relative_step.enabled
-        )
-        self._chunk_ref_state = None
-        if self.use_relative_actions and not self._chunk_anchor_active:
+        if self.use_relative_actions and (relative_step is None or not relative_step.enabled):
             raise ValueError(
                 "relative checkpoint but no enabled RelativeActionsProcessorStep in the "
                 "preprocessor -- cannot chunk-anchor; refusing to roll out"
             )
 
+        # select_action() compat state (vis_wbc_policy_prediction.py): rolling raw
+        # observation history + the unconsumed tail of the last predicted chunk.
+        self._obs_history: deque[PolicyObservation] = deque(maxlen=self.n_obs_steps)
+        self._chunk_tail: deque[np.ndarray] = deque()
+
     def reset(self) -> None:
         self.policy.reset()
-        self._chunk_ref_state = None
-
-    def _action_queue_len(self) -> int:
-        """Peek at the policy's internal action queue length (ACT or Diffusion)."""
-        q = getattr(self.policy, "_action_queue", None)
-        if q is not None:
-            return len(q)
-        queues = getattr(self.policy, "_queues", None)
-        if queues is not None and "action" in queues:
-            return len(queues["action"])
-        return -1
+        self._obs_history.clear()
+        self._chunk_tail.clear()
 
     def _chw(self, img_hwc: np.ndarray):
         import cv2  # noqa: PLC0415
@@ -566,36 +772,99 @@ class _PolicyBundle:
         t = self._torch.from_numpy(np.ascontiguousarray(img_hwc))
         return t.permute(2, 0, 1).float() / 255.0
 
-    def select_action(self, state: np.ndarray, head_rgb: np.ndarray,
-                      wrist_rgb: np.ndarray | None) -> np.ndarray:
-        state = np.asarray(state, dtype=np.float32).reshape(-1)
+    def _sample_dict(self, obs: PolicyObservation) -> dict:
+        """Validate one raw observation and build the (unbatched) sample dict."""
+        state = np.asarray(obs.state, dtype=np.float32).reshape(-1)
         if state.shape != (len(STATE_AXES),) or not np.all(np.isfinite(state)):
             raise ValueError(f"bad observation.state (shape {state.shape} or non-finite)")
         sample: dict = {
             "observation.state": self._torch.from_numpy(state),
-            "observation.images.head_rgb": self._chw(head_rgb),
+            "observation.images.head_rgb": self._chw(obs.head_rgb),
         }
         if self.use_wrist:
-            if wrist_rgb is None:
+            if obs.wrist_rgb is None:
                 raise ValueError("policy consumes wrist_rgb but no wrist frame is available")
-            sample["observation.images.wrist_rgb"] = self._chw(wrist_rgb)
+            sample["observation.images.wrist_rgb"] = self._chw(obs.wrist_rgb)
+        return sample
 
-        # Chunk anchoring (relative only): at replan (empty queue) the pre-processor
-        # caches the fresh state -> snapshot it as the chunk anchor after post(). For
-        # in-chunk pops (non-empty queue) restore that anchor before post() so
-        # AbsoluteActionsProcessorStep adds back the replan state, not the drifting
-        # current obs. No-op for absolute checkpoints.
-        qlen_before = self._action_queue_len() if self._chunk_anchor_active else -1
-        processed = self.pre(sample)
-        if self._chunk_anchor_active and qlen_before > 0:
-            self._relative_step.set_cached_state(self._chunk_ref_state)
+    def predict_chunk(self, obs_history: Sequence[PolicyObservation]) -> np.ndarray:
+        """One full forward pass -> ``(n_action_steps, 29)`` float32 ABSOLUTE actions.
+
+        ``obs_history`` is oldest-first at the DATASET cadence (1/fps apart, the
+        spacing the n_obs_steps>1 policy was trained on -- NOT the replan
+        interval), at most ``n_obs_steps`` long; shorter histories are left-padded
+        by repeating the oldest sample, exactly like LeRobot's ``populate_queues``
+        bootstraps an episode start. Frame 0 of the returned chunk is the
+        CURRENT-step command (modeling_diffusion.py extracts actions from
+        ``start = n_obs_steps - 1``).
+
+        Bypasses the policy's internal ACTION queue: each observation runs through
+        ``self.pre`` (so the RelativeActionsProcessorStep cache ends on the LAST =
+        replan observation), the observation queues are populated the way
+        ``modeling_diffusion.select_action`` does it, and ``predict_action_chunk``
+        runs once. ``self.post`` de-normalizes the whole ``(1, n, 29)`` chunk; for
+        relative checkpoints AbsoluteActionsProcessorStep broadcasts the cached
+        anchor over every frame, de-relativizing the entire chunk against the
+        replan state (empirically exact round trip).
+        """
+        from lerobot.policies.utils import populate_queues  # noqa: PLC0415
+        from lerobot.utils.constants import ACTION, OBS_IMAGES  # noqa: PLC0415
+
+        history = list(obs_history)
+        if not 1 <= len(history) <= self.n_obs_steps:
+            raise ValueError(
+                f"obs_history must hold 1..{self.n_obs_steps} samples, got {len(history)}"
+            )
+        history = [history[0]] * (self.n_obs_steps - len(history)) + history
+        batch = None
+        for obs in history:
+            batch = dict(self.pre(self._sample_dict(obs)))
+            # The pipeline emits a placeholder ACTION key at inference; it must not
+            # reach the queues (modeling_diffusion.select_action pops it likewise).
+            batch.pop(ACTION, None)
+            if self._uses_obs_queues:
+                if self.policy.config.image_features:
+                    batch[OBS_IMAGES] = self._torch.stack(
+                        [batch[key] for key in self.policy.config.image_features], dim=-4
+                    )
+                self.policy._queues = populate_queues(  # noqa: SLF001
+                    self.policy._queues, batch  # noqa: SLF001
+                )
         with self._torch.no_grad():
-            a = self.policy.select_action(processed)
-        a = self.post(a)
-        if self._chunk_anchor_active and qlen_before == 0:
-            cached = self._relative_step.get_cached_state()
-            self._chunk_ref_state = None if cached is None else cached.detach().clone()
-        return np.asarray(a.detach().cpu().numpy(), dtype=np.float32).reshape(-1)
+            chunk = self.policy.predict_action_chunk(batch)
+        if chunk.ndim != 3 or chunk.shape[0] != 1 or chunk.shape[1] < self.n_action_steps:
+            raise ValueError(
+                f"predict_action_chunk returned {tuple(chunk.shape)}; expected "
+                f"(1, >={self.n_action_steps}, {len(ACTION_AXES)})"
+            )
+        chunk = self.post(chunk[:, : self.n_action_steps])
+        out = np.asarray(chunk.detach().cpu().numpy(), dtype=np.float32)
+        out = out.reshape(-1, out.shape[-1])
+        if out.shape != (self.n_action_steps, len(ACTION_AXES)) or not np.all(
+            np.isfinite(out)
+        ):
+            raise ValueError(f"bad action chunk {out.shape} (or non-finite)")
+        return out
+
+    def select_action(self, state: np.ndarray, head_rgb: np.ndarray,
+                      wrist_rgb: np.ndarray | None) -> np.ndarray:
+        """One action per call at the dataset cadence (offline-eval compat shim).
+
+        Used by ``vis_wbc_policy_prediction.py``, NOT by the live rollout (its
+        inference worker calls :meth:`predict_chunk`). Keeps a rolling
+        ``n_obs_steps`` observation history, replans via :meth:`predict_chunk`
+        when the previous chunk is exhausted, and pops one frame per call --
+        the same replan cadence, observation history content, and chunk
+        anchoring as the old lerobot-internal-queue path.
+        """
+        self._obs_history.append(PolicyObservation(
+            state=np.asarray(state, dtype=np.float32).reshape(-1),
+            head_rgb=head_rgb,
+            wrist_rgb=wrist_rgb,
+        ))
+        if not self._chunk_tail:
+            self._chunk_tail.extend(self.predict_chunk(tuple(self._obs_history)))
+        return np.asarray(self._chunk_tail.popleft(), dtype=np.float32).reshape(-1)
 
 
 def _build_state(driver, fk: WBCPolicyFK, state_frame: str = "base") -> np.ndarray:
@@ -620,6 +889,193 @@ def _build_state(driver, fk: WBCPolicyFK, state_frame: str = "base") -> np.ndarr
     if not (np.isfinite(grip_l) and np.isfinite(grip_r)):
         raise RuntimeError("gripper obs still NaN (no FC03 reply yet); cannot build state")
     return build_state_vector(poses, base_pose, grip_l, grip_r, state_frame=state_frame)
+
+
+class _InferenceWorker:
+    """Async chunk inference: observation gathering + GPU forward OFF the 100 Hz thread.
+
+    Each cycle: gather ``n_obs_steps`` freshness-gated observations spaced
+    ``dataset_dt`` apart (the training cadence -- an n_obs_steps=2 policy must see
+    0.1 s obs spacing, not the replan interval), run ``predict_chunk``, stamp
+    frame ``k`` with ``t_obs + k * dataset_dt`` (``t_obs`` = the LAST
+    observation's local grab time; frame 0 is the current-step command), drop
+    frames not strictly after ``inference_end + execution_latency``, and queue
+    the survivors. All schedule math lives on the workstation ``perf_counter``
+    timeline; the robot-clock camera ``frame_ns`` stamps are used ONLY for the
+    same-publisher strictly-increasing freshness gate and logged raw for offline
+    delivery-latency TREND analysis (plan.md clock-domain rules).
+
+    THREADING AUDIT (plan.md Task 4 Step 3) -- every cross-thread call is a
+    read-only, thread-safe cache read:
+
+    * ``driver._grab_head_images`` / ``_grab_wrist_image``: dexcontrol camera
+      ``get_obs`` on zenoh subscriber caches (documented "Thread Safety: This
+      method is thread-safe", dexcontrol zed_camera.py).
+    * ``driver._read_measured_joints`` (via ``_build_state``): dexcontrol
+      ``get_joint_pos`` subscriber-cache reads.
+    * ``driver._odom.pose``: OdometryThread property, lock-protected copy.
+    * ``driver._last_obs_grip_left/right``: plain float reads (GIL-atomic),
+      written only by the main thread's gripper polling.
+
+    All hardware WRITES (actuate, gripper commands, record_tick) stay on the
+    main thread. ``io_log.record`` is called only from THIS thread in live mode
+    (bare list append; the main thread joins the worker before ``io_log.stop``).
+    A crash never dies silently: the traceback is printed and ``failed`` is set;
+    the main loop converts it into a clean shutdown through its ``finally``.
+    """
+
+    def __init__(self, *, policy: _PolicyBundle, driver, fk: WBCPolicyFK,
+                 buffer: ActionScheduleBuffer, io_log, t0: float, dataset_dt: float,
+                 policy_interval: float, execution_latency: float,
+                 stop_event: threading.Event) -> None:
+        if not np.isfinite(dataset_dt) or dataset_dt <= 0.0:
+            raise ValueError(f"dataset_dt must be finite and > 0, got {dataset_dt}")
+        if not np.isfinite(policy_interval) or policy_interval <= 0.0:
+            raise ValueError(f"policy_interval must be finite and > 0, got {policy_interval}")
+        if not np.isfinite(execution_latency) or execution_latency < 0.0:
+            raise ValueError(f"execution_latency must be finite and >= 0, got {execution_latency}")
+        self._policy = policy
+        self._driver = driver
+        self._fk = fk
+        self._buffer = buffer
+        self._io_log = io_log
+        self._t0 = float(t0)
+        self._dataset_dt = float(dataset_dt)
+        self._policy_interval = float(policy_interval)
+        self._execution_latency = float(execution_latency)
+        self._stop = stop_event
+        self.failed = threading.Event()
+        self.fail_reason = ""
+        self._last_head_ns = -1
+        self._last_wrist_ns = -1  # stays -1 when the policy has no wrist input
+        # Per-grab budget for a strictly-fresh frame: the cameras run ~15 fps, so a
+        # new frame normally lands well inside 2 dataset periods; beyond that the
+        # cycle is skipped and retried (record_tick's stale-grace abort backstops
+        # a truly stalled publisher from the main thread).
+        self._grab_timeout = max(2.0 * self._dataset_dt, 0.2)
+        self._skipped = 0
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="wbc-policy-inference"
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def join(self, timeout: float) -> bool:
+        """Join the worker; True when it exited within ``timeout``."""
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def _grab_fresh_observation(self) -> PolicyObservation | None:
+        """One freshness-gated observation, or None on timeout/stop.
+
+        Both publisher stamps must strictly advance past the previous sample this
+        worker used (same-clock comparison per publisher, mirroring record_tick's
+        guard): the policy must never see a camera frame twice.
+        """
+        deadline = time.perf_counter() + self._grab_timeout
+        while not self._stop.is_set():
+            head = self._driver._grab_head_images()  # noqa: SLF001 -- audited read
+            wrist = (
+                self._driver._grab_wrist_image()  # noqa: SLF001 -- audited read
+                if self._policy.use_wrist else None
+            )
+            head_ns = None if head is None else int(head[2])
+            wrist_ns = None if wrist is None else int(wrist[1])
+            fresh = head_ns is not None and head_ns > self._last_head_ns and (
+                not self._policy.use_wrist
+                or (wrist_ns is not None and wrist_ns > self._last_wrist_ns)
+            )
+            if fresh:
+                state = _build_state(self._driver, self._fk, self._policy.state_frame)
+                self._last_head_ns = head_ns
+                if wrist_ns is not None:
+                    self._last_wrist_ns = wrist_ns
+                return PolicyObservation(
+                    state=state, head_rgb=head[0],
+                    wrist_rgb=None if wrist is None else wrist[0],
+                )
+            if time.perf_counter() >= deadline:
+                return None
+            self._stop.wait(0.005)
+        return None
+
+    def _gather(self) -> tuple[list[PolicyObservation], float] | None:
+        """``n_obs_steps`` fresh observations at the dataset cadence + t_obs."""
+        obs_list: list[PolicyObservation] = []
+        prev_grab_t = 0.0
+        for i in range(self._policy.n_obs_steps):
+            if i:
+                self._stop.wait(
+                    max(0.0, prev_grab_t + self._dataset_dt - time.perf_counter())
+                )
+                if self._stop.is_set():
+                    return None
+            obs = self._grab_fresh_observation()
+            if obs is None:
+                return None
+            prev_grab_t = time.perf_counter()
+            obs_list.append(obs)
+        return obs_list, prev_grab_t
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.is_set():
+                cycle_t0 = time.perf_counter()
+                gathered = self._gather()
+                if gathered is None:
+                    if self._stop.is_set():
+                        break
+                    self._skipped += 1
+                    if self._skipped <= 3 or self._skipped % 20 == 0:
+                        print(f"\n[wbc_policy_rollout] inference worker: no fresh "
+                              f"camera frame within {self._grab_timeout:.2f}s "
+                              f"(skip #{self._skipped}); retrying")
+                    continue  # the grab loop already waited out its budget
+                obs_list, t_obs = gathered
+                t_pred0 = time.perf_counter()
+                chunk = self._policy.predict_chunk(obs_list)
+                t_end = time.perf_counter()
+                n = chunk.shape[0]
+                timestamps = t_obs + self._dataset_dt * np.arange(n, dtype=np.float64)
+                actions = scheduled_actions_from_chunk(chunk, timestamps)
+                kept = drop_stale_actions(actions, t_end + self._execution_latency)
+                if kept:
+                    self._buffer.queue(kept, now=t_end)
+                    if kept[-1].timestamp < t_end + self._policy_interval:
+                        print(f"\n[wbc_policy_rollout] WARNING: chunk covers only "
+                              f"{kept[-1].timestamp - t_end:.2f}s past inference end "
+                              f"but the next replan is ~{self._policy_interval:g}s away "
+                              f"(inference {t_end - t_pred0:.2f}s): the buffer will run "
+                              "dry -> stale-source holds. Lower --policy-interval or "
+                              "speed up inference.")
+                else:
+                    print(f"\n[wbc_policy_rollout] WARNING: entire chunk stale "
+                          f"(inference {t_end - t_pred0:.2f}s + latency "
+                          f"{self._execution_latency:g}s passed the last frame at "
+                          f"t_obs+{(n - 1) * self._dataset_dt:.2f}s); nothing queued")
+                self._io_log.record({
+                    "t": np.float64(t_obs - self._t0),
+                    "timestamp_ns": np.int64(time.time_ns()),
+                    "state": obs_list[-1].state,
+                    # FULL pre-drop chunk: constant (n_action_steps, 29) shape so
+                    # EpisodeRecorder can np.stack; n_dropped says what was queued.
+                    "action": chunk,
+                    "action_offsets_s": (timestamps - self._t0).astype(np.float64),
+                    "base_pose": np.asarray(self._driver._odom.pose, np.float32),  # noqa: SLF001
+                    "inference_s": np.float32(t_end - t_pred0),
+                    "obs_gather_s": np.float32(t_pred0 - cycle_t0),
+                    "n_dropped": np.int64(n - len(kept)),
+                    "head_frame_ns": np.int64(self._last_head_ns),
+                    "wrist_frame_ns": np.int64(self._last_wrist_ns),
+                })
+                self._stop.wait(
+                    max(0.0, self._policy_interval - (time.perf_counter() - cycle_t0))
+                )
+        except Exception as exc:  # surfaced via self.failed -- never a silent death
+            traceback.print_exc()
+            self.fail_reason = f"{type(exc).__name__}: {exc}"
+            self.failed.set()
 
 
 def _run_rollout(args: argparse.Namespace) -> None:
@@ -665,11 +1121,22 @@ def _run_rollout(args: argparse.Namespace) -> None:
         state_frame = policy.state_frame
         print(f"[wbc_policy_rollout] policy on {policy.device}; head+"
               f"{'wrist' if policy.use_wrist else 'no-wrist'} @ {policy.image_hw}; "
-              f"relative={policy.use_relative_actions} state_frame={policy.state_frame}")
+              f"relative={policy.use_relative_actions} state_frame={policy.state_frame}; "
+              f"n_obs_steps={policy.n_obs_steps} n_action_steps={policy.n_action_steps}")
+        chunk_coverage = policy.n_action_steps / args.dataset_fps
+        if args.policy_interval > chunk_coverage:
+            print(f"[wbc_policy_rollout] WARNING: --policy-interval "
+                  f"{args.policy_interval:g}s exceeds the chunk coverage "
+                  f"{chunk_coverage:g}s ({policy.n_action_steps} steps @ "
+                  f"{args.dataset_fps:g} fps): the scheduled buffer will run dry "
+                  "between replans -> periodic stale-source holds")
 
     fk = WBCPolicyFK(ik=ik)  # FK on the live solver's own model
     driver = mod.HardwareDriver(args, ik, cfg, enable)
     io_log = EpisodeRecorder(str(Path(args.save_dir) / "policy_io"))
+    schedule_buffer = ActionScheduleBuffer()
+    stop_event = threading.Event()
+    worker: _InferenceWorker | None = None
     try:
         dt = 1.0 / args.ik_rate
         cmd_period = 1.0 / args.cmd_rate
@@ -741,9 +1208,19 @@ def _run_rollout(args: argparse.Namespace) -> None:
               f"WBC {args.ik_rate:g} Hz; recording -> {args.save_dir}")
         t0 = time.perf_counter()
         now = t0
-        next_policy_t = now
+        next_cmd_t = now
         if source is not None:
             source.start(t0)
+        else:
+            # Start inference only now: observations must be post-engage/post-align
+            # (the odometry origin and ik.reset() world anchor are already set).
+            worker = _InferenceWorker(
+                policy=policy, driver=driver, fk=fk, buffer=schedule_buffer,
+                io_log=io_log, t0=t0, dataset_dt=1.0 / args.dataset_fps,
+                policy_interval=args.policy_interval,
+                execution_latency=args.execution_latency, stop_event=stop_event,
+            )
+            worker.start()
         replay_end_wall: float | None = None
         last_cmd_wall: float | None = None
         grip_l = np.float32(0.0)
@@ -754,6 +1231,10 @@ def _run_rollout(args: argparse.Namespace) -> None:
             if args.max_seconds > 0 and now - t0 >= args.max_seconds:
                 print(f"\n[wbc_policy_rollout] --max-seconds {args.max_seconds:g} reached.")
                 break
+            if worker is not None and worker.failed.is_set():
+                raise RuntimeError(
+                    f"[wbc_policy_rollout] inference worker died: {worker.fail_reason}"
+                )
 
             if source is not None:
                 frame = source.advance(now)
@@ -814,40 +1295,25 @@ def _run_rollout(args: argparse.Namespace) -> None:
                     print(f"\n[wbc_policy_rollout] replay finished: {source.n_frames} "
                           f"frames in {now - t0:.1f}s.")
                     break
-            elif now >= next_policy_t:
-                t_inf0 = time.perf_counter()
-                head_imgs = driver._grab_head_images()  # noqa: SLF001
-                wrist = driver._grab_wrist_image()  # noqa: SLF001
-                if head_imgs is None:
-                    raise RuntimeError("head camera delivered no frame at the policy tick")
-                if policy.use_wrist and wrist is None:
-                    raise RuntimeError("wrist camera delivered no frame at the policy tick")
-                state = _build_state(driver, fk, state_frame)
-                action = policy.select_action(
-                    state, head_imgs[0], None if wrist is None else wrist[0]
-                )
-                targets = split_policy_action(action)
-                interp.push(targets["left"], targets["right"], targets["head"],
-                            now=now, duration=cmd_period)
-                grip_l, grip_r = targets["left_gripper"], targets["right_gripper"]
-                last_cmd_wall = now
-                io_log.record({
-                    "t": np.float64(now - t0),
-                    "timestamp_ns": np.int64(time.time_ns()),
-                    "state": state,
-                    "action": action,
-                    "target": {
-                        "left": targets["left"].astype(np.float32),
-                        "right": targets["right"].astype(np.float32),
-                        "head": targets["head"].astype(np.float32),
-                    },
-                    "base_pose": np.asarray(driver._odom.pose, np.float32),  # noqa: SLF001
-                    "inference_s": np.float32(time.perf_counter() - t_inf0),
-                })
-                # Re-anchor if inference overran whole policy periods.
-                next_policy_t += cmd_period
-                if now > next_policy_t:
-                    next_policy_t = now + cmd_period
+            elif now >= next_cmd_t:
+                # 10 Hz command sampler: NO camera grab, state build, or GPU work
+                # on this thread -- the inference worker owns those. last_cmd_wall
+                # advances ONLY when the buffer yields a payload, so the untouched
+                # compute_hold_reason watchdog covers a dead/stalled worker
+                # (awaiting-command before the first chunk, stale-source once the
+                # trajectory is exhausted past --source-timeout). `now` is fresh at
+                # push time by construction (the old inline path backdated the
+                # interpolator segment by the inference duration).
+                scheduled = schedule_buffer.sample(now)
+                if scheduled is not None:
+                    interp.push(scheduled.left, scheduled.right, scheduled.head,
+                                now=now, duration=cmd_period)
+                    grip_l = scheduled.grip_left
+                    grip_r = scheduled.grip_right
+                    last_cmd_wall = now
+                next_cmd_t += cmd_period
+                if now > next_cmd_t:
+                    next_cmd_t = now + cmd_period
 
             # Policy/replay head targets skip the stateful filters: action/head is
             # already post-LPF/post-deadband (see wbc_tick's docstring).
@@ -873,7 +1339,15 @@ def _run_rollout(args: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         print("\n[wbc_policy_rollout] Ctrl-C: stopping motion.")
     finally:
+        # Order matters: signal the worker (instant), halt the robot immediately
+        # (never wait behind a GPU forward), then join the worker BEFORE stopping
+        # the io_log it records into (bare list append, single-writer contract).
+        stop_event.set()
         driver.stop_all_motion()
+        if worker is not None and not worker.join(timeout=10.0):
+            print("[wbc_policy_rollout] WARNING: inference worker still running after "
+                  "10s (GPU forward in flight?); the policy IO log may lose its last "
+                  "chunk record")
         if io_log.recording:
             path = io_log.stop()
             while io_log.saving:
@@ -913,6 +1387,18 @@ def main() -> None:
                         help="skip the Enter-to-engage prompt.")
     parser.add_argument("--max-seconds", type=float, default=0.0,
                         help="stop after this many seconds (0 = run until Ctrl-C).")
+    parser.add_argument("--policy-interval", type=float, default=0.4,
+                        help="seconds between inference-thread replans (default 0.4: "
+                             "replans halfway through an 8-step 10 Hz chunk; a chunk "
+                             "covers n_action_steps/--dataset-fps seconds).")
+    parser.add_argument("--execution-latency", type=float, default=0.0,
+                        help="stale-action cutoff offset: chunk frames scheduled at or "
+                             "before inference-end + this many seconds are dropped, "
+                             "never time-shifted (default 0.0).")
+    parser.add_argument("--dataset-fps", type=float, default=10.0,
+                        help="fps the TRAINING dataset was ported at (sets the "
+                             "synthesized chunk timestep and the observation-history "
+                             "spacing; default 10).")
     mod = _load_wbc_vr_robot()
     hw = parser.add_argument_group("hardware (defaults match wbc_vr_robot.py)")
     hw.add_argument("--home-tol", type=float, default=mod.DEFAULT_HOME_TOL)
@@ -964,6 +1450,12 @@ def main() -> None:
 
     if args.max_seconds < 0 or not np.isfinite(args.max_seconds):
         parser.error("--max-seconds must be finite and >= 0")
+    if not np.isfinite(args.policy_interval) or args.policy_interval <= 0:
+        parser.error("--policy-interval must be finite and > 0")
+    if not np.isfinite(args.execution_latency) or args.execution_latency < 0:
+        parser.error("--execution-latency must be finite and >= 0")
+    if not np.isfinite(args.dataset_fps) or args.dataset_fps <= 0:
+        parser.error("--dataset-fps must be finite and > 0")
     _run_rollout(args)
 
 
