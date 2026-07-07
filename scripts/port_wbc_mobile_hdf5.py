@@ -36,6 +36,14 @@ Sidecars per episode (not in the parquet):
     world_T_base(obs/base/pose) @ base_T_zed), ``base_extrinsic`` (base_T_zed
     from the state FK), ``intrinsic`` (static intrinsic rescaled to the output
     size, broadcast (T',3,3)).
+``debug/timing/episode_XXXXXX.npz`` key ``timestamp_ns`` (T',) always; plus, for
+    takes recorded with the timing-aware recorder, the per-frame capture stamps
+    ``head_frame_ns``/``left_wrist_frame_ns``/``grab_wall_ns`` (T',) and the 0-d
+    ``ntp_offset_ns``/``ntp_rtt_ns``/``ntp_queried_at_ns`` SoC clock calibration,
+    plus optional 0-d ``camera_ntp_{head,wrist}_*`` camera-publisher-host clock
+    calibration -- everything scripts/audit_episode_latency.py needs, preserved
+    through the port so latency analysis / camera-latency-correction ablations
+    never require the raw takes.
 
 Episode ordering & splits: raw ``episode_<N>.hdf5`` are ported in NUMERIC index
 order (the recorder writes non-zero-padded names, so a lexicographic sort is
@@ -271,6 +279,107 @@ def read_required_array(f: h5py.File, key: str, source: str | Path,
     return arr
 
 
+_TIMING_KEYS = ("head_frame_ns", "left_wrist_frame_ns", "grab_wall_ns")
+_NTP_KEYS = ("offset_ns", "rtt_ns", "queried_at_ns")
+_CAMERA_NTP_LABELS = ("head", "wrist")
+_CAMERA_NTP_INT_KEYS = ("offset_ns", "rtt_ns", "queried_at_ns")
+_CAMERA_NTP_STR_KEYS = ("sensor_id", "source")
+
+
+def load_episode_timing(f: h5py.File, source: str | Path,
+                        frame_count: int) -> dict | None:
+    """Optional per-frame capture-stamp block written by the timing-aware recorder.
+
+    Returns None for takes predating the timing fields (pre-2026-07 recorder).
+    When present the fields are validated aggressively: ALL of
+    ``obs/images/{head_frame_ns,left_wrist_frame_ns,grab_wall_ns}`` must exist
+    together (a partial set is a recorder bug, not an old take), be
+    ``(frame_count,)`` int64, positive, and strictly increasing (the recorder's
+    freshness gate forbids duplicate frames). ``meta/ntp`` is optional on top --
+    the recorder omits it when ``query_ntp`` fails -- but must be complete 0-d
+    int64 when present (``offset_ns`` may be negative; the others must not be).
+    Returned dict maps the per-frame keys to (T,) arrays and ``ntp_<key>`` to 0-d
+    arrays, matching the ``debug/timing`` sidecar layout. Optional
+    ``meta/camera_ntp/{head,wrist}`` groups are flattened to
+    ``camera_ntp_<label>_<key>`` scalar sidecar entries.
+    """
+    present = [key for key in _TIMING_KEYS if f"obs/images/{key}" in f]
+    if not present:
+        return None
+    if len(present) != len(_TIMING_KEYS):
+        missing = sorted(set(_TIMING_KEYS) - set(present))
+        raise RuntimeError(
+            f"{source}: partial timing fields -- obs/images has {present} but is "
+            f"missing {missing}; a timing-aware take must carry all of them"
+        )
+    timing: dict[str, np.ndarray] = {}
+    for key in _TIMING_KEYS:
+        arr = np.asarray(f[f"obs/images/{key}"][()])
+        if arr.shape != (frame_count,) or arr.dtype != np.int64:
+            raise RuntimeError(
+                f"{source}: obs/images/{key} must be ({frame_count},) int64, got "
+                f"{arr.shape} {arr.dtype}"
+            )
+        if np.any(arr <= 0):
+            raise RuntimeError(f"{source}: obs/images/{key} has non-positive stamps")
+        if arr.shape[0] > 1 and np.any(np.diff(arr) <= 0):
+            raise RuntimeError(
+                f"{source}: obs/images/{key} is not strictly increasing -- the "
+                "recorder freshness gate forbids duplicate frames; corrupt take"
+            )
+        timing[key] = arr
+    ntp_present = [key for key in _NTP_KEYS if f"meta/ntp/{key}" in f]
+    if ntp_present and len(ntp_present) != len(_NTP_KEYS):
+        missing = sorted(set(_NTP_KEYS) - set(ntp_present))
+        raise RuntimeError(
+            f"{source}: partial meta/ntp -- has {ntp_present}, missing {missing}"
+        )
+    for key in ntp_present:
+        val = np.asarray(f[f"meta/ntp/{key}"][()])
+        if val.shape != () or val.dtype != np.int64:
+            raise RuntimeError(
+                f"{source}: meta/ntp/{key} must be 0-d int64, got {val.shape} {val.dtype}"
+            )
+        if key != "offset_ns" and int(val) <= 0:
+            raise RuntimeError(f"{source}: meta/ntp/{key} must be positive, got {int(val)}")
+        timing[f"ntp_{key}"] = val
+    for label in _CAMERA_NTP_LABELS:
+        group_path = f"meta/camera_ntp/{label}"
+        if group_path not in f:
+            continue
+        node = f[group_path]
+        if not isinstance(node, h5py.Group):
+            raise RuntimeError(f"{source}: {group_path} must be an HDF5 group")
+        expected = set(_CAMERA_NTP_INT_KEYS) | set(_CAMERA_NTP_STR_KEYS)
+        present = {key for key in expected if f"{group_path}/{key}" in f}
+        if present != expected:
+            raise RuntimeError(
+                f"{source}: partial {group_path} -- has {sorted(present)}, "
+                f"missing {sorted(expected - present)}"
+            )
+        for key in _CAMERA_NTP_INT_KEYS:
+            val = np.asarray(f[f"{group_path}/{key}"][()])
+            if val.shape != () or val.dtype != np.int64:
+                raise RuntimeError(
+                    f"{source}: {group_path}/{key} must be 0-d int64, got "
+                    f"{val.shape} {val.dtype}"
+                )
+            if key != "offset_ns" and int(val) <= 0:
+                raise RuntimeError(
+                    f"{source}: {group_path}/{key} must be positive, got {int(val)}"
+                )
+            timing[f"camera_ntp_{label}_{key}"] = val
+        for key in _CAMERA_NTP_STR_KEYS:
+            val = np.asarray(f[f"{group_path}/{key}"][()])
+            if val.shape != () or val.dtype.kind not in "SUO":
+                raise RuntimeError(
+                    f"{source}: {group_path}/{key} must be a 0-d string/bytes scalar, "
+                    f"got {val.shape} {val.dtype}"
+                )
+            timing[f"camera_ntp_{label}_{key}"] = val
+    return timing
+
+
 def _validate_target_batch(name: str, mats: np.ndarray, source: str | Path) -> None:
     """(T,4,4) finite pose batch whose rotation columns are unit within tolerance."""
     if mats.ndim != 3 or mats.shape[1:] != (4, 4):
@@ -425,6 +534,7 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
         eef_right = read_required_array(f, "action/eef/right", hdf5_path)
         head_target = read_required_array(f, "action/head", hdf5_path)
         timestamp_ns = read_required_array(f, "timestamp_ns", hdf5_path)
+        timing = load_episode_timing(f, hdf5_path, rgb.shape[0])
 
     if rgb.ndim != 4 or rgb.shape[-1] != 3 or rgb.dtype != np.uint8:
         raise RuntimeError(f"{hdf5_path}: expected (T,H,W,3) uint8 head RGB, got "
@@ -498,6 +608,7 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
     return {
         "rgb": rgb, "wrist_rgb": wrist_rgb, "depth": depth, "intrinsic": intrinsic,
         "base_pose": base_pose, "frame_count": frame_count, "t0": t0,
+        "timestamp_ns": ts, "timing": timing,
     }
 
 
@@ -528,6 +639,21 @@ def build_features(resize_h: int, resize_w: int) -> dict:
 
 def _sidecar_path(variant_root: Path, kind: str, episode_idx: int) -> Path:
     return Path(variant_root) / "debug" / kind / f"episode_{episode_idx:06d}.npz"
+
+
+def timing_sidecar_arrays(ep: dict, start: int, end: int) -> dict[str, np.ndarray]:
+    """``debug/timing`` payload for the kept window ``[start, end)``.
+
+    The record-tick wall clock always; the capture stamps + once-per-run NTP and
+    camera-NTP calibrations ride along when the take has them (timing-aware recorder).
+    Per-frame (ndim 1) arrays are trimmed to the kept window like every other
+    stream; 0-d calibration scalars are copied verbatim.
+    """
+    arrays: dict[str, np.ndarray] = {"timestamp_ns": ep["timestamp_ns"][start:end]}
+    if ep["timing"] is not None:
+        for key, arr in ep["timing"].items():
+            arrays[key] = arr[start:end] if arr.ndim == 1 else arr
+    return arrays
 
 
 def _scaled_intrinsic(intrinsic: np.ndarray, raw_hw: tuple[int, int],
@@ -615,9 +741,14 @@ def add_episode(dataset, hdf5_path: Path, fk: WBCPolicyFK, resize_h: int,
         base_extrinsic=base_extrinsic,
         intrinsic=np.broadcast_to(intrinsic_resized, (kept, 3, 3)).copy(),
     )
-    logging.info("Ported %s: %d frames [%d,%d) of %d, sidecars %s / %s",
+
+    timing_path = _sidecar_path(variant_root, "timing", episode_idx)
+    timing_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(timing_path, **timing_sidecar_arrays(ep, start, end))
+
+    logging.info("Ported %s: %d frames [%d,%d) of %d, sidecars %s / %s / %s",
                  hdf5_path.name, kept, start, end, frame_count,
-                 depth_path.name, calib_path.name)
+                 depth_path.name, calib_path.name, timing_path.name)
     return frame_count, kept
 
 
@@ -797,8 +928,8 @@ def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: 
     Confirms ``observation.state``/``action`` for the split's first episode first kept
     frame match an independent recomputation (SAME FK model); the action EEF/head blocks
     are the VERBATIM world targets (no composition); grippers are binary; depth/calib are
-    NOT parquet features; and both sidecars round-trip. Needs lerobot -- only the real
-    conversion calls it (the dexmate-only unit tests never do).
+    NOT parquet features; and the depth/calib/timing sidecars round-trip. Needs lerobot --
+    only the real conversion calls it (the dexmate-only unit tests never do).
     """
     meta = dataset.meta
     logging.info("verify[%s]: fps=%s episodes=%s frames=%s robot=%s", split,
@@ -829,7 +960,8 @@ def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: 
     # Recompute the first stored frame independently (same FK) and pull the raw verbatim
     # targets to confirm the action is a straight copy (no base composition).
     ep = load_and_validate_episode(first_item["path"], fps)
-    start, _ = _resolve_window(ep["frame_count"], ep["t0"], first_item["trim"], first_item["path"])
+    start, end = _resolve_window(ep["frame_count"], ep["t0"], first_item["trim"],
+                                 first_item["path"])
     with h5py.File(first_item["path"], "r") as raw:
         action_eef, action_head = load_action_targets_world(raw, start)
         exp_state, exp_action = compute_frame_state_action(
@@ -882,12 +1014,29 @@ def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: 
     if not np.allclose(intrinsic_sc[0], expected_intrinsic, atol=1e-4):
         raise RuntimeError(f"verify[{split}]: calib intrinsic[0] != rescaled static intrinsic")
 
+    # Timing sidecar: the record-tick wall clock must round-trip exactly; the
+    # capture-stamp/NTP keys must be present iff the raw take carries them.
+    timing_path = _sidecar_path(variant_root, "timing", 0)
+    if not timing_path.exists():
+        raise RuntimeError(f"verify[{split}]: timing sidecar missing: {timing_path}")
+    with np.load(timing_path) as data:
+        timing_keys = set(data.keys())
+        ts_sc = data["timestamp_ns"]
+    if not np.array_equal(ts_sc, ep["timestamp_ns"][start:end]):
+        raise RuntimeError(f"verify[{split}]: timing sidecar timestamp_ns roundtrip mismatch")
+    expected_timing = set() if ep["timing"] is None else set(ep["timing"])
+    if timing_keys != expected_timing | {"timestamp_ns"}:
+        raise RuntimeError(
+            f"verify[{split}]: timing sidecar keys {sorted(timing_keys)} != raw take's "
+            f"{sorted(expected_timing | {'timestamp_ns'})}"
+        )
+
     logging.info(
         "verify[%s] OK: head_rgb=%s wrist_rgb=%s state=%s action=%s depth=%s "
-        "calib=extrinsic%s+base%s+intrinsic%s", split,
+        "calib=extrinsic%s+base%s+intrinsic%s timing=%s", split,
         tuple(head_rgb.shape), tuple(wrist_rgb.shape), tuple(state.shape), tuple(action.shape),
         tuple(depth_stack.shape), tuple(extrinsic_sc.shape), tuple(base_extrinsic_sc.shape),
-        tuple(intrinsic_sc.shape),
+        tuple(intrinsic_sc.shape), sorted(timing_keys),
     )
 
 

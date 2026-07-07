@@ -42,8 +42,9 @@ and pushes one ``TargetInterpolator`` segment -- so a slow inference never
 stalls a WBC tick. If inference dies or the buffer runs dry, ``last_cmd_wall``
 stops advancing and the existing ``--source-timeout`` watchdog holds the robot.
 Scheduling math lives entirely on the workstation ``perf_counter`` timeline;
-the robot-clock camera ``timestamp_ns`` is used only for same-publisher
-freshness gating (never converted across clocks).
+the camera ``timestamp_ns`` (SDK capture time on the camera-publisher-host
+clock) is used only for same-publisher freshness gating (never converted
+across clocks).
 
 Run in the dexmate_lerobot conda env ON the robot (needs lerobot + the hardware
 SDK). Absolute and relative checkpoints are both supported:
@@ -901,9 +902,11 @@ class _InferenceWorker:
     observation's local grab time; frame 0 is the current-step command), drop
     frames not strictly after ``inference_end + execution_latency``, and queue
     the survivors. All schedule math lives on the workstation ``perf_counter``
-    timeline; the robot-clock camera ``frame_ns`` stamps are used ONLY for the
-    same-publisher strictly-increasing freshness gate and logged raw for offline
-    delivery-latency TREND analysis (plan.md clock-domain rules).
+    timeline; the camera ``frame_ns`` stamps (SDK capture time, camera-publisher-
+    host clock) are used ONLY for the same-publisher strictly-increasing freshness
+    gate and logged raw for offline latency analysis -- join them against the
+    episode file's ``meta/camera_ntp`` from the same run for absolute staleness
+    (plan.md clock-domain rules).
 
     THREADING AUDIT (plan.md Task 4 Step 3) -- every cross-thread call is a
     read-only, thread-safe cache read:

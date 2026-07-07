@@ -22,7 +22,8 @@ the same pattern; this one adds the ZED-X-Mini/GMSL open, depth, and crop+resize
      ├─ publisher → sensors/<id>/right_rgb  (RGBImageCodec)            [opt-in]
      ├─ publisher → sensors/<id>/depth      (DepthImageCodec, float32 m)
      ├─ publisher → sensors/<id>/pose       (JsonDataCodec, quat+trans) [--enable-tracking]
-     └─ service   → sensors/<id>/info       (JsonDataCodec)
+     ├─ service   → sensors/<id>/info       (JsonDataCodec)
+     └─ service   → sensors/<id>/clock      (JsonDataCodec, publisher host clock)
 
 With ``--enable-tracking`` the SDK positional-tracking module (VSLAM+IMU) also
 runs and the camera pose in the tracking world is published each grab
@@ -229,6 +230,27 @@ def _depth_to_color(depth_m: np.ndarray) -> np.ndarray:
     return cv2.applyColorMap(gray, cv2.COLORMAP_TURBO)
 
 
+def _zed_image_timestamp_ns(zed: sl.Camera) -> int:
+    """SDK IMAGE timestamp for the latest successful grab(), in UNIX ns."""
+    timestamp = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE)
+    ns = int(timestamp.get_nanoseconds())
+    if ns <= 0:
+        raise RuntimeError("ZED SDK returned no IMAGE timestamp after grab()")
+    return ns
+
+
+def _clock_response(sensor_id: str, sequence: int) -> dict:
+    """NTP-style clock service response from this publisher host."""
+    t1 = time.time_ns()
+    return {
+        "server_receive_time_ns": int(t1),
+        "server_send_time_ns": int(time.time_ns()),
+        "source": "zed_publisher_host",
+        "sensor_id": str(sensor_id),
+        "sequence": int(sequence),
+    }
+
+
 def main() -> None:
     args = tyro.cli(Args)
     verify = args.verify or args.save_dir is not None
@@ -331,6 +353,7 @@ def main() -> None:
     depth_topic = f"sensors/{args.sensor_id}/depth"
     pose_topic = f"sensors/{args.sensor_id}/pose"
     info_topic = f"sensors/{args.sensor_id}/info"
+    clock_topic = f"sensors/{args.sensor_id}/clock"
 
     node = Node(name="head_zedx_pub", namespace=args.namespace)
     logger.info(
@@ -367,6 +390,7 @@ def main() -> None:
         "depth": {"published": 0, "last_timestamp_ns": 0},
         "pose": {"published": 0, "last_timestamp_ns": 0},
     }
+    sequence_state = {"latest": 0}
     info_stats = {"queries": 0, "last_log_s": 0.0}
 
     def _camera_info(_request: bytes | None = None) -> dict:
@@ -430,8 +454,14 @@ def main() -> None:
             "statistics": frame_stats,
         }
 
+    def _clock(_request: bytes | None = None) -> dict:
+        return _clock_response(args.sensor_id, sequence_state["latest"])
+
     info_service = node.create_service(
         info_topic, _camera_info, response_encoder=JsonDataCodec.encode
+    )
+    clock_service = node.create_service(
+        clock_topic, _clock, response_encoder=JsonDataCodec.encode
     )
     pub_topics = f"'{left_topic}'"
     if right_pub is not None:
@@ -442,6 +472,7 @@ def main() -> None:
         pub_topics += f", '{pose_topic}'"
     logger.info(f"Publishing on {pub_topics}  (depth={'on' if args.enable_depth else 'off'})")
     logger.info(f"Serving camera info on '{info_topic}'")
+    logger.info(f"Serving publisher clock on '{clock_topic}'")
     resolved = f"left={node.resolve_topic(left_topic)!r}"
     if right_pub is not None:
         resolved += f", right={node.resolve_topic(right_topic)!r}"
@@ -478,21 +509,36 @@ def main() -> None:
         while True:
             if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
                 continue
-            # Timestamp the captured frame before retrieve/crop/depth work. During
-            # slow frames this is the time FK should match against, not the later
-            # publish time after image processing.
-            ts = time.time_ns()
+            # SDK timestamp of the grabbed image. This rides the codec-preserved
+            # timestamp_ns field; extra payload keys are dropped by RGBImageCodec.
+            ts = _zed_image_timestamp_ns(zed)
 
             zed.retrieve_image(left_mat, sl.VIEW.LEFT)
             # ZED returns BGRA — convert to RGB (RGBImageCodec / vr_reader expect RGB).
             left_full = cv2.cvtColor(left_mat.get_data(), cv2.COLOR_BGRA2RGB)
             left_rgb = _crop_resize(left_full, args.crop, out_hw, cv2.INTER_AREA)
 
+            seq += 1
+            # Publish the policy-consumed RGB immediately. NEURAL depth retrieval can take
+            # most of a camera frame; putting RGB behind it makes the workstation select
+            # an older head image than the wrist image at record ticks.
+            left_pub.publish(
+                {"data": left_rgb, "timestamp_ns": ts, "sequence": seq,
+                 "width": out_w, "height": out_h}
+            )
+            sequence_state["latest"] = seq
+            frame_stats["left_rgb"]["published"] = seq
+            frame_stats["left_rgb"]["last_timestamp_ns"] = ts
+
             right_rgb = None
             if right_pub is not None:
                 zed.retrieve_image(right_mat, sl.VIEW.RIGHT)
                 right_full = cv2.cvtColor(right_mat.get_data(), cv2.COLOR_BGRA2RGB)
                 right_rgb = _crop_resize(right_full, args.crop, out_hw, cv2.INTER_AREA)
+                right_pub.publish(
+                    {"data": right_rgb, "timestamp_ns": ts, "sequence": seq,
+                     "width": out_w, "height": out_h}
+                )
 
             depth_safe = None
             if args.enable_depth:
@@ -543,16 +589,6 @@ def main() -> None:
                     "localization_only": args.localization_only,
                 }
 
-            seq += 1
-            left_pub.publish(
-                {"data": left_rgb, "timestamp_ns": ts, "sequence": seq,
-                 "width": out_w, "height": out_h}
-            )
-            if right_pub is not None:
-                right_pub.publish(
-                    {"data": right_rgb, "timestamp_ns": ts, "sequence": seq,
-                     "width": out_w, "height": out_h}
-                )
             if depth_pub is not None:
                 depth_pub.publish(
                     {"depth_values": depth_safe, "timestamp_ns": ts, "sequence": seq,
@@ -562,8 +598,6 @@ def main() -> None:
                 pose_msg["timestamp_ns"] = ts
                 pose_msg["sequence"] = seq
                 pose_pub.publish(pose_msg)
-            frame_stats["left_rgb"]["published"] = seq
-            frame_stats["left_rgb"]["last_timestamp_ns"] = ts
             if right_pub is not None:
                 frame_stats["right_rgb"]["published"] = seq
                 frame_stats["right_rgb"]["last_timestamp_ns"] = ts
@@ -650,6 +684,7 @@ def main() -> None:
         if args.enable_tracking:
             zed.disable_positional_tracking()
         zed.close()
+        clock_service.shutdown()
         info_service.shutdown()
         node.shutdown()
 

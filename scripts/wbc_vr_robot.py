@@ -55,6 +55,16 @@ NOT stored -- it was base-relative head FK (base-blind) and is recomputed offlin
 lands in the world frame (see ``scripts/vis_episode.py``). The wrist camera streams from
 ``sensors/wrist_zedm/*`` (needs an external ZED-SDK publisher; see vr_reader).
 
+Timing metadata for offline camera-latency audits (``scripts/audit_episode_latency.py``):
+each frame stores the publisher capture stamps ``obs/images/{head_frame_ns,
+left_wrist_frame_ns}`` (camera-publisher-host clock) and ``obs/images/grab_wall_ns``
+(workstation clock right after both grabs). ``meta/ntp`` preserves the robot
+SoC-minus-workstation offset from ``Robot.query_ntp()``; ``meta/camera_ntp`` stores
+camera-publisher-host-minus-workstation offsets from the ZED publishers' lightweight
+clock services and is required for new recordings. Absolute camera staleness should use ``camera_ntp``;
+the recorder itself keeps pairing the latest-ARRIVED image with fresh proprio (the
+training-consistent convention; see plan.md).
+
 Run in the dexmate conda env (pinocchio + pink + dexcomm + dexcontrol)
 """
 
@@ -69,7 +79,7 @@ from dataclasses import asdict
 from typing import Callable, Optional
 
 import numpy as np
-from dexcomm.codecs import DictDataCodec
+from dexcomm.codecs import DictDataCodec, JsonDataCodec
 
 from omniteleop.common import get_config
 from omniteleop.common.head_camera import ZED_K
@@ -143,6 +153,11 @@ DEFAULT_RECORD_STALE_GRACE = 0.20
 # (see leader/vr_reader.py + tests/test_wrist_zedm_depth.py). RGB-only; left eye only.
 _WRIST_SENSOR_ID = "wrist_zedm"
 _WRIST_OBS_KEY = "left_rgb"
+_HEAD_SENSOR_ID = "head_camera"
+_CAMERA_CLOCK_SAMPLE_COUNT = 15
+_CAMERA_CLOCK_MIN_SAMPLES = 8
+_CAMERA_CLOCK_TIMEOUT_S = 0.5
+_CAMERA_CLOCK_MAX_CONSECUTIVE_FAILURES = 3
 
 
 def _wbc_follower_status_topic() -> str:
@@ -210,6 +225,48 @@ def _publish_abort_status(source, exc: BaseException) -> None:
         time.sleep(0.25)  # let zenoh flush before teardown closes the session
     except Exception:
         pass
+
+
+def _camera_clock_topic(sensor_id: str) -> str:
+    return f"sensors/{sensor_id}/clock"
+
+
+def _ntp_offset_rtt_ns(t0: int, t1: int, t2: int, t3: int) -> tuple[int, int]:
+    """NTP-style offset/rtt in ns for client/workstation t0,t3 and server t1,t2."""
+    return round(((int(t1) - int(t0)) + (int(t2) - int(t3))) / 2.0), int(t3) - int(t0)
+
+
+def _bytes_scalar(text: str) -> np.ndarray:
+    return np.asarray(str(text).encode("utf-8"))
+
+
+def _camera_clock_calibration_from_samples(
+    samples: list[dict],
+    *,
+    sensor_id: str,
+    source: str,
+    queried_at_ns: int,
+) -> dict:
+    """Collapse NTP clock samples to the static ``meta/camera_ntp/*`` payload.
+
+    Keep the lower-RTT half to avoid obvious delayed replies while staying close to
+    dexcontrol's simple mean-offset style. Returns HDF5-safe scalar arrays.
+    """
+    valid = [
+        s for s in samples
+        if int(s.get("rtt_ns", 0)) > 0 and np.isfinite(float(s.get("offset_ns", 0)))
+    ]
+    if not valid:
+        raise ValueError("no valid camera clock samples")
+    valid.sort(key=lambda s: int(s["rtt_ns"]))
+    keep = valid[:max(1, (len(valid) + 1) // 2)]
+    return {
+        "offset_ns": np.int64(round(float(np.mean([int(s["offset_ns"]) for s in keep])))),
+        "rtt_ns": np.int64(round(float(np.mean([int(s["rtt_ns"]) for s in keep])))),
+        "queried_at_ns": np.int64(int(queried_at_ns)),
+        "sensor_id": _bytes_scalar(sensor_id),
+        "source": _bytes_scalar(source),
+    }
 
 
 # Hardware safety / bring-up defaults (robot-specific; conservative for a first slow
@@ -1150,12 +1207,11 @@ class HardwareDriver:
             monitor.send_status_request()
 
     def _await_record_cameras(self) -> None:
-        """Warn (don't fail) if the --record cameras aren't streaming yet.
+        """Require the --record cameras to be streaming before a take can start.
 
         head_camera + wrist_zedm are enabled in the --record Robot build. The wrist needs
-        an external ZED-SDK publisher on ``sensors/wrist_zedm/*``; if it isn't up yet,
-        record_tick skips frames until both stream, so warn but continue (it may start
-        before the first engage).
+        an external ZED-SDK publisher on ``sensors/wrist_zedm/*``. New recordings fail
+        early if either required camera is unavailable.
         """
         for cam in ("head_camera", _WRIST_SENSOR_ID):
             if not self.robot.has_sensor(cam):
@@ -1166,8 +1222,10 @@ class HardwareDriver:
             if hasattr(sensor, "wait_for_active") and not sensor.wait_for_active(timeout=5.0):
                 extra = (f" -- needs a ZED-SDK publisher on sensors/{_WRIST_SENSOR_ID}/*"
                          if cam == _WRIST_SENSOR_ID else "")
-                print(f"[wbc_vr_robot] WARNING: {cam} not active within 5s; record frames "
-                      f"are skipped until it streams{extra}.")
+                raise RuntimeError(
+                    f"[wbc_vr_robot] --record requires {cam} active before recording; "
+                    f"not active within 5s{extra}."
+                )
 
     def _init_recording(self) -> None:
         """Set up the optional vr_reader-format episode recorder (``--record``).
@@ -1185,7 +1243,11 @@ class HardwareDriver:
             does NOT store the per-frame ``extrinsic`` -- ``world_t_cam`` is recomputed offline
             from ``obs/base/pose`` + ``obs/joint`` (see ``scripts/vis_episode.py``).
         ``action/gripper`` is the leader trigger command, ``obs/gripper`` the Robotiq FC03
-        achieved position, and ``obs/images`` carries head_left_rgb/head_depth/left_wrist_rgb.
+        achieved position, and ``obs/images`` carries head_left_rgb/head_depth/left_wrist_rgb
+        plus the per-frame capture stamps (head_frame_ns/left_wrist_frame_ns/grab_wall_ns);
+        ``meta/ntp`` stores the once-per-run robot-SoC-vs-local clock offset, while
+        ``meta/camera_ntp`` stores camera-publisher-host-vs-local offsets
+        (see :meth:`_query_ntp_calibration` and :meth:`_query_camera_clock_calibrations`).
         """
         self._record_period = 0.0
         self._next_record_t = 0.0
@@ -1204,11 +1266,148 @@ class HardwareDriver:
         # head FK (base-blind, wrong once the base drives) and is fully recomputable, so it
         # is recomputed offline as world_t_cam = world_t_base(obs/base/pose) . FK_cam(obs/
         # joint) -- see scripts/vis_episode.py -- which lands the cloud in the world frame.
-        self._episode.set_static({"obs": {"images": {"intrinsic": ZED_K.astype(np.float32)}}})
+        static: dict = {"obs": {"images": {"intrinsic": ZED_K.astype(np.float32)}}}
+        static["meta"] = {
+            "ntp": self._query_ntp_calibration(),
+            "camera_ntp": self._query_camera_clock_calibrations(),
+        }
+        self._episode.set_static(static)
         print(f"[wbc_vr_robot] recording -> {self.args.save_dir} "
               f"(episode_{self._episode.episode_id}, {self.args.record_rate:g}Hz, "
               "head_left_rgb+head_depth+left_wrist_rgb, +torso action, +gripper obs/action, "
-              "+base pose obs)")
+              "+base pose obs, +frame capture stamps)")
+
+    def _query_ntp_calibration(self) -> dict:
+        """Robot->workstation clock offset, stored once per run as ``meta/ntp``.
+
+        ``offset_ns`` follows dexcontrol's NTP convention (server minus client, i.e.
+        robot SoC clock minus THIS machine's clock). This is preserved for diagnostics
+        and as a legacy fallback in the audit tool. ZED image stamps are produced by the
+        standalone camera publishers, so authoritative absolute camera staleness uses
+        ``meta/camera_ntp`` from :meth:`_query_camera_clock_calibrations`.
+
+        Raises before recording starts when unavailable: new takes must carry this
+        calibration so timing audits can identify the SoC-vs-camera-host distinction.
+        """
+        query = getattr(self.robot, "query_ntp", None)
+        if query is None:
+            raise RuntimeError("[wbc_vr_robot] --record requires Robot.query_ntp().")
+        try:
+            result = query(sample_count=15)
+        except Exception as exc:
+            raise RuntimeError(
+                f"[wbc_vr_robot] --record query_ntp failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        offset = float(result.get("offset", np.nan))
+        rtt = float(result.get("rtt", np.nan))
+        if not result.get("success") or not np.isfinite(offset) or not np.isfinite(rtt):
+            raise RuntimeError(f"[wbc_vr_robot] --record query_ntp unusable: {result}")
+        print(f"[wbc_vr_robot] NTP calibration: robot(SoC) - local = {offset * 1e3:+.2f} ms "
+              f"(rtt {rtt * 1e3:.2f} ms) -> meta/ntp")
+        return {
+            "offset_ns": np.int64(round(offset * 1e9)),
+            "rtt_ns": np.int64(round(rtt * 1e9)),
+            "queried_at_ns": np.int64(time.time_ns()),
+        }
+
+    def _query_camera_clock_calibrations(self) -> dict:
+        """Camera-publisher-host clock offsets, stored under ``meta/camera_ntp``.
+
+        The ZED image ``timestamp_ns`` fields are stamped by the standalone camera
+        publishers, not by the robot SoC. Querying ``Robot.query_ntp()`` is still useful
+        SoC metadata, but absolute camera staleness needs camera-host minus workstation
+        offsets from ``sensors/<sensor_id>/clock``.
+
+        Both head and wrist camera clock services are required for new recordings.
+        """
+        out: dict = {}
+        for label, sensor_id in (("head", _HEAD_SENSOR_ID), ("wrist", _WRIST_SENSOR_ID)):
+            out[label] = self._query_camera_clock_calibration(label, sensor_id)
+        return out
+
+    def _query_camera_clock_calibration(self, label: str, sensor_id: str) -> dict:
+        node = getattr(self.robot, "_node", None)
+        if node is None:
+            raise RuntimeError(
+                f"[wbc_vr_robot] --record requires a DexComm node for {label} "
+                "camera-host clock calibration."
+            )
+        topic = _camera_clock_topic(sensor_id)
+        try:
+            client = node.create_service_client(
+                service_name=topic,
+                request_encoder=JsonDataCodec.encode,
+                response_decoder=JsonDataCodec.decode,
+                timeout=_CAMERA_CLOCK_TIMEOUT_S,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"[wbc_vr_robot] cannot create {label} camera clock client {topic!r}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        samples: list[dict] = []
+        source = "zed_publisher_host"
+        failures = 0
+        last_error: Optional[BaseException] = None
+        for i in range(_CAMERA_CLOCK_SAMPLE_COUNT):
+            t0 = time.time_ns()
+            request = {
+                "client_send_time_ns": int(t0),
+                "sample_count": int(_CAMERA_CLOCK_SAMPLE_COUNT),
+                "sample_index": int(i),
+            }
+            try:
+                response = client.call(request)
+                t3 = time.time_ns()
+                if not isinstance(response, dict):
+                    raise ValueError(f"non-dict response {type(response).__name__}")
+                t1 = int(response.get("server_receive_time_ns", 0))
+                t2 = int(response.get("server_send_time_ns", 0))
+                if t1 <= 0 or t2 <= 0 or t2 < t1:
+                    raise ValueError(
+                        f"invalid server timestamps receive={t1!r} send={t2!r}"
+                )
+                reply_sensor = response.get("sensor_id")
+                if reply_sensor is not None and str(reply_sensor) != sensor_id:
+                    raise ValueError(
+                        f"sensor_id mismatch: expected {sensor_id!r}, got {reply_sensor!r}"
+                    )
+                offset_ns, rtt_ns = _ntp_offset_rtt_ns(t0, t1, t2, t3)
+                if rtt_ns <= 0:
+                    raise ValueError(f"invalid rtt_ns={rtt_ns}")
+                samples.append({"offset_ns": offset_ns, "rtt_ns": rtt_ns})
+                source = str(response.get("source", source))
+                failures = 0
+            except Exception as exc:
+                last_error = exc
+                failures += 1
+                if failures >= _CAMERA_CLOCK_MAX_CONSECUTIVE_FAILURES:
+                    break
+            if i < _CAMERA_CLOCK_SAMPLE_COUNT - 1:
+                time.sleep(0.01)
+
+        if len(samples) < _CAMERA_CLOCK_MIN_SAMPLES:
+            detail = (
+                f"; last error: {type(last_error).__name__}: {last_error}"
+                if last_error is not None else ""
+            )
+            raise RuntimeError(
+                f"[wbc_vr_robot] {label} camera clock {topic!r} returned "
+                f"{len(samples)}/{_CAMERA_CLOCK_SAMPLE_COUNT} usable samples; need "
+                f">= {_CAMERA_CLOCK_MIN_SAMPLES}{detail}."
+            )
+        queried_at_ns = time.time_ns()
+        cal = _camera_clock_calibration_from_samples(
+            samples, sensor_id=sensor_id, source=source, queried_at_ns=queried_at_ns
+        )
+        print(
+            f"[wbc_vr_robot] Camera clock calibration {label}/{sensor_id}: "
+            f"camera_host - local = {int(cal['offset_ns']) / 1e6:+.2f} ms "
+            f"(rtt {int(cal['rtt_ns']) / 1e6:.2f} ms, samples {len(samples)}) "
+            f"-> meta/camera_ntp/{label}"
+        )
+        return cal
 
     @staticmethod
     def _unwrap_frame(name: str, entry) -> tuple[np.ndarray, int]:
@@ -1242,10 +1441,11 @@ class HardwareDriver:
         None until both streams have delivered a frame (parity with vr_reader's
         ``_all_selected_streams_ready`` -- so the saved HDF5 keeps consistent keys and shapes
         across frames). ``frame_ns`` is the publisher capture timestamp of the ``left_rgb``
-        frame (``include_timestamp=True``); record_tick rejects a stale frame (camera stalled
-        below the record rate). Raises ValueError on a malformed shape or a missing timestamp,
-        so a miswired/legacy camera fails loudly instead of recording garbage or silently
-        skipping the freshness check.
+        frame (``include_timestamp=True``); depth must carry the SAME timestamp, otherwise
+        the matching depth message has not arrived yet after the publisher's early-RGB path.
+        record_tick rejects a stale frame (camera stalled below the record rate). Raises
+        ValueError on a malformed shape or a missing timestamp, so a miswired/legacy camera
+        fails loudly instead of recording garbage or silently skipping the freshness check.
         """
         obs = self.robot.sensors.head_camera.get_obs(
             obs_keys=["left_rgb", "depth"], include_timestamp=True
@@ -1255,7 +1455,9 @@ class HardwareDriver:
         if left_entry is None or depth_entry is None:
             return None
         left_rgb, frame_ns = self._unwrap_frame("head_camera left_rgb", left_entry)
-        depth, _ = self._unwrap_frame("head_camera depth", depth_entry)
+        depth, depth_ns = self._unwrap_frame("head_camera depth", depth_entry)
+        if depth_ns != frame_ns:
+            return None
         left_rgb = np.asarray(left_rgb)
         depth = np.asarray(depth)
         if left_rgb.ndim != 3 or left_rgb.shape[2] != 3:
@@ -1475,8 +1677,8 @@ class HardwareDriver:
         head_left_rgb, head_depth_u16, _ = imgs
         wrist_left_rgb, _ = wrist
         # Arrival-age history for the stale-abort diagnostic: local wall clock minus the
-        # publisher capture stamp (spans the robot->workstation clock offset, so compare
-        # head vs wrist and the trend over time, not the absolute value).
+        # publisher capture stamp (spans the camera-host->workstation clock offset, so
+        # compare head vs wrist and the trend over time, not the absolute value).
         wall_ns = time.time_ns()
         self._frame_age_log.append(
             (now, (wall_ns - head_ns) / 1e6, (wall_ns - wrist_ns) / 1e6)
@@ -1521,6 +1723,14 @@ class HardwareDriver:
             "head_left_rgb": head_left_rgb,
             "head_depth": head_depth_u16,
             "left_wrist_rgb": wrist_left_rgb,
+            # Publisher capture stamps (camera-publisher-host clock) of THIS tick's frames plus the
+            # local wall clock right after both grabs -- the raw material for offline
+            # camera-latency audits/correction (scripts/audit_episode_latency.py, with
+            # meta/camera_ntp when available). Always valid here: the freshness gate above
+            # skips the tick unless BOTH stamps strictly advanced.
+            "head_frame_ns": np.int64(head_ns),
+            "left_wrist_frame_ns": np.int64(wrist_ns),
+            "grab_wall_ns": np.int64(wall_ns),
             # intrinsic is recorded once via set_static (not per frame); extrinsic is NOT
             # recorded -- world_t_cam is recomputed offline from obs/base/pose + obs/joint.
         }
@@ -1945,10 +2155,12 @@ def main() -> None:
     parser.add_argument("--record", action="store_true",
                         help="record an episode (vr_reader EpisodeRecorder format) while "
                              "engaged: action+obs joints (incl. torso), gripper obs/action, "
-                             "head_left_rgb/head_depth/left_wrist_rgb, a static intrinsic, and "
-                             "(with --enable base) the obs/base/pose used to rebuild "
-                             "world_t_cam offline. The wrist camera needs an external ZED-SDK "
-                             "publisher on sensors/wrist_zedm/*. OFF by default.")
+                             "head_left_rgb/head_depth/left_wrist_rgb, a static intrinsic, "
+                             "per-frame capture stamps + a once-per-run meta/ntp clock offset "
+                             "(latency audits), and (with --enable base) the obs/base/pose "
+                             "used to rebuild world_t_cam offline. The wrist camera needs an "
+                             "external ZED-SDK publisher on sensors/wrist_zedm/*. OFF by "
+                             "default.")
     parser.add_argument("--save-dir", default=DEFAULT_SAVE_DIR,
                         help=f"directory for recorded episodes (default {DEFAULT_SAVE_DIR}).")
     parser.add_argument("--record-rate", type=float, default=DEFAULT_RECORD_RATE,

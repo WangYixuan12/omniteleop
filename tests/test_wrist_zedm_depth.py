@@ -13,7 +13,8 @@ bypasses dexsensor and publishes directly.
      ├─ publisher → sensors/<id>/left_rgb   (RGBImageCodec, RGB uint8)
      ├─ publisher → sensors/<id>/right_rgb  (RGBImageCodec, RGB uint8)
      ├─ publisher → sensors/<id>/depth      (DepthImageCodec)   [opt-in]
-     └─ service   → sensors/<id>/info       (JsonDataCodec)
+     ├─ service   → sensors/<id>/info       (JsonDataCodec)
+     └─ service   → sensors/<id>/clock      (JsonDataCodec, publisher host clock)
 
 Topic naming matches the head_camera convention (left_rgb / right_rgb /
 depth) so vr_reader's ``ZedCameraSensor`` subscribes to wrist streams the
@@ -154,6 +155,27 @@ def _depth_to_color(depth_m: np.ndarray) -> np.ndarray:
     return cv2.applyColorMap(gray, cv2.COLORMAP_TURBO)
 
 
+def _zed_image_timestamp_ns(zed: sl.Camera) -> int:
+    """SDK IMAGE timestamp for the latest successful grab(), in UNIX ns."""
+    timestamp = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE)
+    ns = int(timestamp.get_nanoseconds())
+    if ns <= 0:
+        raise RuntimeError("ZED SDK returned no IMAGE timestamp after grab()")
+    return ns
+
+
+def _clock_response(sensor_id: str, sequence: int) -> dict:
+    """NTP-style clock service response from this publisher host."""
+    t1 = time.time_ns()
+    return {
+        "server_receive_time_ns": int(t1),
+        "server_send_time_ns": int(time.time_ns()),
+        "source": "zed_publisher_host",
+        "sensor_id": str(sensor_id),
+        "sequence": int(sequence),
+    }
+
+
 def main() -> None:
     args = tyro.cli(Args)
     verify = args.verify or args.save_dir is not None
@@ -209,6 +231,8 @@ def main() -> None:
     left_topic = f"sensors/{args.sensor_id}/left_rgb"
     right_topic = f"sensors/{args.sensor_id}/right_rgb"
     depth_topic = f"sensors/{args.sensor_id}/depth"
+    info_topic = f"sensors/{args.sensor_id}/info"
+    clock_topic = f"sensors/{args.sensor_id}/clock"
 
     node = Node(name="wrist_zedm_test", namespace=args.namespace)
     logger.info(
@@ -243,6 +267,7 @@ def main() -> None:
         "right_rgb": {"published": 0, "last_timestamp_ns": 0},
         "depth": {"published": 0, "last_timestamp_ns": 0},
     }
+    sequence_state = {"latest": 0}
     info_stats = {"queries": 0, "last_log_s": 0.0}
 
     def _camera_info(_request: bytes | None = None) -> dict:
@@ -280,10 +305,17 @@ def main() -> None:
             "statistics": frame_stats,
         }
 
-    info_topic = f"sensors/{args.sensor_id}/info"
+    def _clock(_request: bytes | None = None) -> dict:
+        return _clock_response(args.sensor_id, sequence_state["latest"])
+
     info_service = node.create_service(
         info_topic,
         _camera_info,
+        response_encoder=JsonDataCodec.encode,
+    )
+    clock_service = node.create_service(
+        clock_topic,
+        _clock,
         response_encoder=JsonDataCodec.encode,
     )
     pub_topics = f"'{left_topic}'"
@@ -293,6 +325,7 @@ def main() -> None:
         pub_topics += f", '{depth_topic}'"
     logger.info(f"Publishing on {pub_topics}  (depth={'on' if args.enable_depth else 'off'})")
     logger.info(f"Serving camera info on '{info_topic}'")
+    logger.info(f"Serving publisher clock on '{clock_topic}'")
     resolved = f"left={node.resolve_topic(left_topic)!r}"
     if right_pub is not None:
         resolved += f", right={node.resolve_topic(right_topic)!r}"
@@ -325,6 +358,9 @@ def main() -> None:
         while True:
             if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
                 continue
+            # SDK timestamp of the grabbed image. This rides the codec-preserved
+            # timestamp_ns field; extra payload keys are dropped by RGBImageCodec.
+            ts = _zed_image_timestamp_ns(zed)
 
             zed.retrieve_image(left_mat, sl.VIEW.LEFT)
             # ZED returns BGRA — convert to RGB (the RGBImageCodec / vr_reader /
@@ -350,7 +386,6 @@ def main() -> None:
                     depth_m, nan=0.0, posinf=0.0, neginf=0.0
                 ).astype(np.float32)
 
-            ts = time.time_ns()
             seq = pub_count + 1
             left_pub.publish(
                 {
@@ -381,6 +416,7 @@ def main() -> None:
                         "height": height,
                     }
                 )
+            sequence_state["latest"] = seq
             for stream_stats in frame_stats.values():
                 stream_stats["published"] = seq
                 stream_stats["last_timestamp_ns"] = ts
@@ -472,6 +508,7 @@ def main() -> None:
         logger.info("Stopped by user.")
     finally:
         zed.close()
+        clock_service.shutdown()
         info_service.shutdown()
         node.shutdown()
 
