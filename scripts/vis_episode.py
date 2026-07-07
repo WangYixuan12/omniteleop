@@ -114,6 +114,13 @@ _OBS_NAMES = [
 # Marker colors: obs = blue, action = red.
 _OBS_COLOR = (0, 80, 255)
 _ACTION_COLOR = (255, 0, 0)
+_BASE_COLOR = (230, 190, 0)
+_BASE_X_COLOR = (230, 60, 60)
+_BASE_Y_COLOR = (60, 200, 60)
+_BASE_YAW_COLOR = (80, 120, 255)
+_AXIS_X_COLOR = (255, 0, 0)
+_AXIS_Y_COLOR = (0, 200, 0)
+_AXIS_Z_COLOR = (80, 120, 255)
 
 # Deploy position-condition markers (3D world + 2D head RGB overlay).
 _POS_COND_COLOR_BEFORE = (0, 200, 255)
@@ -151,6 +158,7 @@ def project_world_to_pixel(
     pts_world: np.ndarray, K: np.ndarray, world_t_cam: np.ndarray, z_min: float = 0.01
 ) -> tuple[np.ndarray, np.ndarray]:
     """Project (N, 3) world points into pixel coords using the same convention
+
     as ``unproject_depth`` (camera frame: +x right, +y down, +z forward).
 
     Returns ``(uv, valid)`` where ``uv`` is (N, 2) float32 pixel coords and
@@ -311,6 +319,56 @@ def load_world_t_base(obs_group: dict, num_frames: int) -> np.ndarray:
             f"obs/base/pose shape {pose.shape} != ({num_frames}, 3) = (x, y, yaw)"
         )
     return lift_base_pose_se3(pose)
+
+
+def base_path_xyz(world_t_base: np.ndarray) -> np.ndarray:
+    """Return the base odometry path as ``(N, 3)`` world XYZ points."""
+    T = np.asarray(world_t_base, dtype=np.float64)
+    if T.ndim != 3 or T.shape[1:] != (4, 4):
+        raise ValueError(f"world_t_base must have shape (N, 4, 4), got {T.shape}")
+    return T[:, :3, 3].astype(np.float32)
+
+
+def load_action_head_world(data: dict, num_frames: int) -> np.ndarray | None:
+    """Optional ``action/head`` stream, recorded as world-frame head targets.
+
+    WBC recorder episodes contain ``action/head`` ``(N,4,4)``. Legacy teleop and
+    deploy-layout episodes may not, in which case the viewer still shows the
+    observed head/camera pose.
+    """
+    action_group = data.get("action") if isinstance(data, dict) else None
+    if not isinstance(action_group, dict) or "head" not in action_group:
+        return None
+    head = np.asarray(action_group["head"], dtype=np.float64)
+    if head.shape != (num_frames, 4, 4):
+        raise ValueError(
+            f"action/head shape {head.shape} is not ({num_frames}, 4, 4)"
+        )
+    return head
+
+
+def pose_axis_arrows(
+    pose: np.ndarray, axis_length: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return local XYZ arrows for geometry logged under a transformed pose."""
+    T = np.asarray(pose, dtype=np.float64)
+    if T.shape != (4, 4):
+        raise ValueError(f"pose must have shape (4, 4), got {T.shape}")
+    origins = np.zeros((3, 3), dtype=np.float32)
+    vectors = (np.eye(3, dtype=np.float32) * float(axis_length)).astype(np.float32)
+    colors = np.asarray(
+        [_AXIS_X_COLOR, _AXIS_Y_COLOR, _AXIS_Z_COLOR], dtype=np.uint8
+    )
+    return origins, vectors, colors
+
+
+def finite_pose_positions(poses: np.ndarray) -> np.ndarray:
+    """Return world positions for finite ``(N,4,4)`` poses."""
+    T = np.asarray(poses, dtype=np.float64)
+    if T.ndim != 3 or T.shape[1:] != (4, 4):
+        raise ValueError(f"poses must have shape (N, 4, 4), got {T.shape}")
+    finite = np.all(np.isfinite(T), axis=(1, 2))
+    return T[finite, :3, 3].astype(np.float32)
 
 
 def transform_points_se3(T: np.ndarray, pts: np.ndarray) -> np.ndarray:
@@ -557,6 +615,12 @@ def main() -> None:
     #    base-relative rendering. ────────────────────────────────────────────────
     world_t_base = load_world_t_base(data["obs"], N)
     extrinsics = world_t_base @ extrinsics  # base_t_cam -> world_t_cam
+    base_path = base_path_xyz(world_t_base)
+    action_head = load_action_head_world(data, N)
+    if action_head is not None:
+        print("Head action: plotting action/head world-frame targets")
+    else:
+        print("Head action: no action/head stream; plotting observed head/camera only")
 
     # ── EEF obs (blue) / action (red) markers ────────────────────────────────
     # markers: list of (entity_path, color, pos (N,3), R (N,3,3)). The future
@@ -655,6 +719,12 @@ def main() -> None:
             ],
         )
     )
+    side_panels.append(
+        rrb.TimeSeriesView(
+            name="base pose (x, y, yaw)",
+            contents=["/plot/base_pose"],
+        )
+    )
     if position_condition is not None:
         side_panels.append(
             rrb.TextLogView(
@@ -684,6 +754,16 @@ def main() -> None:
     rr.send_blueprint(blueprint, make_active=True, make_default=True)
 
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+    rr.log(
+        "world/base_path",
+        rr.LineStrips3D([base_path], colors=[_BASE_COLOR], radii=0.008),
+        static=True,
+    )
+    rr.log(
+        "world/base_path/pts",
+        rr.Points3D(base_path, colors=[_BASE_COLOR], radii=0.006),
+        static=True,
+    )
 
     # ── distinct colors per gripper series (otherwise rerun auto-picks green for both)
     rr.log(
@@ -704,6 +784,14 @@ def main() -> None:
     rr.log(
         "plot/gripper/act_right",
         rr.SeriesLines(colors=[60, 180, 75], names="act_right"),
+        static=True,
+    )
+    rr.log(
+        "plot/base_pose",
+        rr.SeriesLines(
+            colors=[_BASE_X_COLOR, _BASE_Y_COLOR, _BASE_YAW_COLOR],
+            names=["base_x (m)", "base_y (m)", "base_yaw (rad)"],
+        ),
         static=True,
     )
     if position_condition is not None:
@@ -749,6 +837,62 @@ def main() -> None:
         if wrist_rgb is not None:
             rr.log("image/left_wrist_rgb", rr.Image(wrist_rgb[idx]))
 
+        # ── base and head poses: match vis_episode_processed_wbc entity names ──
+        wtb = world_t_base[idx]
+        rr.log(
+            "world/base",
+            rr.Transform3D(translation=wtb[:3, 3], mat3x3=wtb[:3, :3]),
+        )
+        base_axis_origins, base_axis_vectors, base_axis_colors = pose_axis_arrows(
+            wtb, axis_length=0.25
+        )
+        rr.log(
+            "world/base/axes",
+            rr.Arrows3D(
+                origins=base_axis_origins,
+                vectors=base_axis_vectors,
+                colors=base_axis_colors,
+                radii=0.01,
+            ),
+        )
+        rr.log(
+            "world/state/head/frame",
+            rr.Transform3D(
+                translation=world_t_cam[:3, 3],
+                mat3x3=world_t_cam[:3, :3],
+            ),
+        )
+        obs_head_tail = finite_pose_positions(extrinsics[idx:])
+        rr.log(
+            "world/state/head/marker",
+            rr.Points3D(obs_head_tail, colors=[_OBS_COLOR], radii=0.006),
+        )
+        rr.log(
+            "world/state/head/pt",
+            rr.Points3D(world_t_cam[None, :3, 3], colors=[_OBS_COLOR], radii=0.02),
+        )
+        if action_head is not None:
+            ah = action_head[idx]
+            if np.all(np.isfinite(ah)):
+                rr.log(
+                    "world/action/head/frame",
+                    rr.Transform3D(
+                        translation=ah[:3, 3],
+                        mat3x3=ah[:3, :3],
+                    ),
+                )
+                action_head_tail = finite_pose_positions(action_head[idx:])
+                rr.log(
+                    "world/action/head/marker",
+                    rr.Points3D(action_head_tail, colors=[_ACTION_COLOR], radii=0.006),
+                )
+                rr.log(
+                    "world/action/head/pt",
+                    rr.Points3D(ah[None, :3, 3], colors=[_ACTION_COLOR], radii=0.02),
+                )
+            else:
+                rr.log("world/action/head", rr.Clear(recursive=True))
+
         # ── colored point cloud (manual unproject + voxel downsample) ───────
         depth_m = depth_mm[idx] / 1000.0
         pts, mask = unproject_depth(depth_m, K, world_t_cam)
@@ -771,7 +915,7 @@ def main() -> None:
         link_tf = robot_mesh_gen.compute_fk_from_link_names(
             qpos, robot_link_names, in_obj_frame=True
         )
-        wtb = world_t_base[idx]  # base-relative link poses -> world frame (identity if no base)
+        # base-relative link poses -> world frame (identity if no base)
         for name in robot_link_names:
             tf = wtb @ link_tf[name]
             rr.log(
@@ -794,6 +938,16 @@ def main() -> None:
         rr.log("plot/gripper/obs_right", rr.Scalars(float(obs_grip_right[idx])))
         rr.log("plot/gripper/act_left", rr.Scalars(float(act_grip_left[idx])))
         rr.log("plot/gripper/act_right", rr.Scalars(float(act_grip_right[idx])))
+        rr.log(
+            "plot/base_pose",
+            rr.Scalars(
+                [
+                    float(wtb[0, 3]),
+                    float(wtb[1, 3]),
+                    float(np.arctan2(wtb[1, 0], wtb[0, 0])),
+                ]
+            ),
+        )
 
         # ── optional deploy position condition: selected [before, after] ─────
         if position_condition is not None:
