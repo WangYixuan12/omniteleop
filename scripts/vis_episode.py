@@ -128,6 +128,10 @@ _POS_COND_COLOR_AFTER = (255, 225, 25)
 _POS_COND_RADIUS_3D = 0.015
 _POS_COND_RADIUS_2D = 2.5
 
+# Default gRPC endpoint of a running rerun Viewer (matches a bare `rerun
+# --headless`, i.e. no --port). Used by --connect for the MCP debug workflow.
+_DEFAULT_VIEWER_URL = "rerun+http://127.0.0.1:9876/proxy"
+
 
 def gram_schmidt_6d_to_R(r6: np.ndarray) -> np.ndarray:
     """Recover (3, 3) rotation from Zhou et al. 6-D representation."""
@@ -464,7 +468,23 @@ def main() -> None:
         "viewer (useful over SSH: generate on the server, open later with "
         "`rerun FILE.rrd`). Default: spawn the viewer (single-script workflow).",
     )
+    parser.add_argument(
+        "--connect",
+        type=str,
+        nargs="?",
+        const=_DEFAULT_VIEWER_URL,
+        default=None,
+        help="Log to an ALREADY-RUNNING rerun Viewer over gRPC instead of "
+        "spawning one or writing an .rrd. Bare --connect uses "
+        f"{_DEFAULT_VIEWER_URL} (a `rerun --headless` with no --port); pass a URL "
+        "to override. This is the display-less / MCP debug workflow: start "
+        "`rerun --headless` (optionally `--port N`), then --connect to it so the "
+        "rerun MCP can inspect the same viewer. Mutually exclusive with --save.",
+    )
     args = parser.parse_args()
+
+    if args.connect is not None and args.save is not None:
+        parser.error("--connect and --save are mutually exclusive")
 
     data, _ = load_dict_from_hdf5(args.hdf5)
 
@@ -671,8 +691,11 @@ def main() -> None:
     robot_mesh_gen = RobotMeshGenerator("vega_no_effector")
 
     # ── rerun ────────────────────────────────────────────────────────────────
-    rr.init("vis_episode", spawn=args.save is None)
-    if args.save is not None:
+    rr.init("vis_episode", spawn=args.save is None and args.connect is None)
+    if args.connect is not None:
+        rr.connect_grpc(args.connect)
+        print(f"Connecting to running viewer at {args.connect} (no viewer spawned)")
+    elif args.save is not None:
         rr.save(args.save)
         print(f"Streaming to {args.save} (headless; no viewer spawned)")
 

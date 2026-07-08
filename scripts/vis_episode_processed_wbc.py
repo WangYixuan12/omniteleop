@@ -97,6 +97,10 @@ from omniteleop.wbc_policy_format import (
 
 _DEFAULT_DATASET_DIR = "/home/yixuan/Dexmate/data/processed_wbc/dexmate_wbc_eef_head"
 
+# Default gRPC endpoint of a running rerun Viewer (matches a bare `rerun
+# --headless`, i.e. no --port). Used by --connect for the MCP debug workflow.
+_DEFAULT_VIEWER_URL = "rerun+http://127.0.0.1:9876/proxy"
+
 # ── Policy vector layout (omniteleop.wbc_policy_format; validated against the
 #    dataset's stored axis names below). EEF/head offsets are shared by state and
 #    action; the base block is state-only. ────────────────────────────────────
@@ -354,9 +358,24 @@ def main() -> None:
         "viewer (useful over SSH: generate on the server, open later with "
         "`rerun FILE.rrd`). Default: spawn the viewer.",
     )
+    parser.add_argument(
+        "--connect",
+        type=str,
+        nargs="?",
+        const=_DEFAULT_VIEWER_URL,
+        default=None,
+        help="Log to an ALREADY-RUNNING rerun Viewer over gRPC instead of "
+        "spawning one or writing an .rrd. Bare --connect uses "
+        f"{_DEFAULT_VIEWER_URL} (a `rerun --headless` with no --port); pass a URL "
+        "to override. This is the display-less / MCP debug workflow: start "
+        "`rerun --headless` (optionally `--port N`), then --connect to it so the "
+        "rerun MCP can inspect the same viewer. Mutually exclusive with --save.",
+    )
     args = parser.parse_args()
     if args.stride < 1:
         raise ValueError(f"--stride must be >= 1, got {args.stride}")
+    if args.connect is not None and args.save is not None:
+        parser.error("--connect and --save are mutually exclusive")
 
     dataset_root = Path(args.dataset_dir)
     if not dataset_root.is_dir():
@@ -490,8 +509,11 @@ def main() -> None:
     print(f"built {len(figs)} matplotlib figures (6 EEF xyz + 1 base path)")
 
     # ── rerun setup ──────────────────────────────────────────────────────────
-    rr.init("vis_episode_processed_wbc", spawn=args.save is None)
-    if args.save is not None:
+    rr.init("vis_episode_processed_wbc", spawn=args.save is None and args.connect is None)
+    if args.connect is not None:
+        rr.connect_grpc(args.connect)
+        print(f"Connecting to running viewer at {args.connect} (no viewer spawned)")
+    elif args.save is not None:
         rr.save(args.save)
         print(f"Streaming to {args.save} (headless; no viewer spawned)")
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
@@ -590,8 +612,8 @@ def main() -> None:
         # Mobile base triad (odometry pose).
         base_tf = world_t_base[idx]
         rr.log("world/base",
-               rr.Transform3D(translation=base_tf[:3, 3], mat3x3=base_tf[:3, :3],
-                              axis_length=0.25))
+               rr.Transform3D(translation=base_tf[:3, 3], mat3x3=base_tf[:3, :3]),
+               rr.TransformAxes3D(axis_length=0.25))
 
         # Per-arm EEF: red = action world target (trail + triad), blue = achieved
         # observation.state composed to world (trail + triad).
@@ -600,22 +622,26 @@ def main() -> None:
             rr.log(f"world/action/{side}/marker",
                    rr.Points3D(action_pos[side][idx:], colors=[_COLOR_ACTION], radii=0.006))
             rr.log(f"world/action/{side}/frame",
-                   rr.Transform3D(translation=am[:3, 3], mat3x3=am[:3, :3], axis_length=0.12))
+                   rr.Transform3D(translation=am[:3, 3], mat3x3=am[:3, :3]),
+                   rr.TransformAxes3D(axis_length=0.12))
             sm = state_world[side][idx]
             rr.log(f"world/state/{side}/marker",
                    rr.Points3D(state_world_pos[side][idx:], colors=[_COLOR_STATE], radii=0.006))
             rr.log(f"world/state/{side}/frame",
-                   rr.Transform3D(translation=sm[:3, 3], mat3x3=sm[:3, :3], axis_length=0.12))
+                   rr.Transform3D(translation=sm[:3, 3], mat3x3=sm[:3, :3]),
+                   rr.TransformAxes3D(axis_length=0.12))
 
         # Head: red = action world target; blue = achieved (coincident with camera).
         ah = action_head[idx]
         rr.log("world/action/head/frame",
-               rr.Transform3D(translation=ah[:3, 3], mat3x3=ah[:3, :3], axis_length=0.2))
+               rr.Transform3D(translation=ah[:3, 3], mat3x3=ah[:3, :3]),
+               rr.TransformAxes3D(axis_length=0.2))
         rr.log("world/action/head/pt",
                rr.Points3D(ah[None, :3, 3], colors=[_COLOR_ACTION], radii=0.02))
         sh = state_world_head[idx]
         rr.log("world/state/head/frame",
-               rr.Transform3D(translation=sh[:3, 3], mat3x3=sh[:3, :3], axis_length=0.2))
+               rr.Transform3D(translation=sh[:3, 3], mat3x3=sh[:3, :3]),
+               rr.TransformAxes3D(axis_length=0.2))
         rr.log("world/state/head/pt",
                rr.Points3D(sh[None, :3, 3], colors=[_COLOR_STATE], radii=0.02))
 
@@ -657,7 +683,7 @@ def main() -> None:
         rr.log("plots/base_pose",
                rr.Scalars([float(state[idx, 29]), float(state[idx, 30]), float(state[idx, 31])]))
 
-    if figs and args.save is None:
+    if figs and args.save is None and args.connect is None:
         plt.show()
 
 
