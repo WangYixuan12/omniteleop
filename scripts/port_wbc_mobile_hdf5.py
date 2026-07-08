@@ -70,6 +70,18 @@ Index log (``--log_index <csv>``, default off): one row per emitted episode --
 WITHIN its split), ``num_frames_before`` (raw take length), ``num_frames_after``
 (frames actually written after the leading-NaN drop or the trim).
 
+Position conditioning (``--positions-dir <dir>``, default off): attach a CONSTANT
+``observation.environment_state`` (``--object_nums`` * 3, default 6) to every frame of
+every ported episode -- the SceneDiff changed-object 3D positions in the engage-origin
+WORLD frame (the SAME frame as ``action`` / ``observation.state[29:32]``), ARRANGED
+``[s1_src, s1_dst, ...]`` by the task order. Read per episode from
+``<dir>/<source>/episode_<N>.npz`` (``source`` in {raw, recovery}, so a raw
+``episode_<N>`` and a ``recovery/<N>`` sharing an index never collide), written by
+scene_diff Part A (``run_wbc_pos_condition.sh``). Every ported episode MUST have its
+npz -- validated UP FRONT, before any dataset is written or overwritten. This is a
+single-stage task, so NO per-frame ``observation.pos_condition_mask`` is emitted (the
+one constant vector holds throughout, forward-compatible with N grasp cycles).
+
 Environments: the unit tests need only the dexmate env (pinocchio/pink); the
 actual conversion + ``verify()`` additionally need ``lerobot`` and ``tqdm``
 (``dexmate_lerobot`` env) -- both imports are lazy.
@@ -80,7 +92,8 @@ Usage:
     --fps 10 --resize-h 120 --resize-w 160 --repo-id dexmate_wbc_eef_head \
     --split-csv ~/Dexmate/data/raw_data/split.csv \
     --include_recovery_data ~/Dexmate/data/raw_data/recovery \
-    --log_index ~/Dexmate/data/raw_data/log_index.csv
+    --log_index ~/Dexmate/data/raw_data/log_index.csv \
+    --positions-dir ~/Dexmate/data/scene_diff/positions --object_nums 2
 """
 
 from __future__ import annotations
@@ -636,8 +649,117 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
     }
 
 
-def build_features(resize_h: int, resize_w: int) -> dict:
-    return {
+# ---------------------------------------------------------------------------
+# Optional ENV-state conditioning: SceneDiff changed-object positions
+# ---------------------------------------------------------------------------
+# With --positions-dir, the porter attaches a CONSTANT observation.environment_state
+# (object_nums*3,) to every frame of each episode: the SceneDiff-detected object 3D
+# positions in the engage-origin WORLD frame -- the SAME frame as the action targets and
+# observation.state[29:32] base anchor -- ARRANGED by the episode's task order. Part A
+# (scene_diff/scripts/extract_object_positions.py, via run_wbc_pos_condition.sh) writes,
+# per episode, ``positions`` (object_nums,3) in a fixed SIZE order plus the resolved task
+# ``order`` (grasp->box=src, release->cloth=dst), under
+# ``<positions-dir>/<source>/episode_<N>.npz`` (source in {raw, recovery}; the subdir keys
+# the file so raw episode_<N> and recovery/<N> never collide). This porter reorders by that
+# ``order`` into [s1_src, s1_dst, ...] and broadcasts the ONE vector to every frame (the
+# single-stage "same condition throughout" requirement, forward-compatible with N grasp
+# cycles). Position-extraction quality (object count == object_nums; per-object n_valid)
+# is gated UPSTREAM by Part A, which only emits an npz for passing episodes; here we
+# defensively check shape/finiteness/permutation/frame and fail fast on a missing file.
+OBS_ENV_STATE_KEY = "observation.environment_state"
+DEFAULT_OBJECT_NUMS = 2
+# Stage roles in the arranged env-state: [s1_src, s1_dst, s2_src, s2_dst, ...].
+STAGE_ROLES = ("src", "dst")
+
+
+def env_state_axes(object_nums: int) -> list[str]:
+    """Axis names for the (object_nums*3,) ARRANGED env-state.
+
+    For the standard task (object_nums a multiple of 2 = n_stages grasp cycles) the slots
+    are named by stage and role (s1_src_x .. sN_dst_z); otherwise a generic obj{i}_{x,y,z}
+    naming is used. Mirrors port_dexmate_hdf5.env_state_axes.
+    """
+    n_stages, rem = divmod(object_nums, len(STAGE_ROLES))
+    if rem == 0:
+        return [f"s{s + 1}_{role}_{a}"
+                for s in range(n_stages) for role in STAGE_ROLES for a in "xyz"]
+    return [f"obj{i}_{a}" for i in range(object_nums) for a in "xyz"]
+
+
+def build_env_state_vector(positions: np.ndarray, order: list[int]) -> np.ndarray:
+    """Reorder the size-ordered ``positions`` (M,3) by ``order`` and flatten to (M*3,)."""
+    return positions[order].reshape(-1).astype(np.float32)
+
+
+def load_episode_positions(positions_dir: Path, source: str, raw_index: int,
+                           object_nums: int) -> np.ndarray:
+    """``<positions-dir>/<source>/episode_<N>.npz`` -> ARRANGED env-state (object_nums*3,).
+
+    Keyed by ``(source, raw_index)`` -- the source subdir ({raw, recovery}) disambiguates a
+    raw ``episode_<N>`` from a ``recovery/<N>`` that share an index. Reads the size-ordered
+    ``positions`` (object_nums,3) and the resolved ``order`` written by Part A and returns
+    ``positions[order]`` flattened. Fails fast if the file is missing, a key is absent,
+    ``positions`` is not (object_nums,3), any value is non-finite, ``order`` is not a
+    permutation of range(object_nums), or the npz frame is not the WORLD frame this port
+    conditions in (guards against pointing --positions-dir at the tabletop positions).
+    """
+    path = Path(positions_dir) / source / f"episode_{raw_index}.npz"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"positions file for {source}/episode_{raw_index} not found: {path} "
+            "(run run_wbc_pos_condition.sh / scene_diff Part A first, or drop --positions-dir)"
+        )
+    with np.load(path, allow_pickle=True) as data:
+        for key in ("positions", "order"):
+            if key not in data:
+                raise ValueError(f"{path}: missing '{key}' array (regenerate with Part A)")
+        positions = np.asarray(data["positions"], dtype=np.float32)
+        order = [int(x) for x in np.asarray(data["order"]).reshape(-1)]
+        frame = str(data["frame"]) if "frame" in data else "world"
+    if frame != "world":
+        raise ValueError(
+            f"{path}: env-state npz frame is {frame!r}, expected 'world' -- the WBC port "
+            "conditions in the engage-origin world frame (is --positions-dir the tabletop set?)"
+        )
+    if positions.shape != (object_nums, 3):
+        raise ValueError(
+            f"{path}: positions shape {positions.shape} != ({object_nums}, 3) "
+            "(object count must match --object_nums; gated in extract_object_positions.py)"
+        )
+    _validate_finite("positions", positions, path)
+    if sorted(order) != list(range(object_nums)):
+        raise ValueError(f"{path}: order {order} is not a permutation of range({object_nums})")
+    vector = build_env_state_vector(positions, order)
+    if vector.shape != (object_nums * 3,):
+        raise ValueError(f"{path}: assembled env_state {vector.shape} != ({object_nums * 3},)")
+    return vector
+
+
+def validate_all_episode_positions(positions_dir: Path, work: list[dict],
+                                   object_nums: int) -> dict[tuple[str, int], np.ndarray]:
+    """Load + validate EVERY work item's env-state up front; fail before any dataset write.
+
+    Returns ``{(source, raw_index): env_state_vector}``. Aggregates ALL per-episode failures
+    into one error so a single run surfaces every missing/bad npz at once.
+    """
+    env_state_by_key: dict[tuple[str, int], np.ndarray] = {}
+    failures: list[str] = []
+    for item in work:
+        key = (item["source"], item["raw_index"])
+        try:
+            env_state_by_key[key] = load_episode_positions(
+                positions_dir, item["source"], item["raw_index"], object_nums)
+        except Exception as exc:
+            failures.append(f"- {item['source']}/episode_{item['raw_index']}: {exc}")
+    if failures:
+        raise RuntimeError(
+            "Changed-object position validation failed; no dataset was written:\n"
+            + "\n".join(failures))
+    return env_state_by_key
+
+
+def build_features(resize_h: int, resize_w: int, object_nums: int | None = None) -> dict:
+    features = {
         "observation.images.head_rgb": {
             "dtype": "video",
             "shape": (resize_h, resize_w, 3),
@@ -659,6 +781,18 @@ def build_features(resize_h: int, resize_w: int) -> dict:
             "names": {"axes": list(ACTION_AXES)},
         },
     }
+    # Optional constant global conditioning: SceneDiff object positions (ENV state). This
+    # is float32 (NOT an image/video dtype), so no policy auto-loads it as a VISUAL input;
+    # the train command wires it into input_features as type ENV (diffusion consumes
+    # observation.environment_state natively). Single-stage -> no pos_condition_mask.
+    if object_nums is not None:
+        axes = env_state_axes(object_nums)
+        features[OBS_ENV_STATE_KEY] = {
+            "dtype": "float32",
+            "shape": (len(axes),),
+            "names": {"axes": axes},
+        }
+    return features
 
 
 def _sidecar_path(variant_root: Path, kind: str, episode_idx: int) -> Path:
@@ -692,12 +826,15 @@ def _scaled_intrinsic(intrinsic: np.ndarray, raw_hw: tuple[int, int],
 def add_episode(dataset, hdf5_path: Path, fk: WBCPolicyFK, resize_h: int,
                 resize_w: int, task: str, variant_root: Path, episode_idx: int,
                 fps: int, state_frame: str = "base",
-                *, trim: tuple[int, int] | None = None) -> tuple[int, int]:
+                *, trim: tuple[int, int] | None = None,
+                env_state_vec: np.ndarray | None = None) -> tuple[int, int]:
     """Port one raw episode; returns ``(num_frames_before, num_frames_after)``.
 
     ``num_frames_before`` is the raw take length; ``num_frames_after`` is the number
     of frames written -- after the leading-NaN-gripper drop (``trim is None``) or after
     the ABSOLUTE INCLUSIVE ``trim=(frame_start, frame_end)`` recovery segment.
+    ``env_state_vec`` (when given) is the CONSTANT (object_nums*3,) ENV-state broadcast to
+    every frame as ``observation.environment_state``.
     """
     if not task:
         raise ValueError("task must be a non-empty string")
@@ -740,13 +877,16 @@ def add_episode(dataset, hdf5_path: Path, fk: WBCPolicyFK, resize_h: int,
             depth_resized[i] = cv2.resize(depth[t], (resize_w, resize_h),
                                           interpolation=cv2.INTER_NEAREST)
 
-            dataset.add_frame({
+            frame = {
                 "observation.images.head_rgb": rgb_resized,
                 "observation.images.wrist_rgb": wrist_resized,
                 "observation.state": state,
                 "action": action,
                 "task": task,
-            })
+            }
+            if env_state_vec is not None:
+                frame[OBS_ENV_STATE_KEY] = env_state_vec
+            dataset.add_frame(frame)
 
     dataset.save_episode()
 
@@ -922,10 +1062,11 @@ def write_log_index(log_index_path: Path, rows: list[dict]) -> None:
 
 
 def _write_meta(variant_root: Path, split: str, state_frame: str, fps: int,
-                resize_h: int, resize_w: int, task: str) -> None:
+                resize_h: int, resize_w: int, task: str,
+                object_nums: int | None = None) -> None:
     """Write the ``dexmate_meta.json`` sidecar describing this split's schema."""
     relative_ready = state_frame == "world"
-    (variant_root / "dexmate_meta.json").write_text(json.dumps({
+    meta = {
         "schema": "wbc_eef_head_v1",
         "split": split,
         "state_axes": list(STATE_AXES), "action_axes": list(ACTION_AXES),
@@ -942,11 +1083,20 @@ def _write_meta(variant_root: Path, split: str, state_frame: str, fps: int,
         "fps": fps, "resize_h": resize_h, "resize_w": resize_w,
         "task": task, "robot_type": ROBOT_TYPE,
         "gripper_binary_threshold": GRIPPER_BINARY_THRESHOLD,
-    }, indent=2))
+    }
+    # Constant ENV-state conditioning (only when --positions-dir was used). The env-state
+    # is world-frame and per-episode CONSTANT, so the train command normalizes it MIN_MAX.
+    if object_nums is not None:
+        meta["env_state_key"] = OBS_ENV_STATE_KEY
+        meta["object_nums"] = object_nums
+        meta["env_state_axes"] = env_state_axes(object_nums)
+        meta["env_state_frame"] = "world (engage-origin, same as action targets)"
+    (variant_root / "dexmate_meta.json").write_text(json.dumps(meta, indent=2))
 
 
 def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: int,
-           fps: int, state_frame: str, variant_root: Path, split: str) -> None:
+           fps: int, state_frame: str, variant_root: Path, split: str,
+           env_state_vec: np.ndarray | None = None) -> None:
     """Re-open a written split dataset and cross-check frame 0 against a fresh build.
 
     Confirms ``observation.state``/``action`` for the split's first episode first kept
@@ -980,6 +1130,23 @@ def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: 
         raise RuntimeError(f"verify[{split}]: state shape {state.shape} != ({len(STATE_AXES)},)")
     if action.shape != (len(ACTION_AXES),):
         raise RuntimeError(f"verify[{split}]: action shape {action.shape} != ({len(ACTION_AXES)},)")
+
+    # ENV-state conditioning: the declared feature and the first frame's stored vector must
+    # match the loaded positions exactly iff positions were requested (feature must be ABSENT
+    # otherwise). Constancy across frames follows from broadcasting the one vector in add_episode.
+    if env_state_vec is not None:
+        if OBS_ENV_STATE_KEY not in meta.features:
+            raise RuntimeError(
+                f"verify[{split}]: {OBS_ENV_STATE_KEY} missing though positions were requested")
+        env_item = item[OBS_ENV_STATE_KEY].cpu().numpy()
+        if env_item.shape != env_state_vec.shape:
+            raise RuntimeError(
+                f"verify[{split}]: env_state shape {env_item.shape} != {env_state_vec.shape}")
+        if not np.allclose(env_item, env_state_vec, atol=1e-5):
+            raise RuntimeError(f"verify[{split}]: stored env_state[0] != loaded positions vector")
+    elif OBS_ENV_STATE_KEY in meta.features:
+        raise RuntimeError(
+            f"verify[{split}]: {OBS_ENV_STATE_KEY} present but positions were not requested")
 
     # Recompute the first stored frame independently (same FK) and pull the raw verbatim
     # targets to confirm the action is a straight copy (no base composition).
@@ -1068,13 +1235,20 @@ def convert_dataset(raw_dir: Path, repo_id: str, fps: int, resize_h: int,
                     resize_w: int, task: str, root: Path, overwrite: bool,
                     state_frame: str = "base", include_recovery_data: Path | None = None,
                     log_index: Path | None = None,
-                    split_map: Mapping[tuple[str, int], str] | None = None) -> dict:
+                    split_map: Mapping[tuple[str, int], str] | None = None,
+                    positions_dir: Path | None = None,
+                    object_nums: int = DEFAULT_OBJECT_NUMS) -> dict:
     """Full conversion (needs lerobot + tqdm -- run in the dexmate_lerobot env).
 
     Splits the episodes per ``split_map`` (from split.csv) into
     ``<root>/<split>/<repo_id>/`` datasets (unlisted -> :data:`DEFAULT_SPLIT`); one tqdm
     bar spans every episode across splits, and each split is ``verify()``-ed after it is
     written. Returns ``{split: LeRobotDataset}``.
+
+    When ``positions_dir`` is set, every ported episode also carries a constant
+    ``observation.environment_state`` (object_nums*3,) from
+    ``<positions_dir>/<source>/episode_<N>.npz`` -- pre-validated for ALL episodes before
+    any dataset is created/overwritten (fail fast, keyed by ``(source, raw_index)``).
     """
     from lerobot.datasets import LeRobotDataset, recompute_stats  # noqa: PLC0415
     from tqdm import tqdm  # noqa: PLC0415
@@ -1087,6 +1261,15 @@ def convert_dataset(raw_dir: Path, repo_id: str, fps: int, resize_h: int,
         len(work), len(work) - n_recovery, n_recovery,
         ", ".join(f"{s}:{len(v)}" for s, v in splits.items()), state_frame,
     )
+
+    # ENV-state conditioning: validate EVERY episode's positions npz UP FRONT, before the
+    # pre-existing-dir check below removes anything -- a missing/bad npz must abort with no
+    # data written or deleted. Keyed by (source, raw_index) via the positions subdir.
+    env_state_by_key: dict[tuple[str, int], np.ndarray] = {}
+    if positions_dir is not None:
+        env_state_by_key = validate_all_episode_positions(positions_dir, work, object_nums)
+        logging.info("ENV-state conditioning ON: object_nums=%d, loaded positions for %d "
+                     "episode(s) from %s", object_nums, len(env_state_by_key), positions_dir)
 
     # Fail fast on pre-existing split dirs BEFORE any heavy work / partial writes.
     variant_roots = {s: Path(root) / s / repo_id for s in splits}
@@ -1105,15 +1288,20 @@ def convert_dataset(raw_dir: Path, repo_id: str, fps: int, resize_h: int,
         for split, items in splits.items():
             variant_root = variant_roots[split]
             dataset = LeRobotDataset.create(
-                repo_id=repo_id, fps=fps, features=build_features(resize_h, resize_w),
+                repo_id=repo_id, fps=fps,
+                features=build_features(
+                    resize_h, resize_w,
+                    object_nums if positions_dir is not None else None),
                 root=variant_root, robot_type=ROBOT_TYPE, use_videos=True,
             )
             split_total = 0
             for processed_idx, item in enumerate(items):
+                env_vec = (env_state_by_key[(item["source"], item["raw_index"])]
+                           if positions_dir is not None else None)
                 num_before, num_after = add_episode(
                     dataset, item["path"], fk, resize_h, resize_w, task,
                     variant_root=variant_root, episode_idx=processed_idx, fps=fps,
-                    state_frame=state_frame, trim=item["trim"])
+                    state_frame=state_frame, trim=item["trim"], env_state_vec=env_vec)
                 split_total += num_after
                 log_rows.append({"split": split, "source": item["source"],
                                  "raw_index": item["raw_index"], "processed_index": processed_idx,
@@ -1121,9 +1309,13 @@ def convert_dataset(raw_dir: Path, repo_id: str, fps: int, resize_h: int,
                 pbar.update(1)
             dataset.finalize()
             dataset = recompute_stats(dataset, skip_image_video=True)
-            _write_meta(variant_root, split, state_frame, fps, resize_h, resize_w, task)
-            verify(dataset, items[0], fk, resize_h, resize_w, fps, state_frame,
-                   variant_root, split)
+            _write_meta(variant_root, split, state_frame, fps, resize_h, resize_w, task,
+                        object_nums=object_nums if positions_dir is not None else None)
+            first = items[0]
+            first_env = (env_state_by_key[(first["source"], first["raw_index"])]
+                         if positions_dir is not None else None)
+            verify(dataset, first, fk, resize_h, resize_w, fps, state_frame,
+                   variant_root, split, env_state_vec=first_env)
             datasets[split] = dataset
             grand_total += split_total
             logging.info("Split %s finalized: %d episode(s), %d frames", split,
@@ -1175,9 +1367,23 @@ def main() -> None:
                              "split is written to <root>/<split>/<repo_id>/. If the DEFAULT "
                              "file is absent all episodes -> train; an explicitly-passed "
                              "missing file errors.")
+    parser.add_argument("--positions-dir", "--positions_dir", dest="positions_dir",
+                        type=Path, default=None,
+                        help="enable ENV-state conditioning: root of the SceneDiff positions "
+                             "with <source>/episode_<N>.npz (source in {raw, recovery}), e.g. "
+                             "~/Dexmate/data/scene_diff/positions. Each ported episode gets a "
+                             "CONSTANT observation.environment_state (object_nums*3,) of the "
+                             "arranged object WORLD positions. Every ported episode must have "
+                             "its npz (validated up front); off by default.")
+    parser.add_argument("--object_nums", "--object-nums", dest="object_nums", type=int,
+                        default=DEFAULT_OBJECT_NUMS,
+                        help=f"number of conditioned objects; env-state dim = object_nums*3 "
+                             f"(default {DEFAULT_OBJECT_NUMS}). Only used with --positions-dir.")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if args.positions_dir is not None and args.object_nums < 1:
+        raise SystemExit(f"--object_nums must be >= 1, got {args.object_nums}")
 
     state_frame = "world" if args.relative_actions else "base"
     if state_frame not in STATE_FRAMES:  # defensive; STATE_FRAMES is the source of truth
@@ -1204,7 +1410,8 @@ def main() -> None:
                         args.resize_w, args.task, args.root, args.overwrite,
                         state_frame=state_frame,
                         include_recovery_data=args.include_recovery_data,
-                        log_index=args.log_index, split_map=split_map)
+                        log_index=args.log_index, split_map=split_map,
+                        positions_dir=args.positions_dir, object_nums=args.object_nums)
     except Exception as exc:  # CLI boundary: name the failure, exit 1
         logging.error("%s", exc)
         sys.exit(1)

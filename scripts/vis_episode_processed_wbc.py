@@ -42,8 +42,9 @@ Panels:
   * 3D world -- depth point cloud (world frame), per-arm EEF markers/frames
     (red = ``action`` world target, blue = ``observation.state`` achieved->world),
     head frames (red target / blue achieved, the latter coincident with the camera),
-    the mobile base triad + its full odometry path (gold), and the head camera
-    pinhole/frustum.
+    the mobile base triad + its full odometry path (gold), optional
+    ``observation.environment_state`` position-condition markers, and the head
+    camera pinhole/frustum.
   * Head RGB / depth -- ``observation.images.head_rgb`` + depth sidecar, overlaid
     with the projected achieved (blue) and commanded (red) EEF pixels.
   * Wrist RGB -- ``observation.images.wrist_rgb`` (plain 2D; no calibration/depth).
@@ -79,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -116,9 +118,20 @@ _COLOR_BASE   = (230, 190, 0)  # gold — mobile base odometry
 _COLOR_BASE_X = (230, 60, 60)
 _COLOR_BASE_Y = (60, 200, 60)
 _COLOR_BASE_YAW = (80, 120, 255)
+_COLOR_POS_COND_SRC = (0, 200, 255)
+_COLOR_POS_COND_DST = (255, 225, 25)
+_COLOR_POS_COND_OTHER = (
+    (180, 220, 80),
+    (255, 140, 40),
+    (180, 120, 255),
+    (255, 105, 180),
+)
+
+OBS_ENV_STATE_KEY = "observation.environment_state"
 
 _GRIPPER_Y_MIN = -0.2
 _GRIPPER_Y_MAX = 1.1
+_POS_COND_RADIUS_3D = 0.018
 
 
 # ── Generic helpers copied verbatim from vis_episode_processed.py so the two
@@ -190,6 +203,106 @@ def _rgb_to_hwc(t) -> np.ndarray:
     if a.dtype != np.uint8:
         a = a.astype(np.uint8)
     return a
+
+
+def _position_condition_labels(axis_names: list[str] | None, point_count: int) -> list[str]:
+    """Convert environment-state axis names into one label per xyz point."""
+    if axis_names is None or len(axis_names) != point_count * 3:
+        return [f"obj{i}" for i in range(point_count)]
+
+    labels: list[str] = []
+    for point_idx in range(point_count):
+        names = axis_names[point_idx * 3 : point_idx * 3 + 3]
+        suffixes = ("_x", "_y", "_z")
+        prefixes: list[str] = []
+        for name, suffix in zip(names, suffixes, strict=True):
+            if not name.endswith(suffix):
+                prefixes = []
+                break
+            prefixes.append(name[: -len(suffix)])
+        if prefixes and len(set(prefixes)) == 1 and prefixes[0]:
+            labels.append(prefixes[0])
+        else:
+            labels.append(f"obj{point_idx}")
+    return labels
+
+
+def _position_condition_colors(labels: list[str]) -> np.ndarray:
+    """Stable marker colors, highlighting src/dst pairs when names expose them."""
+    colors: list[tuple[int, int, int]] = []
+    for idx, label in enumerate(labels):
+        if label.endswith(("_src", "_before")):
+            colors.append(_COLOR_POS_COND_SRC)
+        elif label.endswith(("_dst", "_after")):
+            colors.append(_COLOR_POS_COND_DST)
+        else:
+            colors.append(_COLOR_POS_COND_OTHER[idx % len(_COLOR_POS_COND_OTHER)])
+    return np.asarray(colors, dtype=np.uint8)
+
+
+def _position_condition_link_strips(
+    points: np.ndarray, finite: np.ndarray, labels: list[str]
+) -> tuple[list[np.ndarray], list[tuple[int, int, int]], list[str]]:
+    """Build src->dst line strips for paired SceneDiff condition points."""
+    strips: list[np.ndarray] = []
+    colors: list[tuple[int, int, int]] = []
+    line_labels: list[str] = []
+    for start in range(0, len(labels) - 1, 2):
+        if not (finite[start] and finite[start + 1]):
+            continue
+        left, right = labels[start], labels[start + 1]
+        if not (left.endswith("_src") and right.endswith("_dst")):
+            continue
+        strips.append(np.stack([points[start], points[start + 1]]).astype(np.float32))
+        colors.append(_COLOR_POS_COND_DST)
+        stage = left[: -len("_src")]
+        line_labels.append(f"{stage}: src->dst")
+    return strips, colors, line_labels
+
+
+def load_processed_wbc_position_condition(dataset) -> dict[str, np.ndarray | list[str]] | None:
+    """Read optional processed-WBC position condition from ``observation.environment_state``.
+
+    The porter writes this as a flat ``object_nums * 3`` world-frame vector on every
+    frame. This helper reshapes it to ``(N, object_nums, 3)`` and derives point labels
+    from the feature axis names when available.
+    """
+    features = getattr(getattr(dataset, "meta", None), "features", {})
+    if OBS_ENV_STATE_KEY not in features:
+        return None
+
+    rows: list[np.ndarray] = []
+    for idx in range(len(dataset)):
+        frame = dataset[idx]
+        if OBS_ENV_STATE_KEY not in frame:
+            raise KeyError(
+                f"{OBS_ENV_STATE_KEY} is declared in dataset features but missing from frame {idx}"
+            )
+        value = frame[OBS_ENV_STATE_KEY]
+        arr = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+        rows.append(np.asarray(arr, dtype=np.float32).reshape(-1))
+
+    env_state = np.stack(rows).astype(np.float32)
+    if env_state.shape[1] == 0 or env_state.shape[1] % 3 != 0:
+        raise ValueError(
+            f"{OBS_ENV_STATE_KEY} must have a non-empty multiple-of-3 width, "
+            f"got {env_state.shape}"
+        )
+    if not np.all(np.isfinite(env_state)):
+        bad = np.argwhere(~np.isfinite(env_state))[0]
+        raise ValueError(f"{OBS_ENV_STATE_KEY} has a non-finite value at {bad.tolist()}")
+
+    feature = features[OBS_ENV_STATE_KEY]
+    axes = None
+    if isinstance(feature, Mapping):
+        names = feature.get("names")
+        if isinstance(names, Mapping) and "axes" in names:
+            axes = [str(axis) for axis in names["axes"]]
+    point_count = env_state.shape[1] // 3
+    return {
+        "points": env_state.reshape(len(dataset), point_count, 3),
+        "labels": _position_condition_labels(axes, point_count),
+    }
 
 
 def _format_lag_ms(lag_ms: float, *, include_unit: bool = False) -> str:
@@ -411,6 +524,14 @@ def main() -> None:
     for key in ("observation.images.head_rgb", "observation.images.wrist_rgb"):
         if key not in dataset.meta.features:
             raise ValueError(f"{dataset_root.name} is missing {key}.")
+    position_condition = load_processed_wbc_position_condition(dataset)
+    position_condition_points: np.ndarray | None = None
+    position_condition_labels: list[str] = []
+    position_condition_colors: np.ndarray | None = None
+    if position_condition is not None:
+        position_condition_points = np.asarray(position_condition["points"], dtype=np.float32)
+        position_condition_labels = list(position_condition["labels"])
+        position_condition_colors = _position_condition_colors(position_condition_labels)
 
     # observation.state EEF/head frame (porter dexmate_meta.json). "base" (default,
     # absolute-action dataset) must be composed to world for display; "world"
@@ -498,6 +619,11 @@ def main() -> None:
     print(f"  base drove x∈[{base_xy[:,0].min():.2f},{base_xy[:,0].max():.2f}] "
           f"y∈[{base_xy[:,1].min():.2f},{base_xy[:,1].max():.2f}] m, "
           f"yaw∈[{base_yaw.min():.3f},{base_yaw.max():.3f}] rad")
+    if position_condition_points is not None:
+        print(
+            f"  position condition: {len(position_condition_labels)} world points "
+            f"({', '.join(position_condition_labels)})"
+        )
 
     # ── Matplotlib figures (EEF xyz per arm + base top-down). ────────────────
     t_s = np.arange(N, dtype=np.float64) * dt_s
@@ -597,6 +723,7 @@ def main() -> None:
             rr.log("world/action", rr.Clear(recursive=True))
             rr.log("world/state", rr.Clear(recursive=True))
             rr.log("world/base", rr.Clear(recursive=True))
+            rr.log("world/position_condition", rr.Clear(recursive=True))
             rr.log("world/camera/eef_state_2d", rr.Clear(recursive=False))
             rr.log("world/camera/eef_action_2d", rr.Clear(recursive=False))
             continue
@@ -673,6 +800,42 @@ def main() -> None:
         cols = rgb[mask]
         pts, cols = voxel_downsample(pts, cols, args.voxel)
         rr.log("world/pcd", rr.Points3D(pts, colors=cols, radii=0.003))
+
+        # Optional processed SceneDiff position condition, already in the same
+        # engage-origin world frame as action and base odometry.
+        if position_condition_points is not None and position_condition_colors is not None:
+            pc_points = position_condition_points[idx]
+            finite = np.all(np.isfinite(pc_points), axis=1)
+            label_arr = np.asarray(position_condition_labels, dtype=object)
+            if finite.any():
+                rr.log(
+                    "world/position_condition/points",
+                    rr.Points3D(
+                        pc_points[finite],
+                        colors=position_condition_colors[finite],
+                        radii=np.full(int(finite.sum()), _POS_COND_RADIUS_3D, dtype=np.float32),
+                        labels=label_arr[finite].tolist(),
+                        show_labels=True,
+                    ),
+                )
+            else:
+                rr.log("world/position_condition/points", rr.Clear(recursive=False))
+            strips, strip_colors, strip_labels = _position_condition_link_strips(
+                pc_points, finite, position_condition_labels
+            )
+            if strips:
+                rr.log(
+                    "world/position_condition/links",
+                    rr.LineStrips3D(
+                        strips,
+                        colors=strip_colors,
+                        radii=np.full(len(strips), 0.006, dtype=np.float32),
+                        labels=strip_labels,
+                        show_labels=True,
+                    ),
+                )
+            else:
+                rr.log("world/position_condition/links", rr.Clear(recursive=False))
 
         # Gripper scalars per arm: [action (binary), observation.state (raw)].
         for side in _ARM_SIDES:
