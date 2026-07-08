@@ -127,10 +127,16 @@ _POS_COND_COLOR_BEFORE = (0, 200, 255)
 _POS_COND_COLOR_AFTER = (255, 225, 25)
 _POS_COND_RADIUS_3D = 0.015
 _POS_COND_RADIUS_2D = 2.5
+_HEAD_DEPTH_ENTITY = "/world/camera/depth"
 
 # Default gRPC endpoint of a running rerun Viewer (matches a bare `rerun
 # --headless`, i.e. no --port). Used by --connect for the MCP debug workflow.
 _DEFAULT_VIEWER_URL = "rerun+http://127.0.0.1:9876/proxy"
+
+
+def head_depth_hidden_overrides() -> dict[str, rrb.EntityBehavior]:
+    """Hide head depth by default while keeping it toggleable in the sidebar."""
+    return {_HEAD_DEPTH_ENTITY: rrb.EntityBehavior(visible=False)}
 
 
 def gram_schmidt_6d_to_R(r6: np.ndarray) -> np.ndarray:
@@ -703,13 +709,11 @@ def main() -> None:
     # Entity paths below mirror where the streams are logged further down; an
     # explicit blueprint also stops the viewer falling back to a stale auto
     # layout that reported "Entity not found in view" for the wrist image.
-    # In --deploy mode the depth stream clutters the views (a translucent layer
-    # over head_left_rgb and a backprojected point cloud competing with the
-    # colored /world/pcd in 3D), so hide /world/camera/depth by default in both.
+    # The depth stream clutters the views (a translucent layer over head_left_rgb
+    # and a backprojected point cloud competing with the colored /world/pcd in
+    # 3D), so hide /world/camera/depth by default in both.
     # It stays in the blueprint and can be toggled back on from the viewer.
-    depth_override = (
-        {"/world/camera/depth": rrb.EntityBehavior(visible=False)} if args.deploy else None
-    )
+    depth_override = head_depth_hidden_overrides()
 
     side_panels: list = []
     if wrist_rgb is not None:

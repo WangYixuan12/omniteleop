@@ -132,6 +132,7 @@ OBS_ENV_STATE_KEY = "observation.environment_state"
 _GRIPPER_Y_MIN = -0.2
 _GRIPPER_Y_MAX = 1.1
 _POS_COND_RADIUS_3D = 0.018
+_HEAD_DEPTH_ENTITY = "/world/camera/depth"
 
 
 # ── Generic helpers copied verbatim from vis_episode_processed.py so the two
@@ -203,6 +204,11 @@ def _rgb_to_hwc(t) -> np.ndarray:
     if a.dtype != np.uint8:
         a = a.astype(np.uint8)
     return a
+
+
+def head_depth_hidden_overrides() -> dict[str, rrb.EntityBehavior]:
+    """Hide head depth by default while keeping it toggleable in the sidebar."""
+    return {_HEAD_DEPTH_ENTITY: rrb.EntityBehavior(visible=False)}
 
 
 def _position_condition_labels(axis_names: list[str] | None, point_count: int) -> list[str]:
@@ -647,6 +653,7 @@ def main() -> None:
     playback_fps = float(dataset.fps) if dataset.fps else 10.0
     lookback = max(400, min(N, 5000))
     lookahead = min(80, max(1, N // 50 + 5))
+    depth_override = head_depth_hidden_overrides()
 
     def _cursor_range(origin: str, name: str, y_range=None) -> rrb.TimeSeriesView:
         axis_y = (
@@ -667,8 +674,16 @@ def main() -> None:
         rrb.Blueprint(
             rrb.Vertical(
                 rrb.Horizontal(
-                    rrb.Spatial3DView(origin="world", name="World (pcd + EEF + base odom)"),
-                    rrb.Spatial2DView(origin="world/camera", name="Head RGB / depth"),
+                    rrb.Spatial3DView(
+                        origin="world",
+                        name="World (pcd + EEF + base odom)",
+                        overrides=depth_override,
+                    ),
+                    rrb.Spatial2DView(
+                        origin="world/camera",
+                        name="Head RGB / depth",
+                        overrides=depth_override,
+                    ),
                     rrb.Spatial2DView(origin="wrist", name="Wrist RGB"),
                     column_shares=[2.0, 1.3, 1.3],
                 ),
