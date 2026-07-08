@@ -38,7 +38,8 @@ Sidecars per episode (not in the parquet):
     size, broadcast (T',3,3)).
 ``debug/timing/episode_XXXXXX.npz`` key ``timestamp_ns`` (T',) always; plus, for
     takes recorded with the timing-aware recorder, the per-frame capture stamps
-    ``head_frame_ns``/``left_wrist_frame_ns``/``grab_wall_ns`` (T',) and the 0-d
+    ``head_frame_ns``/``left_wrist_frame_ns``/``grab_wall_ns`` (T'), optional
+    ``head_depth_frame_ns`` (T') when present, and the 0-d
     ``ntp_offset_ns``/``ntp_rtt_ns``/``ntp_queried_at_ns`` SoC clock calibration,
     plus optional 0-d ``camera_ntp_{head,wrist}_*`` camera-publisher-host clock
     calibration -- everything scripts/audit_episode_latency.py needs, preserved
@@ -280,6 +281,7 @@ def read_required_array(f: h5py.File, key: str, source: str | Path,
 
 
 _TIMING_KEYS = ("head_frame_ns", "left_wrist_frame_ns", "grab_wall_ns")
+_OPTIONAL_TIMING_KEYS = ("head_depth_frame_ns",)
 _NTP_KEYS = ("offset_ns", "rtt_ns", "queried_at_ns")
 _CAMERA_NTP_LABELS = ("head", "wrist")
 _CAMERA_NTP_INT_KEYS = ("offset_ns", "rtt_ns", "queried_at_ns")
@@ -300,11 +302,19 @@ def load_episode_timing(f: h5py.File, source: str | Path,
     int64 when present (``offset_ns`` may be negative; the others must not be).
     Returned dict maps the per-frame keys to (T,) arrays and ``ntp_<key>`` to 0-d
     arrays, matching the ``debug/timing`` sidecar layout. Optional
+    ``obs/images/head_depth_frame_ns`` is optional for compatibility with takes recorded
+    before depth carried its own stamp; when present it is validated and preserved.
     ``meta/camera_ntp/{head,wrist}`` groups are flattened to
     ``camera_ntp_<label>_<key>`` scalar sidecar entries.
     """
     present = [key for key in _TIMING_KEYS if f"obs/images/{key}" in f]
+    optional_present = [key for key in _OPTIONAL_TIMING_KEYS if f"obs/images/{key}" in f]
     if not present:
+        if optional_present:
+            raise RuntimeError(
+                f"{source}: optional timing fields {optional_present} exist without "
+                f"required {list(_TIMING_KEYS)}; corrupt timing metadata"
+            )
         return None
     if len(present) != len(_TIMING_KEYS):
         missing = sorted(set(_TIMING_KEYS) - set(present))
@@ -326,6 +336,20 @@ def load_episode_timing(f: h5py.File, source: str | Path,
             raise RuntimeError(
                 f"{source}: obs/images/{key} is not strictly increasing -- the "
                 "recorder freshness gate forbids duplicate frames; corrupt take"
+            )
+        timing[key] = arr
+    for key in optional_present:
+        arr = np.asarray(f[f"obs/images/{key}"][()])
+        if arr.shape != (frame_count,) or arr.dtype != np.int64:
+            raise RuntimeError(
+                f"{source}: obs/images/{key} must be ({frame_count},) int64, got "
+                f"{arr.shape} {arr.dtype}"
+            )
+        if np.any(arr <= 0):
+            raise RuntimeError(f"{source}: obs/images/{key} has non-positive stamps")
+        if arr.shape[0] > 1 and np.any(np.diff(arr) < 0):
+            raise RuntimeError(
+                f"{source}: obs/images/{key} is not monotonic -- corrupt take"
             )
         timing[key] = arr
     ntp_present = [key for key in _NTP_KEYS if f"meta/ntp/{key}" in f]

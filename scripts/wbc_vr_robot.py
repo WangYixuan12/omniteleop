@@ -57,7 +57,8 @@ lands in the world frame (see ``scripts/vis_episode.py``). The wrist camera stre
 
 Timing metadata for offline camera-latency audits (``scripts/audit_episode_latency.py``):
 each frame stores the publisher capture stamps ``obs/images/{head_frame_ns,
-left_wrist_frame_ns}`` (camera-publisher-host clock) and ``obs/images/grab_wall_ns``
+head_depth_frame_ns,left_wrist_frame_ns}`` (camera-publisher-host clock) and
+``obs/images/grab_wall_ns``
 (workstation clock right after both grabs). ``meta/ntp`` preserves the robot
 SoC-minus-workstation offset from ``Robot.query_ntp()``; ``meta/camera_ntp`` stores
 camera-publisher-host-minus-workstation offsets from the ZED publishers' lightweight
@@ -72,6 +73,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import os
 import threading
 import time
 from collections import deque
@@ -616,6 +618,15 @@ class HardwareDriver:
         # intermediates here and debug_row() assembles them after actuation. Touched
         # only by the (single-threaded) follower loop.
         self._dbg: dict = {}
+        # Optional 100 Hz base-steering telemetry (env-gated; NO dexcontrol edits). When
+        # WBC_BASE_STEER_LOG names an .npz path, _drive_base logs per-tick commanded twist,
+        # MEASURED steer/drive joint state, and the steer target the chassis SHOULD command
+        # (verified wbc_swerve replica of _compute_wheel_control) so a rollout re-run reveals
+        # whether the steering servo actually reaches the commanded angle -- the forward-command
+        # -> ~45deg base-heading drift is absent from the 10 Hz episode (no steer joints).
+        _steer_log_env = os.environ.get("WBC_BASE_STEER_LOG")
+        self._steer_log_path = os.path.expanduser(_steer_log_env) if _steer_log_env else None
+        self._steer_log: Optional[list] = [] if self._steer_log_path else None
         # Grippers (always active): cache the last commanded triggers for action/gripper
         # recording, the FC03 achieved-position obs (gPO/255), and the per-arm status
         # monitors (set up under --record). Initialized here so close() can tear down even
@@ -1103,6 +1114,76 @@ class HardwareDriver:
         self._dbg["base_pd_err"] = np.asarray(err, dtype=float)
         self._dbg["base_cmd"] = np.asarray(cmd, dtype=float)
         self._dbg["base_action"] = action
+        if self._steer_log is not None:
+            self._log_base_steer(chassis, cmd, action, snap)
+
+    def _log_base_steer(self, chassis, cmd, action: str, snap) -> None:
+        """Append one 100 Hz base-steering telemetry row (env-gated, WBC_BASE_STEER_LOG).
+
+        Records the commanded twist, the MEASURED steer/drive joint state, and the steer
+        target the chassis SHOULD command for this twist (computed with the wbc_swerve
+        replica of dexcontrol's _compute_wheel_control -- the same math the real chassis
+        runs, so target ~0 for a pure-forward twist). An offline pass then checks whether
+        the steering servo actually reaches that target: commanded ~0 but MEASURED ~45deg
+        during a forward segment is the drift, invisible in the 10 Hz episode.
+        """
+        from omniteleop.follower import wbc_swerve  # noqa: PLC0415 -- debug-only
+
+        try:
+            steer_read = np.asarray(chassis.steering_angle, dtype=float)
+            drive_read = np.asarray(chassis.wheel_velocity, dtype=float)
+        except Exception:
+            return
+        if steer_read.shape != (2,) or drive_read.shape != (2,):
+            return
+        cmd_t = (float(cmd[0]), float(cmd[1]), float(cmd[2]))
+        try:
+            wheels = wbc_swerve.swerve_command(
+                cmd_t, {"L": float(steer_read[0]), "R": float(steer_read[1])}
+            )
+            steer_tgt = np.array([wheels["L"].steer, wheels["R"].steer], dtype=float)
+            flipped = np.array([wheels["L"].flipped, wheels["R"].flipped], dtype=bool)
+        except Exception:
+            steer_tgt = np.full(2, np.nan)
+            flipped = np.zeros(2, dtype=bool)
+        twist = self._odom.twist if self._odom is not None else np.full(3, np.nan)
+        self._steer_log.append({
+            "t": float(time.perf_counter()),
+            "cmd": np.asarray(cmd_t, dtype=float),
+            "steer_read": steer_read,
+            "drive_read": drive_read,
+            "steer_tgt": steer_tgt,
+            "flipped": flipped,
+            "odom_pose": np.asarray(snap["pose"], dtype=float),
+            "odom_twist": np.asarray(twist, dtype=float),
+            "action": str(action),
+        })
+
+    def _dump_base_steer_log(self) -> None:
+        """Serialize env-gated 100 Hz base-steering telemetry to WBC_BASE_STEER_LOG (.npz)."""
+        if self._steer_log is None:
+            return
+        if not self._steer_log:
+            print(f"[wbc_vr_robot] base-steer log empty; nothing written to "
+                  f"{self._steer_log_path}")
+            return
+        rows = self._steer_log
+        arrs = {
+            "t": np.asarray([r["t"] for r in rows], dtype=np.float64),
+            "cmd": np.stack([r["cmd"] for r in rows]),
+            "steer_read": np.stack([r["steer_read"] for r in rows]),
+            "drive_read": np.stack([r["drive_read"] for r in rows]),
+            "steer_tgt": np.stack([r["steer_tgt"] for r in rows]),
+            "flipped": np.stack([r["flipped"] for r in rows]),
+            "odom_pose": np.stack([r["odom_pose"] for r in rows]),
+            "odom_twist": np.stack([r["odom_twist"] for r in rows]),
+            "action": np.asarray([r["action"] for r in rows]),
+        }
+        try:
+            np.savez(self._steer_log_path, **arrs)
+            print(f"[wbc_vr_robot] wrote {len(rows)} base-steer rows -> {self._steer_log_path}")
+        except Exception as exc:  # best-effort debug artifact
+            print(f"[wbc_vr_robot] WARNING: failed to write base-steer log: {exc}")
 
     def _allow_base_yaw_hold_in_xy(self) -> bool:
         return self.cfg.base_dofs == "xy" and bool(self.args.base_yaw_hold_in_xy)
@@ -1244,7 +1325,8 @@ class HardwareDriver:
             from ``obs/base/pose`` + ``obs/joint`` (see ``scripts/vis_episode.py``).
         ``action/gripper`` is the leader trigger command, ``obs/gripper`` the Robotiq FC03
         achieved position, and ``obs/images`` carries head_left_rgb/head_depth/left_wrist_rgb
-        plus the per-frame capture stamps (head_frame_ns/left_wrist_frame_ns/grab_wall_ns);
+        plus the per-frame capture stamps
+        (head_frame_ns/head_depth_frame_ns/left_wrist_frame_ns/grab_wall_ns);
         ``meta/ntp`` stores the once-per-run robot-SoC-vs-local clock offset, while
         ``meta/camera_ntp`` stores camera-publisher-host-vs-local offsets
         (see :meth:`_query_ntp_calibration` and :meth:`_query_camera_clock_calibrations`).
@@ -1435,15 +1517,16 @@ class HardwareDriver:
             )
         return entry["data"], int(ts)
 
-    def _grab_head_images(self) -> Optional[tuple[np.ndarray, np.ndarray, int]]:
-        """Poll the head camera -> ``(left_rgb uint8 HxWx3, depth uint16 HxW, frame_ns)`` or None.
+    def _grab_head_images(self) -> Optional[tuple[np.ndarray, np.ndarray, int, int]]:
+        """Poll head camera -> ``(left_rgb, depth_u16, rgb_frame_ns, depth_frame_ns)`` or None.
 
         None until both streams have delivered a frame (parity with vr_reader's
         ``_all_selected_streams_ready`` -- so the saved HDF5 keeps consistent keys and shapes
-        across frames). ``frame_ns`` is the publisher capture timestamp of the ``left_rgb``
-        frame (``include_timestamp=True``); depth must carry the SAME timestamp, otherwise
-        the matching depth message has not arrived yet after the publisher's early-RGB path.
-        record_tick rejects a stale frame (camera stalled below the record rate). Raises
+        across frames). ``rgb_frame_ns`` is the publisher capture timestamp of the
+        ``left_rgb`` frame (``include_timestamp=True``), and ``depth_frame_ns`` is recorded
+        separately because the early-RGB publisher path can expose RGB one capture before
+        the depth message is ready. record_tick rejects stale RGB frames (camera stalled
+        below the record rate) but does not wait for same-frame RGBD. Raises
         ValueError on a malformed shape or a missing timestamp, so a miswired/legacy camera
         fails loudly instead of recording garbage or silently skipping the freshness check.
         """
@@ -1456,8 +1539,9 @@ class HardwareDriver:
             return None
         left_rgb, frame_ns = self._unwrap_frame("head_camera left_rgb", left_entry)
         depth, depth_ns = self._unwrap_frame("head_camera depth", depth_entry)
-        if depth_ns != frame_ns:
-            return None
+        # If a future pointcloud/depth policy requires same-frame RGBD again, restore:
+        # if depth_ns != frame_ns:
+        #     return None
         left_rgb = np.asarray(left_rgb)
         depth = np.asarray(depth)
         if left_rgb.ndim != 3 or left_rgb.shape[2] != 3:
@@ -1470,7 +1554,7 @@ class HardwareDriver:
             )
         # meters -> millimeters, clipped to uint16 (matches vr_reader's head_depth).
         depth_u16 = np.clip(depth * 1000, 0, 65535).astype(np.uint16)
-        return np.ascontiguousarray(left_rgb, dtype=np.uint8), depth_u16, frame_ns
+        return np.ascontiguousarray(left_rgb, dtype=np.uint8), depth_u16, frame_ns, depth_ns
 
     def _grab_wrist_image(self) -> Optional[tuple[np.ndarray, int]]:
         """Poll the wrist ZED-M left eye -> ``(left_wrist_rgb uint8 HxWx3, frame_ns)`` or None.
@@ -1674,7 +1758,7 @@ class HardwareDriver:
                   f"{head_ns - self._last_rec_head_ns} ns, wrist Δ="
                   f"{wrist_ns - self._last_rec_wrist_ns} ns).")
             self._stale_since = None
-        head_left_rgb, head_depth_u16, _ = imgs
+        head_left_rgb, head_depth_u16, _, head_depth_ns = imgs
         wrist_left_rgb, _ = wrist
         # Arrival-age history for the stale-abort diagnostic: local wall clock minus the
         # publisher capture stamp (spans the camera-host->workstation clock offset, so
@@ -1726,9 +1810,10 @@ class HardwareDriver:
             # Publisher capture stamps (camera-publisher-host clock) of THIS tick's frames plus the
             # local wall clock right after both grabs -- the raw material for offline
             # camera-latency audits/correction (scripts/audit_episode_latency.py, with
-            # meta/camera_ntp when available). Always valid here: the freshness gate above
-            # skips the tick unless BOTH stamps strictly advanced.
+            # meta/camera_ntp when available). The freshness gate above requires head RGB and
+            # wrist stamps to advance; depth's stamp is recorded separately for RGBD audits.
             "head_frame_ns": np.int64(head_ns),
+            "head_depth_frame_ns": np.int64(head_depth_ns),
             "left_wrist_frame_ns": np.int64(wrist_ns),
             "grab_wall_ns": np.int64(wall_ns),
             # intrinsic is recorded once via set_static (not per frame); extrinsic is NOT
@@ -1806,6 +1891,7 @@ class HardwareDriver:
         # daemon thread, so block here until it finishes -- otherwise process exit could
         # kill the save mid-write.
         self.stop_recording_episode()
+        self._dump_base_steer_log()
         # Best-effort teardown of the FC03 gripper-status subscribers.
         for monitor in getattr(self, "_grip_monitors", {}).values():
             try:
