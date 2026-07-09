@@ -822,6 +822,13 @@ class _PolicyBundle:
         self._obs_history.clear()
         self._chunk_tail.clear()
 
+    def describe(self) -> str:
+        """One-line banner for _run_rollout. Other policy families override this."""
+        return (f"LeRobot policy on {self.device}; head+"
+                f"{'wrist' if self.use_wrist else 'no-wrist'} @ {self.image_hw}; "
+                f"relative={self.use_relative_actions} state_frame={self.state_frame}; "
+                f"n_obs_steps={self.n_obs_steps} n_action_steps={self.n_action_steps}")
+
     def set_env_state(self, vec: np.ndarray) -> None:
         """Pin the constant SceneDiff position condition fed to every observation.
 
@@ -1289,7 +1296,18 @@ def _prepare_live_position_condition(args: argparse.Namespace, driver, fk: WBCPo
     return env_vec
 
 
-def _run_rollout(args: argparse.Namespace) -> None:
+def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
+                 worker_factory=None) -> None:
+    """Drive the 100 Hz WBC loop from a policy (or a recorded episode).
+
+    ``policy_factory(policy_path)`` and ``worker_factory(**kwargs)`` default to
+    :class:`_PolicyBundle` / :class:`_InferenceWorker` (LeRobot image policies).
+    ``scripts/wbc_maniflow_rollout.py`` swaps in a ManiFlow point-cloud pair so both
+    policy families share ONE hardware loop, alignment, scheduler and watchdog -- a
+    second copy of this loop is exactly the kind of divergence that gets a robot hurt.
+    A replacement bundle must expose ``describe``/``reset``/``predict_chunk``/
+    ``state_frame``/``n_obs_steps``/``n_action_steps``/``use_env_state``.
+    """
     from omniteleop.common.recorder import EpisodeRecorder  # noqa: PLC0415
     from omniteleop.wbc_robot_util import parse_enable_mask  # noqa: PLC0415
     from omniteleop.wbc_stream import (  # noqa: PLC0415
@@ -1328,12 +1346,9 @@ def _run_rollout(args: argparse.Namespace) -> None:
     else:
         mode = "rollout"
         print(f"[wbc_policy_rollout] loading policy {args.policy_path} ...")
-        policy = _PolicyBundle(args.policy_path)
+        policy = (policy_factory or _PolicyBundle)(args.policy_path)
         state_frame = policy.state_frame
-        print(f"[wbc_policy_rollout] policy on {policy.device}; head+"
-              f"{'wrist' if policy.use_wrist else 'no-wrist'} @ {policy.image_hw}; "
-              f"relative={policy.use_relative_actions} state_frame={policy.state_frame}; "
-              f"n_obs_steps={policy.n_obs_steps} n_action_steps={policy.n_action_steps}")
+        print(f"[wbc_policy_rollout] {policy.describe()}")
         chunk_coverage = policy.n_action_steps / args.dataset_fps
         if args.policy_interval > chunk_coverage:
             print(f"[wbc_policy_rollout] WARNING: --policy-interval "
@@ -1452,7 +1467,7 @@ def _run_rollout(args: argparse.Namespace) -> None:
         else:
             # Start inference only now: observations must be post-engage/post-align
             # (the odometry origin and ik.reset() world anchor are already set).
-            worker = _InferenceWorker(
+            worker = (worker_factory or _InferenceWorker)(
                 policy=policy, driver=driver, fk=fk, buffer=schedule_buffer,
                 io_log=io_log, t0=t0, dataset_dt=1.0 / args.dataset_fps,
                 policy_interval=args.policy_interval,
@@ -1595,7 +1610,8 @@ def _run_rollout(args: argparse.Namespace) -> None:
         driver.close()
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Every CLI flag of the shared rollout. ``wbc_maniflow_rollout.py`` extends this."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1681,7 +1697,12 @@ def main() -> None:
                     help="scene_diff repo holding run_live_pos_condition.sh.")
     pc.add_argument("--scene-diff-python", default=DEFAULT_SCENE_DIFF_PYTHON,
                     help="interpreter for SceneDiff (scene_diff/.venv-merged/bin/python).")
-    args = parser.parse_args()
+    return parser
+
+
+def finalize_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Validate the parsed args and fill the wbik.yaml-sourced hardware defaults in place."""
+    mod = _load_wbc_vr_robot()
 
     if bool(args.policy_path) == bool(args.replay_episode):
         parser.error("exactly one of --policy-path / --replay-episode is required")
@@ -1731,6 +1752,12 @@ def main() -> None:
         parser.error("--execution-latency must be finite and >= 0")
     if not np.isfinite(args.dataset_fps) or args.dataset_fps <= 0:
         parser.error("--dataset-fps must be finite and > 0")
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    finalize_args(parser, args)
     _run_rollout(args)
 
 

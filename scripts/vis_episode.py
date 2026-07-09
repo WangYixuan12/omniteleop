@@ -4,10 +4,11 @@ Logs RGB-D, the colored point cloud, robot meshes, and EEF obs/action markers
 under a single ``frame`` timeline so the rerun viewer's scrubber doubles as
 prev/next/jump navigation.
 
-Two episode layouts are supported via ``--deploy``:
+Two episode layouts are detected from the HDF5 schema:
 
-* default (teleop / ``raw_data`` layout, written by ``leader/vr_reader.py`` or
-  ``scripts/wbc_vr_robot.py``)::
+* WBC recorder layout (teleop and current policy rollouts, written by
+  ``leader/vr_reader.py``, ``scripts/wbc_vr_robot.py``, or
+  ``scripts/wbc_policy_rollout.py``)::
 
       obs/images/{head_left_rgb, head_depth, left_wrist_rgb}
       obs/images/intrinsic   (3, 3) static (wbc_vr_robot) or (N, 3, 3) -- REQUIRED
@@ -23,7 +24,7 @@ Two episode layouts are supported via ``--deploy``:
   streams (``L_ee`` / ``R_ee``): obs = ``obs/joint/*_arm``, action =
   ``action/joint/*_arm`` (with torso/head taken from the obs streams).
 
-* ``--deploy`` (policy rollout, written by ``follower/policy_rollout.py``)::
+* legacy policy rollout::
 
       time/{begin_build_observation, begin_inference, finish_inference, publish_command, ...}
       obs/images/{head_left_rgb, head_depth, left_wrist_rgb, intrinsic, extrinsic}
@@ -42,10 +43,15 @@ Two episode layouts are supported via ``--deploy``:
   Torso/head joints aren't recorded, so they're held at ``INIT_*`` for
   robot-mesh FK. ``obs/images/intrinsic`` is REQUIRED in BOTH modes (no
   hardcoded-ZED fallback -- the old default only matched a full raw SVGA frame
-  and mis-scaled cropped/resized recordings); ``--deploy`` additionally requires
-  the saved ``obs/images/extrinsic`` (no FK camera-extrinsic fallback). A single
+  and mis-scaled cropped/resized recordings); rollouts additionally require the
+  saved ``obs/images/extrinsic`` (no FK camera-extrinsic fallback). A single
   shared matrix is broadcast over frames. A ``debug/latency.png`` is written from
   the ``time`` group.
+
+For the current WBC recorder layout, ``scripts/wbc_policy_rollout.py
+--position-condition`` saves the constant policy condition beside the episode at
+``scene_diff/episode_N/episode_N.npz``. The viewer loads those ordered world-frame
+points automatically and draws them with source-to-destination links.
 
 When ``obs/base/pose`` is present (``wbc_vr_robot.py --enable base``), the head-camera
 extrinsic (``world_t_cam = world_t_base · base_t_cam``), robot meshes, colored point
@@ -62,7 +68,7 @@ the scrubber advances; a coordinate frame marks the current-frame pose.
 Usage::
 
     python scripts/vis_episode.py --hdf5 data/episode_0.hdf5
-    python scripts/vis_episode.py --hdf5 deploy/act/0/episode_0.hdf5 --deploy
+    python scripts/vis_episode.py --hdf5 rollout/episode_0.hdf5
     python scripts/vis_episode.py --hdf5 data/episode_0.hdf5 --save out.rrd
 
 Robot link geometry is logged once as static and animated per-frame with a
@@ -122,9 +128,15 @@ _AXIS_X_COLOR = (255, 0, 0)
 _AXIS_Y_COLOR = (0, 200, 0)
 _AXIS_Z_COLOR = (80, 120, 255)
 
-# Deploy position-condition markers (3D world + 2D head RGB overlay).
+# Rollout position-condition markers (3D world + 2D head RGB overlay).
 _POS_COND_COLOR_BEFORE = (0, 200, 255)
 _POS_COND_COLOR_AFTER = (255, 225, 25)
+_POS_COND_COLOR_OTHER = (
+    (180, 220, 80),
+    (255, 140, 40),
+    (180, 120, 255),
+    (255, 105, 180),
+)
 _POS_COND_RADIUS_3D = 0.015
 _POS_COND_RADIUS_2D = 2.5
 _HEAD_DEPTH_ENTITY = "/world/camera/depth"
@@ -317,7 +329,7 @@ def load_world_t_base(obs_group: dict, num_frames: int) -> np.ndarray:
 
     Episodes recorded with a moving base (``scripts/wbc_vr_robot.py --enable base``) carry
     ``obs/base/pose`` ``(N, 3) = (x, y, yaw)`` in the engage-origin world frame. Without it
-    (deploy rollouts, legacy teleop) the base is treated as fixed at the world origin
+    (rollouts, legacy teleop) the base is treated as fixed at the world origin
     (identity) -> base-relative rendering, i.e. unchanged behavior.
     """
     base_group = obs_group.get("base") if isinstance(obs_group, dict) else None
@@ -343,7 +355,7 @@ def load_action_head_world(data: dict, num_frames: int) -> np.ndarray | None:
     """Optional ``action/head`` stream, recorded as world-frame head targets.
 
     WBC recorder episodes contain ``action/head`` ``(N,4,4)``. Legacy teleop and
-    deploy-layout episodes may not, in which case the viewer still shows the
+    rollout-layout episodes may not, in which case the viewer still shows the
     observed head/camera pose.
     """
     action_group = data.get("action") if isinstance(data, dict) else None
@@ -399,7 +411,7 @@ def transform_rots_se3(T: np.ndarray, Rm: np.ndarray) -> np.ndarray:
 def load_deploy_position_condition(
     obs_group: dict, num_frames: int
 ) -> dict[str, np.ndarray] | None:
-    """Read optional deploy position-condition arrays from an episode obs group."""
+    """Read optional rollout position-condition arrays from an episode obs group."""
     if "position_condition" not in obs_group:
         return None
     group = obs_group["position_condition"]
@@ -429,6 +441,129 @@ def load_deploy_position_condition(
     return {"stage": stage, "mask": mask, "condition_6d": condition_6d}
 
 
+def position_condition_labels(axis_names: list[str] | None, point_count: int) -> list[str]:
+    """Convert environment-state axis names into one label per xyz point."""
+    if axis_names is None or len(axis_names) != point_count * 3:
+        return [f"obj{idx}" for idx in range(point_count)]
+
+    labels: list[str] = []
+    for point_idx in range(point_count):
+        names = axis_names[point_idx * 3 : point_idx * 3 + 3]
+        prefixes = []
+        for name, suffix in zip(names, ("_x", "_y", "_z"), strict=True):
+            if not name.endswith(suffix):
+                prefixes = []
+                break
+            prefixes.append(name[: -len(suffix)])
+        if prefixes and len(set(prefixes)) == 1 and prefixes[0]:
+            labels.append(prefixes[0])
+        else:
+            labels.append(f"obj{point_idx}")
+    return labels
+
+
+def position_condition_colors(labels: list[str]) -> np.ndarray:
+    """Return stable colors, highlighting source/destination point pairs."""
+    colors: list[tuple[int, int, int]] = []
+    for idx, label in enumerate(labels):
+        if label.endswith(("_src", "_before")):
+            colors.append(_POS_COND_COLOR_BEFORE)
+        elif label.endswith(("_dst", "_after")):
+            colors.append(_POS_COND_COLOR_AFTER)
+        else:
+            colors.append(_POS_COND_COLOR_OTHER[idx % len(_POS_COND_COLOR_OTHER)])
+    return np.asarray(colors, dtype=np.uint8)
+
+
+def position_condition_link_strips(
+    points: np.ndarray, finite: np.ndarray, labels: list[str]
+) -> tuple[list[np.ndarray], list[tuple[int, int, int]], list[str]]:
+    """Build source-to-destination links for paired SceneDiff condition points."""
+    strips: list[np.ndarray] = []
+    colors: list[tuple[int, int, int]] = []
+    line_labels: list[str] = []
+    for start in range(0, len(labels) - 1, 2):
+        if not (finite[start] and finite[start + 1]):
+            continue
+        source, destination = labels[start], labels[start + 1]
+        if not (source.endswith("_src") and destination.endswith("_dst")):
+            continue
+        strips.append(np.stack([points[start], points[start + 1]]).astype(np.float32))
+        colors.append(_POS_COND_COLOR_AFTER)
+        line_labels.append(f"{source[: -len('_src')]}: src->dst")
+    return strips, colors, line_labels
+
+
+def _scene_diff_position_labels(point_count: int) -> list[str]:
+    """Name the ordered policy inputs as source/destination pairs when possible."""
+    if point_count % 2:
+        return position_condition_labels(None, point_count)
+    axis_names = [
+        f"s{idx // 2 + 1}_{'src' if idx % 2 == 0 else 'dst'}_{axis}"
+        for idx in range(point_count)
+        for axis in ("x", "y", "z")
+    ]
+    return position_condition_labels(axis_names, point_count)
+
+
+def load_scene_diff_position_condition(
+    hdf5_path: str | Path,
+) -> dict[str, np.ndarray | list[str] | Path] | None:
+    """Read the paired SceneDiff position-condition sidecar for an episode.
+
+    ``scripts/wbc_policy_rollout.py`` records the HDF5 with the standard WBC
+    recorder schema and stores the constant position condition separately as
+    ``scene_diff/episode_N/episode_N.npz``. The policy consumes
+    ``positions[order]``; that is the world-frame point order rendered here.
+    """
+    episode_path = Path(hdf5_path)
+    npz_path = (
+        episode_path.parent
+        / "scene_diff"
+        / episode_path.stem
+        / f"{episode_path.stem}.npz"
+    )
+    if not npz_path.is_file():
+        return None
+
+    with np.load(npz_path) as data:
+        missing = [key for key in ("positions", "order") if key not in data]
+        if missing:
+            raise KeyError(f"{npz_path}: missing {missing}; have {list(data.files)}")
+        positions = np.asarray(data["positions"], dtype=np.float32)
+        order = np.asarray(data["order"], dtype=np.int64).reshape(-1)
+
+    if positions.ndim != 2 or positions.shape[1] != 3 or positions.shape[0] == 0:
+        raise ValueError(f"{npz_path}: positions must have shape (M, 3), got {positions.shape}")
+    if order.shape != (positions.shape[0],) or not np.array_equal(
+        np.sort(order), np.arange(positions.shape[0])
+    ):
+        raise ValueError(f"{npz_path}: order {order.tolist()} is not a positions permutation")
+    points = positions[order]
+    if not np.all(np.isfinite(points)):
+        raise ValueError(f"{npz_path}: ordered position condition contains non-finite values")
+    return {
+        "points": points,
+        "labels": _scene_diff_position_labels(len(points)),
+        "path": npz_path,
+    }
+
+
+def is_rollout_episode(data: dict) -> bool:
+    """Detect the policy-rollout layout from its recorded EEF streams."""
+    obs_group = data.get("obs") if isinstance(data, dict) else None
+    action_group = data.get("action") if isinstance(data, dict) else None
+    if not isinstance(obs_group, dict) or not isinstance(action_group, dict):
+        return False
+
+    def has_bimanual_eef(group: object) -> bool:
+        return isinstance(group, dict) and all(side in group for side in ("left", "right"))
+
+    return has_bimanual_eef(obs_group.get("eef_9d")) and has_bimanual_eef(
+        action_group.get("eef_9d")
+    )
+
+
 def format_position_condition_frame(
     stage: np.integer | int, mask: np.ndarray, condition_6d: np.ndarray
 ) -> str:
@@ -453,15 +588,6 @@ def main() -> None:
         type=str,
         default="/home/yixuan/Dexmate/data/raw_data/episode_7.hdf5",
         help="Path to episode HDF5 file",
-    )
-    parser.add_argument(
-        "--deploy",
-        action="store_true",
-        help="Read a policy-rollout episode (follower/policy_rollout.py layout) "
-        "instead of a teleop recording: EEF markers come from "
-        "obs/action eef_9d/{left,right}, torso/head joints are held at INIT_*, "
-        "saved obs/images/{intrinsic,extrinsic} are required (no hardcoded/FK "
-        "fallback), and a debug/latency.png is written.",
     )
     parser.add_argument(
         "--voxel", type=float, default=0.012, help="Voxel size for PCD downsample (m)"
@@ -493,8 +619,10 @@ def main() -> None:
         parser.error("--connect and --save are mutually exclusive")
 
     data, _ = load_dict_from_hdf5(args.hdf5)
+    is_rollout = is_rollout_episode(data)
+    scene_diff_position_condition = load_scene_diff_position_condition(args.hdf5)
 
-    if args.deploy and "time" in data:
+    if is_rollout and "time" in data:
         report_pipeline_latencies(data["time"], args.hdf5)
 
     # ── load image arrays (shared key names across both layouts) ─────────────
@@ -533,7 +661,7 @@ def main() -> None:
 
     # Torso/head: teleop records them; rollouts hold them at INIT_* (used here
     # for robot-mesh + camera-extrinsic FK only).
-    if args.deploy:
+    if is_rollout:
         obs_torso = np.tile(np.asarray(INIT_TORSO_JOINTS, dtype=np.float64), (N, 1))
         obs_head = np.tile(np.asarray(INIT_HEAD_JOINTS, dtype=np.float64), (N, 1))
     else:
@@ -545,17 +673,24 @@ def main() -> None:
     obs_grip_right = np.array(data["obs"]["gripper"]["right"])  # (N,)
     act_grip_left = np.array(data["action"]["gripper"]["left"])  # (N,)
     act_grip_right = np.array(data["action"]["gripper"]["right"])  # (N,)
-    position_condition = (
-        load_deploy_position_condition(data["obs"], N) if args.deploy else None
-    )
+    position_condition = load_deploy_position_condition(data["obs"], N)
 
     wrist_note = f"  |  wrist: {wrist_rgb.shape[1:3]}" if wrist_rgb is not None else "  |  no wrist"
+    episode_kind = (
+        "legacy rollout"
+        if is_rollout
+        else "position-conditioned WBC rollout"
+        if scene_diff_position_condition is not None
+        else "teleop"
+    )
     print(
-        f"Episode ({'deploy' if args.deploy else 'teleop'}): {N} frames  |  "
+        f"Episode ({episode_kind}): {N} frames  |  "
         f"head image: {H}x{W}{wrist_note}"
     )
     if position_condition is not None:
         print("Position condition: plotting obs/position_condition stage/mask/condition_6d")
+    if scene_diff_position_condition is not None:
+        print(f"Position condition: plotting {scene_diff_position_condition['path']}")
 
     # ── intrinsics: the saved matrix is REQUIRED in both modes. There is no
     #    hardcoded fallback -- the old default was the raw SVGA K, which only
@@ -608,7 +743,7 @@ def main() -> None:
                     Rm[k, idx] = M[:3, :3]
         return pos, Rm
 
-    # ── extrinsics: deploy requires the saved matrix (no FK fallback); teleop
+    # ── extrinsics: rollouts require the saved matrix (no FK fallback); teleop
     #    falls back to per-frame FK from the (obs / INIT) joints when absent. ──
     if "extrinsic" in img_group:
         extrinsics = np.array(img_group["extrinsic"], dtype=np.float64)
@@ -619,9 +754,9 @@ def main() -> None:
                 f"obs/images/extrinsic shape {extrinsics.shape} is not (4, 4) or ({N}, 4, 4)"
             )
         print(f"Using saved obs/images/extrinsic {extrinsics.shape}")
-    elif args.deploy:
+    elif is_rollout:
         raise KeyError(
-            f"obs/images/extrinsic missing in --deploy episode {args.hdf5!r}; "
+            f"obs/images/extrinsic missing in rollout episode {args.hdf5!r}; "
             "refusing to fall back to FK camera extrinsics "
             f"(obs/images has: {list(img_group)})"
         )
@@ -637,7 +772,7 @@ def main() -> None:
     # ── world frame: compose obs/base/pose so the cloud, robot, and EEF markers
     #    render in a fixed WORLD frame as the base drives. The extrinsic above is
     #    base-RELATIVE (base_t_cam, saved or FK); world_t_cam = world_t_base · base_t_cam.
-    #    No obs/base/pose (deploy rollouts, legacy teleop) -> identity, i.e. unchanged
+    #    No obs/base/pose (rollouts, legacy teleop) -> identity, i.e. unchanged
     #    base-relative rendering. ────────────────────────────────────────────────
     world_t_base = load_world_t_base(data["obs"], N)
     extrinsics = world_t_base @ extrinsics  # base_t_cam -> world_t_cam
@@ -654,7 +789,7 @@ def main() -> None:
     # pose is a Transform3D under "{path}/frame".
     print("Building EEF obs/action marker streams ...")
     markers: list[tuple[str, tuple[int, int, int], np.ndarray, np.ndarray]] = []
-    if args.deploy:
+    if is_rollout:
         # Both arms, read directly from the recorded eef_9d streams.
         for side in ("left", "right"):
             obs_pos, obs_R = eef9_to_pos_R(
@@ -682,8 +817,8 @@ def main() -> None:
         markers.append(("world/eef_action/right", _ACTION_COLOR, act_pos[1], act_R[1]))
 
     # Lift EEF markers (built base-relative for teleop / in the recorded eef frame for
-    # deploy) into the world frame with the same per-frame world_t_base (identity when
-    # obs/base/pose is absent, so deploy/legacy episodes are unchanged).
+    # rollouts) into the world frame with the same per-frame world_t_base (identity when
+    # obs/base/pose is absent, so rollout/legacy episodes are unchanged).
     markers = [
         (
             path,
@@ -791,6 +926,40 @@ def main() -> None:
         rr.Points3D(base_path, colors=[_BASE_COLOR], radii=0.006),
         static=True,
     )
+    if scene_diff_position_condition is not None:
+        scene_diff_points = np.asarray(scene_diff_position_condition["points"], dtype=np.float32)
+        scene_diff_labels = list(scene_diff_position_condition["labels"])
+        scene_diff_colors = position_condition_colors(scene_diff_labels)
+        rr.log(
+            "world/position_condition/points",
+            rr.Points3D(
+                scene_diff_points,
+                colors=scene_diff_colors,
+                radii=np.full(len(scene_diff_points), _POS_COND_RADIUS_3D, dtype=np.float32),
+                labels=scene_diff_labels,
+                show_labels=True,
+            ),
+            static=True,
+        )
+        scene_diff_links, scene_diff_link_colors, scene_diff_link_labels = (
+            position_condition_link_strips(
+                scene_diff_points,
+                np.ones(len(scene_diff_points), dtype=bool),
+                scene_diff_labels,
+            )
+        )
+        if scene_diff_links:
+            rr.log(
+                "world/position_condition/links",
+                rr.LineStrips3D(
+                    scene_diff_links,
+                    colors=scene_diff_link_colors,
+                    radii=np.full(len(scene_diff_links), 0.006, dtype=np.float32),
+                    labels=scene_diff_link_labels,
+                    show_labels=True,
+                ),
+                static=True,
+            )
 
     # ── distinct colors per gripper series (otherwise rerun auto-picks green for both)
     rr.log(
@@ -976,7 +1145,7 @@ def main() -> None:
             ),
         )
 
-        # ── optional deploy position condition: selected [before, after] ─────
+        # ── optional rollout position condition: selected [before, after] ────
         if position_condition is not None:
             pc_stage = position_condition["stage"][idx]
             pc_mask = position_condition["mask"][idx]
