@@ -4,5 +4,6 @@
 data/
 Dexmate
 geriyoco.vscode-image-gallery-1.2.1.vsix
-legacy/
 PIPELINE_WBC.md
+legacy/LiDAR
+legacy/VSLAM

@@ -10,15 +10,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Plan
 - Proactively check edge cases. 
 - Proactively ask clarifying questions to confirm intent, until inputs, specs, and constraints are clear. Do not assume anything ambiguous.
+- If multiple interpretations exist, present them — do not pick one silently. If a simpler approach exists, say so and push back.
 
 ### Implement
 - Refer to /home/yixuan/omniteleop/dexcontrol (also in conda env dexmate) to understand, but do not touch it.
 - Validate all input dimensions aggressively. Raise ValueError on any mismatch. Never use placeholder/dummy data (zeros, None, etc.) to make code "run".
 - Implement functions one at a time. Empirically verify the output (e.g. rendering point clouds, displaying images, or inspecting tensor statistics). Let me confirm the transformation is correct before we proceed.
 - Prefer small, incremental contributions over sweeping refactors.
+- Write the minimum code that solves the problem. No speculative features, no abstractions for single-use code, no unrequested configurability, no error handling for impossible scenarios.
+- Keep changes surgical: every changed line should trace to the request. Do not "improve" adjacent code, reformat, or refactor what is not broken. Match existing style.
+- Remove imports/variables/functions that YOUR changes orphaned; mention pre-existing dead code rather than deleting it.
 
 ### Verify
 - Review correctness, performance implications, and edge cases.
+- Turn the task into a verifiable goal before starting ("fix the bug" → "write a test that reproduces it, then make it pass") and loop until it passes.
 - For model training and evaluation, ensure the entire pipeline — including data loading, preprocessing, training, metrics, and checkpoints — is functional and compatible with the latest changes.
 
 ### Summarize
