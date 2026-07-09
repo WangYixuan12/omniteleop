@@ -73,7 +73,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import os
 import threading
 import time
 from collections import deque
@@ -618,15 +617,6 @@ class HardwareDriver:
         # intermediates here and debug_row() assembles them after actuation. Touched
         # only by the (single-threaded) follower loop.
         self._dbg: dict = {}
-        # Optional 100 Hz base-steering telemetry (env-gated; NO dexcontrol edits). When
-        # WBC_BASE_STEER_LOG names an .npz path, _drive_base logs per-tick commanded twist,
-        # MEASURED steer/drive joint state, and the steer target the chassis SHOULD command
-        # (verified wbc_swerve replica of _compute_wheel_control) so a rollout re-run reveals
-        # whether the steering servo actually reaches the commanded angle -- the forward-command
-        # -> ~45deg base-heading drift is absent from the 10 Hz episode (no steer joints).
-        _steer_log_env = os.environ.get("WBC_BASE_STEER_LOG")
-        self._steer_log_path = os.path.expanduser(_steer_log_env) if _steer_log_env else None
-        self._steer_log: Optional[list] = [] if self._steer_log_path else None
         # Grippers (always active): cache the last commanded triggers for action/gripper
         # recording, the FC03 achieved-position obs (gPO/255), and the per-arm status
         # monitors (set up under --record). Initialized here so close() can tear down even
@@ -1114,76 +1104,6 @@ class HardwareDriver:
         self._dbg["base_pd_err"] = np.asarray(err, dtype=float)
         self._dbg["base_cmd"] = np.asarray(cmd, dtype=float)
         self._dbg["base_action"] = action
-        if self._steer_log is not None:
-            self._log_base_steer(chassis, cmd, action, snap)
-
-    def _log_base_steer(self, chassis, cmd, action: str, snap) -> None:
-        """Append one 100 Hz base-steering telemetry row (env-gated, WBC_BASE_STEER_LOG).
-
-        Records the commanded twist, the MEASURED steer/drive joint state, and the steer
-        target the chassis SHOULD command for this twist (computed with the wbc_swerve
-        replica of dexcontrol's _compute_wheel_control -- the same math the real chassis
-        runs, so target ~0 for a pure-forward twist). An offline pass then checks whether
-        the steering servo actually reaches that target: commanded ~0 but MEASURED ~45deg
-        during a forward segment is the drift, invisible in the 10 Hz episode.
-        """
-        from omniteleop.follower import wbc_swerve  # noqa: PLC0415 -- debug-only
-
-        try:
-            steer_read = np.asarray(chassis.steering_angle, dtype=float)
-            drive_read = np.asarray(chassis.wheel_velocity, dtype=float)
-        except Exception:
-            return
-        if steer_read.shape != (2,) or drive_read.shape != (2,):
-            return
-        cmd_t = (float(cmd[0]), float(cmd[1]), float(cmd[2]))
-        try:
-            wheels = wbc_swerve.swerve_command(
-                cmd_t, {"L": float(steer_read[0]), "R": float(steer_read[1])}
-            )
-            steer_tgt = np.array([wheels["L"].steer, wheels["R"].steer], dtype=float)
-            flipped = np.array([wheels["L"].flipped, wheels["R"].flipped], dtype=bool)
-        except Exception:
-            steer_tgt = np.full(2, np.nan)
-            flipped = np.zeros(2, dtype=bool)
-        twist = self._odom.twist if self._odom is not None else np.full(3, np.nan)
-        self._steer_log.append({
-            "t": float(time.perf_counter()),
-            "cmd": np.asarray(cmd_t, dtype=float),
-            "steer_read": steer_read,
-            "drive_read": drive_read,
-            "steer_tgt": steer_tgt,
-            "flipped": flipped,
-            "odom_pose": np.asarray(snap["pose"], dtype=float),
-            "odom_twist": np.asarray(twist, dtype=float),
-            "action": str(action),
-        })
-
-    def _dump_base_steer_log(self) -> None:
-        """Serialize env-gated 100 Hz base-steering telemetry to WBC_BASE_STEER_LOG (.npz)."""
-        if self._steer_log is None:
-            return
-        if not self._steer_log:
-            print(f"[wbc_vr_robot] base-steer log empty; nothing written to "
-                  f"{self._steer_log_path}")
-            return
-        rows = self._steer_log
-        arrs = {
-            "t": np.asarray([r["t"] for r in rows], dtype=np.float64),
-            "cmd": np.stack([r["cmd"] for r in rows]),
-            "steer_read": np.stack([r["steer_read"] for r in rows]),
-            "drive_read": np.stack([r["drive_read"] for r in rows]),
-            "steer_tgt": np.stack([r["steer_tgt"] for r in rows]),
-            "flipped": np.stack([r["flipped"] for r in rows]),
-            "odom_pose": np.stack([r["odom_pose"] for r in rows]),
-            "odom_twist": np.stack([r["odom_twist"] for r in rows]),
-            "action": np.asarray([r["action"] for r in rows]),
-        }
-        try:
-            np.savez(self._steer_log_path, **arrs)
-            print(f"[wbc_vr_robot] wrote {len(rows)} base-steer rows -> {self._steer_log_path}")
-        except Exception as exc:  # best-effort debug artifact
-            print(f"[wbc_vr_robot] WARNING: failed to write base-steer log: {exc}")
 
     def _allow_base_yaw_hold_in_xy(self) -> bool:
         return self.cfg.base_dofs == "xy" and bool(self.args.base_yaw_hold_in_xy)
@@ -1891,7 +1811,6 @@ class HardwareDriver:
         # daemon thread, so block here until it finishes -- otherwise process exit could
         # kill the save mid-write.
         self.stop_recording_episode()
-        self._dump_base_steer_log()
         # Best-effort teardown of the FC03 gripper-status subscribers.
         for monitor in getattr(self, "_grip_monitors", {}).values():
             try:

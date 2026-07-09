@@ -54,13 +54,10 @@ Inspect ``<record_dir>/scene_diff/deploy_before_overlay.png`` and ``.../_work/sk
 
 from __future__ import annotations
 
-import os
 import pathlib
-import subprocess
 import sys
 from typing import Optional
 
-import h5py
 import numpy as np
 import tyro
 from loguru import logger
@@ -68,18 +65,16 @@ from loguru import logger
 from omniteleop.common.head_camera import ZED_K
 from omniteleop.common.logging import setup_logging
 from omniteleop.follower.policy_rollout import PolicyRolloutController
+from omniteleop.follower.scenediff_live import (
+    invoke_scenediff,
+    prompt_for_slot_order,
+    write_live_capture_hdf5,
+)
 
 # Defaults match scene_diff/run_live_pos_condition.sh + run_deploy_pos_condition.sh.
 _DEFAULT_SCENE_DIFF_REPO = "/home/yixuan/scene_diff"
 _DEFAULT_SCENE_DIFF_PYTHON = "/home/yixuan/scene_diff/.venv-merged/bin/python"
 _DEFAULT_REFERENCE_HDF5 = "/home/yixuan/Dexmate/data/reference_scene/episode_0.hdf5"
-_RUN_SCRIPT_NAME = "run_live_pos_condition.sh"
-
-# HDF5 keys read by scene_diff/scripts/make_deploy_before_hdf5.py.
-_RGB_KEY = "obs/images/head_left_rgb"
-_DEPTH_KEY = "obs/images/head_depth"
-_EXTRINSIC_KEY = "obs/images/extrinsic"
-_INTRINSIC_KEY = "obs/images/intrinsic"
 
 
 class LiveSceneDiffRolloutController(PolicyRolloutController):
@@ -311,73 +306,7 @@ class LiveSceneDiffRolloutController(PolicyRolloutController):
         assigned to task slot k of ``[s1_src, s1_dst, s2_src, s2_dst, ...]``. Re-asks until
         the answers form a permutation of ``range(object_nums)``.
         """
-        stage_classes = object_nums // 2
-        slot_names: list[str] = []
-        for s in range(stage_classes):
-            slot_names += [f"s{s + 1}_src", f"s{s + 1}_dst"]
-
-        self._show_overlay(overlay_path)
-        logger.info(
-            f"The overlay labels each detected object with a size-slot index "
-            f"0..{object_nums - 1}. For each task slot, type the label of the matching object."
-        )
-        while True:
-            chosen: list[int] = []
-            ok = True
-            for name in slot_names:
-                raw = input(
-                    f"  {name} = which labelled object [0..{object_nums - 1}]? "
-                ).strip()
-                try:
-                    chosen.append(int(raw))
-                except ValueError:
-                    logger.warning("  not an integer; start over.")
-                    ok = False
-                    break
-            if ok and sorted(chosen) == list(range(object_nums)):
-                logger.success(f"order = {chosen}  ({list(zip(slot_names, chosen))})")
-                return chosen
-            if ok:
-                logger.warning(
-                    f"  {chosen} is not a permutation of 0..{object_nums - 1} "
-                    "(use each object exactly once); start over."
-                )
-
-    def _show_overlay(self, overlay_path: pathlib.Path) -> None:
-        """Best-effort, NON-BLOCKING preview of the size-slot overlay.
-
-        Always prints the path. If a desktop display is present, also fires the OS image
-        viewer in the BACKGROUND so it cannot stall the prompt. cv2 HighGUI
-        (``imshow``/``waitKey``) is deliberately avoided here: it can HANG indefinitely over
-        SSH / headless or with a conflicting conda Qt, which would freeze the whole rollout.
-        """
-        print(f"\n>>> Size-slot overlay: {overlay_path} <<<\n", flush=True)
-        if not overlay_path.exists():
-            logger.warning(
-                f"slot overlay not found at {overlay_path}; open it manually if it exists."
-            )
-            return
-        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-            logger.info(
-                "no DISPLAY (headless/SSH) — open the overlay PNG above on your workstation "
-                "(e.g. scp it), then answer the prompts below."
-            )
-            return
-        for opener in ("xdg-open", "eog", "feh", "display"):
-            try:
-                subprocess.Popen(
-                    [opener, str(overlay_path)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                logger.info(f"opened the overlay with {opener} (background window).")
-                return
-            except FileNotFoundError:
-                continue
-            except Exception as exc:  # noqa: BLE001 - viewer is strictly best-effort
-                logger.warning(f"{opener} failed ({exc}); open {overlay_path} manually.")
-                return
-        logger.info(f"no image viewer found on PATH; open {overlay_path} manually.")
+        return prompt_for_slot_order(object_nums, overlay_path, log=logger.info)
 
     def _write_live_capture(
         self,
@@ -389,81 +318,30 @@ class LiveSceneDiffRolloutController(PolicyRolloutController):
     ) -> None:
         """Write the single live head frame as a deploy-like HDF5.
 
-        Includes the FK-computed extrinsic (world_T_head_camera, (4,4) float32,
-        pinhole convention) and intrinsic ((3,3) float32) so
-        make_deploy_before_hdf5.py uses the actual camera pose rather than
-        copying the reference scene's calibration. A leading frame axis of 1 is
-        added to RGB/depth so the reader's ``rgb_ds[frame]`` indexing works;
-        extrinsic/intrinsic are stored without a frame axis (they are constant
-        for the whole capture and extract_first_hdf5_rgb_depth handles both).
+        Includes the FK-computed extrinsic (world_T_head_camera, (4,4) float32, pinhole
+        convention) and intrinsic ((3,3) float32) so make_deploy_before_hdf5.py uses the
+        actual camera pose rather than copying the reference scene's calibration. The
+        layout is owned by :mod:`omniteleop.follower.scenediff_live`.
         """
-        if left_rgb.ndim != 3 or left_rgb.shape[2] != 3:
-            raise ValueError(f"head rgb must be (H, W, 3), got {left_rgb.shape}")
-        if depth_u16.ndim != 2:
-            raise ValueError(f"head depth must be (H, W), got {depth_u16.shape}")
-        if left_rgb.shape[:2] != depth_u16.shape:
-            raise ValueError(
-                f"rgb {left_rgb.shape[:2]} != depth {depth_u16.shape} (must match)"
-            )
-        if extrinsic.shape != (4, 4):
-            raise ValueError(f"extrinsic must be (4, 4), got {extrinsic.shape}")
-        if intrinsic.shape != (3, 3):
-            raise ValueError(f"intrinsic must be (3, 3), got {intrinsic.shape}")
-        rgb = np.ascontiguousarray(left_rgb, dtype=np.uint8)[None, ...]
-        depth = np.ascontiguousarray(depth_u16, dtype=np.uint16)[None, ...]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with h5py.File(path, "w") as f:
-            f.create_dataset(_RGB_KEY, data=rgb)
-            f.create_dataset(_DEPTH_KEY, data=depth)
-            f.create_dataset(_EXTRINSIC_KEY, data=extrinsic.astype(np.float32))
-            f.create_dataset(_INTRINSIC_KEY, data=intrinsic.astype(np.float32))
+        write_live_capture_hdf5(path, left_rgb, depth_u16, extrinsic, intrinsic)
 
     def _invoke_scenediff(
         self, live_hdf5: pathlib.Path, out_dir: pathlib.Path
     ) -> pathlib.Path:
         """Run run_live_pos_condition.sh in .venv-merged and return the npz path."""
-        script = self._sd_repo / _RUN_SCRIPT_NAME
-        if not script.exists():
-            raise FileNotFoundError(f"SceneDiff driver not found: {script}")
-        if not pathlib.Path(self._sd_python).exists():
-            raise FileNotFoundError(
-                f"SceneDiff interpreter not found: {self._sd_python} "
-                "(expected scene_diff/.venv-merged)"
-            )
-
-        # Clean env: drop the rollout's PYTHONPATH (e.g. lerobot_original/src) and
-        # PYTHONHOME so they cannot shadow the .venv-merged interpreter's modules.
-        env = os.environ.copy()
-        env.pop("PYTHONPATH", None)
-        env.pop("PYTHONHOME", None)
-        env["PYTHON"] = self._sd_python
-        env["REFERENCE"] = self._sd_reference
-        env["SAM"] = self._sd_sam
-        env["OBJ_NUM"] = str(self._sd_obj_num)
-        env["POS_COND_MATCHING"] = self._sd_pos_cond_matching
-        if self._sd_config:
-            env["CONFIG"] = self._sd_config
-
-        cmd = ["bash", str(script), str(live_hdf5), str(out_dir)]
-        logger.info(f"Running SceneDiff: PYTHON={self._sd_python} {' '.join(cmd)}")
-        # Inherit stdio so SAM3 progress is visible; enforce a wall-clock timeout.
-        result = subprocess.run(
-            cmd, env=env, cwd=str(self._sd_repo), timeout=self._sd_timeout
+        return invoke_scenediff(
+            repo=self._sd_repo,
+            python=self._sd_python,
+            live_hdf5=live_hdf5,
+            out_dir=out_dir,
+            reference=self._sd_reference,
+            sam=self._sd_sam,
+            obj_num=self._sd_obj_num,
+            matching=self._sd_pos_cond_matching,
+            config=self._sd_config or None,
+            timeout=self._sd_timeout,
+            log=logger.info,
         )
-        npz = out_dir / "episode_0.npz"
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"SceneDiff failed (exit {result.returncode}); see output above and "
-                f"scratch under {out_dir / '_work'}"
-            )
-        if not npz.exists():
-            raise FileNotFoundError(
-                "SceneDiff produced no position condition — the detection gate failed "
-                f"(wrong object count / too few valid pixels). Inspect "
-                f"{out_dir / 'deploy_before_overlay.png'} and "
-                f"{out_dir / '_work' / 'skip.json'}, fix the scene/params, and rerun."
-            )
-        return npz
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────

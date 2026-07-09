@@ -75,10 +75,27 @@ autonomously glides its arms to the reference EEF poses (the leader's
 poses hold within the leader's alignment tolerances, then blocks on Enter
 before the take actually starts. Recording begins only after that gate.
 
+Position conditioning (``--position-condition``): a checkpoint trained with a SceneDiff
+``observation.environment_state`` (README step 3) is REQUIRED to pass ``--position-condition``.
+After engage and after ``--align-reference`` has brought the arms to the shared start pose
+(before recording / inference), the rollout captures one head frame, stamps it with the FK
+``world_T_zed`` extrinsic (engage-origin world, the same frame as ``action`` /
+``observation.state[29:32]``), and shells out to ``scene_diff/run_live_pos_condition.sh`` (in
+its own ``.venv-merged`` interpreter) to diff it against ``--reference-hdf5`` and reduce the
+change to the object world positions. The operator resolves the ``[box, cloth]`` order from the
+size-slot overlay (``--pos-cond-matching prompt --prompt-after-capture``), and the flat
+``positions[order]`` is pinned as a constant env-state for the whole episode (single stage --
+no per-frame stage mask). A missing npz means the detection gate failed; the rollout raises
+before policy motion starts.
+
 Usage:
   python scripts/wbc_policy_rollout.py --policy-path /path/to/checkpoint \
       --align-reference ~/Dexmate/data/raw_data/reference.hdf5 \
       [--auto-start] [--max-seconds 120] [--save-dir ~/Dexmate/data/raw_data_rollout]
+  # position-conditioned checkpoint (live SceneDiff after reference alignment):
+  python scripts/wbc_policy_rollout.py --policy-path /path/to/conditioned_checkpoint \
+      --align-reference ~/Dexmate/data/raw_data/reference.hdf5 \
+      --position-condition --prompt-after-capture
   python scripts/wbc_policy_rollout.py \
       --replay-episode ~/Dexmate/data/raw_data/episode_0.hdf5 \
       --align-reference ~/Dexmate/data/raw_data/reference.hdf5
@@ -103,11 +120,17 @@ from omniteleop.wbc_policy_format import (
     ACTION_AXES,
     STATE_AXES,
     WBCPolicyFK,
+    base_pose_to_mat,
     build_state_vector,
     mat_to_pos6d,
     pos6d_to_mat,
 )
 from omniteleop.wbc_stream import _blend_pose  # numpy+scipy only, light import
+from omniteleop.follower.scenediff_live import (  # dependency-light shared live plumbing
+    invoke_scenediff as _invoke_scenediff,
+    prompt_for_slot_order,
+    write_live_capture_hdf5 as _write_live_capture_hdf5,
+)
 
 DEFAULT_ROLLOUT_SAVE_DIR = str(Path("~/Dexmate/data/raw_data_rollout").expanduser())
 DEFAULT_REPLAY_SAVE_DIR = str(Path("~/Dexmate/data/replay_raw_data").expanduser())
@@ -122,6 +145,26 @@ REPLAY_GAP_WARN_S = 0.5
 # IK/base transient). Fail closed instead.
 REPLAY_START_POS_TOL_M = 0.15
 REPLAY_START_ROT_TOL_DEG = 30.0
+
+# --- Live SceneDiff position conditioning (--position-condition) --------------------
+# Mobile analog of live_scenediff_rollout.py: after reference alignment we capture ONE
+# head frame, stamp it with the FK world_T_zed extrinsic (engage-origin world), diff it
+# against the fixed reference scene, and feed the arranged object positions to the policy
+# as a constant observation.environment_state. SceneDiff runs in its own interpreter
+# (scene_diff/.venv-merged) so its VRAM (SAM3 + DINOv3) is a subprocess, never shared
+# with the loaded policy.
+DEFAULT_SCENE_DIFF_REPO = "/home/yixuan/scene_diff"
+DEFAULT_SCENE_DIFF_PYTHON = "/home/yixuan/scene_diff/.venv-merged/bin/python"
+# The mobile "after"/moved reference = the LAST frame of the fixed reference episode, the
+# SAME scene training diffed against (run_wbc_pos_condition.sh REFERENCE_LAST). Positions
+# land in the live engage-origin WORLD frame because make_deploy_before_hdf5.py uses the
+# live capture's OWN embedded extrinsic (world_T_zed), not the reference's calibration.
+DEFAULT_POS_COND_REFERENCE = "/home/yixuan/Dexmate/data/scene_diff/_before/reference_last.hdf5"
+# The live-capture HDF5 writer, the SceneDiff subprocess invoker and the operator-order
+# prompt are shared with the tabletop path in omniteleop.follower.scenediff_live (imported
+# above): the single-frame HDF5 layout and the run_live_pos_condition.sh env interface are
+# cross-repo CONTRACTS, kept in ONE place. Only the mobile-specific pieces live below --
+# the FK world_T_zed (base-odometry composition) and the flat single-stage env-state.
 
 
 def split_policy_action(action: np.ndarray) -> dict[str, np.ndarray | np.float32]:
@@ -682,7 +725,7 @@ class _PolicyBundle:
             make_pre_post_processors,
         )
         from lerobot.processor import RelativeActionsProcessorStep  # noqa: PLC0415
-        from lerobot.utils.constants import ACTION, OBS_STATE  # noqa: PLC0415
+        from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE  # noqa: PLC0415
 
         self._torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -719,6 +762,21 @@ class _PolicyBundle:
             raise ValueError("policy must consume observation.images.head_rgb")
         chw = in_feats["observation.images.head_rgb"].shape  # (C, H, W)
         self.image_hw = (int(chw[1]), int(chw[2]))
+
+        # Optional SceneDiff position conditioning: the policy declares
+        # observation.environment_state (a constant object_nums*3 world-frame vector). The
+        # live wrapper computes it once at the rollout start pose and calls set_env_state()
+        # BEFORE inference; _sample_dict then rides it on every observation (finding 2:
+        # inject before the obs queues fill, else a conditioned checkpoint KeyErrors on the
+        # OBS_ENV_STATE queue).
+        self.use_env_state = OBS_ENV_STATE in in_feats
+        self.env_state_dim = int(in_feats[OBS_ENV_STATE].shape[0]) if self.use_env_state else 0
+        if self.use_env_state and (self.env_state_dim < 3 or self.env_state_dim % 3 != 0):
+            raise ValueError(
+                f"observation.environment_state dim {self.env_state_dim} must be a positive "
+                "multiple of 3 (object_nums*3); wrong checkpoint?"
+            )
+        self._env_state: np.ndarray | None = None
 
         self.n_obs_steps = int(getattr(pcfg, "n_obs_steps", 1))
         n_action_steps = getattr(pcfg, "n_action_steps", None)
@@ -764,6 +822,23 @@ class _PolicyBundle:
         self._obs_history.clear()
         self._chunk_tail.clear()
 
+    def set_env_state(self, vec: np.ndarray) -> None:
+        """Pin the constant SceneDiff position condition fed to every observation.
+
+        ``vec`` is the arranged ``positions[order]`` world-frame vector (length
+        ``env_state_dim`` = object_nums*3). Held for the whole episode -- identical to
+        training, where the env-state is a per-episode constant. Must be called before the
+        inference worker starts.
+        """
+        if not self.use_env_state:
+            raise RuntimeError(
+                "checkpoint has no observation.environment_state input; cannot set env-state")
+        v = np.asarray(vec, dtype=np.float32).reshape(-1)
+        if v.shape != (self.env_state_dim,) or not np.all(np.isfinite(v)):
+            raise ValueError(
+                f"env-state must be a finite ({self.env_state_dim},) vector, got {v.shape}")
+        self._env_state = v
+
     def _chw(self, img_hwc: np.ndarray):
         import cv2  # noqa: PLC0415
 
@@ -786,6 +861,12 @@ class _PolicyBundle:
             if obs.wrist_rgb is None:
                 raise ValueError("policy consumes wrist_rgb but no wrist frame is available")
             sample["observation.images.wrist_rgb"] = self._chw(obs.wrist_rgb)
+        if self.use_env_state:
+            if self._env_state is None:
+                raise RuntimeError(
+                    "policy consumes observation.environment_state but set_env_state() was "
+                    "never called -- run with --position-condition")
+            sample["observation.environment_state"] = self._torch.from_numpy(self._env_state)
         return sample
 
     def predict_chunk(self, obs_history: Sequence[PolicyObservation]) -> np.ndarray:
@@ -1081,6 +1162,133 @@ class _InferenceWorker:
             self.failed.set()
 
 
+def _live_world_T_zed(driver, fk: WBCPolicyFK) -> np.ndarray:
+    """FK ``world_T_zed`` for the CURRENT head pose (engage-origin world frame).
+
+    Identical construction to ``make_wbc_before_hdf5.world_T_zed_at`` (training): ``world_T_zed
+    = base_pose_to_mat(odom base pose) @ base_T_zed``, where ``base_T_zed =
+    fk.base_frame_poses(...)["head"]`` is the ``zed_depth_frame`` OPTICAL pose (z-forward,
+    x-right, y-down) -- the exact convention ``extract_first_hdf5_rgb_depth`` back-projects
+    depth through (finding 6). So the detected centroids land in the SAME engage-origin world
+    as the policy's ``action`` targets and ``observation.state[29:32]`` base anchor.
+    """
+    measured = driver._read_measured_joints()  # noqa: SLF001 -- same read as _build_state
+    for grp in ("torso", "left_arm", "right_arm", "head"):
+        if measured.get(grp) is None:
+            raise RuntimeError(f"measured {grp} joints unavailable; cannot compute head extrinsic")
+    base_T_zed = np.asarray(
+        fk.base_frame_poses(measured["torso"], measured["left_arm"],
+                            measured["right_arm"], measured["head"])["head"],
+        dtype=np.float64,
+    )
+    if driver._odom is None:  # noqa: SLF001
+        raise RuntimeError("odometry required (--enable base) to anchor world_T_zed")
+    base_pose = np.asarray(driver._odom.pose, dtype=np.float64)  # noqa: SLF001
+    world_T_zed = base_pose_to_mat(base_pose) @ base_T_zed
+    if world_T_zed.shape != (4, 4) or not np.all(np.isfinite(world_T_zed)):
+        raise RuntimeError(f"bad world_T_zed {world_T_zed.shape} (or non-finite)")
+    return world_T_zed.astype(np.float32)
+
+
+def _pos_cond_log(msg: str) -> None:
+    print(f"[wbc_policy_rollout] {msg}", flush=True)
+
+
+def _prompt_for_pos_cond_order(object_nums: int, overlay_path: Path) -> list[int]:
+    """Operator picks the task order from the size-slot overlay (shared prompt + task hint).
+
+    Returns ``order`` (length ``object_nums``): ``order[k]`` is the size-slot index assigned
+    to task slot k of ``[s1_src, s1_dst, ...]``. For the box->cloth task (object_nums=2):
+    s1_src = the BOX, s1_dst = the CLOTH.
+    """
+    return prompt_for_slot_order(
+        object_nums, overlay_path, log=_pos_cond_log,
+        hint="for the box->cloth task, s1_src = the BOX, s1_dst = the CLOTH.",
+    )
+
+
+def _invoke_live_scenediff(args: argparse.Namespace, live_hdf5: Path, out_dir: Path,
+                           obj_num: int) -> Path:
+    """Adapt the rollout CLI args to the shared SceneDiff invoker; return episode_0.npz."""
+    return _invoke_scenediff(
+        repo=args.scene_diff_repo, python=args.scene_diff_python,
+        live_hdf5=live_hdf5, out_dir=out_dir, reference=args.reference_hdf5,
+        sam=args.sam, obj_num=obj_num, matching=args.pos_cond_matching,
+        config=args.scenediff_config or None, timeout=args.scenediff_timeout,
+        log=_pos_cond_log,
+    )
+
+
+def _position_condition_output_dir(save_dir: str | Path, episode_id: int) -> Path:
+    if not isinstance(episode_id, (int, np.integer)) or int(episode_id) < 0:
+        raise RuntimeError(
+            f"position-condition needs a pending episode_<N>.hdf5 id, got {episode_id!r}"
+        )
+    return Path(save_dir) / "scene_diff" / f"episode_{int(episode_id)}"
+
+
+def _prepare_live_position_condition(args: argparse.Namespace, driver, fk: WBCPolicyFK,
+                                     bundle: "_PolicyBundle") -> np.ndarray:
+    """Capture -> SceneDiff -> arranged env-state ``(bundle.env_state_dim,)`` in engage-origin world.
+
+    ``object_nums`` is DERIVED from the policy's env-state dim (``env_state_dim // 3``), never
+    hardcoded. Returns ``positions[order].reshape(-1)`` -- the FLAT vector the mobile policy
+    consumes directly (single stage; no before/after split, unlike the tabletop 2-stage
+    collapse). SceneDiff outputs land under ``<save_dir>/scene_diff/episode_N/``, where
+    ``N`` is the pending main recorder id for the paired ``episode_N.hdf5``.
+    """
+    from omniteleop.common.head_camera import ZED_K  # noqa: PLC0415
+
+    object_nums = bundle.env_state_dim // 3
+    episode = getattr(driver, "_episode", None)
+    if episode is None:
+        raise RuntimeError("--position-condition requires rollout recording to pair SceneDiff "
+                           "outputs with episode_<N>.hdf5")
+    out_dir = _position_condition_output_dir(args.save_dir, getattr(episode, "episode_id", None))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    live_hdf5 = out_dir / "live_capture.hdf5"
+
+    if args.prompt_before_capture:
+        input("\n>>> Robot is at the rollout start pose. Stage the scene, then press ENTER "
+              "to capture the head frame and run SceneDiff (Ctrl-C to abort) <<<\n")
+
+    # 1) One head frame at the rollout start viewpoint + its FK world_T_zed extrinsic.
+    head = driver._grab_head_images()  # noqa: SLF001 -- audited camera-cache read
+    if head is None:
+        raise RuntimeError("head camera delivered no frame for the position-condition capture")
+    rgb, depth_u16 = head[0], head[1]
+    extrinsic = _live_world_T_zed(driver, fk)
+    intrinsic = np.asarray(ZED_K, dtype=np.float32)
+    _write_live_capture_hdf5(live_hdf5, rgb, depth_u16, extrinsic, intrinsic)
+    print(f"[wbc_policy_rollout] live 'before' frame -> {live_hdf5}  rgb={rgb.shape} "
+          f"depth={depth_u16.shape}  cam_xyz=[{extrinsic[0,3]:.3f},{extrinsic[1,3]:.3f},"
+          f"{extrinsic[2,3]:.3f}]", flush=True)
+
+    # 2) SceneDiff (own interpreter). 3) resolve the [box,cloth] order (operator prompt live).
+    npz = _invoke_live_scenediff(args, live_hdf5, out_dir, object_nums)
+    with np.load(npz, allow_pickle=True) as data:
+        if "positions" not in data or "order" not in data:
+            raise ValueError(f"{npz}: expected positions+order, got {list(data.files)}")
+        positions = np.asarray(data["positions"], dtype=np.float32)
+        order = [int(x) for x in np.asarray(data["order"]).reshape(-1)]
+    if positions.shape != (object_nums, 3) or not np.all(np.isfinite(positions)):
+        raise ValueError(
+            f"{npz}: positions {tuple(positions.shape)} != ({object_nums}, 3) or non-finite")
+
+    if args.pos_cond_matching == "prompt" and args.prompt_after_capture:
+        order = _prompt_for_pos_cond_order(object_nums, out_dir / "deploy_slot_overlay.png")
+    elif args.pos_cond_matching == "prompt":
+        print("[wbc_policy_rollout] WARNING: pos_cond_matching=prompt but --prompt-after-capture "
+              "is off; using the npz's identity (size) order with no operator input.", flush=True)
+    if sorted(order) != list(range(object_nums)):
+        raise ValueError(f"{npz}: order {order} is not a permutation of range({object_nums})")
+
+    env_vec = positions[order].reshape(-1).astype(np.float32)
+    print(f"[wbc_policy_rollout] position condition ready: order={order} "
+          f"env_state={np.round(env_vec, 3).tolist()}", flush=True)
+    return env_vec
+
+
 def _run_rollout(args: argparse.Namespace) -> None:
     from omniteleop.common.recorder import EpisodeRecorder  # noqa: PLC0415
     from omniteleop.wbc_robot_util import parse_enable_mask  # noqa: PLC0415
@@ -1133,6 +1341,17 @@ def _run_rollout(args: argparse.Namespace) -> None:
                   f"{chunk_coverage:g}s ({policy.n_action_steps} steps @ "
                   f"{args.dataset_fps:g} fps): the scheduled buffer will run dry "
                   "between replans -> periodic stale-source holds")
+        # A conditioned checkpoint MUST get its env-state (else _sample_dict raises); an
+        # unconditioned one must NOT be asked to (finding 2). Enforce the match up front.
+        if args.position_condition and not policy.use_env_state:
+            raise SystemExit(
+                "[wbc_policy_rollout] --position-condition given but the checkpoint declares "
+                "no observation.environment_state input")
+        if policy.use_env_state and not args.position_condition:
+            raise SystemExit(
+                "[wbc_policy_rollout] checkpoint requires observation.environment_state "
+                f"(dim {policy.env_state_dim}); pass --position-condition (+ --reference-hdf5) "
+                "so it is computed live at the rollout start pose")
 
     fk = WBCPolicyFK(ik=ik)  # FK on the live solver's own model
     driver = mod.HardwareDriver(args, ik, cfg, enable)
@@ -1185,6 +1404,7 @@ def _run_rollout(args: argparse.Namespace) -> None:
         # control to a human Enter-press. Runs BEFORE recording starts, so the
         # glide is never part of the take (mirrors the leader's align stage).
         start_left, start_right, start_head = left0, right0, head0
+        did_align = False
         if args.align_reference:
             left_ref, right_ref = load_alignment_references(args.align_reference, ik)
             print(f"[wbc_policy_rollout] gliding to the reference pose from "
@@ -1198,6 +1418,21 @@ def _run_rollout(args: argparse.Namespace) -> None:
             start_left, start_right = left_ref, right_ref
             # No 100 Hz ticks run while blocked on Enter: stop/hold everything so
             # no chassis twist or in-flight position target survives the prompt.
+            driver.stop_all_motion()
+            did_align = True
+
+        # Live SceneDiff position condition: capture ONE head frame after the robot is at
+        # the rollout start pose (post --align-reference when supplied), diff it against the
+        # fixed reference, and pin the constant env-state BEFORE recording/inference starts.
+        # Held safe during the minutes-long SceneDiff subprocess (no 100 Hz ticks run while it
+        # blocks). The subprocess owns the GPU; the loaded diffusion policy sits idle.
+        # set_env_state survives the earlier policy.reset().
+        if args.position_condition and policy is not None:
+            driver.stop_all_motion()
+            env_vec = _prepare_live_position_condition(args, driver, fk, policy)
+            policy.set_env_state(env_vec)
+
+        if did_align:
             driver.stop_all_motion()
             input(f"\n[wbc_policy_rollout] at reference pose. Press Enter to actually "
                   f"start the {mode} online ... ")
@@ -1414,10 +1649,47 @@ def main() -> None:
     hw.add_argument("--record-rate", type=float, default=mod.DEFAULT_RECORD_RATE)
     hw.add_argument("--record-stale-grace", type=float,
                     default=mod.DEFAULT_RECORD_STALE_GRACE)
+
+    pc = parser.add_argument_group("position conditioning (live SceneDiff, --policy-path only)")
+    pc.add_argument("--position-condition", action="store_true",
+                    help="compute a live SceneDiff observation.environment_state after engage "
+                         "and post-reference-alignment: capture one head frame, diff it against "
+                         "--reference-hdf5, and pin the arranged object world positions for the "
+                         "whole episode. REQUIRED for a checkpoint that declares "
+                         "observation.environment_state.")
+    pc.add_argument("--reference-hdf5", default=DEFAULT_POS_COND_REFERENCE,
+                    help="fixed 'after'/moved reference scene the live frame is diffed against "
+                         "(the SAME scene training used; default the Part-A reference_last.hdf5).")
+    pc.add_argument("--pos-cond-matching", default="prompt",
+                    choices=("prompt", "size", "hungarian"),
+                    help="ordering forwarded to extract_object_positions.py. Live scenes have no "
+                         "demo trajectory, so use 'prompt' (default): the operator reads the "
+                         "size-slot overlay and types [box, cloth].")
+    pc.add_argument("--prompt-before-capture", action="store_true",
+                    help="pause for ENTER at the rollout start pose and before the head capture "
+                         "(post-reference-alignment when --align-reference is supplied).")
+    pc.add_argument("--prompt-after-capture", action="store_true",
+                    help="in prompt mode, preview the size-slot overlay after capture (background "
+                         "viewer if a display exists, else the path is printed) and read the task "
+                         "order from the terminal. Without it, prompt mode uses the identity order.")
+    pc.add_argument("--sam", default="sam3", help="SAM version for change detection (default sam3).")
+    pc.add_argument("--scenediff-config", default=None,
+                    help="override the SceneDiff config path (relative to the scene_diff repo).")
+    pc.add_argument("--scenediff-timeout", type=float, default=1200.0,
+                    help="wall-clock timeout (s) for the SceneDiff subprocess (default 1200).")
+    pc.add_argument("--scene-diff-repo", default=DEFAULT_SCENE_DIFF_REPO,
+                    help="scene_diff repo holding run_live_pos_condition.sh.")
+    pc.add_argument("--scene-diff-python", default=DEFAULT_SCENE_DIFF_PYTHON,
+                    help="interpreter for SceneDiff (scene_diff/.venv-merged/bin/python).")
     args = parser.parse_args()
 
     if bool(args.policy_path) == bool(args.replay_episode):
         parser.error("exactly one of --policy-path / --replay-episode is required")
+    if args.position_condition and not args.policy_path:
+        parser.error("--position-condition requires --policy-path (replay has no policy to "
+                     "condition)")
+    if args.position_condition and not np.isfinite(args.scenediff_timeout):
+        parser.error("--scenediff-timeout must be finite")
     if args.align_reference is None:
         parser.error("--align-reference is required (pass '--align-reference none' to "
                      "deliberately start from the current pose)")
