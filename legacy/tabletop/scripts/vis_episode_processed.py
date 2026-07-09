@@ -110,10 +110,10 @@ _OBS_NAMES = (
     list(_TORSO_JOINTS) + list(_LEFT_ARM_JOINTS) + list(_RIGHT_ARM_JOINTS) + list(_HEAD_JOINTS)
 )
 
-_COLOR_ACTION = (255, 0, 0)   # red  — ``action`` markers + binary gripper
-_COLOR_STATE  = (0, 80, 255)  # blue — ``observation.state`` markers + raw gripper
+_COLOR_ACTION = (255, 0, 0)  # red  — ``action`` markers + binary gripper
+_COLOR_STATE = (0, 80, 255)  # blue — ``observation.state`` markers + raw gripper
 _COLOR_CONDITION_BEFORE = (255, 180, 0)  # orange — selected condition before XYZ
-_COLOR_CONDITION_AFTER = (0, 220, 120)   # green  — selected condition after XYZ
+_COLOR_CONDITION_AFTER = (0, 220, 120)  # green  — selected condition after XYZ
 _COLOR_CONDITION_LINE = (255, 255, 255)  # white  — before->after condition vector
 
 _OBS_ENV_STATE_KEY = "observation.environment_state"
@@ -156,6 +156,7 @@ def joint_index_maps(
     arm_slice = {side: slice(i * 8, i * 8 + 7) for i, side in enumerate(arm_sides)}
     grip = {side: i * 8 + 7 for i, side in enumerate(arm_sides)}
     return arm_slice, grip
+
 
 _GRIPPER_Y_MIN = -0.2
 _GRIPPER_Y_MAX = 1.1
@@ -207,9 +208,7 @@ def select_position_conditions(
 
     env = np.asarray(env_state, dtype=np.float32)
     if env.ndim != 2:
-        raise ValueError(
-            f"{_OBS_ENV_STATE_KEY} must be 2-D (T, D), got shape {env.shape}"
-        )
+        raise ValueError(f"{_OBS_ENV_STATE_KEY} must be 2-D (T, D), got shape {env.shape}")
     if not np.all(np.isfinite(env)):
         raise ValueError(f"{_OBS_ENV_STATE_KEY} must contain only finite values")
 
@@ -235,19 +234,11 @@ def select_position_conditions(
             f"to match {_OBS_ENV_STATE_KEY} shape {env.shape}, got {mask.shape}"
         )
     if not np.all(np.isfinite(mask)):
-        raise ValueError(
-            f"{_OBS_POS_CONDITION_MASK_KEY} must contain finite one-hot values"
-        )
+        raise ValueError(f"{_OBS_POS_CONDITION_MASK_KEY} must contain finite one-hot values")
 
-    is_binary = np.isclose(mask, 0.0, atol=1e-4, rtol=0) | np.isclose(
-        mask, 1.0, atol=1e-4, rtol=0
-    )
-    if not np.all(is_binary) or not np.allclose(
-        mask.sum(axis=-1), 1.0, atol=1e-4, rtol=0
-    ):
-        raise ValueError(
-            f"{_OBS_POS_CONDITION_MASK_KEY} must be one-hot along the last dimension"
-        )
+    is_binary = np.isclose(mask, 0.0, atol=1e-4, rtol=0) | np.isclose(mask, 1.0, atol=1e-4, rtol=0)
+    if not np.all(is_binary) or not np.allclose(mask.sum(axis=-1), 1.0, atol=1e-4, rtol=0):
+        raise ValueError(f"{_OBS_POS_CONDITION_MASK_KEY} must be one-hot along the last dimension")
 
     env_blocks = env.reshape(frame_count, object_count, condition_dim)
     return np.sum(env_blocks * mask[:, :, None], axis=1, dtype=np.float32)
@@ -304,8 +295,9 @@ class _Kin:
         self.name_to_idx = {j.name: i for i, j in enumerate(active)}
         self.dof = self.kin.sapien_robot.dof
 
-    def _qpos(self, torso: np.ndarray, l_arm: np.ndarray, r_arm: np.ndarray,
-              head: np.ndarray) -> np.ndarray:
+    def _qpos(
+        self, torso: np.ndarray, l_arm: np.ndarray, r_arm: np.ndarray, head: np.ndarray
+    ) -> np.ndarray:
         qpos = np.zeros(self.dof, dtype=np.float64)
         for vals, names in (
             (torso, _TORSO_JOINTS),
@@ -417,30 +409,32 @@ def _build_eef_xyz_figs(
     the raw-HDF5 viewer ``vis_teleop_curves.fig_eef_xyz(show_extrema_gaps=True)``
     instead; this viewer keeps the processed-dataset curves uncluttered.
     """
-    color_action = (1.0, 0.0, 0.0)         # red  — action
-    color_state  = (0.0, 80 / 255.0, 1.0)  # blue — observation.state
+    color_action = (1.0, 0.0, 0.0)  # red  — action
+    color_state = (0.0, 80 / 255.0, 1.0)  # blue — observation.state
     figs: list[plt.Figure] = []
     for axis_idx, axis_name in enumerate("xyz"):
         act = action_xyz[:, axis_idx]
-        st  = state_xyz[:, axis_idx]
+        st = state_xyz[:, axis_idx]
         lag_ms = estimate_lag_ms(act, st, dt_s)
 
         fig, ax = plt.subplots(figsize=(11, 4))
         ax.plot(t, act, color=color_action, lw=1.4, label="action")
-        ax.plot(t, st,  color=color_state,  lw=1.2, label="observation.state")
+        ax.plot(t, st, color=color_state, lw=1.2, label="observation.state")
 
         ax.text(
-            0.01, 0.95,
+            0.01,
+            0.95,
             f"lag = {_format_lag_ms(lag_ms, include_unit=True)}   "
             f"(positive = observation.state lags action)",
-            transform=ax.transAxes, fontsize=9, va="top", ha="left",
+            transform=ax.transAxes,
+            fontsize=9,
+            va="top",
+            ha="left",
             bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.85),
         )
         ax.set_xlabel("t (s)")
         ax.set_ylabel(f"eef_{axis_name} (m)")
-        ax.set_title(
-            f"{prefix}EEF {axis_name}"
-        )
+        ax.set_title(f"{prefix}EEF {axis_name}")
         ax.legend(loc="upper right", fontsize=8)
         ax.grid(alpha=0.3)
         fig.tight_layout()
@@ -454,17 +448,17 @@ def main() -> None:
         "--marker_and_plot_dir",
         type=str,
         help="Path to the dexmate_eef_eef variant root. Provides "
-             "observation.state (eef) + action for the rerun markers, gripper "
-             "curves, matplotlib EEF xyz figures, and the RGB / depth / "
-             "point-cloud camera scene.",
+        "observation.state (eef) + action for the rerun markers, gripper "
+        "curves, matplotlib EEF xyz figures, and the RGB / depth / "
+        "point-cloud camera scene.",
     )
     parser.add_argument(
         "--urdf_joint_motion_dir",
         type=str,
         required=True,
         help="Path to the dexmate_joint_joint variant root. Provides "
-             "observation.state (joint) so state[:7] drives the URDF mesh "
-             "right-arm pose.",
+        "observation.state (joint) so state[:7] drives the URDF mesh "
+        "right-arm pose.",
     )
     parser.add_argument("--episode_index", type=int, default=0)
     parser.add_argument(
@@ -554,7 +548,9 @@ def main() -> None:
             )
     print(f"arm mode: {'bimanual' if n_arms == 2 else 'single-arm'} (sides={arm_sides})")
 
-    state_joint = np.stack([dataset_joint[i]["observation.state"].numpy() for i in range(N)])  # (N, 8*n_arms)
+    state_joint = np.stack(
+        [dataset_joint[i]["observation.state"].numpy() for i in range(N)]
+    )  # (N, 8*n_arms)
     action_joint = np.stack([dataset_joint[i]["action"].numpy() for i in range(N)])  # (N, 8*n_arms)
 
     state_eef: np.ndarray | None = None
@@ -562,10 +558,13 @@ def main() -> None:
     position_condition: np.ndarray | None = None
     if eef_enabled:
         assert dataset_eef is not None
-        state_eef = np.stack([dataset_eef[i]["observation.state"].numpy() for i in range(N)])  # (N, 10*n_arms)
+        state_eef = np.stack(
+            [dataset_eef[i]["observation.state"].numpy() for i in range(N)]
+        )  # (N, 10*n_arms)
         action = np.stack([dataset_eef[i]["action"].numpy() for i in range(N)])  # (N, 10*n_arms)
         missing_position_features = [
-            key for key in (_OBS_ENV_STATE_KEY, _OBS_POS_CONDITION_MASK_KEY)
+            key
+            for key in (_OBS_ENV_STATE_KEY, _OBS_POS_CONDITION_MASK_KEY)
             if key not in dataset_eef.meta.features
         ]
         if missing_position_features:
@@ -575,9 +574,9 @@ def main() -> None:
                 "can overlay the selected 6-D position condition on the head RGB."
             )
         env_state = np.stack([dataset_eef[i][_OBS_ENV_STATE_KEY].numpy() for i in range(N)])
-        pos_condition_mask = np.stack([
-            dataset_eef[i][_OBS_POS_CONDITION_MASK_KEY].numpy() for i in range(N)
-        ])
+        pos_condition_mask = np.stack(
+            [dataset_eef[i][_OBS_POS_CONDITION_MASK_KEY].numpy() for i in range(N)]
+        )
         position_condition = select_position_conditions(env_state, pos_condition_mask)  # (N, 6)
         if position_condition.shape != (N, 6):
             raise ValueError(
@@ -586,9 +585,7 @@ def main() -> None:
             )
 
     # Depth sidecar (NOT in the parquet — see docstring).
-    depth_sidecar = (
-        camera_root / "debug" / "depth" / f"episode_{args.episode_index:06d}.npz"
-    )
+    depth_sidecar = camera_root / "debug" / "depth" / f"episode_{args.episode_index:06d}.npz"
     if not depth_sidecar.exists():
         raise FileNotFoundError(
             f"depth sidecar missing: {depth_sidecar}. Re-run port_dexmate_hdf5.py "
@@ -605,25 +602,19 @@ def main() -> None:
 
     # Calibration sidecar: per-frame extrinsic (T, 4, 4) and intrinsic (T, 3, 3).
     # Intrinsic is already rescaled to the stored resize_h × resize_w frame.
-    calib_sidecar = (
-        camera_root / "debug" / "calib" / f"episode_{args.episode_index:06d}.npz"
-    )
+    calib_sidecar = camera_root / "debug" / "calib" / f"episode_{args.episode_index:06d}.npz"
     if not calib_sidecar.exists():
         raise FileNotFoundError(
             f"calib sidecar missing: {calib_sidecar}. Re-run port_dexmate_hdf5.py "
             "with --overwrite to regenerate."
         )
     with np.load(calib_sidecar) as data:
-        extrinsic_stack = data["extrinsic"].astype(np.float64)   # (T, 4, 4) world_T_cam
-        intrinsic_stack = data["intrinsic"].astype(np.float64)   # (T, 3, 3)
+        extrinsic_stack = data["extrinsic"].astype(np.float64)  # (T, 4, 4) world_T_cam
+        intrinsic_stack = data["intrinsic"].astype(np.float64)  # (T, 3, 3)
     if extrinsic_stack.shape[0] != N:
-        raise ValueError(
-            f"calib sidecar extrinsic frame count {extrinsic_stack.shape[0]} != {N}"
-        )
+        raise ValueError(f"calib sidecar extrinsic frame count {extrinsic_stack.shape[0]} != {N}")
     if intrinsic_stack.shape[0] != N:
-        raise ValueError(
-            f"calib sidecar intrinsic frame count {intrinsic_stack.shape[0]} != {N}"
-        )
+        raise ValueError(f"calib sidecar intrinsic frame count {intrinsic_stack.shape[0]} != {N}")
 
     if state_joint.shape[1] != 8 * n_arms:
         raise ValueError(
@@ -653,11 +644,9 @@ def main() -> None:
     state_eef_pos: dict[str, np.ndarray] = {}
     if eef_enabled:
         assert state_eef is not None and action is not None
-        action_pos = {
-            side: action[:, eef_base[side]:eef_base[side] + 3] for side in arm_sides
-        }
+        action_pos = {side: action[:, eef_base[side] : eef_base[side] + 3] for side in arm_sides}
         state_eef_pos = {
-            side: state_eef[:, eef_base[side]:eef_base[side] + 3] for side in arm_sides
+            side: state_eef[:, eef_base[side] : eef_base[side] + 3] for side in arm_sides
         }
 
     # ── EEF xyz figures (eef variant only) ───────────────────────────────────
@@ -675,9 +664,7 @@ def main() -> None:
             f"(dt = {dt_s*1000:.1f} ms, fps = {1.0/dt_s:.1f} Hz)"
         )
         object_count = env_state.shape[1] // 6
-        mask_switches = (
-            np.flatnonzero(np.diff(np.argmax(pos_condition_mask, axis=1)) != 0) + 1
-        )
+        mask_switches = np.flatnonzero(np.diff(np.argmax(pos_condition_mask, axis=1)) != 0) + 1
         print(
             f"position condition: env_state {env_state.shape[1]}D over "
             f"{object_count} object slots -> selected 6D; mask switches at frames "
@@ -797,8 +784,8 @@ def main() -> None:
         frame = dataset_rgb[idx]
 
         # Per-frame camera pose and intrinsics from calib sidecar.
-        world_t_cam = extrinsic_stack[idx]          # (4, 4) world_T_cam
-        K = intrinsic_stack[idx]                     # (3, 3) already at stored resolution
+        world_t_cam = extrinsic_stack[idx]  # (4, 4) world_T_cam
+        K = intrinsic_stack[idx]  # (3, 3) already at stored resolution
         K32 = K.astype(np.float32)
         rr.log(
             "world/camera",
@@ -822,7 +809,7 @@ def main() -> None:
                     f"world/action/{side}/frame",
                     rr.Transform3D(
                         translation=action_pos[side][idx],
-                        mat3x3=gram_schmidt_6d_to_R(action[idx, b + 3:b + 9]),
+                        mat3x3=gram_schmidt_6d_to_R(action[idx, b + 3 : b + 9]),
                     ),
                 )
                 rr.log(
@@ -833,7 +820,7 @@ def main() -> None:
                     f"world/state/{side}/frame",
                     rr.Transform3D(
                         translation=state_eef_pos[side][idx],
-                        mat3x3=gram_schmidt_6d_to_R(state_eef[idx, b + 3:b + 9]),
+                        mat3x3=gram_schmidt_6d_to_R(state_eef[idx, b + 3 : b + 9]),
                     ),
                 )
 
@@ -867,9 +854,7 @@ def main() -> None:
                 rr.log("world/camera/eef_state_2d", rr.Clear(recursive=False))
 
             condition_xyz = position_condition[idx].reshape(2, 3)
-            condition_uv, condition_valid = project_world_to_pixel(
-                condition_xyz, K, world_t_cam
-            )
+            condition_uv, condition_valid = project_world_to_pixel(condition_xyz, K, world_t_cam)
             valid_condition_idx = np.flatnonzero(condition_valid)
             if len(valid_condition_idx) > 0:
                 condition_colors = np.asarray(
@@ -924,9 +909,7 @@ def main() -> None:
             + list(INIT_HEAD_JOINTS)
         )
         joint_names = _WHEEL_NAMES + _OBS_NAMES
-        qpos = robot_mesh_gen.convert_to_sapien_joint_order(
-            np.array(joint_vals), joint_names
-        )
+        qpos = robot_mesh_gen.convert_to_sapien_joint_order(np.array(joint_vals), joint_names)
         link_tf = robot_mesh_gen.compute_fk_from_link_names(
             qpos, robot_link_names, in_obj_frame=True
         )

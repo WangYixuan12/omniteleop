@@ -106,7 +106,7 @@ def clause_to_slots(clause: str, source: str) -> tuple[int, int]:
             "'<before object> to <after object>'"
         )
     slots = []
-    for role, raw_name in zip(("before", "after"), parts):
+    for role, raw_name in zip(("before", "after"), parts, strict=False):
         name = normalize_object(raw_name)
         if name not in OBJECT_SLOTS:
             raise ValueError(
@@ -133,7 +133,7 @@ def parse_conditions_file(path: Path) -> list[dict]:
         )
 
     conditions: list[dict] = []
-    for ci, (header, idx_line) in enumerate(zip(lines[0::2], lines[1::2])):
+    for ci, (header, idx_line) in enumerate(zip(lines[0::2], lines[1::2], strict=False)):
         m = HEADER_RE.match(header)
         if not m:
             raise ValueError(
@@ -152,14 +152,16 @@ def parse_conditions_file(path: Path) -> list[dict]:
         dup = {i for i in raw_indices if raw_indices.count(i) > 1}
         if dup:
             raise ValueError(f"{path}: condition {header!r} repeats indices {sorted(dup)}")
-        conditions.append({
-            "label": chr(ord("A") + ci),
-            "description": re.sub(r"\s*:\s*$", "", header),
-            "permutation": [s1_src, s1_dst, s2_src, s2_dst],
-            "stage1": {"src": s1_src, "dst": s1_dst},
-            "stage2": {"src": s2_src, "dst": s2_dst},
-            "raw_indices": raw_indices,
-        })
+        conditions.append(
+            {
+                "label": chr(ord("A") + ci),
+                "description": re.sub(r"\s*:\s*$", "", header),
+                "permutation": [s1_src, s1_dst, s2_src, s2_dst],
+                "stage1": {"src": s1_src, "dst": s1_dst},
+                "stage2": {"src": s2_src, "dst": s2_dst},
+                "raw_indices": raw_indices,
+            }
+        )
 
     # No raw episode may belong to two conditions.
     seen: dict[int, str] = {}
@@ -173,9 +175,9 @@ def parse_conditions_file(path: Path) -> list[dict]:
     return conditions
 
 
-def build_plan(conditions: list[dict], source_files: dict[int, Path]) -> tuple[
-    list[dict], dict[str, list[int]], dict[str, list[int]]
-]:
+def build_plan(
+    conditions: list[dict], source_files: dict[int, Path]
+) -> tuple[list[dict], dict[str, list[int]], dict[str, list[int]]]:
     """Assign each condition's available episodes to splits and renamed indices.
 
     Returns (entries, unused_by_cond, missing_by_cond). Each entry gains a split and a
@@ -199,16 +201,18 @@ def build_plan(conditions: list[dict], source_files: dict[int, Path]) -> tuple[
             )
         cursor = 0
         for split, count in SPLIT_SPEC:
-            for raw in available[cursor:cursor + count]:
-                entries.append({
-                    "raw_index": raw,
-                    "split": split,
-                    "condition": cond["label"],
-                    "description": cond["description"],
-                    "permutation": cond["permutation"],
-                    "stage1": cond["stage1"],
-                    "stage2": cond["stage2"],
-                })
+            for raw in available[cursor : cursor + count]:
+                entries.append(
+                    {
+                        "raw_index": raw,
+                        "split": split,
+                        "condition": cond["label"],
+                        "description": cond["description"],
+                        "permutation": cond["permutation"],
+                        "stage1": cond["stage1"],
+                        "stage2": cond["stage2"],
+                    }
+                )
             cursor += count
         leftover = available[cursor:]
         if leftover:
@@ -225,17 +229,21 @@ def build_plan(conditions: list[dict], source_files: dict[int, Path]) -> tuple[
 
 def conditions_payload(entries: list[dict], split: str) -> dict:
     """Build the conditions.json content for one split (renamed-index ordered)."""
-    split_entries = sorted((e for e in entries if e["split"] == split),
-                           key=lambda e: e["renamed_index"])
-    episodes = [{
-        "renamed_index": e["renamed_index"],
-        "raw_index": e["raw_index"],
-        "condition": e["condition"],
-        "description": e["description"],
-        "order": e["permutation"],
-        "stage1": e["stage1"],
-        "stage2": e["stage2"],
-    } for e in split_entries]
+    split_entries = sorted(
+        (e for e in entries if e["split"] == split), key=lambda e: e["renamed_index"]
+    )
+    episodes = [
+        {
+            "renamed_index": e["renamed_index"],
+            "raw_index": e["raw_index"],
+            "condition": e["condition"],
+            "description": e["description"],
+            "order": e["permutation"],
+            "stage1": e["stage1"],
+            "stage2": e["stage2"],
+        }
+        for e in split_entries
+    ]
     return {
         "object_slots": OBJECT_SLOTS,
         "order_format": "[s1_src, s1_dst, s2_src, s2_dst] as object size-slot indices",
@@ -260,16 +268,33 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--src", type=Path, default=DEFAULT_SRC,
-                    help=f"source directory of episode_*.hdf5 (default: {DEFAULT_SRC})")
-    ap.add_argument("--dst", type=Path, default=DEFAULT_DST,
-                    help=f"destination root directory (default: {DEFAULT_DST})")
-    ap.add_argument("--conditions", type=Path, default=DEFAULT_CONDITIONS,
-                    help=f"position-condition txt (default: {DEFAULT_CONDITIONS})")
-    ap.add_argument("--mode", choices=("copy", "hardlink", "move"), default="copy",
-                    help="how to materialize files in dst (default: copy)")
-    ap.add_argument("--apply", action="store_true",
-                    help="actually perform operations; otherwise dry-run")
+    ap.add_argument(
+        "--src",
+        type=Path,
+        default=DEFAULT_SRC,
+        help=f"source directory of episode_*.hdf5 (default: {DEFAULT_SRC})",
+    )
+    ap.add_argument(
+        "--dst",
+        type=Path,
+        default=DEFAULT_DST,
+        help=f"destination root directory (default: {DEFAULT_DST})",
+    )
+    ap.add_argument(
+        "--conditions",
+        type=Path,
+        default=DEFAULT_CONDITIONS,
+        help=f"position-condition txt (default: {DEFAULT_CONDITIONS})",
+    )
+    ap.add_argument(
+        "--mode",
+        choices=("copy", "hardlink", "move"),
+        default="copy",
+        help="how to materialize files in dst (default: copy)",
+    )
+    ap.add_argument(
+        "--apply", action="store_true", help="actually perform operations; otherwise dry-run"
+    )
     args = ap.parse_args()
 
     if not args.src.is_dir():
@@ -289,8 +314,9 @@ def main():
         print(f"[{label}] {cond['description']}")
         print(f"      permutation [s1_src,s1_dst,s2_src,s2_dst] = {cond['permutation']}")
         for split, _ in SPLIT_SPEC:
-            raws = [e["raw_index"] for e in entries
-                    if e["condition"] == label and e["split"] == split]
+            raws = [
+                e["raw_index"] for e in entries if e["condition"] == label and e["split"] == split
+            ]
             print(f"      {split:5s}: {raws}")
         if label in unused_by_cond:
             print(f"      UNUSED: {unused_by_cond[label]}")
@@ -300,12 +326,15 @@ def main():
 
     # ---- Rename plan + split totals ----
     for split, _ in SPLIT_SPEC:
-        split_entries = sorted((e for e in entries if e["split"] == split),
-                               key=lambda e: e["renamed_index"])
+        split_entries = sorted(
+            (e for e in entries if e["split"] == split), key=lambda e: e["renamed_index"]
+        )
         print(f"[{split}] {len(split_entries)} episode(s):")
         for e in split_entries:
-            print(f"  episode_{e['raw_index']}.hdf5  ->  {split}/episode_{e['renamed_index']}.hdf5"
-                  f"  (cond {e['condition']}, order {e['permutation']})")
+            print(
+                f"  episode_{e['raw_index']}.hdf5  ->  {split}/episode_{e['renamed_index']}.hdf5"
+                f"  (cond {e['condition']}, order {e['permutation']})"
+            )
     total = len(entries)
     used = sorted(e["raw_index"] for e in entries)
     unused_total = sorted(set(source_files) - set(used))
@@ -352,14 +381,18 @@ def main():
         sidecar = split_dir / "conditions.json"
         payload = json.loads(sidecar.read_text())
         sidecar_idx = {ep["renamed_index"] for ep in payload["episodes"]}
-        sidecar_ok = (len(payload["episodes"]) == expected
-                      and sidecar_idx == set(range(expected))
-                      and all(len(ep["order"]) == 4 for ep in payload["episodes"]))
+        sidecar_ok = (
+            len(payload["episodes"]) == expected
+            and sidecar_idx == set(range(expected))
+            and all(len(ep["order"]) == 4 for ep in payload["episodes"])
+        )
         status = "OK" if (actual == expected and contiguous and sidecar_ok) else "MISMATCH"
         if status != "OK":
             ok = False
-        print(f"  {split}: files {actual}/{expected}, contiguous={contiguous}, "
-              f"sidecar_ok={sidecar_ok} -> {status}")
+        print(
+            f"  {split}: files {actual}/{expected}, contiguous={contiguous}, "
+            f"sidecar_ok={sidecar_ok} -> {status}"
+        )
     print(f"  total destination files: {total_actual}; total planned: {total}")
     if total_actual != total:
         ok = False

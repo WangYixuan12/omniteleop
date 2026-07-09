@@ -32,9 +32,7 @@ HEAD_CROP_LEFT, HEAD_CROP_RIGHT = 150, 800
 
 
 def _to_chw(img_hwc: np.ndarray) -> torch.Tensor:
-    return (
-        torch.from_numpy(np.ascontiguousarray(img_hwc)).permute(2, 0, 1).float() / 255.0
-    )
+    return torch.from_numpy(np.ascontiguousarray(img_hwc)).permute(2, 0, 1).float() / 255.0
 
 
 def main() -> None:
@@ -49,10 +47,7 @@ def main() -> None:
     pcfg = PreTrainedConfig.from_pretrained(args.policy_path)
     pcfg.pretrained_path = args.policy_path
     policy = (
-        get_policy_class(pcfg.type)
-        .from_pretrained(args.policy_path, config=pcfg)
-        .to(device)
-        .eval()
+        get_policy_class(pcfg.type).from_pretrained(args.policy_path, config=pcfg).to(device).eval()
     )
     pre, _post = make_pre_post_processors(
         policy_cfg=pcfg,
@@ -61,7 +56,7 @@ def main() -> None:
     )
 
     n_classes = int(getattr(pcfg, "stage_prediction_num_classes", 2))
-    n_action_steps = int(getattr(pcfg, "n_action_steps"))
+    n_action_steps = int(pcfg.n_action_steps)
     image_h, image_w = (
         int(pcfg.input_features["observation.images.head_rgb"].shape[1]),
         int(pcfg.input_features["observation.images.head_rgb"].shape[2]),
@@ -101,15 +96,9 @@ def main() -> None:
     env_state_vec = np.tile(cond6d_active, n_classes).astype(np.float32)
 
     def build_raw(i: int, stage_for_mask: int) -> dict:
-        state = np.concatenate(
-            [eef9_l[i], [grip_l[i]], eef9_r[i], [grip_r[i]]]
-        ).astype(np.float32)
-        cropped = head[i][
-            HEAD_CROP_TOP:HEAD_CROP_BOTTOM, HEAD_CROP_LEFT:HEAD_CROP_RIGHT
-        ]
-        policy_head = cv2.resize(
-            cropped, (image_w, image_h), interpolation=cv2.INTER_AREA
-        )
+        state = np.concatenate([eef9_l[i], [grip_l[i]], eef9_r[i], [grip_r[i]]]).astype(np.float32)
+        cropped = head[i][HEAD_CROP_TOP:HEAD_CROP_BOTTOM, HEAD_CROP_LEFT:HEAD_CROP_RIGHT]
+        policy_head = cv2.resize(cropped, (image_w, image_h), interpolation=cv2.INTER_AREA)
         mask = np.zeros((n_classes,), dtype=np.float32)
         mask[stage_for_mask] = 1.0
         sample = {
@@ -119,9 +108,7 @@ def main() -> None:
             OBS_POS_CONDITION_MASK: torch.from_numpy(mask),
         }
         if use_wrist:
-            policy_wrist = cv2.resize(
-                wrist[i], (image_w, image_h), interpolation=cv2.INTER_AREA
-            )
+            policy_wrist = cv2.resize(wrist[i], (image_w, image_h), interpolation=cv2.INTER_AREA)
             sample["observation.images.wrist_rgb"] = _to_chw(policy_wrist)
         return sample
 
@@ -144,9 +131,7 @@ def main() -> None:
         logits = predict(build_raw(i, int(rec_stage[i])))  # (n_action_steps, n_classes)
         l0 = logits[0]
         pred_off0[i] = int(np.argmax(l0))
-        prob1_off0[i] = float(
-            np.exp(l0[1]) / np.exp(l0).sum()
-        ) if n_classes == 2 else np.nan
+        prob1_off0[i] = float(np.exp(l0[1]) / np.exp(l0).sum()) if n_classes == 2 else np.nan
         pred_anyoff[i] = int((logits.argmax(axis=-1) == 1).any())
 
     # Replan frames = where the live loop actually ran the head (queue empty).
@@ -169,8 +154,10 @@ def main() -> None:
 
     print("\n=== does ANY chunk offset ever predict stage 1? ===")
     print(f"frames where some offset argmax==1: {int(pred_anyoff.sum())} / {n}")
-    print(f"max P(class1) over all frames @off0: {float(prob1_off0.max()):.4f} "
-          f"(min {float(prob1_off0.min()):.4f})")
+    print(
+        f"max P(class1) over all frames @off0: {float(prob1_off0.max()):.4f} "
+        f"(min {float(prob1_off0.min()):.4f})"
+    )
 
     # ── env_state independence check: perturb the inactive slot, confirm stage logits ──
     # are unchanged. This validates that omitting the true npz slot is sound.

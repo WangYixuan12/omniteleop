@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Think before writing. Inspect relevant files, existing patterns, and comments to match project conventions.
 
 ### Plan
-- Proactively check edge cases. 
+- Proactively check edge cases.
 - Proactively ask clarifying questions to confirm intent, until inputs, specs, and constraints are clear. Do not assume anything ambiguous.
 - If multiple interpretations exist, present them — do not pick one silently. If a simpler approach exists, say so and push back.
 

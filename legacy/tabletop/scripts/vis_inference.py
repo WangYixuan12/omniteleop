@@ -346,9 +346,7 @@ def evaluate_eef_pose_prediction_safety_bimanual(
         init_visualizer=False,
         joint_regions_to_lock=["BASE"],
         target_frames=[_LEFT_ARM_EEF_LINK, _RIGHT_ARM_EEF_LINK],
-        initial_joint_configuration_dict=motion_manager_state_dict(
-            chained_left, chained_right
-        ),
+        initial_joint_configuration_dict=motion_manager_state_dict(chained_left, chained_right),
     )
     if mm.pin_robot is None:
         raise ValueError("MotionManager failed to initialize")
@@ -363,15 +361,15 @@ def evaluate_eef_pose_prediction_safety_bimanual(
     for idx in range(n):
         l9 = pred_left_eef9[idx].astype(np.float64)
         r9 = pred_right_eef9[idx].astype(np.float64)
-        if l9.shape != (9,) or r9.shape != (9,) or not (
-            np.all(np.isfinite(l9)) and np.all(np.isfinite(r9))
+        if (
+            l9.shape != (9,)
+            or r9.shape != (9,)
+            or not (np.all(np.isfinite(l9)) and np.all(np.isfinite(r9)))
         ):
             bump("eef_non_finite")
             continue
 
-        mm.set_joint_pos(
-            motion_manager_state_dict(chained_left, chained_right, motion_limits)
-        )
+        mm.set_joint_pos(motion_manager_state_dict(chained_left, chained_right, motion_limits))
         tl = np.eye(4, dtype=np.float64)
         tl[:3, :3] = gram_schmidt_6d_to_R(l9[3:9])
         tl[:3, 3] = l9[:3]
@@ -581,8 +579,14 @@ def main() -> None:
     # ── GT future EEF (FK on commanded arm joints) ───────────────────────────
     print(f"Computing GT EEF via FK from {left_key} / {right_key} ...")
     gt_eef_left, gt_eef_right = compute_arm_eef_bimanual(
-        kin, name_to_idx_kin, left_eef_link_idx, right_eef_link_idx,
-        obs_torso, action_left_arm, action_right_arm, obs_head,
+        kin,
+        name_to_idx_kin,
+        left_eef_link_idx,
+        right_eef_link_idx,
+        obs_torso,
+        action_left_arm,
+        action_right_arm,
+        obs_head,
     )
     gt_left_xyz = gt_eef_left[:, :3, 3].astype(np.float32)
     gt_right_xyz = gt_eef_right[:, :3, 3].astype(np.float32)
@@ -639,9 +643,7 @@ def main() -> None:
         pred_space = _resolve_pred_space(args.pred_space, n_cols)
         block = 8 if pred_space == "joint" else 10
         if n_cols < 2 * block:
-            raise ValueError(
-                f"{pred_space} bimanual pred needs ≥{2 * block} columns; got {n_cols}"
-            )
+            raise ValueError(f"{pred_space} bimanual pred needs ≥{2 * block} columns; got {n_cols}")
         left_block = pred_arr[:, 0:block]
         right_block = pred_arr[:, block : 2 * block]
 
@@ -649,31 +651,45 @@ def main() -> None:
             pred_left_joints = left_block[:, :7]
             pred_right_joints = right_block[:, :7]
             pred_eef_left, pred_eef_right = compute_arm_eef_bimanual(
-                kin, name_to_idx_kin, left_eef_link_idx, right_eef_link_idx,
-                obs_torso, pred_left_joints, pred_right_joints, obs_head,
+                kin,
+                name_to_idx_kin,
+                left_eef_link_idx,
+                right_eef_link_idx,
+                obs_torso,
+                pred_left_joints,
+                pred_right_joints,
+                obs_head,
             )
             pred_left_xyz = pred_eef_left[:, :3, 3].astype(np.float32)
             pred_right_xyz = pred_eef_right[:, :3, 3].astype(np.float32)
             pred_safety_pass, safety_reasons = evaluate_joint_prediction_safety_bimanual(
-                pred_left_joints, pred_right_joints,
-                left_lower, left_upper, right_lower, right_upper,
-                left_workspace, right_workspace,
+                pred_left_joints,
+                pred_right_joints,
+                left_lower,
+                left_upper,
+                right_lower,
+                right_upper,
+                left_workspace,
+                right_workspace,
             )
         else:
             pred_left_xyz = left_block[:, 0:3].astype(np.float32)
             pred_right_xyz = right_block[:, 0:3].astype(np.float32)
             pred_safety_pass, safety_reasons = evaluate_eef_pose_prediction_safety_bimanual(
-                left_block[:, 0:9], right_block[:, 0:9],
-                left_lower, left_upper, right_lower, right_upper,
-                left_workspace, right_workspace,
+                left_block[:, 0:9],
+                right_block[:, 0:9],
+                left_lower,
+                left_upper,
+                right_lower,
+                right_upper,
+                left_workspace,
+                right_workspace,
             )
 
         pred_left_valid = np.isfinite(pred_left_xyz).all(axis=1)
         pred_right_valid = np.isfinite(pred_right_xyz).all(axis=1)
         if pred_safety_pass.shape != (N,):
-            raise ValueError(
-                f"Internal safety mask shape {pred_safety_pass.shape} != ({N},)"
-            )
+            raise ValueError(f"Internal safety mask shape {pred_safety_pass.shape} != ({N},)")
         print(
             f"Loaded predictions: ep={ep}, frames={end - start}, "
             f"pred_space={pred_space} (cols={n_cols})"
@@ -704,8 +720,12 @@ def main() -> None:
         extrinsics = np.zeros((N, 4, 4), dtype=np.float64)
         for idx in range(N):
             qpos = qpos_from_arms(
-                kin, name_to_idx_kin, obs_torso[idx], obs_left_arm[idx],
-                obs_right_arm[idx], obs_head[idx],
+                kin,
+                name_to_idx_kin,
+                obs_torso[idx],
+                obs_left_arm[idx],
+                obs_right_arm[idx],
+                obs_head[idx],
             )
             extrinsics[idx] = kin.compute_fk_from_link_idx(qpos, [cam_link_idx])[0]
 
@@ -742,17 +762,22 @@ def main() -> None:
     PRED_RIGHT_COLOR = np.array([60, 220, 80], dtype=np.uint8)  # green — right predicted
     PRED_FAIL_COLOR = np.array([255, 220, 40], dtype=np.uint8)  # yellow — failed guard
 
-    def log_future_markers(path: str, xyz: np.ndarray, valid: np.ndarray,
-                           idx: int, color: np.ndarray,
-                           safety_pass: np.ndarray | None = None) -> None:
+    def log_future_markers(
+        path: str,
+        xyz: np.ndarray,
+        valid: np.ndarray,
+        idx: int,
+        color: np.ndarray,
+        safety_pass: np.ndarray | None = None,
+    ) -> None:
         """Log frames idx+1..N-1 of a trajectory; recolor yellow where guards fail."""
-        future_mask = valid[idx + 1:]
-        future_xyz = xyz[idx + 1:][future_mask]
+        future_mask = valid[idx + 1 :]
+        future_xyz = xyz[idx + 1 :][future_mask]
         if not future_xyz.size:
             rr.log(path, rr.Clear(recursive=False))
             return
         if safety_pass is not None:
-            future_pass = safety_pass[idx + 1:][future_mask]
+            future_pass = safety_pass[idx + 1 :][future_mask]
             colors = np.where(
                 future_pass[:, None], color[None, :], PRED_FAIL_COLOR[None, :]
             ).astype(np.uint8)
@@ -805,7 +830,10 @@ def main() -> None:
             )
 
         # ── current EEF coordinate frames (skip NaN frames) ─────────────────
-        for name, mat in (("world/eef/left", gt_eef_left[idx]), ("world/eef/right", gt_eef_right[idx])):
+        for name, mat in (
+            ("world/eef/left", gt_eef_left[idx]),
+            ("world/eef/right", gt_eef_right[idx]),
+        ):
             if np.all(np.isfinite(mat)):
                 rr.log(name, rr.Transform3D(translation=mat[:3, 3], mat3x3=mat[:3, :3]))
             else:
@@ -813,19 +841,29 @@ def main() -> None:
 
         # ── future GT EEF trajectory markers (both arms) ────────────────────
         log_future_markers("world/eef_traj/left", gt_left_xyz, gt_left_valid, idx, GT_LEFT_COLOR)
-        log_future_markers("world/eef_traj/right", gt_right_xyz, gt_right_valid, idx, GT_RIGHT_COLOR)
+        log_future_markers(
+            "world/eef_traj/right", gt_right_xyz, gt_right_valid, idx, GT_RIGHT_COLOR
+        )
 
         # ── future predicted EEF trajectory markers (both arms) ─────────────
         if pred_left_xyz is not None:
             assert pred_right_xyz is not None
             assert pred_left_valid is not None and pred_right_valid is not None
             log_future_markers(
-                "world/eef_traj/left_pred", pred_left_xyz, pred_left_valid, idx,
-                PRED_LEFT_COLOR, pred_safety_pass,
+                "world/eef_traj/left_pred",
+                pred_left_xyz,
+                pred_left_valid,
+                idx,
+                PRED_LEFT_COLOR,
+                pred_safety_pass,
             )
             log_future_markers(
-                "world/eef_traj/right_pred", pred_right_xyz, pred_right_valid, idx,
-                PRED_RIGHT_COLOR, pred_safety_pass,
+                "world/eef_traj/right_pred",
+                pred_right_xyz,
+                pred_right_valid,
+                idx,
+                PRED_RIGHT_COLOR,
+                pred_safety_pass,
             )
 
 

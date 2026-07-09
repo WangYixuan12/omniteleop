@@ -124,9 +124,7 @@ def test_record_frame_saves_position_condition_when_present() -> None:
         "position_condition": {
             "stage": 1,
             "mask": np.array([0.0, 1.0], dtype=np.float32),
-            "condition_6d": np.array(
-                [7.0, 8.0, 9.0, 10.0, 11.0, 12.0], dtype=np.float32
-            ),
+            "condition_6d": np.array([7.0, 8.0, 9.0, 10.0, 11.0, 12.0], dtype=np.float32),
         },
     }
 

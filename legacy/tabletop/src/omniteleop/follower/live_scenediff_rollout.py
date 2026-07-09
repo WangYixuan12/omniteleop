@@ -79,7 +79,8 @@ _DEFAULT_REFERENCE_HDF5 = "/home/yixuan/Dexmate/data/reference_scene/episode_0.h
 
 class LiveSceneDiffRolloutController(PolicyRolloutController):
     """PolicyRolloutController that computes its position condition from the live
-    head observation at rollout start (see module docstring)."""
+    head observation at rollout start (see module docstring).
+    """
 
     def __init__(
         self,
@@ -152,9 +153,7 @@ class LiveSceneDiffRolloutController(PolicyRolloutController):
         # object_nums = 2 x stage_prediction_num_classes. Override the CLI obj_num to match.
         stage_classes = int(getattr(pcfg, "stage_prediction_num_classes", 2))
         if stage_classes < 1:
-            raise ValueError(
-                f"policy stage_prediction_num_classes={stage_classes} must be >= 1"
-            )
+            raise ValueError(f"policy stage_prediction_num_classes={stage_classes} must be >= 1")
         self._sd_stage_classes = stage_classes
         self._sd_object_nums = 2 * stage_classes
         env_state_dim = int(pcfg.input_features[OBS_ENV_STATE].shape[0])
@@ -275,9 +274,9 @@ class LiveSceneDiffRolloutController(PolicyRolloutController):
                 f"{episode_npz}: order {order} is not a permutation of range({object_nums})"
             )
 
-        arranged = positions[order]            # [s1_src, s1_dst, s2_src, s2_dst, ...]
-        before_xyz = arranged[0::2]            # sources -> per-stage "before"
-        after_xyz = arranged[1::2]             # goals   -> per-stage "after"
+        arranged = positions[order]  # [s1_src, s1_dst, s2_src, s2_dst, ...]
+        before_xyz = arranged[0::2]  # sources -> per-stage "before"
+        after_xyz = arranged[1::2]  # goals   -> per-stage "after"
         stage_classes = object_nums // 2
         if before_xyz.shape != (stage_classes, 3) or after_xyz.shape != (stage_classes, 3):
             raise ValueError(
@@ -325,9 +324,7 @@ class LiveSceneDiffRolloutController(PolicyRolloutController):
         """
         write_live_capture_hdf5(path, left_rgb, depth_u16, extrinsic, intrinsic)
 
-    def _invoke_scenediff(
-        self, live_hdf5: pathlib.Path, out_dir: pathlib.Path
-    ) -> pathlib.Path:
+    def _invoke_scenediff(self, live_hdf5: pathlib.Path, out_dir: pathlib.Path) -> pathlib.Path:
         """Run run_live_pos_condition.sh in .venv-merged and return the npz path."""
         return invoke_scenediff(
             repo=self._sd_repo,

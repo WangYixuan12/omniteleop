@@ -11,7 +11,7 @@ pip install omniteleop
 ## Official docs
 
 - [Dexmate](https://docs.dexmate.ai/dSBwCBpol8PGkSXTS9bJ)
-- [ZED camera](https://www.stereolabs.com/docs) 
+- [ZED camera](https://www.stereolabs.com/docs)
   - [Depth sensing](https://www.stereolabs.com/docs/depth-sensing)
   - Update 'dexsensor gen-cfg' if reinstall
 
@@ -20,13 +20,13 @@ pip install omniteleop
 - WLAN
 
 ```bash
-sudo iw dev wlP1p1s0 set power_save off  
+sudo iw dev wlP1p1s0 set power_save off
 sudo nmcli connection modify Dexmate_5G 802-11-wireless.powersave 2
 ```
 
 - Head camera
   - Something worthy of trying if latency in dexmate@vega-1:~/.dexmate/sensors/default.toml
-    - Under [[sensors]] id = "head_camera" 
+    - Under [[sensors]] id = "head_camera"
       - [sensors.params] rate = 15
       - [sensors.streams] right_rgb = false
       - [sensors.params] depth_mode = "NEURAL_LIGHT"
@@ -148,7 +148,7 @@ Visualize the ported dataset: `observation.state` (base-frame EEF/head FK compos
 
 **3.** Train in LeRobot
 
-The checkpoint must report `observation.state` dim `32`, `action` dim `29`, image keys `observation.images.head_rgb` and optionally `observation.images.wrist_rgb`; with position conditioning it also carries `observation.environment_state` dim `6` (the SceneDiff `[box, cloth]` world positions from steps 1.5/2). Continuous state/action dims are normalized with 1–99 percentile stats (`QUANTILES` mode; the porter already writes `q01`/`q99` into `meta/stats.json`), while the constant env-state uses `MIN_MAX`. 
+The checkpoint must report `observation.state` dim `32`, `action` dim `29`, image keys `observation.images.head_rgb` and optionally `observation.images.wrist_rgb`; with position conditioning it also carries `observation.environment_state` dim `6` (the SceneDiff `[box, cloth]` world positions from steps 1.5/2). Continuous state/action dims are normalized with 1–99 percentile stats (`QUANTILES` mode; the porter already writes `q01`/`q99` into `meta/stats.json`), while the constant env-state uses `MIN_MAX`.
 
 ```markdown
 Current implemented schema:
@@ -291,7 +291,7 @@ REL_EXCLUDE='[9,19]'
 
 `scripts/wbc_policy_rollout.py` and `scripts/vis_wbc_policy_prediction.py` auto-detect `use_relative_actions` from the checkpoint and build world-frame state + chunk-anchor de-relativization accordingly — same commands as below (point `--policy-path` at the relative checkpoint).
 
-**4.** 
+**4.**
 
 Validate the checkpoint OFFLINE before any hardware rollout — run the rollout's exact inference path (_PolicyBundle.select_action + split_policy_action) over a processed episode and overlay the policy's predicted 29-D world-frame action against the recorded ground-truth action. Rerun shows per-entity (left/right/head) GT (red) vs predicted (magenta) pose + error line, GT/pred EEF reprojected into the head image, gripper series, the base odometry path, and the depth point cloud; matplotlib + stdout report per-entity translation/rotation MAE. Run in dexmate_lerobot:
 
@@ -384,7 +384,7 @@ python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py set -
 ### Arm joint to eef
 
 ```bash
-python /home/yixuan/omniteleop/scripts/misc/check_eef_pos.py # robot.right_arm.get_joint_pos() first, and the run this to calculate eef from joint 
+python /home/yixuan/omniteleop/scripts/misc/check_eef_pos.py # robot.right_arm.get_joint_pos() first, and the run this to calculate eef from joint
 ```
 
 

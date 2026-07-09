@@ -90,12 +90,18 @@ from dexbot_utils import RobotInfo
 from dexbot_utils.configs.components.sensors.cameras import ZedXCameraConfig
 from dexcomm import Node, RateLimiter
 from dexcomm.codecs import DictDataCodec
-from dexcontrol.core.config import get_robot_config
-from dexcontrol.robot import Robot
 from dexmotion.ik import LocalPinkIKSolver
 from dexmotion.motion_manager import MotionManager
+
+# LeRobot policy stack
+from lerobot.configs import PreTrainedConfig
+from lerobot.policies import get_policy_class, make_pre_post_processors
+from lerobot.processor import RelativeActionsProcessorStep
+from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_POS_CONDITION_MASK
 from loguru import logger
 
+from dexcontrol.core.config import get_robot_config
+from dexcontrol.robot import Robot
 from omniteleop.common import get_config
 from omniteleop.common.head_camera import ZED_K
 from omniteleop.common.logging import setup_logging
@@ -120,12 +126,6 @@ from omniteleop.follower.workspace_check import (
     DEFAULT_LEFT_LINK,
     WorkspaceChecker,
 )
-
-# LeRobot policy stack
-from lerobot.configs import PreTrainedConfig
-from lerobot.policies import get_policy_class, make_pre_post_processors
-from lerobot.processor import RelativeActionsProcessorStep
-from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_POS_CONDITION_MASK
 
 # Wrist ZED-M sensor id + obs key (mirrors vr_reader._WRIST_SENSOR_ID and the
 # left-eye obs key it consumes from sensors/wrist_zedm/left_rgb).
@@ -168,10 +168,7 @@ def _mat_to_pos6d(M: np.ndarray) -> np.ndarray:
 
 def _to_chw(img_hwc: np.ndarray) -> torch.Tensor:
     """HWC uint8 → CHW float32 in [0, 1] (mirrors LeRobotDataset.__getitem__)."""
-    return (
-        torch.from_numpy(np.ascontiguousarray(img_hwc)).permute(2, 0, 1).float()
-        / 255.0
-    )
+    return torch.from_numpy(np.ascontiguousarray(img_hwc)).permute(2, 0, 1).float() / 255.0
 
 
 def _next_record_subdir(record_root: str | pathlib.Path) -> pathlib.Path:
@@ -180,9 +177,7 @@ def _next_record_subdir(record_root: str | pathlib.Path) -> pathlib.Path:
     root.mkdir(parents=True, exist_ok=True)
 
     existing_indices = (
-        int(path.name)
-        for path in root.iterdir()
-        if path.is_dir() and path.name.isdecimal()
+        int(path.name) for path in root.iterdir() if path.is_dir() and path.name.isdecimal()
     )
     next_idx = max(existing_indices, default=-1) + 1
     while True:
@@ -262,9 +257,7 @@ class PolicyRolloutController:
 
         from omniteleop import LIB_PATH
 
-        config_path = (
-            LIB_PATH / "configs" / f"{config_name}.yaml" if config_name else None
-        )
+        config_path = LIB_PATH / "configs" / f"{config_name}.yaml" if config_name else None
         self.config = get_config(config_path)
         # Outer command-hold loop (must be high-frequency for set_joint_pos(wait_time=0)).
         self.control_rate = self.config.get_rate("control_rate", 100)
@@ -311,9 +304,7 @@ class PolicyRolloutController:
 
         # Joint feedback publisher.
         joint_topic = self.config.get_topic("robot_joints")
-        self.joint_pub = self.node.create_publisher(
-            joint_topic, encoder=DictDataCodec.encode
-        )
+        self.joint_pub = self.node.create_publisher(joint_topic, encoder=DictDataCodec.encode)
 
         # Per-arm workspace gates (in robot base frame). Left mirrors right
         # across the sagittal plane (see workspace_check.DEFAULT_LEFT_BOUNDS).
@@ -361,9 +352,7 @@ class PolicyRolloutController:
             self._cache_head_camera_calibration()
             # self._record_dir was resolved above (before initialize_robot).
             rollout_record_dir = _next_record_subdir(self._record_dir)  # type: ignore[arg-type]
-            self._recorder: Optional[EpisodeRecorder] = EpisodeRecorder(
-                str(rollout_record_dir)
-            )
+            self._recorder: Optional[EpisodeRecorder] = EpisodeRecorder(str(rollout_record_dir))
             logger.info(f"Recording rollouts to {rollout_record_dir}")
         else:
             self._recorder = None
@@ -401,9 +390,7 @@ class PolicyRolloutController:
         in_feats = pcfg.input_features
         img_keys = [k for k in in_feats if k.startswith("observation.images.")]
         if not img_keys:
-            raise ValueError(
-                f"policy {policy_path} declares no observation.images.* inputs"
-            )
+            raise ValueError(f"policy {policy_path} declares no observation.images.* inputs")
         known = {"observation.images.head_rgb", "observation.images.wrist_rgb"}
         unknown = [k for k in img_keys if k not in known]
         if unknown:
@@ -415,8 +402,7 @@ class PolicyRolloutController:
         self._use_wrist = "observation.images.wrist_rgb" in in_feats
         if not self._use_head:
             raise ValueError(
-                "policy must declare observation.images.head_rgb "
-                f"(got image inputs: {img_keys})"
+                "policy must declare observation.images.head_rgb " f"(got image inputs: {img_keys})"
             )
         # Derive resize target from the head feature shape [C, H, W]; both views
         # share the same shape in our porter, so this also sizes the wrist view.
@@ -446,9 +432,7 @@ class PolicyRolloutController:
             robot_configs.sensors[_WRIST_SENSOR_ID].enabled = True
         self.robot = Robot(configs=robot_configs)
         if not self.robot.has_sensor("head_camera"):
-            raise RuntimeError(
-                "head_camera was enabled in robot config but is not available"
-            )
+            raise RuntimeError("head_camera was enabled in robot config but is not available")
         if self.robot.sensors.head_camera.wait_for_active(timeout=5.0):
             logger.info("Head camera streaming started.")
         else:
@@ -561,10 +545,7 @@ class PolicyRolloutController:
                 )
         pcfg.pretrained_path = policy_path
         self._policy = (
-            get_policy_class(pcfg.type)
-            .from_pretrained(policy_path, config=pcfg)
-            .to(device)
-            .eval()
+            get_policy_class(pcfg.type).from_pretrained(policy_path, config=pcfg).to(device).eval()
         )
         # ACT/Diffusion processors are saved with the checkpoint (no need to
         # supply dataset_stats — only Gr00t needs the override path).
@@ -577,7 +558,7 @@ class PolicyRolloutController:
         # Auto-detect variant routing: bimanual (16 joint / 20 eef = two arms) or
         # single-arm (8 joint / 10 eef = one arm). state/action share the per-arm block
         # size (8 joint, 10 eef) and the same arm COUNT.
-        from lerobot.utils.constants import OBS_STATE, ACTION
+        from lerobot.utils.constants import ACTION, OBS_STATE
 
         in_feats = self._policy.config.input_features
         out_feats = self._policy.config.output_features
@@ -619,9 +600,7 @@ class PolicyRolloutController:
 
         rel_exclude_map = getattr(pcfg, "relative_exclude_dims", None) or {}
         rel_exclude_action = (
-            list(rel_exclude_map.get("action", []))
-            if isinstance(rel_exclude_map, dict)
-            else None
+            list(rel_exclude_map.get("action", [])) if isinstance(rel_exclude_map, dict) else None
         )
         self.variant = _Variant(
             state_dim=state_dim,
@@ -641,9 +620,7 @@ class PolicyRolloutController:
             (s for s in self._pre.steps if isinstance(s, RelativeActionsProcessorStep)),
             None,
         )
-        self._chunk_anchor_active = (
-            self._relative_step is not None and self._relative_step.enabled
-        )
+        self._chunk_anchor_active = self._relative_step is not None and self._relative_step.enabled
         self._chunk_ref_state: Optional[torch.Tensor] = None
 
         # Print chunking like infer_dexmate.py for sanity.
@@ -751,9 +728,7 @@ class PolicyRolloutController:
         with np.load(path, allow_pickle=True) as data:
             missing = [k for k in ("before_xyz", "after_xyz") if k not in data.files]
             if missing:
-                raise ValueError(
-                    f"{path}: missing keys {missing} (available: {list(data.files)})"
-                )
+                raise ValueError(f"{path}: missing keys {missing} (available: {list(data.files)})")
             before_xyz = np.asarray(data["before_xyz"], dtype=np.float32)
             after_xyz = np.asarray(data["after_xyz"], dtype=np.float32)
 
@@ -881,17 +856,13 @@ class PolicyRolloutController:
         qd.update({f"R_arm_j{i + 1}": float(q) for i, q in enumerate(right_arm)})
         qd.update(
             {
-                f"torso_j{i + 1}": self._fixed_motion_joint_value(
-                    f"torso_j{i + 1}", float(q)
-                )
+                f"torso_j{i + 1}": self._fixed_motion_joint_value(f"torso_j{i + 1}", float(q))
                 for i, q in enumerate(INIT_TORSO_JOINTS)
             }
         )
         qd.update(
             {
-                f"head_j{i + 1}": self._fixed_motion_joint_value(
-                    f"head_j{i + 1}", float(q)
-                )
+                f"head_j{i + 1}": self._fixed_motion_joint_value(f"head_j{i + 1}", float(q))
                 for i, q in enumerate(INIT_HEAD_JOINTS)
             }
         )
@@ -909,12 +880,8 @@ class PolicyRolloutController:
             int(np.max(np.abs(np.array(INIT_TORSO_JOINTS) - curr_torso)) / joint_delta),
         )
         for i in range(steps):
-            interp = curr_torso + (np.array(INIT_TORSO_JOINTS) - curr_torso) * (
-                i + 1
-            ) / steps
-            self.robot.torso.set_joint_pos(
-                interp.tolist(), wait_time=0.1, exit_on_reach=True
-            )
+            interp = curr_torso + (np.array(INIT_TORSO_JOINTS) - curr_torso) * (i + 1) / steps
+            self.robot.torso.set_joint_pos(interp.tolist(), wait_time=0.1, exit_on_reach=True)
 
         # Left arm: move to SAFE_LEFT_ARM_JOINTS first, then INIT_LEFT_ARM_JOINTS
         for waypoints in (SAFE_LEFT_ARM_JOINTS, INIT_LEFT_ARM_JOINTS):
@@ -945,12 +912,8 @@ class PolicyRolloutController:
             int(np.max(np.abs(np.array(INIT_HEAD_JOINTS) - curr_head)) / joint_delta),
         )
         for i in range(steps):
-            interp = curr_head + (np.array(INIT_HEAD_JOINTS) - curr_head) * (
-                i + 1
-            ) / steps
-            self.robot.head.set_joint_pos(
-                interp.tolist(), wait_time=0.1, exit_on_reach=True
-            )
+            interp = curr_head + (np.array(INIT_HEAD_JOINTS) - curr_head) * (i + 1) / steps
+            self.robot.head.set_joint_pos(interp.tolist(), wait_time=0.1, exit_on_reach=True)
         logger.info("Robot at home position.")
 
     # ── observation ───────────────────────────────────────────────────────────
@@ -989,9 +952,7 @@ class PolicyRolloutController:
                 "head_camera.HEAD_CROP_TBLR / HEAD_RESIZE_HW)"
             )
         # Depth metres → uint16 millimetres, as-is (matches vr_reader).
-        depth_u16 = np.clip(self._pick_obs(obs, "depth") * 1000, 0, 65535).astype(
-            np.uint16
-        )
+        depth_u16 = np.clip(self._pick_obs(obs, "depth") * 1000, 0, 65535).astype(np.uint16)
         return left_rgb, depth_u16
 
     def capture_head_frame(self) -> tuple[np.ndarray, np.ndarray]:
@@ -1038,7 +999,8 @@ class PolicyRolloutController:
 
     def _current_eef_poses(self) -> dict[str, np.ndarray]:
         """4x4 SE(3) of L_ee and R_ee in robot base frame, via MotionManager FK
-        on the live observed joints."""
+        on the live observed joints.
+        """
         assert self._motion_manager is not None
         self._motion_manager.set_joint_pos(self._motion_manager_state_dict())
         fk = self._motion_manager.fk(
@@ -1143,9 +1105,7 @@ class PolicyRolloutController:
         """Update the active position-condition stage after validation."""
         new_stage = int(stage)
         if not 0 <= new_stage < self._stage_num_classes:
-            raise ValueError(
-                f"predicted stage {new_stage} outside [0, {self._stage_num_classes})"
-            )
+            raise ValueError(f"predicted stage {new_stage} outside [0, {self._stage_num_classes})")
         if new_stage != self._current_stage:
             logger.info(f"Position-condition stage {self._current_stage} -> {new_stage}")
             self._current_stage = new_stage
@@ -1268,9 +1228,7 @@ class PolicyRolloutController:
         sample_position_condition = self._position_condition_record(raw_sample)
         if qlen_before <= 0:
             self._active_position_condition = sample_position_condition
-        position_condition = getattr(
-            self, "_active_position_condition", sample_position_condition
-        )
+        position_condition = getattr(self, "_active_position_condition", sample_position_condition)
         if position_condition is None:
             position_condition = sample_position_condition
 
@@ -1293,9 +1251,7 @@ class PolicyRolloutController:
         if self._chunk_anchor_active and qlen_before == 0:
             assert self._relative_step is not None
             cached = self._relative_step.get_cached_state()
-            self._chunk_ref_state = (
-                cached.detach().clone() if cached is not None else None
-            )
+            self._chunk_ref_state = cached.detach().clone() if cached is not None else None
 
         # Fallback for policy classes whose stage API depends on internal queues
         # populated by select_action() (e.g. DiffusionPolicy). ACT is handled above
@@ -1340,9 +1296,7 @@ class PolicyRolloutController:
         block ``{side: action[:b]}`` (``b`` = ``arm_action_block``).
         """
         b = self.variant.arm_action_block
-        return {
-            side: action[i * b : (i + 1) * b] for i, side in enumerate(self._arm_sides)
-        }
+        return {side: action[i * b : (i + 1) * b] for i, side in enumerate(self._arm_sides)}
 
     @staticmethod
     def _block_to_se3(block: np.ndarray) -> np.ndarray:
@@ -1397,16 +1351,13 @@ class PolicyRolloutController:
             # each driven arm targets the policy pose; an inactive arm targets its current
             # observed pose (held in place). Only driven-arm joints are extracted/sent.
             target_pose = {
-                _ARM_FRAME[side]: self._block_to_se3(blocks[side])
-                for side in self._arm_sides
+                _ARM_FRAME[side]: self._block_to_se3(blocks[side]) for side in self._arm_sides
             }
             for side in _ARM_ORDER:
                 if side not in self._arm_sides:
                     if self._last_obs_eef_se3 is None:
                         return None, "no_observed_eef_for_inactive_arm", grips
-                    target_pose[_ARM_FRAME[side]] = self._last_obs_eef_se3[side].astype(
-                        np.float64
-                    )
+                    target_pose[_ARM_FRAME[side]] = self._last_obs_eef_se3[side].astype(np.float64)
             try:
                 arm_solution, in_collision, within_limits = self._motion_manager.ik(
                     target_pose=target_pose,
@@ -1433,9 +1384,7 @@ class PolicyRolloutController:
 
         # 10°/tick clamp against each chained driven arm (clamps read MM arm state,
         # which was just seeded to the chained values and is unchanged by IK).
-        safe = {
-            side: self._proc[side].limit_joint_step(raw[side]) for side in self._arm_sides
-        }
+        safe = {side: self._proc[side].limit_joint_step(raw[side]) for side in self._arm_sides}
         targets = {side: safe[side].astype(np.float32) for side in self._arm_sides}
 
         # Validate EVERY driven arm's post-clamp target before committing any chain.
@@ -1469,9 +1418,9 @@ class PolicyRolloutController:
         """
         if self.variant.action_is_eef:
             T = np.eye(4, dtype=np.float32)
-            T[:3, :3] = _gram_schmidt_6d_to_R(
-                action_block[3:9].astype(np.float64)
-            ).astype(np.float32)
+            T[:3, :3] = _gram_schmidt_6d_to_R(action_block[3:9].astype(np.float64)).astype(
+                np.float32
+            )
             T[:3, 3] = action_block[:3].astype(np.float32)
             pos6d = action_block[:9].astype(np.float32)
             return T, pos6d
@@ -1501,9 +1450,7 @@ class PolicyRolloutController:
 
     # ── safety ───────────────────────────────────────────────────────────────
 
-    def _check_arm_joint_target(
-        self, side: str, joint_target: np.ndarray
-    ) -> tuple[bool, str]:
+    def _check_arm_joint_target(self, side: str, joint_target: np.ndarray) -> tuple[bool, str]:
         """Validate one arm's 7-DOF command (shape, finiteness, hardware limits)."""
         if joint_target.shape != (7,):
             return False, f"{side}_arm_bad_shape:{joint_target.shape}"
@@ -1566,9 +1513,7 @@ class PolicyRolloutController:
                 }
                 if self.has_torso:
                     positions["torso"] = self.robot.torso.get_joint_pos().tolist()
-                self.joint_pub.publish(
-                    {"timestamp_ns": time.time_ns(), "joints": positions}
-                )
+                self.joint_pub.publish({"timestamp_ns": time.time_ns(), "joints": positions})
             except Exception as e:
                 logger.warning(f"Joint feedback error: {e}")
             rate.sleep()
@@ -1609,9 +1554,7 @@ class PolicyRolloutController:
             "left": self._last_gripper_cmd_left,
             "right": self._last_gripper_cmd_right,
         }
-        joint_targets: dict[str, np.ndarray] = {
-            s: _last_cmd[s].copy() for s in self._arm_sides
-        }
+        joint_targets: dict[str, np.ndarray] = {s: _last_cmd[s].copy() for s in self._arm_sides}
         gripper_targets: dict[str, float] = {s: _last_gcmd[s] for s in self._arm_sides}
         consecutive_rejects = 0
         REJECT_LIMIT = 1
@@ -1646,9 +1589,7 @@ class PolicyRolloutController:
                     # so it needs no resync.)
                     if all(self._proc[s] is not None for s in self._arm_sides):
                         for s in self._arm_sides:
-                            obs = np.array(
-                                self._robot_arm(s).get_joint_pos(), dtype=np.float32
-                            )
+                            obs = np.array(self._robot_arm(s).get_joint_pos(), dtype=np.float32)
                             self._chained[s] = obs
                             self._proc[s].apply_positions(obs.tolist())
                             # Align the held command with the live pose so the first
@@ -1676,9 +1617,7 @@ class PolicyRolloutController:
                         consecutive_rejects += 1
                         logger.warning(f"Action rejected: {reason}")
                         if consecutive_rejects >= REJECT_LIMIT:
-                            logger.error(
-                                f"{consecutive_rejects} consecutive rejects — exiting."
-                            )
+                            logger.error(f"{consecutive_rejects} consecutive rejects — exiting.")
                             break
                     else:
                         for s in self._arm_sides:
@@ -1828,10 +1767,7 @@ class PolicyRolloutController:
         if self._use_wrist:
             assert self._last_obs_wrist_rgb is not None
             images["left_wrist_rgb"] = self._last_obs_wrist_rgb
-        if (
-            self._head_camera_intrinsic is not None
-            and self._head_camera_extrinsic is not None
-        ):
+        if self._head_camera_intrinsic is not None and self._head_camera_extrinsic is not None:
             images["intrinsic"] = self._head_camera_intrinsic
             images["extrinsic"] = self._head_camera_extrinsic
 
@@ -1849,18 +1785,14 @@ class PolicyRolloutController:
             obs["position_condition"] = {
                 "stage": np.int32(position_condition["stage"]),
                 "mask": np.asarray(position_condition["mask"], dtype=np.float32),
-                "condition_6d": np.asarray(
-                    position_condition["condition_6d"], dtype=np.float32
-                ),
+                "condition_6d": np.asarray(position_condition["condition_6d"], dtype=np.float32),
             }
 
         self._recorder.record(  # type: ignore[union-attr]
             {
                 "time": {
                     "timestamp_ns": np.int64(step_info["t_obs_ns_wallclock"]),
-                    "begin_build_observation": np.int64(
-                        step_info["begin_build_obs_ns"]
-                    ),
+                    "begin_build_observation": np.int64(step_info["begin_build_obs_ns"]),
                     "begin_inference": np.int64(step_info["begin_inference_ns"]),
                     "finish_inference": np.int64(step_info["finish_inference_ns"]),
                     "publish_command": np.int64(publish_command_ns),
