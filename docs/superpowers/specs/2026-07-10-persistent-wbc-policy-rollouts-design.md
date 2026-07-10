@@ -35,10 +35,17 @@ episode waits at an idle prompt regardless of `--auto-start`:
 Press Enter to home and start the next rollout (Ctrl-C exits) ...
 ```
 
-Pressing Enter first runs the driver's nominal homing routine while the process
-and hardware connection remain live. The episode then performs the same engage
-reset and optional reference alignment as the first rollout. The initial episode
-does not repeat the nominal home already performed by `HardwareDriver` startup.
+Pressing Enter first reuses the driver's startup gripper activation path for both
+grippers. That path issues the existing Robotiq reset/activate sequence, after
+which the driver polls its existing FC03 status monitors until both normalized
+achieved positions are at most `0.05` (`0.0` is fully open). Only then does it
+run the nominal homing routine
+while the process and hardware connection remain live. If either gripper does not
+confirm open within five seconds, motion is stopped and the session terminates
+instead of homing with a potentially held object. The episode then performs the
+same engage reset and optional reference alignment as the first rollout. The
+initial episode does not repeat the activation or nominal home already performed
+by `HardwareDriver` startup.
 
 ## Position-Conditioned Rollouts
 
@@ -110,6 +117,8 @@ at the episode/session boundary. They will verify:
 - two rollouts reuse the same persistent driver and policy but receive fresh
   per-episode scheduler, worker, reset calls, and recorder starts;
 - the second rollout homes before engage and the first does not double-home;
+- the second rollout reuses startup gripper activation, confirms both grippers
+  open, and only then homes; confirmation timeout prevents homing;
 - replay restarts from frame zero for each rollout;
 - position-conditioned policies rerun SceneDiff and set a fresh environment
   state before each recorder/worker start, using successive pending episode IDs;
