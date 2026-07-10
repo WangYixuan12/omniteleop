@@ -115,6 +115,7 @@ import numpy as np
 
 from omniteleop.wbc_policy_format import (
     ACTION_AXES,
+    GRIPPER_BINARY_THRESHOLD,
     GRIPPER_DIMS,
     RELATIVE_EXCLUDE_DIMS,
     SKIP_NORMALIZATION_DIMS,
@@ -137,7 +138,6 @@ DEFAULT_RESIZE_H = 120
 DEFAULT_RESIZE_W = 160
 DEFAULT_TASK = "dexmate_wbc"
 DEFAULT_REPO_ID = "dexmate_wbc_eef_head"
-GRIPPER_BINARY_THRESHOLD = 0.5
 ROBOT_TYPE = "dexmate_vega_wbc"
 # Splits are written to <root>/<split>/<repo_id>/ (tabletop porter layout).
 ALL_SPLITS = ("train", "val", "test")

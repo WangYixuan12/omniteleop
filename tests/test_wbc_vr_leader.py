@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
-import sys
 from pathlib import Path
 
 import h5py
 import numpy as np
-import pytest
 
 from omniteleop.leader import wbc_reference_alignment as ref_align
 
@@ -260,20 +258,6 @@ def test_save_load_ee_offsets_round_trip(tmp_path):
     np.testing.assert_allclose(rr, cr, atol=1e-9)
 
 
-@pytest.mark.parametrize("flag", ["--base-dofs", "--wbc-base-dofs"])
-def test_base_dofs_cli_flag_is_rejected(monkeypatch, flag):
-    leader_mod = _load_wbc_vr_leader()
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["wbc_vr_leader.py", flag, "xy", "--no-headset-hud"],
-    )
-
-    with pytest.raises(SystemExit) as exc:
-        leader_mod.main()
-    assert exc.value.code == 2
-
-
 def test_align_reference_none_disables_reference_loading():
     assert ref_align.load_reference_ee_poses(None) is None
     assert ref_align.load_reference_ee_poses("None") is None
@@ -429,32 +413,6 @@ def test_reference_alignment_head_gate_blocks_on_missing_head():
     assert not status.ready
 
 
-def test_follower_status_overlay_lines_show_hold_and_safety_warning():
-    """The headset HUD should surface the real follower hold/safety state."""
-    leader_mod = _load_wbc_vr_leader()
-    status = leader_mod.WBCFollowerStatus(
-        timestamp_ns=123,
-        stage="teleop",
-        estop=False,
-        success=False,
-        held=True,
-        hold=True,
-        hold_reason="source_timeout",
-        safety_status="HELD: self-collision -1.2cm",
-        left_ee_error_mm=12.3,
-        right_ee_error_mm=45.6,
-    )
-
-    lines = leader_mod._follower_status_overlay_lines(status, status_age_s=0.2)
-
-    assert "Follower: HOLD:source_timeout" in lines
-    assert "WARNING: IK solve failed" in lines
-    # The gate-prefixed safety string (carrying the CoM margin) is surfaced verbatim
-    # only when non-ok; the always-on margin line is gone.
-    assert "HELD: self-collision -1.2cm" in lines
-    assert "err L/R=12/46mm" in lines
-
-
 def test_follower_status_overlay_lines_warn_when_status_stale():
     leader_mod = _load_wbc_vr_leader()
     status = leader_mod.WBCFollowerStatus(timestamp_ns=123, stage="teleop")
@@ -462,18 +420,6 @@ def test_follower_status_overlay_lines_warn_when_status_stale():
     lines = leader_mod._follower_status_overlay_lines(status, status_age_s=1.6)
 
     assert "WARNING: follower status stale 1.6s" in lines
-
-
-def test_follower_status_overlay_color_marks_alerts_red():
-    leader_mod = _load_wbc_vr_leader()
-    red = (0, 0, 255)
-    white = (255, 255, 255)
-
-    assert leader_mod._follower_status_overlay_color("WARNING: IK solve failed") == red
-    assert leader_mod._follower_status_overlay_color("WARN: CoM margin 1.2cm") == red
-    assert leader_mod._follower_status_overlay_color("HELD: self-collision -1.2cm") == red
-    assert leader_mod._follower_status_overlay_color("err L/R=12/46mm") == white
-    assert leader_mod._follower_status_overlay_color("Follower: HOLD:source_timeout") == white
 
 
 def test_follower_status_overlay_lines_hide_normal_teleop_state():

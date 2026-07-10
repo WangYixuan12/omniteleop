@@ -76,12 +76,10 @@ Sidecars (``--dataset_dir`` only; NOT in the parquet; written by the porter in l
 
 Usage::
 
-    # LeRobot dataset (dexmate_lerobot env: needs lerobot + rerun)
     python scripts/vis_episode_processed_wbc.py \\
         --dataset_dir /home/yixuan/Dexmate/data/processed_wbc/train/dexmate_wbc_eef_head \\
         --episode_index 0
 
-    # ManiFlow point-cloud zarr (dexmate env: needs zarr + rerun)
     python scripts/vis_episode_processed_wbc.py \\
         --zarr /home/yixuan/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_train.zarr \\
         --episode_index 0
@@ -89,8 +87,8 @@ Usage::
     # headless over SSH -> open later with `rerun FILE.rrd`:
     python scripts/vis_episode_processed_wbc.py --save /tmp/wbc_ep0.rrd
 
-The two heavy readers are imported lazily, so each mode only needs its own env:
-``lerobot`` is absent from ``dexmate`` and ``zarr`` is absent from ``dexmate_lerobot``.
+``--dataset_dir`` needs ``lerobot`` (``dexmate_lerobot``); ``--zarr`` needs ``zarr``
+(available in both ``dexmate`` and ``dexmate_lerobot``).
 """
 
 from __future__ import annotations
@@ -105,6 +103,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 import torch
+import zarr
 
 from omniteleop.wbc_policy_format import (
     ACTION_AXES,
@@ -270,7 +269,7 @@ def load_processed_wbc_position_condition(dataset) -> dict[str, np.ndarray | lis
 
 # ── Episode sources. Both formats carry the SAME 32-D state / 29-D action; they
 #    differ only in the observation (RGB+depth sidecars vs a stored point cloud).
-#    Each reader imports its heavy dependency lazily so a mode only needs its env. ──
+#    LeRobot is imported lazily so --zarr still runs in envs without lerobot. ──
 def load_lerobot_episode(dataset_root: Path, episode_index: int) -> dict:
     """The LeRobotDataset variant written by ``scripts/port_wbc_mobile_hdf5.py``."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: PLC0415
@@ -356,9 +355,7 @@ def load_maniflow_zarr_episode(zarr_path: Path, episode_index: int) -> dict:
     it, so what you see is what the policy trains on. The sibling ``.meta.json`` supplies
     ``state_frame`` (``world`` by default here, unlike the LeRobot porter's ``base``).
     """
-    import zarr  # noqa: PLC0415 -- absent from dexmate_lerobot; only this mode needs it
-
-    root = zarr.open(str(zarr_path), "r")
+    root = zarr.open(str(zarr_path), mode="r")
     for key in ("data/point_cloud", "data/state", "data/action", "meta/episode_ends"):
         if key not in root:
             raise ValueError(f"{zarr_path}: missing {key} (not a ManiFlow WBC zarr)")

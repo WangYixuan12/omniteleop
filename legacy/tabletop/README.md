@@ -16,12 +16,6 @@ workflow; the current mobile manipulation pipeline starts in
 python /home/dexmate/yixuan/omniteleop/tests/test_wrist_zedm_depth.py --duration 10 --save-dir /home/dexmate/yixuan/Dexmate
 ```
 
-3.2 check RoI:
-
-```python
-python /home/yixuan/omniteleop/tests/crop_and_resize.py
-```
-
 1. ssh lambda, conda activate dexmate
 2. run
   (dexmate) python src/omniteleop/follower/vr_robot_controller.py # workspace_check = True, joint positions in vr_mode_const, head_mode and left_arm_mode in src/omniteleop/configs/vega_1_f5d6.yaml

@@ -10,7 +10,7 @@ measured odometry base pose ``(x, y, yaw)`` in the engage-origin world frame —
 policy's only absolute world anchor (images are egocentric).
 
 ``action`` (29,): the WORLD-frame targets given VERBATIM to ``ik.solve()`` at the
-record tick — left/right EEF targets + clipped gripper commands + the
+record tick — left/right EEF targets + binary gripper commands + the
 post-LPF/post-deadband head target. Rollout feeds these straight back into the
 ``TargetInterpolator`` -> ``ik.solve()`` path with no base composition.
 
@@ -52,6 +52,10 @@ STATE_AXES = ACTION_AXES + BASE_AXES
 # relative step subtracts observation.state[:29] from the world action element-wise
 # (cross-frame subtraction is meaningless otherwise). See PLAN.md / port_wbc_mobile_hdf5.
 STATE_FRAMES = ("base", "world")
+
+# Action grippers are categorical open/closed commands. Dataset conversion and
+# live policy rollout share this threshold so their command semantics cannot drift.
+GRIPPER_BINARY_THRESHOLD = 0.5
 
 # Dim groups of the 29-D action layout (observation.state[:29] mirrors it),
 # derived from the axis names so they can never drift from ACTION_AXES.

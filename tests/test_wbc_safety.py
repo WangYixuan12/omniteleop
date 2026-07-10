@@ -3,9 +3,9 @@
 Covers the Pink whole-body IK backend, plus a unit test of the backend-agnostic
 :class:`~omniteleop.follower.wbc_safety.SafetyGate`.
 
-Needs mujoco, so run with the dexmate env::
+Needs mujoco, so run with pytest in the dexmate env::
 
-    /home/yixuan/miniforge3/envs/dexmate/bin/python tests/test_wbc_safety.py
+    /home/yixuan/miniforge3/envs/dexmate/bin/python -m pytest tests/test_wbc_safety.py
 """
 
 from __future__ import annotations
@@ -373,26 +373,3 @@ def test_pink_solver_gate_guards_true_com():
     """
     ik, _, _ = _make()
     assert ik._gate.enable_com is True  # noqa: SLF001
-
-
-def _main() -> int:
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-    failures = 0
-    for t in tests:
-        try:
-            t()
-            print(f"PASS  {t.__name__}")
-        except AssertionError as exc:
-            failures += 1
-            print(f"FAIL  {t.__name__}: {exc}")
-        except Exception as exc:  # surface setup errors per-test
-            failures += 1
-            print(f"ERROR {t.__name__}: {type(exc).__name__}: {exc}")
-    print(f"\n{len(tests) - failures}/{len(tests)} passed")
-    return 1 if failures else 0
-
-
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(_main())

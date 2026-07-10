@@ -7,7 +7,7 @@ Drives the real robot from a LeRobot checkpoint trained on the
   observation.state (32,) = base-frame ACHIEVED L/R EEF pos3+rot6+gripper and
       zed_depth_frame head pos3+rot6 (WBC FK on measured joints, base zero) +
       the measured odometry base pose (x, y, yaw) in the engage-origin world.
-  action (29,) = WORLD-frame L/R EEF + head targets (pos3+rot6) + grippers.
+  action (29,) = WORLD-frame L/R EEF + head targets (pos3+rot6) + binary grippers.
 
 The action is decoded with NO base composition, ever: ``split_policy_action``
 only rebuilds the three 4x4 poses (Gram-Schmidt on the 6-D rotation) and the
@@ -116,8 +116,18 @@ from pathlib import Path
 
 import numpy as np
 
+from omniteleop.follower.scenediff_live import (  # dependency-light shared live plumbing
+    invoke_scenediff as _invoke_scenediff,
+)
+from omniteleop.follower.scenediff_live import (
+    prompt_for_slot_order,
+)
+from omniteleop.follower.scenediff_live import (
+    write_live_capture_hdf5 as _write_live_capture_hdf5,
+)
 from omniteleop.wbc_policy_format import (
     ACTION_AXES,
+    GRIPPER_BINARY_THRESHOLD,
     STATE_AXES,
     WBCPolicyFK,
     base_pose_to_mat,
@@ -126,11 +136,6 @@ from omniteleop.wbc_policy_format import (
     pos6d_to_mat,
 )
 from omniteleop.wbc_stream import _blend_pose  # numpy+scipy only, light import
-from omniteleop.follower.scenediff_live import (  # dependency-light shared live plumbing
-    invoke_scenediff as _invoke_scenediff,
-    prompt_for_slot_order,
-    write_live_capture_hdf5 as _write_live_capture_hdf5,
-)
 
 DEFAULT_ROLLOUT_SAVE_DIR = str(Path("~/Dexmate/data/raw_data_rollout").expanduser())
 DEFAULT_REPLAY_SAVE_DIR = str(Path("~/Dexmate/data/replay_raw_data").expanduser())
@@ -168,12 +173,13 @@ DEFAULT_POS_COND_REFERENCE = "/home/yixuan/Dexmate/data/scene_diff/_before/refer
 
 
 def split_policy_action(action: np.ndarray) -> dict[str, np.ndarray | np.float32]:
-    """29-D policy action -> world-frame 4x4 targets + gripper commands.
+    """29-D policy action -> world-frame 4x4 targets + binary gripper commands.
 
     Pure reshaping: positions pass through, 6-D rotations are re-orthonormalized
     by ``pos6d_to_mat``. The outputs are ALREADY world-frame ``ik.solve()``
     targets -- never compose them with any base pose, at the 10 Hz policy tick
-    or the 100 Hz WBC tick.
+    or the 100 Hz WBC tick. Postprocessed gripper predictions are thresholded at
+    the same value used to binarize the training actions.
     """
     action = np.asarray(action, dtype=np.float32).reshape(-1)
     if action.shape != (len(ACTION_AXES),):
@@ -184,8 +190,8 @@ def split_policy_action(action: np.ndarray) -> dict[str, np.ndarray | np.float32
         "left": pos6d_to_mat(action[0:9]),
         "right": pos6d_to_mat(action[10:19]),
         "head": pos6d_to_mat(action[20:29]),
-        "left_gripper": np.float32(action[9]),
-        "right_gripper": np.float32(action[19]),
+        "left_gripper": np.float32(action[9] >= GRIPPER_BINARY_THRESHOLD),
+        "right_gripper": np.float32(action[19] >= GRIPPER_BINARY_THRESHOLD),
     }
 
 
@@ -277,7 +283,7 @@ def drop_stale_actions(
 def _interpolate_scheduled(
     prev: ScheduledPolicyAction, future: ScheduledPolicyAction, query_time: float
 ) -> ScheduledPolicyAction:
-    """Blend two scheduled actions at ``query_time`` (lerp pos/grip, slerp rot)."""
+    """Blend poses at ``query_time`` while holding the previous binary grippers."""
     if future.timestamp <= prev.timestamp:
         return future
     alpha = float(np.clip(
@@ -288,10 +294,8 @@ def _interpolate_scheduled(
         left=_blend_pose(prev.left, future.left, alpha),
         right=_blend_pose(prev.right, future.right, alpha),
         head=_blend_pose(prev.head, future.head, alpha),
-        grip_left=np.float32((1.0 - alpha) * float(prev.grip_left)
-                             + alpha * float(future.grip_left)),
-        grip_right=np.float32((1.0 - alpha) * float(prev.grip_right)
-                              + alpha * float(future.grip_right)),
+        grip_left=prev.grip_left,
+        grip_right=prev.grip_right,
     )
 
 
@@ -302,8 +306,9 @@ class ActionScheduleBuffer:
     FUTURE entries and trims entries already in the past (``queue_actions``,
     rby1_policy.py 717-731). ``sample()`` (main thread, 10 Hz) evaluates the
     scheduled trajectory at a query time: previous/future bracketing knots,
-    positions/grippers lerped, rotations slerped, anchored on the LAST EXECUTED
-    sample for continuity across replans (``_last_executed_action``); before the
+    positions lerped and rotations slerped, anchored on the LAST EXECUTED sample
+    for continuity across replans (``_last_executed_action``). Binary grippers
+    hold the latest due knot instead of becoming interpolated widths; before the
     first knot the first knot passes through verbatim.
 
     Deliberate deviation from rby1 (plan.md hold semantics): rby1 returns the
@@ -369,9 +374,17 @@ class ActionScheduleBuffer:
                 out = future  # before the first knot: command it verbatim (early glide)
             else:
                 out = _interpolate_scheduled(prev, future, query_time)
-            if out is None:
+            gripper_source = passed if passed is not None else (
+                prev if prev is not None else future
+            )
+            if out is None or gripper_source is None:
                 return None
-            executed = replace(out, timestamp=float(query_time))
+            executed = replace(
+                out,
+                timestamp=float(query_time),
+                grip_left=gripper_source.grip_left,
+                grip_right=gripper_source.grip_right,
+            )
             self._last_executed = executed
             return executed
 
