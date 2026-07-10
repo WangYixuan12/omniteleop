@@ -28,7 +28,8 @@ data collection. Every rollout records:
                                       action/head = the POLICY world targets)
   <save-dir>/policy_io/episode_N.hdf5 live rollout: ONE record per predicted
                                       chunk (state, full (n, 29) chunk, schedule
-                                      offsets, timing); replay: one record per
+                                      offsets, timing, and position-condition
+                                      instrumentation); replay: one record per
                                       released command (state/action vectors)
 
 Inference is asynchronous (ported from deps/rby1-wbc, see plan.md): an
@@ -660,6 +661,7 @@ def run_reference_alignment(
     last_print = t_start
     pos_mm = (float("inf"), float("inf"))
     rot_deg = (float("inf"), float("inf"))
+    last_tick_status = "not-run"
     while True:
         now = now_fn()
         if now - t_start > timeout_s:
@@ -667,12 +669,25 @@ def run_reference_alignment(
                 f"[wbc_policy_rollout] reference alignment did not converge within "
                 f"{timeout_s:g}s (L {pos_mm[0]:.0f}mm/{rot_deg[0]:.1f}deg, "
                 f"R {pos_mm[1]:.0f}mm/{rot_deg[1]:.1f}deg vs tol "
-                f"{REFERENCE_ALIGN_POS_TOL_MM:g}mm/{REFERENCE_ALIGN_ROT_TOL_DEG:g}deg)"
+                f"{REFERENCE_ALIGN_POS_TOL_MM:g}mm/{REFERENCE_ALIGN_ROT_TOL_DEG:g}deg; "
+                f"last WBC tick: {last_tick_status})"
             )
-        wbc_tick(ik=ik, driver=driver, enable=enable, interp=interp,
-                 head_lpf=head_lpf, head_deadband=head_deadband, now=now, dt=dt,
-                 grip_left=0.0, grip_right=0.0, last_cmd_wall=now,
-                 live_head_filters=True)
+        result, hold, hold_reason = wbc_tick(
+            ik=ik, driver=driver, enable=enable, interp=interp,
+            head_lpf=head_lpf, head_deadband=head_deadband, now=now, dt=dt,
+            grip_left=0.0, grip_right=0.0, last_cmd_wall=now,
+            live_head_filters=True,
+        )
+        if not hold:
+            last_tick_status = "ok"
+        elif hold_reason is not None:
+            last_tick_status = f"HOLD:{hold_reason}"
+        elif not result.success:
+            last_tick_status = "HOLD:ik-failed"
+        elif result.held:
+            last_tick_status = "HOLD:safety-gate"
+        else:
+            last_tick_status = "HOLD"
         ticks += 1
         left_now, right_now = read_achieved()
         pos_mm = (
@@ -744,6 +759,10 @@ class _PolicyBundle:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         pcfg = PreTrainedConfig.from_pretrained(policy_path)
         pcfg.pretrained_path = policy_path
+        self.checkpoint_path = str(Path(policy_path).expanduser().resolve())
+        self.position_condition_mode = str(
+            getattr(pcfg, "position_condition_mode", "not_applicable")
+        )
         # Relative checkpoints are supported: state must be WORLD-frame (see
         # _build_state / --relative-actions). state_frame follows this flag.
         self.use_relative_actions = bool(getattr(pcfg, "use_relative_actions", False))
@@ -829,11 +848,28 @@ class _PolicyBundle:
         # observation history + the unconsumed tail of the last predicted chunk.
         self._obs_history: deque[PolicyObservation] = deque(maxlen=self.n_obs_steps)
         self._chunk_tail: deque[np.ndarray] = deque()
+        self._last_inference_trace: dict | None = None
+        self._model_environment_trace: np.ndarray | None = None
 
     def reset(self) -> None:
         self.policy.reset()
         self._obs_history.clear()
         self._chunk_tail.clear()
+        self._last_inference_trace = None
+        self._model_environment_trace = None
+
+    def inference_metadata(self) -> dict[str, np.ndarray]:
+        """Constant checkpoint metadata written once in the policy-IO episode."""
+        return {
+            "checkpoint_path": np.asarray(self.checkpoint_path.encode("utf-8")),
+            "position_condition_mode": np.asarray(
+                self.position_condition_mode.encode("utf-8")
+            ),
+        }
+
+    def last_inference_trace(self) -> dict | None:
+        """Small CPU snapshot from the most recent completed inference."""
+        return self._last_inference_trace
 
     def describe(self) -> str:
         """One-line banner for _run_rollout. Other policy families override this."""
@@ -858,6 +894,7 @@ class _PolicyBundle:
             raise ValueError(
                 f"env-state must be a finite ({self.env_state_dim},) vector, got {v.shape}")
         self._env_state = v
+        self._model_environment_trace = None
 
     def _chw(self, img_hwc: np.ndarray):
         import cv2  # noqa: PLC0415
@@ -910,7 +947,7 @@ class _PolicyBundle:
         replan state (empirically exact round trip).
         """
         from lerobot.policies.utils import populate_queues  # noqa: PLC0415
-        from lerobot.utils.constants import ACTION, OBS_IMAGES  # noqa: PLC0415
+        from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES  # noqa: PLC0415
 
         history = list(obs_history)
         if not 1 <= len(history) <= self.n_obs_steps:
@@ -934,6 +971,19 @@ class _PolicyBundle:
                 )
         with self._torch.no_grad():
             chunk = self.policy.predict_action_chunk(batch)
+        model_env = None
+        if self.use_env_state and self._model_environment_trace is None:
+            if self._uses_obs_queues:
+                # This is the same queue and stack order consumed inside DiffusionPolicy's
+                # predict_action_chunk. It has already passed the selector and normalizer.
+                model_env = self._torch.stack(
+                    list(self.policy._queues[OBS_ENV_STATE]), dim=1  # noqa: SLF001
+                )
+            else:
+                # Direct-batch policies consume the last preprocessed observation.
+                model_env = batch[OBS_ENV_STATE]
+                if model_env.ndim == 2:
+                    model_env = model_env.unsqueeze(1)
         if chunk.ndim != 3 or chunk.shape[0] != 1 or chunk.shape[1] < self.n_action_steps:
             raise ValueError(
                 f"predict_action_chunk returned {tuple(chunk.shape)}; expected "
@@ -946,6 +996,36 @@ class _PolicyBundle:
             np.isfinite(out)
         ):
             raise ValueError(f"bad action chunk {out.shape} (or non-finite)")
+        if model_env is not None:
+            model_env_np = np.asarray(model_env.detach().cpu().numpy(), dtype=np.float32)
+            expected = (1, self.n_obs_steps, self.env_state_dim)
+            if model_env_np.shape != expected or not np.all(np.isfinite(model_env_np)):
+                raise ValueError(
+                    f"bad post-normalizer environment tensor {model_env_np.shape}; "
+                    f"expected finite {expected}"
+                )
+            # The raw environment state is pinned for the episode, so selector +
+            # normalizer output is invariant. Snapshot the exact model queue once and
+            # reuse it in subsequent in-memory records (no repeated GPU copy).
+            self._model_environment_trace = model_env_np[0].copy()
+        self._last_inference_trace = None
+        if self.use_env_state:
+            if self._env_state is None:
+                raise RuntimeError("position-conditioned inference has no raw env-state")
+            if self._model_environment_trace is None:
+                raise RuntimeError("position-conditioned inference has no normalized env trace")
+            self._last_inference_trace = {
+                "position_condition": {
+                    "raw_source_destination_xyz": self._env_state.copy(),
+                    "model_input_normalized": self._model_environment_trace.copy(),
+                },
+                "prediction": {
+                    # First postprocessed action: left XYZ then right XYZ.
+                    "first_arm_xyz": np.stack((out[0, 0:3], out[0, 10:13])).astype(
+                        np.float32, copy=True
+                    ),
+                },
+            }
         return out
 
     def select_action(self, state: np.ndarray, head_rgb: np.ndarray,
@@ -1158,7 +1238,7 @@ class _InferenceWorker:
                           f"(inference {t_end - t_pred0:.2f}s + latency "
                           f"{self._execution_latency:g}s passed the last frame at "
                           f"t_obs+{(n - 1) * self._dataset_dt:.2f}s); nothing queued")
-                self._io_log.record({
+                io_frame = {
                     "t": np.float64(t_obs - self._t0),
                     "timestamp_ns": np.int64(time.time_ns()),
                     "state": obs_list[-1].state,
@@ -1172,7 +1252,15 @@ class _InferenceWorker:
                     "n_dropped": np.int64(n - len(kept)),
                     "head_frame_ns": np.int64(self._last_head_ns),
                     "wrist_frame_ns": np.int64(self._last_wrist_ns),
-                })
+                }
+                trace_fn = getattr(self._policy, "last_inference_trace", None)
+                if trace_fn is not None:
+                    trace = trace_fn()
+                    if trace is not None:
+                        io_frame.update(trace)
+                # EpisodeRecorder.record is a bare in-memory list append. HDF5 is written
+                # only after the worker is joined at episode shutdown.
+                self._io_log.record(io_frame)
                 self._stop.wait(
                     max(0.0, self._policy_interval - (time.perf_counter() - cycle_t0))
                 )
@@ -1384,6 +1472,10 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
     fk = WBCPolicyFK(ik=ik)  # FK on the live solver's own model
     driver = mod.HardwareDriver(args, ik, cfg, enable)
     io_log = EpisodeRecorder(str(Path(args.save_dir) / "policy_io"))
+    if policy is not None:
+        metadata_fn = getattr(policy, "inference_metadata", None)
+        if metadata_fn is not None:
+            io_log.set_static({"policy": metadata_fn()})
     schedule_buffer = ActionScheduleBuffer()
     stop_event = threading.Event()
     worker: _InferenceWorker | None = None

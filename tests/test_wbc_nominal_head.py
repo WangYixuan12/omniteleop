@@ -60,6 +60,12 @@ def _raised_config() -> WBCConfig:
     )
 
 
+def _zero_head_config() -> WBCConfig:
+    return _fast_config(
+        nominal_posture={**DEFAULT_NOMINAL_POSTURE, "head_j1": 0.0}
+    )
+
+
 def _to_mat(pose) -> np.ndarray:
     return np.asarray(pose.homogeneous if hasattr(pose, "homogeneous") else pose, dtype=float)
 
@@ -83,7 +89,7 @@ def _level_headset(pos: np.ndarray) -> np.ndarray:
 
 def test_nominal_head_j1_flows_into_nominal_q_and_raises_view():
     """The yaml knob must land in nominal_q and pitch the camera view 1:1 (rad->rad)."""
-    ik0 = VegaWholeBodyIK(_fast_config())
+    ik0 = VegaWholeBodyIK(_zero_head_config())
     ik1 = VegaWholeBodyIK(_raised_config())
 
     assert ik1.nominal_q()[ik1._idx_q["head_j1"]] == pytest.approx(RAISED_HEAD_J1)

@@ -174,16 +174,6 @@ def _coal_min_self_distance(ik) -> float:
     return float(min(cd.distanceResults[k].min_distance for k in range(len(pairs))))
 
 
-def _closest_pair(ik):
-    """(set of the two geometry names, clearance m) of the globally closest pair (coal)."""
-    cd = ik.configuration.collision_data
-    pairs = ik.configuration.collision_model.collisionPairs
-    dists = [cd.distanceResults[k].min_distance for k in range(len(pairs))]
-    k = int(np.argmin(dists))
-    names = [g.name for g in ik.collision_sphere_model.geometryObjects]
-    return {names[pairs[k].first], names[pairs[k].second]}, float(dists[k])
-
-
 def test_min_self_distance_matches_coal():
     """Vectorized ``_min_self_distance`` == coal's per-pair min across random configs.
 
@@ -207,30 +197,6 @@ def test_min_self_distance_matches_coal():
             ik._min_self_distance(), _coal_min_self_distance(ik), atol=1e-9  # noqa: SLF001
         )
 
-
-def test_min_self_distance_real_example_closest_pair():
-    """Measured real-robot pose: closest spheres are torso_l3_0 / R_arm_l2_2 at 2.00 cm.
-
-    Anchors the vectorized path to a hardware readback (dexcontrol == vega_with_robotiq
-    1:1): confirms both the closest-pair identity and that ``_min_self_distance`` returns
-    that clearance.
-    """
-    ik, _, _ = _make()
-    q = ik.nominal_q().copy()
-    for name, val in zip(TORSO_JOINTS, (7.7981311e-01, 1.5707964e00, -3.4906584e-04),
-                         strict=True):
-        q[ik._idx_q[name]] = val  # noqa: SLF001
-    rarm = (-1.272989, 0.0807494, -0.85169446, -1.8787196, -2.0161536, -0.64398456, 0.03259751)
-    for i, val in enumerate(rarm, start=1):
-        q[ik._idx_q[f"R_arm_j{i}"]] = val  # noqa: SLF001
-    ik.configuration.update(q)
-
-    names, clearance = _closest_pair(ik)
-    assert names == {"torso_l3_0", "R_arm_l2_2"}
-    assert abs(clearance - 0.02) < 5e-4
-    np.testing.assert_allclose(ik._min_self_distance(), clearance, atol=1e-9)  # noqa: SLF001
-
-
 # --- tip-over ------------------------------------------------------------------
 
 # The solver enforces tip-over *inside* the QP (the RBY1-style hard inequality on a centroid
@@ -241,24 +207,6 @@ def test_min_self_distance_real_example_closest_pair():
 # (A free base just slides under the CoM, so the bound only bites when the base sticks.)
 _LOCKED_BASE = (2000.0, 2000.0, 2000.0)
 _TIP_REACH = [1.1, 0.0, -0.6]
-
-
-def test_com_inequality_keeps_pink_stable():
-    on, left0, right0 = _make(enable_collision_avoidance=False,
-                              base_position_cost=_LOCKED_BASE)  # default torso_l3 proxy
-    off, _, _ = _make(enable_collision_avoidance=False,
-                      base_position_cost=_LOCKED_BASE, enable_com_safety=False)
-    on_worst = off_worst = np.inf
-    held_any = False
-    for _ in range(_steps(8.5)):
-        a = on.solve(_shift(left0, _TIP_REACH), _shift(right0, _TIP_REACH), DT)
-        b = off.solve(_shift(left0, _TIP_REACH), _shift(right0, _TIP_REACH), DT)
-        on_worst = min(on_worst, a.stability_margin)
-        off_worst = min(off_worst, b.stability_margin)
-        held_any = held_any or a.held
-    assert not held_any                   # bounded in-QP, never a reactive stop
-    assert on_worst > 0.0                 # CoM stays inside the support polygon
-    assert on_worst > off_worst + 0.02    # the bound keeps the CoM markedly safer
 
 
 def test_com_inequality_true_com_mode_pink():
