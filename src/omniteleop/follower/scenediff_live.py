@@ -179,6 +179,7 @@ def invoke_scenediff(
     config: Optional[str] = None,
     timeout: Optional[float] = None,
     script_name: str = RUN_SCRIPT_NAME,
+    frame_label: str = "robot_base",
     log: _Log = print,
 ) -> pathlib.Path:
     """Run ``run_live_pos_condition.sh`` in the SceneDiff ``.venv-merged`` and return the npz.
@@ -210,6 +211,11 @@ def invoke_scenediff(
     env["SAM"] = str(sam)
     env["OBJ_NUM"] = str(obj_num)
     env["POS_COND_MATCHING"] = str(matching)
+    # The npz's frame field is METADATA stamped by extract_object_positions.py -- it must
+    # name the frame of the extrinsic embedded in live_hdf5 (tabletop base_T_cam ->
+    # "robot_base"; mobile WBC world_T_zed -> "world"). Downstream consumers fail closed
+    # on the wrong label rather than mixing frames.
+    env["FRAME_LABEL"] = str(frame_label)
     if config:
         env["CONFIG"] = str(config)
 

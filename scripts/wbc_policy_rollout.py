@@ -32,6 +32,12 @@ data collection. Every rollout records:
                                       instrumentation); replay: one record per
                                       released command (state/action vectors)
 
+After timeout, replay completion, or Ctrl-C during motion, the current episode
+is stopped and fully saved while the policy and robot connection stay live.
+Press Enter at the idle prompt to home and start another rollout; press Ctrl-C
+at that prompt to shut down. Position-conditioned policies rerun SceneDiff for
+every new rollout before recording and inference begin.
+
 Inference is asynchronous (ported from deps/rby1-wbc, see plan.md): an
 inference worker thread gathers ``n_obs_steps`` fresh observations at the
 dataset cadence, predicts a WHOLE action chunk every ``--policy-interval``
@@ -107,11 +113,12 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import itertools
+import signal
 import threading
 import time
 import traceback
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -1216,15 +1223,21 @@ class _InferenceWorker:
                               f"camera frame within {self._grab_timeout:.2f}s "
                               f"(skip #{self._skipped}); retrying")
                     continue  # the grab loop already waited out its budget
+                if self._stop.is_set():
+                    break
                 obs_list, t_obs = gathered
                 t_pred0 = time.perf_counter()
                 chunk = self._policy.predict_chunk(obs_list)
+                if self._stop.is_set():
+                    break
                 t_end = time.perf_counter()
                 n = chunk.shape[0]
                 timestamps = t_obs + self._dataset_dt * np.arange(n, dtype=np.float64)
                 actions = scheduled_actions_from_chunk(chunk, timestamps)
                 kept = drop_stale_actions(actions, t_end + self._execution_latency)
                 if kept:
+                    if self._stop.is_set():
+                        break
                     self._buffer.queue(kept, now=t_end)
                     if kept[-1].timestamp < t_end + self._policy_interval:
                         print(f"\n[wbc_policy_rollout] WARNING: chunk covers only "
@@ -1260,6 +1273,8 @@ class _InferenceWorker:
                         io_frame.update(trace)
                 # EpisodeRecorder.record is a bare in-memory list append. HDF5 is written
                 # only after the worker is joined at episode shutdown.
+                if self._stop.is_set():
+                    break
                 self._io_log.record(io_frame)
                 self._stop.wait(
                     max(0.0, self._policy_interval - (time.perf_counter() - cycle_t0))
@@ -1323,6 +1338,9 @@ def _invoke_live_scenediff(args: argparse.Namespace, live_hdf5: Path, out_dir: P
         live_hdf5=live_hdf5, out_dir=out_dir, reference=args.reference_hdf5,
         sam=args.sam, obj_num=obj_num, matching=args.pos_cond_matching,
         config=args.scenediff_config or None, timeout=args.scenediff_timeout,
+        # live_capture.hdf5 embeds the FK world_T_zed extrinsic, so the backprojected
+        # positions are engage-origin WORLD -- stamp the npz accordingly (checked below).
+        frame_label="world",
         log=_pos_cond_log,
     )
 
@@ -1379,6 +1397,16 @@ def _prepare_live_position_condition(args: argparse.Namespace, driver, fk: WBCPo
             raise ValueError(f"{npz}: expected positions+order, got {list(data.files)}")
         positions = np.asarray(data["positions"], dtype=np.float32)
         order = [int(x) for x in np.asarray(data["order"]).reshape(-1)]
+        frame = str(data["frame"]) if "frame" in data else None
+    # Fail closed on the frame: base/camera-frame coordinates would pass every shape and
+    # finiteness check and silently mis-condition the policy (the policy's env-state is
+    # engage-origin world, like its cloud and actions).
+    if frame != "world":
+        raise ValueError(
+            f"{npz}: live position frame is {frame!r}, expected 'world'. The live capture "
+            "embeds the FK world_T_zed extrinsic and invoke_scenediff stamps "
+            "FRAME_LABEL=world; a different label means an out-of-date scene_diff/"
+            "run_live_pos_condition.sh or the wrong SceneDiff pipeline ran.")
     if positions.shape != (object_nums, 3) or not np.all(np.isfinite(positions)):
         raise ValueError(
             f"{npz}: positions {tuple(positions.shape)} != ({object_nums}, 3) or non-finite")
@@ -1386,8 +1414,10 @@ def _prepare_live_position_condition(args: argparse.Namespace, driver, fk: WBCPo
     if args.pos_cond_matching == "prompt" and args.prompt_after_capture:
         order = _prompt_for_pos_cond_order(object_nums, out_dir / "deploy_slot_overlay.png")
     elif args.pos_cond_matching == "prompt":
-        print("[wbc_policy_rollout] WARNING: pos_cond_matching=prompt but --prompt-after-capture "
-              "is off; using the npz's identity (size) order with no operator input.", flush=True)
+        raise SystemExit(
+            "[wbc_policy_rollout] pos_cond_matching=prompt requires --prompt-after-capture: "
+            "live SceneDiff has no demo trajectory to order objects, so without an operator-"
+            "confirmed order the size order would silently assign the box/cloth roles.")
     if sorted(order) != list(range(object_nums)):
         raise ValueError(f"{npz}: order {order} is not a permutation of range({object_nums})")
 
@@ -1397,94 +1427,279 @@ def _prepare_live_position_condition(args: argparse.Namespace, driver, fk: WBCPo
     return env_vec
 
 
-def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
-                 worker_factory=None) -> None:
-    """Drive the 100 Hz WBC loop from a policy (or a recorded episode).
+def _run_persistent_session(
+    *,
+    run_episode: Callable[[bool], None],
+    home_to_nominal: Callable[[], None],
+    stop_all_motion: Callable[[], None],
+    auto_start: bool,
+    input_fn: Callable[[str], str] = input,
+) -> None:
+    """Run episodes until Ctrl-C is pressed at the between-episode prompt."""
+    first_episode = True
+    while True:
+        if not first_episode:
+            try:
+                input_fn(
+                    "\n[wbc_policy_rollout] Press Enter to home and start the next "
+                    "rollout (Ctrl-C exits) ... "
+                )
+            except KeyboardInterrupt:
+                print("\n[wbc_policy_rollout] idle Ctrl-C: exiting session.")
+                return
+        try:
+            if not first_episode:
+                home_to_nominal()
+            run_episode(first_episode and not auto_start)
+        except KeyboardInterrupt:
+            stop_all_motion()
+            print("\n[wbc_policy_rollout] rollout stopped; process remains ready.")
+        first_episode = False
 
-    ``policy_factory(policy_path)`` and ``worker_factory(**kwargs)`` default to
-    :class:`_PolicyBundle` / :class:`_InferenceWorker` (LeRobot image policies).
-    ``scripts/wbc_maniflow_rollout.py`` swaps in a ManiFlow point-cloud pair so both
-    policy families share ONE hardware loop, alignment, scheduler and watchdog -- a
-    second copy of this loop is exactly the kind of divergence that gets a robot hurt.
-    A replacement bundle must expose ``describe``/``reset``/``predict_chunk``/
-    ``state_frame``/``n_obs_steps``/``n_action_steps``/``use_env_state``.
-    """
-    from omniteleop.common.recorder import EpisodeRecorder  # noqa: PLC0415
-    from omniteleop.wbc_robot_util import parse_enable_mask  # noqa: PLC0415
+
+def _start_rollout_recorders(driver, io_log) -> None:
+    """Start reusable recorders with fresh camera/cadence state."""
+    if driver._episode is not None:  # noqa: SLF001 -- shared rollout recorder
+        driver._episode.start()  # noqa: SLF001
+        driver._last_rec_head_ns = -1  # noqa: SLF001
+        driver._last_rec_wrist_ns = -1  # noqa: SLF001
+        driver._next_record_t = 0.0  # noqa: SLF001
+        driver._stale_since = None  # noqa: SLF001
+        driver._frame_age_log.clear()  # noqa: SLF001
+    io_log.start()
+
+
+def _synchronize_rollout_episode_id(driver, io_log) -> int:
+    """Assign one unused episode id to the main and policy-IO recorders."""
+    main_log = getattr(driver, "_episode", None)
+    if main_log is None:
+        raise RuntimeError("[wbc_policy_rollout] main episode recorder is unavailable")
+    if any(
+        getattr(recorder, state, False)
+        for recorder in (main_log, io_log)
+        for state in ("recording", "saving")
+    ):
+        raise RuntimeError(
+            "[wbc_policy_rollout] cannot assign an episode id while a recorder is active"
+        )
+    episode_id = max(int(main_log.episode_id), int(io_log.episode_id))
+    main_log.episode_id = episode_id
+    io_log.episode_id = episode_id
+    return episode_id
+
+
+def _prepare_rollout_episode_condition(args, driver, fk, policy, io_log) -> int:
+    """Assign the paired id and refresh this episode's optional SceneDiff input."""
+    episode_id = _synchronize_rollout_episode_id(driver, io_log)
+    if args.position_condition and policy is not None:
+        driver.stop_all_motion()
+        env_vec = _prepare_live_position_condition(args, driver, fk, policy)
+        policy.set_env_state(env_vec)
+    return episode_id
+
+
+def _wait_for_recorder_save(recorder) -> bool:
+    """Wait for one async save, returning whether Ctrl-C was deferred."""
+    interrupted = False
+    while recorder.saving:
+        try:
+            time.sleep(0.05)
+        except KeyboardInterrupt:
+            interrupted = True
+    return interrupted
+
+
+def _stop_policy_io_log(io_log) -> None:
+    """Stop and verify a standalone policy-IO recorder save."""
+    if not io_log.recording:
+        return
+    path = io_log.stop()
+    interrupted = _wait_for_recorder_save(io_log)
+    if io_log.last_save_error is not None:
+        raise RuntimeError(
+            f"[wbc_policy_rollout] policy IO save failed: {io_log.last_save_error}"
+        ) from io_log.last_save_error
+    if path is not None:
+        print(f"[wbc_policy_rollout] policy IO log -> {path}")
+    if interrupted:
+        raise KeyboardInterrupt
+
+
+def _finish_rollout_episode(*, driver, io_log, stop_event, worker) -> None:
+    """Stop motion and fully flush one episode without closing hardware."""
+    main_log = getattr(driver, "_episode", None)
+    cleanup_errors: list[BaseException] = []
+    recorder_errors: list[BaseException] = []
+    interrupted = False
+
+    def run_cleanup_step(action: Callable[[], None]) -> None:
+        nonlocal interrupted
+        while True:
+            try:
+                action()
+            except KeyboardInterrupt:
+                interrupted = True
+                continue
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            return
+
+    run_cleanup_step(stop_event.set)
+    run_cleanup_step(driver.stop_all_motion)
+
+    worker_joined = worker is None
+    if worker is not None:
+        while True:
+            try:
+                worker_joined = worker.join(timeout=10.0)
+            except KeyboardInterrupt:
+                interrupted = True
+                continue
+            except BaseException as exc:
+                cleanup_errors.append(
+                    RuntimeError(
+                        "[wbc_policy_rollout] inference worker join failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                )
+            break
+
+    if main_log is None:
+        recorder_errors.append(
+            RuntimeError("[wbc_policy_rollout] main episode recorder is unavailable")
+        )
+    else:
+        main_active = bool(main_log.recording)
+        io_active = bool(io_log.recording)
+        if main_active != io_active:
+            for recorder in (main_log, io_log):
+                if recorder.recording:
+                    run_cleanup_step(recorder.discard)
+            recorder_errors.append(
+                RuntimeError(
+                    "[wbc_policy_rollout] recorder activity is asymmetric; discarded pair"
+                )
+            )
+        elif main_active:
+            main_nonempty = main_log.num_frames() > 0
+            io_nonempty = io_log.num_frames() > 0
+            if not main_nonempty or not io_nonempty:
+                run_cleanup_step(main_log.discard)
+                run_cleanup_step(io_log.discard)
+                if main_nonempty != io_nonempty:
+                    recorder_errors.append(
+                        RuntimeError(
+                            "[wbc_policy_rollout] asymmetric recorder frames; discarded pair"
+                        )
+                    )
+            elif main_log.episode_id != io_log.episode_id:
+                run_cleanup_step(main_log.discard)
+                run_cleanup_step(io_log.discard)
+                recorder_errors.append(
+                    RuntimeError(
+                        "[wbc_policy_rollout] recorder episode ids diverged before save: "
+                        f"main={main_log.episode_id}, policy_io={io_log.episode_id}"
+                    )
+                )
+            else:
+                saved_id = int(main_log.episode_id)
+                paths: list[str] = []
+                for name, recorder in (("main", main_log), ("policy IO", io_log)):
+                    path: str | None = None
+                    while recorder.recording:
+                        try:
+                            path = recorder.stop()
+                        except KeyboardInterrupt:
+                            interrupted = True
+                            continue
+                        except BaseException as exc:
+                            error = RuntimeError(
+                                f"[wbc_policy_rollout] {name} recorder stop failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                            cleanup_errors.append(error)
+                            recorder_errors.append(error)
+                        break
+                    if path is not None:
+                        paths.append(path)
+
+                for recorder in (main_log, io_log):
+                    interrupted = _wait_for_recorder_save(recorder) or interrupted
+
+                for name, recorder in (("main", main_log), ("policy IO", io_log)):
+                    save_error = getattr(recorder, "last_save_error", None)
+                    if save_error is not None:
+                        error = RuntimeError(
+                            f"[wbc_policy_rollout] {name} save failed: {save_error}"
+                        )
+                        cleanup_errors.append(error)
+                        recorder_errors.append(error)
+
+                if recorder_errors:
+                    for path in paths:
+                        Path(path).unlink(missing_ok=True)
+                else:
+                    if paths:
+                        print(f"[wbc_policy_rollout] episode pair saved -> {paths}")
+                    traj = getattr(driver, "_traj", None)
+                    if traj is not None:
+                        run_cleanup_step(lambda: traj.flush(saved_id))
+
+    cleanup_errors.extend(
+        error for error in recorder_errors if error not in cleanup_errors
+    )
+    if not worker_joined:
+        cleanup_errors.append(
+            RuntimeError(
+                "[wbc_policy_rollout] inference worker still running after 10s; "
+                "refusing to start another rollout"
+            )
+        )
+    if worker is not None and worker.failed.is_set():
+        cleanup_errors.append(
+            RuntimeError(
+                f"[wbc_policy_rollout] inference worker died: {worker.fail_reason}"
+            )
+        )
+    if cleanup_errors:
+        primary = cleanup_errors[0]
+        for extra in cleanup_errors[1:]:
+            primary.add_note(f"additional cleanup failure: {type(extra).__name__}: {extra}")
+        raise primary
+    if interrupted:
+        raise KeyboardInterrupt
+
+
+def _run_rollout_episode(
+    args: argparse.Namespace,
+    *,
+    policy,
+    source: RecordedEpisodeSource | None,
+    state_frame: str,
+    mode: str,
+    ik,
+    fk: WBCPolicyFK,
+    driver,
+    enable: dict,
+    io_log,
+    nominal_poses: tuple[np.ndarray, np.ndarray, np.ndarray],
+    worker_factory=None,
+    prompt_for_engage: bool,
+) -> None:
+    """Prepare, execute, and fully save exactly one rollout episode."""
     from omniteleop.wbc_stream import (  # noqa: PLC0415
         HeadTargetLowPassFilter,
         HeadTargetPlanarDeadbandFilter,
         TargetInterpolator,
     )
 
-    mod = _load_wbc_vr_robot()
-
-    enable = parse_enable_mask(args.enable)
-    missing = [g for g in ("torso", "arms", "head", "base") if not enable.get(g)]
-    if missing:
-        raise SystemExit(
-            f"[wbc_policy_rollout] rollout/replay requires --enable torso,arms,head,base "
-            f"(missing: {', '.join(missing)}): the action commands the whole body and "
-            "the state needs odometry"
-        )
-
-    ik, cfg = mod._build_ik()  # noqa: SLF001 -- same solver construction as teleop
-    if cfg.head_mode != "ik":
-        raise SystemExit(
-            "[wbc_policy_rollout] wbik.yaml head_mode must be 'ik': the policy head "
-            "action is a zed_depth_frame pose target consumed by the head FrameTask"
-        )
-    print(f"[wbc_policy_rollout] model nq={ik.model.nq} head_mode={cfg.head_mode}")
-
-    source: RecordedEpisodeSource | None = None
-    policy: _PolicyBundle | None = None
-    if args.replay_episode:
-        source = RecordedEpisodeSource(args.replay_episode)
-        state_frame = "base"
-        mode = "replay"
-        print(f"[wbc_policy_rollout] replaying {args.replay_episode}: "
-              f"{source.n_frames} frames over {source.duration_s:.1f}s (real-time)")
-    else:
-        mode = "rollout"
-        print(f"[wbc_policy_rollout] loading policy {args.policy_path} ...")
-        policy = (policy_factory or _PolicyBundle)(args.policy_path)
-        state_frame = policy.state_frame
-        print(f"[wbc_policy_rollout] {policy.describe()}")
-        chunk_coverage = policy.n_action_steps / args.dataset_fps
-        if args.policy_interval > chunk_coverage:
-            print(f"[wbc_policy_rollout] WARNING: --policy-interval "
-                  f"{args.policy_interval:g}s exceeds the chunk coverage "
-                  f"{chunk_coverage:g}s ({policy.n_action_steps} steps @ "
-                  f"{args.dataset_fps:g} fps): the scheduled buffer will run dry "
-                  "between replans -> periodic stale-source holds")
-        # A conditioned checkpoint MUST get its env-state (else _sample_dict raises); an
-        # unconditioned one must NOT be asked to (finding 2). Enforce the match up front.
-        if args.position_condition and not policy.use_env_state:
-            raise SystemExit(
-                "[wbc_policy_rollout] --position-condition given but the checkpoint declares "
-                "no observation.environment_state input")
-        if policy.use_env_state and not args.position_condition:
-            raise SystemExit(
-                "[wbc_policy_rollout] checkpoint requires observation.environment_state "
-                f"(dim {policy.env_state_dim}); pass --position-condition (+ --reference-hdf5) "
-                "so it is computed live at the rollout start pose")
-
-    fk = WBCPolicyFK(ik=ik)  # FK on the live solver's own model
-    driver = mod.HardwareDriver(args, ik, cfg, enable)
-    io_log = EpisodeRecorder(str(Path(args.save_dir) / "policy_io"))
-    if policy is not None:
-        metadata_fn = getattr(policy, "inference_metadata", None)
-        if metadata_fn is not None:
-            io_log.set_static({"policy": metadata_fn()})
     schedule_buffer = ActionScheduleBuffer()
     stop_event = threading.Event()
     worker: _InferenceWorker | None = None
+    left0, right0, head0 = (pose.copy() for pose in nominal_poses)
     try:
         dt = 1.0 / args.ik_rate
         cmd_period = 1.0 / args.cmd_rate
-        left0 = np.asarray(ik.frame_pose(fk.left_ee_frame).homogeneous, dtype=float)
-        right0 = np.asarray(ik.frame_pose(fk.right_ee_frame).homogeneous, dtype=float)
-        head0 = np.asarray(ik.frame_pose(fk.head_frame).homogeneous, dtype=float)
         interp = TargetInterpolator(cmd_period, left0, right0, head0)
         head_lpf = HeadTargetLowPassFilter(args.head_lpf_tau, head0)
         head_deadband = HeadTargetPlanarDeadbandFilter(
@@ -1492,10 +1707,11 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
             position_deadband=args.head_planar_pos_deadband,
             yaw_deadband=args.head_planar_yaw_deadband,
         )
-
-        if not args.auto_start:
-            input(f"[wbc_policy_rollout] robot homed. Press Enter to ENGAGE the {mode} "
-                  "(Ctrl-C stops motion at any time) ... ")
+        if prompt_for_engage:
+            input(
+                f"[wbc_policy_rollout] robot homed. Press Enter to ENGAGE the {mode} "
+                "(Ctrl-C ends this rollout) ... "
+            )
 
         # Engage: identical world-frame re-anchoring to the teleop follower. The
         # odometry origin is zeroed HERE, before any alignment glide -- matching
@@ -1506,6 +1722,7 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
         head_lpf.reset(head0)
         head_deadband.reset(head0)
         driver.engage_reset(ik, left0, right0, head0)
+        driver._overstep_ticks = 0  # noqa: SLF001 -- per-episode safety history
         if policy is not None:
             policy.reset()
 
@@ -1547,20 +1764,14 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
         # Held safe during the minutes-long SceneDiff subprocess (no 100 Hz ticks run while it
         # blocks). The subprocess owns the GPU; the loaded diffusion policy sits idle.
         # set_env_state survives the earlier policy.reset().
-        if args.position_condition and policy is not None:
-            driver.stop_all_motion()
-            env_vec = _prepare_live_position_condition(args, driver, fk, policy)
-            policy.set_env_state(env_vec)
+        _prepare_rollout_episode_condition(args, driver, fk, policy, io_log)
 
         if did_align:
             driver.stop_all_motion()
             input(f"\n[wbc_policy_rollout] at reference pose. Press Enter to actually "
                   f"start the {mode} online ... ")
 
-        if driver._episode is not None:  # noqa: SLF001 -- record like a teleop take
-            driver._episode.start()  # noqa: SLF001
-            driver._next_record_t = 0.0  # noqa: SLF001
-        io_log.start()
+        _start_rollout_recorders(driver, io_log)
 
         print(f"[wbc_policy_rollout] engaged: {mode} over "
               f"WBC {args.ik_rate:g} Hz; recording -> {args.save_dir}")
@@ -1586,13 +1797,13 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
         ticks = 0
         while True:
             now = time.perf_counter()
-            if args.max_seconds > 0 and now - t0 >= args.max_seconds:
-                print(f"\n[wbc_policy_rollout] --max-seconds {args.max_seconds:g} reached.")
-                break
             if worker is not None and worker.failed.is_set():
                 raise RuntimeError(
                     f"[wbc_policy_rollout] inference worker died: {worker.fail_reason}"
                 )
+            if args.max_seconds > 0 and now - t0 >= args.max_seconds:
+                print(f"\n[wbc_policy_rollout] --max-seconds {args.max_seconds:g} reached.")
+                break
 
             if source is not None:
                 frame = source.advance(now)
@@ -1694,25 +1905,154 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
             sleep = dt - (time.perf_counter() - now)
             if sleep > 0:
                 time.sleep(sleep)
-    except KeyboardInterrupt:
-        print("\n[wbc_policy_rollout] Ctrl-C: stopping motion.")
-    finally:
-        # Order matters: signal the worker (instant), halt the robot immediately
-        # (never wait behind a GPU forward), then join the worker BEFORE stopping
-        # the io_log it records into (bare list append, single-writer contract).
-        stop_event.set()
-        driver.stop_all_motion()
-        if worker is not None and not worker.join(timeout=10.0):
-            print("[wbc_policy_rollout] WARNING: inference worker still running after "
-                  "10s (GPU forward in flight?); the policy IO log may lose its last "
-                  "chunk record")
-        if io_log.recording:
-            path = io_log.stop()
-            while io_log.saving:
-                time.sleep(0.05)
-            if path is not None:
-                print(f"[wbc_policy_rollout] policy IO log -> {path}")
-        driver.close()
+    except BaseException as body_error:
+        try:
+            _finish_rollout_episode(
+                driver=driver,
+                io_log=io_log,
+                stop_event=stop_event,
+                worker=worker,
+            )
+        except BaseException as cleanup_error:
+            if isinstance(body_error, KeyboardInterrupt):
+                raise
+            raise body_error from cleanup_error
+        raise
+    else:
+        _finish_rollout_episode(
+            driver=driver,
+            io_log=io_log,
+            stop_event=stop_event,
+            worker=worker,
+        )
+
+
+def _run_session_with_close(
+    *,
+    run_session: Callable[[], None],
+    close: Callable[[], None],
+) -> None:
+    """Run one persistent session without letting close replace its primary error."""
+    try:
+        run_session()
+    except BaseException as session_error:
+        try:
+            close()
+        except BaseException as close_error:
+            raise session_error from close_error
+        raise
+    else:
+        close()
+
+
+def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
+                 worker_factory=None) -> None:
+    """Drive the 100 Hz WBC loop from a policy (or a recorded episode).
+
+    ``policy_factory(policy_path)`` and ``worker_factory(**kwargs)`` default to
+    :class:`_PolicyBundle` / :class:`_InferenceWorker` (LeRobot image policies).
+    ``scripts/wbc_maniflow_rollout.py`` swaps in a ManiFlow point-cloud pair so both
+    policy families share ONE hardware loop, alignment, scheduler and watchdog -- a
+    second copy of this loop is exactly the kind of divergence that gets a robot hurt.
+    A replacement bundle must expose ``describe``/``reset``/``predict_chunk``/
+    ``state_frame``/``n_obs_steps``/``n_action_steps``/``use_env_state``.
+    """
+    from omniteleop.common.recorder import EpisodeRecorder  # noqa: PLC0415
+    from omniteleop.wbc_robot_util import parse_enable_mask  # noqa: PLC0415
+
+    mod = _load_wbc_vr_robot()
+
+    enable = parse_enable_mask(args.enable)
+    missing = [g for g in ("torso", "arms", "head", "base") if not enable.get(g)]
+    if missing:
+        raise SystemExit(
+            f"[wbc_policy_rollout] rollout/replay requires --enable torso,arms,head,base "
+            f"(missing: {', '.join(missing)}): the action commands the whole body and "
+            "the state needs odometry"
+        )
+
+    ik, cfg = mod._build_ik()  # noqa: SLF001 -- same solver construction as teleop
+    if cfg.head_mode != "ik":
+        raise SystemExit(
+            "[wbc_policy_rollout] wbik.yaml head_mode must be 'ik': the policy head "
+            "action is a zed_depth_frame pose target consumed by the head FrameTask"
+        )
+    print(f"[wbc_policy_rollout] model nq={ik.model.nq} head_mode={cfg.head_mode}")
+
+    source: RecordedEpisodeSource | None = None
+    policy: _PolicyBundle | None = None
+    if args.replay_episode:
+        source = RecordedEpisodeSource(args.replay_episode)
+        state_frame = "base"
+        mode = "replay"
+        print(f"[wbc_policy_rollout] replaying {args.replay_episode}: "
+              f"{source.n_frames} frames over {source.duration_s:.1f}s (real-time)")
+    else:
+        mode = "rollout"
+        print(f"[wbc_policy_rollout] loading policy {args.policy_path} ...")
+        policy = (policy_factory or _PolicyBundle)(args.policy_path)
+        state_frame = policy.state_frame
+        print(f"[wbc_policy_rollout] {policy.describe()}")
+        chunk_coverage = policy.n_action_steps / args.dataset_fps
+        if args.policy_interval > chunk_coverage:
+            print(f"[wbc_policy_rollout] WARNING: --policy-interval "
+                  f"{args.policy_interval:g}s exceeds the chunk coverage "
+                  f"{chunk_coverage:g}s ({policy.n_action_steps} steps @ "
+                  f"{args.dataset_fps:g} fps): the scheduled buffer will run dry "
+                  "between replans -> periodic stale-source holds")
+        # A conditioned checkpoint MUST get its env-state (else _sample_dict raises); an
+        # unconditioned one must NOT be asked to (finding 2). Enforce the match up front.
+        if args.position_condition and not policy.use_env_state:
+            raise SystemExit(
+                "[wbc_policy_rollout] --position-condition given but the checkpoint declares "
+                "no observation.environment_state input")
+        if policy.use_env_state and not args.position_condition:
+            raise SystemExit(
+                "[wbc_policy_rollout] checkpoint requires observation.environment_state "
+                f"(dim {policy.env_state_dim}); pass --position-condition (+ --reference-hdf5) "
+                "so it is computed live at the rollout start pose")
+
+    fk = WBCPolicyFK(ik=ik)  # FK on the live solver's own model
+    driver = mod.HardwareDriver(args, ik, cfg, enable)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    def run_initialized_session() -> None:
+        io_log = EpisodeRecorder(str(Path(args.save_dir) / "policy_io"))
+        if policy is not None:
+            metadata_fn = getattr(policy, "inference_metadata", None)
+            if metadata_fn is not None:
+                io_log.set_static({"policy": metadata_fn()})
+        nominal_poses = (
+            np.asarray(ik.frame_pose(fk.left_ee_frame).homogeneous, dtype=float),
+            np.asarray(ik.frame_pose(fk.right_ee_frame).homogeneous, dtype=float),
+            np.asarray(ik.frame_pose(fk.head_frame).homogeneous, dtype=float),
+        )
+
+        def run_episode(prompt_for_engage: bool) -> None:
+            _run_rollout_episode(
+                args,
+                policy=policy,
+                source=source,
+                state_frame=state_frame,
+                mode=mode,
+                ik=ik,
+                fk=fk,
+                driver=driver,
+                enable=enable,
+                io_log=io_log,
+                nominal_poses=nominal_poses,
+                worker_factory=worker_factory,
+                prompt_for_engage=prompt_for_engage,
+            )
+
+        _run_persistent_session(
+            run_episode=run_episode,
+            home_to_nominal=driver.home_to_nominal,
+            stop_all_motion=driver.stop_all_motion,
+            auto_start=args.auto_start,
+        )
+
+    _run_session_with_close(run_session=run_initialized_session, close=driver.close)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1742,10 +2082,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"episode + policy_io logs (default "
                              f"{DEFAULT_ROLLOUT_SAVE_DIR} with --policy-path, "
                              f"{DEFAULT_REPLAY_SAVE_DIR} with --replay-episode).")
-    parser.add_argument("--auto-start", action="store_true",
-                        help="skip the Enter-to-engage prompt.")
-    parser.add_argument("--max-seconds", type=float, default=0.0,
-                        help="stop after this many seconds (0 = run until Ctrl-C).")
+    parser.add_argument(
+        "--auto-start",
+        action="store_true",
+        help="skip the Enter-to-engage prompt for the first rollout only",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=0.0,
+        help="end each rollout after this many seconds (0 = run until Ctrl-C)",
+    )
     parser.add_argument("--policy-interval", type=float, default=0.4,
                         help="seconds between inference-thread replans (default 0.4: "
                              "replans halfway through an 8-step 10 Hz chunk; a chunk "

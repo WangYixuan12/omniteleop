@@ -75,6 +75,13 @@ include = [
     "LICENSE",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "-p", "no:launch_testing",
+    "-p", "no:launch_ros",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"

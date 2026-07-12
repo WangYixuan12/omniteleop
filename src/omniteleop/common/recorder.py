@@ -131,6 +131,7 @@ class EpisodeRecorder:
         self.saving = False
         self.save_progress: float = 0.0
         self._save_thread: Optional[threading.Thread] = None
+        self.last_save_error: BaseException | None = None
         self.episode_id = peek_next_episode_id(save_dir)
 
     def start(self) -> None:
@@ -166,6 +167,7 @@ class EpisodeRecorder:
         frames = self._frames
         self._frames = []
         self.episode_id += 1
+        self.last_save_error = None
         self.saving = True
         self.save_progress = 0.0
         self._save_thread = threading.Thread(
@@ -173,6 +175,11 @@ class EpisodeRecorder:
         )
         self._save_thread.start()
         return str(path)
+
+    def discard(self) -> None:
+        """Stop recording and drop buffered frames without consuming an episode id."""
+        self.recording = False
+        self._frames = []
 
     def _save_worker(self, frames: list[dict], path: str, static: dict) -> None:
         try:
@@ -184,7 +191,8 @@ class EpisodeRecorder:
 
             _save_dict_with_progress(data, path, on_progress)
             logger.info(f"EpisodeRecorder: {len(frames)} frames → {path}")
-        except Exception:
+        except Exception as exc:
+            self.last_save_error = exc
             logger.exception("EpisodeRecorder: save failed")
         finally:
             self.saving = False
