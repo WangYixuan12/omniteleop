@@ -257,6 +257,20 @@ class WBCConfig:
     # translate the base but cannot rotate it to satisfy EE/head tasks.
     base_dofs: str = _DEFAULTS["base_dofs"]
 
+    # Exclude the mobile base from the whole-body IK chain entirely. When True, ALL
+    # three planar-root DOFs (vx, vy, yaw) are pinned in the QP (via the same
+    # _base_dof_mask / _base_dof_pin_A machinery "xy" uses for yaw), so the solver
+    # coordinates ONLY the torso + arms (+ head, per head_mode) against a base held at
+    # its current pose -- `result.base_twist` is identically zero and `result.base_pose`
+    # never moves. This is the joystick-teleop mode: the operator drives the chassis
+    # DIRECTLY (an external velocity command), the arm EE targets are expressed in the
+    # base frame so they ride the robot, and the QP never steals the base to help the
+    # arms reach. It is INDEPENDENT of `base_dofs` (which still shapes the external
+    # chassis command downstream): lock the base here, and still restrict the joystick
+    # to "xy" (no yaw) there if desired. Default False keeps the base a whole-body IK
+    # DOF (the existing head-follow / EE-reach behavior); no wbik.yaml key required.
+    lock_base_in_ik: bool = False
+
     # Single-axis base motion (one pure chassis motion per tick). The QP resolves
     # leader/EE-target noise into small simultaneous vx/vy/wz, so a "drive straight" leans
     # sideways, an in-place turn wanders, and a meant-to-be-still base creeps. When enabled,
@@ -536,6 +550,14 @@ class VegaWholeBodyIK:
             raise ValueError(
                 f"base_dofs must be one of {BASE_DOF_MODES}, got {self.config.base_dofs!r}"
             )
+        if self.config.solver not in qpsolvers.available_solvers:
+            available = ", ".join(qpsolvers.available_solvers) or "none"
+            raise RuntimeError(
+                f"configured QP solver {self.config.solver!r} is not available to "
+                f"qpsolvers (available: {available}). Install the solver package in "
+                "this Python environment, or change the solver in "
+                f"{DEFAULT_CONFIG_PATH}."
+            )
         self._head_mode = self.config.head_mode
         self._build_model()
         self._build_tasks_and_limits()
@@ -636,8 +658,16 @@ class VegaWholeBodyIK:
         self.model.velocityLimit[0] = cfg.base_xy_max_vel
         self.model.velocityLimit[1] = cfg.base_xy_max_vel
         self.model.velocityLimit[2] = cfg.base_yaw_max_vel
+        # Base-DOF availability in the QP. lock_base_in_ik pins ALL three planar-root
+        # DOFs (base excluded from the whole-body IK -- joystick-teleop mode); otherwise
+        # base_dofs "xy" pins only yaw and "xy_yaw" leaves the full planar root free. The
+        # disabled DOFs below become QP equality rows (dq = 0) via _base_dof_pin_A and are
+        # zeroed in the emitted twist by _apply_base_dof_mask, so a locked base has an
+        # identically-zero base_twist and a fixed base_pose.
         self._base_dof_mask = np.ones(3, dtype=bool)
-        if cfg.base_dofs == "xy":
+        if cfg.lock_base_in_ik:
+            self._base_dof_mask[:] = False
+        elif cfg.base_dofs == "xy":
             self._base_dof_mask[2] = False
         disabled_base = np.flatnonzero(~self._base_dof_mask)
         self._base_dof_pin_A = np.zeros((len(disabled_base), self.model.nv))

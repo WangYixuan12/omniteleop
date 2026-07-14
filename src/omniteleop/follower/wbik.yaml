@@ -83,9 +83,9 @@ head_ik_gain: 100.0
 head_ik_damp: 1.0e-2
 
 # --- Head whole-body IK mode (rby1 `ik` port) ------------------------------------------------
-# ALTERNATIVE to the solve_head "track" path above. "track": head is externally
-# commanded (solve(head_joints=...)) and pinned out of the QP. "ik" (current
-# default): the head DOFs become whole-body QP variables and a head FrameTask tracks
+# "track": head is externally commanded (solve(head_joints=...)) and pinned out of the QP. 
+# head_j1 stays at its current value (nominal_posture.head_j1) and head_j2/head_j3 are tracked.
+# "ik" (current default): the head DOFs become whole-body QP variables and a head FrameTask tracks
 # the headset pose (solve(head_target=...)), so base + torso + head co-track it --
 # the base follows head turn/translation and is anchored when the head is still
 # (the rby1 head_pos_cost/head_ori_cost mechanism). NOTE: distinct from
