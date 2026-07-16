@@ -176,19 +176,26 @@ def invoke_scenediff(
     sam: str,
     obj_num: int,
     matching: str,
+    frame_label: str,
     config: Optional[str] = None,
     timeout: Optional[float] = None,
     script_name: str = RUN_SCRIPT_NAME,
-    frame_label: str = "robot_base",
     log: _Log = print,
 ) -> pathlib.Path:
     """Run ``run_live_pos_condition.sh`` in the SceneDiff ``.venv-merged`` and return the npz.
 
     Passes the live capture + output dir positionally and the reference/SAM/obj-count/
     matching/config through the environment (the interface ``run_live_pos_condition.sh``
-    reads). A clean exit with no ``episode_0.npz`` means SceneDiff's detection gate failed
-    (wrong object count / too few valid pixels) — surfaced as an error before any motion.
+    reads). ``frame_label`` is required (no default): it stamps the npz ``frame`` field and
+    must name the extrinsic in ``live_hdf5`` (tabletop ``base_T_cam`` -> ``"robot_base"``;
+    mobile WBC ``world_T_zed`` -> ``"world"``). A clean exit with no ``episode_0.npz`` means
+    SceneDiff's detection gate failed (wrong object count / too few valid pixels) — surfaced
+    as an error before any motion.
     """
+    if not str(frame_label).strip():
+        raise ValueError(
+            "frame_label is required (e.g. 'robot_base' for tabletop, 'world' for mobile WBC)"
+        )
     repo = pathlib.Path(repo)
     python = pathlib.Path(python)
     out_dir = pathlib.Path(out_dir)

@@ -337,6 +337,8 @@ class LiveSceneDiffRolloutController(PolicyRolloutController):
             matching=self._sd_pos_cond_matching,
             config=self._sd_config or None,
             timeout=self._sd_timeout,
+            # Tabletop live capture uses base_T_cam; stamp npz frame accordingly.
+            frame_label="robot_base",
             log=logger.info,
         )
 
