@@ -5,9 +5,9 @@ The SAPIEN sim follower (``scripts/wbc_vr_record.py``) and the real-robot follow
 (``scripts/wbc_vr_robot.py``) share two things that MUST stay in lock-step, so a take
 recorded and visualized in sim drives the robot the same way it looked:
 
-* :class:`VRTeleopConfig` -- the control-loop tunables (control/command rates,
-  head-target low-pass/deadband, base PD gains, base command slew / clamp / post-deadband,
-  replay speed) that shape the low-rate leader command stream before/around the
+* :class:`VRTeleopConfig` -- the shared leader stick mapping and control-loop tunables
+  (control/command rates, head-target low-pass/deadband, base PD gains, base command
+  slew / clamp / post-deadband, replay speed) that shape the low-rate leader stream and
   whole-body IK. They live in the
   ``vr_teleop:`` block of the canonical ``follower/wbik.yaml`` (the single follower
   config file, beside the WBC *solver* tunables) and are loaded here so BOTH followers
@@ -45,12 +45,16 @@ from omniteleop.common.schemas import VRJointData
 # from_yaml / _NON_WBC_SECTIONS). Absolute path => loadable from any working directory.
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("follower") / "wbik.yaml"
 VR_TELEOP_SECTION = "vr_teleop"
+JOYSTICK_TELEOP_SECTION = "joystick_teleop"
 # Fields the followers require to be STRICTLY positive (their argparse validation rejects
-# <= 0): a replay clock speed, an IK loop rate, a base-twist slew rate, and a base-velocity
-# clamp of 0 are degenerate. The rest are disable-at-zero tunables (deadbands, the LPF tau,
-# PD gains, and cmd_rate -- 0 disables interpolation) and may be 0.
+# <= 0): replay/loop rates, stick maxima, base-twist slew, and a base-velocity clamp of 0
+# are degenerate. The rest are disable-at-zero tunables (deadbands, the LPF tau, PD gains,
+# and cmd_rate -- 0 disables interpolation) and may be 0.
 _STRICTLY_POSITIVE_FIELDS = frozenset(
-    {"replay_speed", "ik_rate", "base_accel", "base_max_speed"}
+    {
+        "replay_speed", "ik_rate", "stick_max_vx", "stick_max_vy", "stick_max_wz",
+        "base_accel", "base_max_speed",
+    }
 )
 _BOOLEAN_FIELDS = frozenset({"base_yaw_hold_in_xy"})
 
@@ -69,6 +73,10 @@ class VRTeleopConfig:
     replay_speed: float                # replay speed multiplier (<1 = slower)
     ik_rate: float                     # whole-body IK / control loop rate (Hz)
     cmd_rate: float                    # leader command rate (Hz), interpolated to ik_rate
+    stick_max_vx: float                # full-scale forward/back thumbstick speed (m/s)
+    stick_max_vy: float                # full-scale strafe thumbstick speed (m/s)
+    stick_max_wz: float                # full-scale yaw thumbstick speed (rad/s)
+    stick_deadzone: float              # per-axis raw thumbstick deadzone in [0, 1)
     head_lpf_tau: float                # head-target low-pass time constant (s); 0 disables
     head_planar_pos_deadband: float    # radial x/y head-target deadband (m)
     head_planar_yaw_deadband: float    # heading-yaw head-target deadband (rad)
@@ -88,7 +96,7 @@ class VRTeleopConfig:
         Every field must be present (the YAML is the single source of truth, no silent
         defaults); unknown keys in the block raise (typo guard). Each value must be a
         finite number that is ``>= 0`` -- or ``> 0`` for the strictly-positive fields
-        (``replay_speed``, ``base_accel``; see ``_STRICTLY_POSITIVE_FIELDS``) -- except
+        (including stick maxima; see ``_STRICTLY_POSITIVE_FIELDS``) -- except
         the explicit boolean fields. All raises are ``ValueError`` carrying the
         ``vr_teleop.<field>`` context (never a bare ``float()`` ``TypeError``).
         """
@@ -136,7 +144,99 @@ class VRTeleopConfig:
                     f"got {raw!r}"
                 )
             values[name] = value
+        if values["stick_deadzone"] >= 1.0:
+            raise ValueError(
+                f"{cfg_path}: {VR_TELEOP_SECTION}.stick_deadzone must be < 1, "
+                f"got {values['stick_deadzone']!r}"
+            )
+        if not math.isclose(values["stick_max_vx"], values["stick_max_vy"]):
+            raise ValueError(
+                f"{cfg_path}: {VR_TELEOP_SECTION}.stick_max_vx and stick_max_vy "
+                "must match so planar intent normalization is unbiased"
+            )
         return cls(**values)
+
+
+@dataclass(frozen=True)
+class JoystickTeleopConfig:
+    """Joystick-specific intent-selection policy from ``joystick_teleop``."""
+
+    single_axis_hysteresis_ratio: float
+
+    @classmethod
+    def from_yaml(cls, path: Optional[Union[str, Path]] = None) -> "JoystickTeleopConfig":
+        """Load and validate the required ``joystick_teleop`` YAML section."""
+        cfg_path = DEFAULT_CONFIG_PATH if path is None else Path(path)
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict) or JOYSTICK_TELEOP_SECTION not in data:
+            raise ValueError(
+                f"{cfg_path}: missing required '{JOYSTICK_TELEOP_SECTION}:' section"
+            )
+        block = data[JOYSTICK_TELEOP_SECTION]
+        if not isinstance(block, dict):
+            raise ValueError(
+                f"{cfg_path}: '{JOYSTICK_TELEOP_SECTION}' must be a mapping, got "
+                f"{type(block).__name__}"
+            )
+        names = {f.name for f in fields(cls)}
+        unknown = sorted(set(block) - names)
+        if unknown:
+            raise ValueError(f"{cfg_path}: unknown {JOYSTICK_TELEOP_SECTION} keys {unknown}")
+        missing = sorted(names - set(block))
+        if missing:
+            raise ValueError(f"{cfg_path}: missing {JOYSTICK_TELEOP_SECTION} keys {missing}")
+        values = {}
+        for name in names:
+            raw = block[name]
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{cfg_path}: {JOYSTICK_TELEOP_SECTION}.{name} must be a number, "
+                    f"got {raw!r}"
+                ) from None
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"{cfg_path}: {JOYSTICK_TELEOP_SECTION}.{name} must be finite and "
+                    f">= 0, got {raw!r}"
+                )
+            values[name] = value
+        return cls(**values)
+
+
+def bind_vr_teleop_args(args, config: VRTeleopConfig, *, head_track: bool = False) -> None:
+    """Bind shared follower-loop config onto an argparse-like namespace.
+
+    ``head_track`` only changes the two planar head deadbands: dedicated neck tracking
+    must not inherit the head-to-base wake-up deadband used by WBC head IK.
+    """
+    args.speed = config.replay_speed
+    args.ik_rate = config.ik_rate
+    args.cmd_rate = config.cmd_rate
+    args.head_lpf_tau = config.head_lpf_tau
+    args.head_planar_pos_deadband = 0.0 if head_track else config.head_planar_pos_deadband
+    args.head_planar_yaw_deadband = 0.0 if head_track else config.head_planar_yaw_deadband
+    args.base_kp_xy = config.base_kp_xy
+    args.base_kp_yaw = config.base_kp_yaw
+    args.base_yaw_hold_in_xy = config.base_yaw_hold_in_xy
+    args.base_deadband = config.base_deadband
+    args.base_accel = config.base_accel
+    args.base_max_speed = config.base_max_speed
+    args.base_post_linear_deadband = config.base_post_linear_deadband
+    args.base_post_angular_deadband = config.base_post_angular_deadband
+
+
+def bind_joystick_teleop_args(
+    args, vr_config: VRTeleopConfig, joystick_config: JoystickTeleopConfig
+) -> None:
+    """Bind shared joystick intent scales onto a follower namespace."""
+    args.joystick_stick_max_vx = vr_config.stick_max_vx
+    args.joystick_stick_max_vy = vr_config.stick_max_vy
+    args.joystick_stick_max_wz = vr_config.stick_max_wz
+    args.joystick_single_axis_hysteresis_ratio = (
+        joystick_config.single_axis_hysteresis_ratio
+    )
 
 
 class VRJointSubscriber:

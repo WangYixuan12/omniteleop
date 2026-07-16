@@ -41,11 +41,17 @@ python scripts/robotiq_gripper_cmd_actual_omni.py # gripper latency by sending c
 
 
 
+## Reference codebase
+
+- [HoMMi](/home/yixuan/hommi)
+
+
+
 ## Robot preparation
 
-1. sshfs [yixuan@128.59.19.217](mailto:yixuan@128.59.19.217):/home/yixuan/omniteleop /home/dexmate/yixuan/omniteleop_yifan
-2. run '(dexmate) dextop node start' '(yixuan_yifan) python /home/dexmate/yixuan/omniteleop_yifan/tests/test_wrist_zedm_depth.py
-  ' and then '(yixuan_yifan) python /home/dexmate/yixuan/omniteleop_yifan/tests/test_head_zedx_depth.py'  in tmux
+1. sshfs [yixuan@192.168.0.166](mailto:yixuan@192.168.0.166):/home/yixuan/omniteleop /home/dexmate/yixuan/omniteleop_yifan
+  sshfs [yixuan@192.168.0.166](mailto:yixuan@192.168.0.166):/media/yixuan/portable_ssd/Dexmate /home/dexmate/yixuan/Dexmate
+2. run '(dexmate) dextop node start' '(yixuan_yifan) python /home/dexmate/yixuan/omniteleop_yifan/tests/test_wrist_zedm_depth.py' and then '(yixuan_yifan) python /home/dexmate/yixuan/omniteleop_yifan/tests/test_head_zedx_depth.py' in tmux
 3. robot=Robot() to prevent arm falling
 
 > Run head before wrist may cause resolution error
@@ -182,7 +188,7 @@ Visualize the ported dataset: `observation.state` (base-frame EEF/head FK compos
 
 **3.** Train in LeRobot
 
-The checkpoint must report `observation.state` dim `32`, `action` dim `29`, image keys `observation.images.head_rgb` and optionally `observation.images.wrist_rgb`; with position conditioning it also carries `observation.environment_state` dim `6` (the SceneDiff `[box, cloth]` world positions from steps 1.5/2). Continuous state/action dims are normalized with 1–99 percentile stats (`QUANTILES` mode; the porter already writes `q01`/`q99` into `meta/stats.json`), while the constant env-state uses `MIN_MAX`.
+The checkpoint must report `observation.state` dim `32`, `action` dim `29`, image keys `observation.images.head_rgb` and optionally `observation.images.wrist_rgb`; with position conditioning it also carries `observation.environment_state` dim `6` (the SceneDiff `[box, cloth]` world positions from steps 1.5/2). Continuous state/action dims and the constant env-state are all normalized with dataset `min`/`max` (`MIN_MAX` mode; the porter already writes these into `meta/stats.json`).
 
 ```markdown
 Current implemented schema:
@@ -207,6 +213,8 @@ wbik.yaml must keep head_mode: "ik" for rollout.
 
 
 
+Frame summary vs ManiFlow (world-frame state/cloud by default): see the comparison table under [Maniflow](#maniflow).
+
 ```bash
 # change --job_name and --output_dir
 # Position condition:
@@ -215,7 +223,7 @@ wbik.yaml must keep head_mode: "ik" for rollout.
   --policy.type=diffusion --policy.device=cuda --policy.push_to_hub=false \
   --policy.horizon=16 --policy.n_action_steps=8 --policy.use_relative_actions=false \
   '--policy.input_features={"observation.images.head_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.images.wrist_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.state": {"type": "STATE", "shape": [32]}, "observation.environment_state": {"type": "ENV", "shape": [6]}}' \
-  '--policy.normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "QUANTILES", "ACTION": "QUANTILES", "ENV": "MIN_MAX"}' \
+  '--policy.normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "MIN_MAX", "ACTION": "MIN_MAX", "ENV": "MIN_MAX"}' \
   '--policy.skip_normalization_dims={"observation.state": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28], "action": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28]}' \
   --policy.position_condition_mode=concat \
   --dataset.repo_id=dexmate_wbc_eef_head \
@@ -230,12 +238,11 @@ wbik.yaml must keep head_mode: "ik" for rollout.
 # --save_best=true overwrites output_dir/checkpoints/best whenever val loss improves
 # (requires val_root + val_freq). Periodic save_freq checkpoints and checkpoints/last are unchanged.
 # Prefer checkpoints/best/pretrained_model for rollout.
-# The 6-D rotation dims (state/action 3-8, 13-18, 23-28) skip normalization; grippers and base x,y,yaw (state 29-31) stay quantile-normalized.
+# The 6-D rotation dims (state/action 3-8, 13-18, 23-28) skip normalization; grippers and base x,y,yaw (state 29-31) stay min-max normalized.
 
 # Position conditioning (needs a dataset ported with step 2 --positions-dir): the ENV input
 # feature "observation.environment_state" [6] and the "ENV": "MIN_MAX" mapping above enable it.
-# ENV is MIN_MAX, NOT quantiles -- the env-state is CONSTANT per episode, so q01/q99 are
-# meaningless; the dataset min/max is the correct scale. Add --policy.position_condition_mode=film
+# STATE/ACTION/ENV all use MIN_MAX (dataset min/max). Add --policy.position_condition_mode=film
 # to route env through a separate identity-init per-block FiLM (default "concat" appends it to the
 # shared global conditioning). Single stage -> stage_prediction_enabled stays false and NO
 # observation.pos_condition_mask. Drop both ENV bits for an unconditioned run. For N>1 grasp cycles
@@ -255,7 +262,7 @@ with a two-line diff, not two pipelines.
   --policy.type=act --policy.device=cuda --policy.push_to_hub=false \
   --policy.chunk_size=16 --policy.n_action_steps=8 \
   '--policy.input_features={"observation.images.head_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.images.wrist_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.state": {"type": "STATE", "shape": [32]}, "observation.environment_state": {"type": "ENV", "shape": [6]}}' \
-  '--policy.normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "QUANTILES", "ACTION": "QUANTILES", "ENV": "MIN_MAX"}' \
+  '--policy.normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "MIN_MAX", "ACTION": "MIN_MAX", "ENV": "MIN_MAX"}' \
   '--policy.skip_normalization_dims={"observation.state": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28], "action": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28]}' \
   --dataset.repo_id=dexmate_wbc_eef_head \
   --dataset.root=/home/yixuan/Dexmate/data/processed_wbc/train/dexmate_wbc_eef_head \
@@ -283,7 +290,7 @@ so conditioning is always concat-like.
 does not emit — ACT raises on the first backward pass. Same reason `stage_prediction_*` is absent
 above. The env shape `[6]` equals the processor's `condition_dim`, so `PositionConditionProcessorStep`
 passes the vector through unmasked; the N-cycle caveat from the diffusion block applies identically.
-- Tabletop normalizes STATE/ACTION with `MEAN_STD`; WBC uses `QUANTILES` (+ rotation-dim skips) to
+- Tabletop normalizes STATE/ACTION with `MEAN_STD`; WBC uses `MIN_MAX` (+ rotation-dim skips) to
 stay consistent with the diffusion run on this dataset. ENV stays `MIN_MAX` in both.
 - `--policy.optimizer_lr=2e-4` overrides ACT's `1e-5` default (matches the tabletop script).
 - **Do not set** `--policy.temporal_ensemble_coeff`: ACT then requires `n_action_steps=1`, and
@@ -306,7 +313,7 @@ feature — the rollout cross-checks the two and aborts on a mismatch.
     --log_index ~/Dexmate/data/raw_data/log_index_rel.csv
 ```
 
-Then recompute action stats over the relative distribution and train with the relative flags. Translations AND 6-D rotations are made relative; only the binary grippers stay absolute (`relative_exclude_dims` `[9, 19]` — the raw-FC03 state gripper is on a different scale than the 0/1 command). The column-wise rotation delta is not itself a rotation, but the post-processor adds the same chunk-anchor state back before the Gram-Schmidt decode, so it is exactly invertible; rotation dims still skip normalization (relative deltas concentrate near 0, where a q01/q99 rescale would amplify noise). `chunk_size` = horizon; `reference_offset` = `n_obs_steps − 1` = 1 for diffusion. For **ACT** the anchor is the chunk start (`action_delta_indices = range(0, chunk_size)`), so use `--operation.reference_offset=0` and `--operation.chunk_size=<--policy.chunk_size>`.
+Then recompute action stats over the relative distribution and train with the relative flags. Translations AND 6-D rotations are made relative; only the binary grippers stay absolute (`relative_exclude_dims` `[9, 19]` — the raw-FC03 state gripper is on a different scale than the 0/1 command). The column-wise rotation delta is not itself a rotation, but the post-processor adds the same chunk-anchor state back before the Gram-Schmidt decode, so it is exactly invertible; rotation dims still skip normalization (relative deltas concentrate near 0, where a min/max rescale would amplify noise). `chunk_size` = horizon; `reference_offset` = `n_obs_steps − 1` = 1 for diffusion. For **ACT** the anchor is the chunk start (`action_delta_indices = range(0, chunk_size)`), so use `--operation.reference_offset=0` and `--operation.chunk_size=<--policy.chunk_size>`.
 
 ```bash
 REL_ROOT=/home/yixuan/Dexmate/data/processed_wbc/dexmate_wbc_eef_head_rel
@@ -322,7 +329,7 @@ REL_EXCLUDE='[9,19]'
   --policy.horizon=16 --policy.n_action_steps=8 --policy.use_relative_actions=true \
   '--policy.relative_exclude_dims={"action": [9, 19]}' \
   '--policy.input_features={"observation.images.head_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.images.wrist_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.state": {"type": "STATE", "shape": [32]}, "observation.environment_state": {"type": "ENV", "shape": [6]}}' \
-  '--policy.normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "QUANTILES", "ACTION": "QUANTILES", "ENV": "MIN_MAX"}' \
+  '--policy.normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "MIN_MAX", "ACTION": "MIN_MAX", "ENV": "MIN_MAX"}' \
   '--policy.skip_normalization_dims={"observation.state": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28], "action": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28]}' \
   --dataset.repo_id=dexmate_wbc_eef_head_rel --dataset.root=$REL_ROOT \
   --batch_size=32 --steps=100000 --save_freq=50000 \
@@ -392,27 +399,37 @@ python scripts/vis_episode.py --hdf5 /home/yixuan/Dexmate/data/rollout/concat_ab
 
 [ManiFlow](https://maniflow-policy.github.io/) (CoRL 2025) trained on the **same raw takes** as the
 diffusion/ACT pipeline above, as a **3D point-cloud** policy. Repo: `/home/yixuan/ManiFlow_Policy`.
-Only `state`/`action` are shared with the LeRobot dataset (the zarr's `action` is **bit-identical**);
-the observation is a world-frame head point cloud instead of RGB.
+The zarr's `action` is **bit-identical** to the LeRobot dataset; `data/state` is the same 32-D layout
+but defaulted to world frame (see table). Visual obs is a world-frame head point cloud instead of RGB.
 
 ```
 data/point_cloud  (T, 1024, 6) float32   engage-origin WORLD XYZ + RGB[0,1]
-data/state        (T, 32)      float32   agent_pos  (WORLD frame -- see below)
+data/state        (T, 32)      float32   agent_pos  (WORLD frame by default)
 data/action       (T, 29)      float32   verbatim ik.solve targets (WORLD)
 meta/episode_ends (E,)         int64
 ```
 
-Three deviations from the LeRobot pipeline, all deliberate:
+**Frame conventions (defaults)** — engage-origin WORLD throughout except DP's egocentric EEF/head:
 
-- `state_frame=world`**, not** `base`**.** The observation is now world-frame *geometry*, so `agent_pos`
-puts the hand in the same coordinates as the points and the action. `world = compose(base, odom)`,
-so it is a pure reparametrization (`--state-frame base` reproduces the old egocentric state).
+
+|                                                | DP / `port_wbc_mobile_hdf5.py`                                           | ManiFlow / `port_wbc_mobile_zarr.py`                    |
+| ---------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------- |
+| Obs EEF/head (`state[:29]` / `agent_pos[:29]`) | **base** (egocentric FK; do not compose `world_T_base` into `[:29]`)     | **world** (`compose(base, odom)`)                       |
+| Obs base pose (`state[29:32]`)                 | world (`obs/base/pose`)                                                  | world (same)                                            |
+| Action (29)                                    | **world** (verbatim `ik.solve` targets)                                  | **world** (bit-identical)                               |
+| Visual obs                                     | RGB `head_rgb` (+ optional `wrist_rgb`)                                  | world-frame head point cloud                            |
+| Env state (optional `--positions-dir`)         | world `[box, cloth]`                                                     | world (same)                                            |
+| Frame override                                 | `--relative-actions` → state in **world** (needed for relative training) | `--state-frame base` → egocentric state (LeRobot-style) |
+
+
+Other deliberate deviations from the LeRobot pipeline:
+
 - **Workspace crop, measured not guessed:** `x∈[0.20,1.70] y∈[-0.90,1.05] z∈[0.60,1.32]` (world,
 `src/omniteleop/wbc_pointcloud.py`). FPS spreads a fixed budget ~uniformly in space, so every cubic
 metre of room the crop keeps is budget stolen from the two small objects. **Task-specific** — a new
 object layout needs new `--crop-min/--crop-max`.
 - **Normalization is ManiFlow's** `mode='limits'` (per-dim min–max) on *all* dims incl. the 6-D
-rotations. It sidesteps the quantile-clipping height ceiling seen with DP.
+rotations (same scale family as DP/ACT `MIN_MAX`, but ManiFlow also normalizes the rotation dims).
 
 
 
@@ -633,6 +650,54 @@ conditioned checkpoint without the flag and vice versa exit before engage.
 
 ### Position conditioning (implemented)
 
+**Current tensor pipeline.** Dimensions: batch `B=64`, observation steps `To=2`, stored points
+`N=1024`, visual/FPS points per observation `P=512`, object slots `K=2`, input channels `C=6`
+(XYZRGB), point features `Fp=128`, state features `Fs=64`, visual features `Do=Fp+Fs=192`,
+SQRT anchor width `A=135`, and DiTX width `D=768`.
+
+```text
+none / concat:
+  point_cloud (B*To=128, N=1024, C=6) XYZRGB
+    --FPS on XYZ--> sampled_cloud (B*To=128, P=512, C=6)
+    --PointNetEncoderXYZRGB, pointwise--> point_feat (B*To=128, P=512, Fp=128)
+
+scene_query_tokens (SQRT):
+  point_cloud (B*To=128, N=1024, C=6) XYZRGB
+    --PointNetEncoderXYZRGB on ALL points-->
+       full_feat (B*To=128, N=1024, Fp=128)
+      |--3-NN queries interpolate local_feat from the full pre-FPS field
+      `--FPS on XYZ + gather features-->
+         point_feat (B*To=128, P=512, Fp=128)
+
+agent_pos:
+  none / SQRT: agent_pos (B*To=128, state_dim=32)
+  concat: cat(agent_pos (B*To=128, state_dim=32),
+              env_state (B*To=128, 3*K=6))
+          -> conditioned_state (B*To=128, state_dim+3*K=38)
+  --state_mlp--> state_feat (B*To=128, Fs=64)
+
+cat(point_feat, state_feat repeated over P=512 points)
+  -> visual (B*To=128, P=512, Do=192)
+  --reshape observations--> vis_cond (B=64, To*P=1024, Do=192)
+  --Linear(Do=192,D=768) + visual position embedding-->
+     visual_context (B=64, To*P=1024, D=768)
+
+SQRT only:
+  anchor_raw = cat feature axis [local_feat(Fp=128), query_xyz(xyz=3),
+                                 pair_delta(xyz=3), nearest_distance_m(1)]
+             -> (B*To=128, K=2, A=135)
+             -> reshape (B=64, To=2, K=2, A=135)
+  --Linear(A=135,D=768) + role/obs-step embeddings + LayerNorm-->
+     position_tokens (B=64, To*K=4, D=768)
+  cat([visual_context, position_tokens], dim=1)
+    -> context_c (B=64, To*P+To*K=1028, D=768)
+```
+
+`query_xyz` and `pair_delta = dst - src` use the same normalized XYZ coordinates as the cloud;
+`nearest_distance_m` is in metres. The 3-NN local feature is blanked when the nearest observed point
+is farther than `position_condition_max_query_dist` (currently 0.1 m), while the other anchor fields
+remain available.
+
 Motivation: the unconditioned `pc1024` rollout grasped the box but placed it **left of the cloth** —
 the policy needed to be told *where* to place. The condition is the per-episode-constant 6-D
 `env_state` = SceneDiff `[box_xyz, cloth_xyz]` in the engage-origin world frame (the same frame as
@@ -646,10 +711,10 @@ baseline: 6 numbers pushed through the shared 64-D state MLP and smeared over ev
 position becomes a **role token**: the DP3 per-point feature field (all 1024 pre-FPS points, so the
 condition does not inherit FPS's small-object coverage loss) is interpolated at the box/cloth
 positions O2O-Afford-style (3-NN inverse-distance), concatenated with the query xyz, the signed
-src→dst displacement, the nearest-point distance and the state feature, projected to 768-D, tagged
-with learned source/target role + obs-step embeddings, and appended to DiTX's cross-attention
-context (4 extra tokens on top of 1024). Every action token can attend directly to "box here",
-"cloth here", "move this way". ~159k extra params, <0.3 GB extra train memory.
+src→dst displacement and the nearest-point distance, projected to 768-D, tagged
+with learned source/target role + obs-step embeddings, then appended to DiTX's cross-attention
+context (4 extra tokens on top of 1024). Every action token can attend
+directly to "box here", "cloth here", "move this way". ~109k extra params, <0.3 GB extra train memory.
 
 Normalization (both modes): `env_state` reuses the **point-cloud XYZ affine** (tiled per slot), not
 independently fitted stats, so queries and cloud share one normalized coordinate system. Ablate
@@ -671,9 +736,9 @@ episode (split.csv), so it never trains — the training set's worst match is 0.
 
 ```bash
 # on dexmate machine
-python dexcontrol/examples/advanced_examples/disable_arm_motors.py disable --side right --joint-idx * --release-brake
+python dexcontrol/examples/advanced_examples/disable_arm_motors.py disable --side right --joint-idx 0 --release-brake
 # lift eef up
-python dexcontrol/examples/advanced_examples/disable_arm_motors.py brake --side right --joints 5 --no-enable
+python dexcontrol/examples/advanced_examples/disable_arm_motors.py brake --side right --joints 0 --no-enable
 python dexcontrol/examples/troubleshooting/clear_error.py
 ```
 
@@ -690,6 +755,7 @@ robot.right_arm.set_joint_pos(q.tolist(), wait_time=2.0, exit_on_reach=True)
 
 ```bash
 # if dead
+python dexcontrol/examples/troubleshooting/display_robot_info.py
 python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py get --side both
 python dexcontrol/examples/advanced_examples/config_force_torque_sensor.py set --side right --enable
 ```

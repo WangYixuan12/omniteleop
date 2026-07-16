@@ -278,6 +278,12 @@ vr_teleop:
   # (zero-order hold). Replay rejects recorded command gaps above 5x this nominal glide.
   ik_rate: 100.0
   cmd_rate: 10.0
+  # Shared full-scale thumbstick mapping for both VR leaders. Joystick followers also
+  # use these maxima to normalize received base intent before single-axis projection.
+  stick_max_vx: 0.3
+  stick_max_vy: 0.3
+  stick_max_wz: 0.5
+  stick_deadzone: 0.1
   # Head-target first-order low-pass time constant (s) before IK; suppresses headset dither
   # that would otherwise resolve into base yaw in head_mode "ik". 0 disables.
   head_lpf_tau: 0.35
@@ -312,3 +318,9 @@ vr_teleop:
   # zeroed legit forward/strafe commands on 35-150 ticks/take); back to the nominal quiet band.
   base_post_linear_deadband: 0.02
   base_post_angular_deadband: 0.12
+
+# Joystick-pipeline-only axis switching policy.
+joystick_teleop:
+  # Joystick direction is explicit operator intent: switch axes immediately instead of
+  # retaining the previous axis with the QP-noise hysteresis used by WBC base motion.
+  single_axis_hysteresis_ratio: 0.0

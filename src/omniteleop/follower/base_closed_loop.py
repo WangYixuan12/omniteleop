@@ -12,6 +12,8 @@ from typing import Optional
 
 import numpy as np
 
+from omniteleop.wbc_stream import deadband_planar_twist_by_reference
+
 BASE_DOF_MODES = ("xy_yaw", "xy")
 
 
@@ -321,6 +323,96 @@ def shape_twist(
     ])
     shaped = prev + np.clip(target - prev, -dmax, dmax)
     return limit_twist(shaped, max_lin_speed, max_ang_speed)
+
+
+def shape_project_twist(
+    raw: np.ndarray,
+    previous_shaped: np.ndarray,
+    dt: float,
+    *,
+    base_dofs: str,
+    allow_yaw_hold: bool,
+    deadband_lin: float,
+    deadband_ang: float,
+    max_lin_speed: float,
+    max_ang_speed: float,
+    max_lin_accel: float,
+    max_ang_accel: float,
+    post_linear_deadband: float,
+    post_angular_deadband: float,
+    enable_single_axis: bool,
+    xy_max_vel: float,
+    yaw_max_vel: float,
+    single_axis_deadband: float,
+    single_axis_hysteresis_ratio: float,
+    prev_axis: Optional[int],
+    preferred_axis: Optional[int] = None,
+) -> tuple[np.ndarray, np.ndarray, Optional[int]]:
+    """Shared post-PD base shaping and final single-axis projection.
+
+    Returns ``(command, shaped_anchor, active_axis)``. ``shaped_anchor`` is the full
+    multi-axis shaped signal retained for the next slew-limiter tick; ``command`` is the
+    masked/projected twist safe to dispatch. A non-``None`` ``preferred_axis`` lets a
+    direct operator command retain its selected intent axis while active. The WBC path
+    omits it and uses the dominant post-PD command with configured hysteresis.
+    """
+    shaped = shape_twist(
+        raw,
+        previous_shaped,
+        dt,
+        deadband_lin=deadband_lin,
+        deadband_ang=deadband_ang,
+        max_lin_speed=max_lin_speed,
+        max_ang_speed=max_ang_speed,
+        max_lin_accel=max_lin_accel,
+        max_ang_accel=max_ang_accel,
+    )
+    shaped = deadband_planar_twist_by_reference(
+        shaped,
+        reference_twist=raw,
+        linear_deadband=post_linear_deadband,
+        angular_deadband=post_angular_deadband,
+    )
+    shaped = mask_planar_twist_for_base_dofs(
+        shaped,
+        base_dofs=base_dofs,
+        allow_yaw_hold=allow_yaw_hold,
+    )
+    if not enable_single_axis:
+        return shaped.copy(), shaped, None
+
+    if preferred_axis is None:
+        command, axis = project_planar_twist_single_axis_for_base_dofs(
+            shaped,
+            base_dofs=base_dofs,
+            allow_yaw_hold=allow_yaw_hold,
+            xy_max_vel=xy_max_vel,
+            yaw_max_vel=yaw_max_vel,
+            deadband=single_axis_deadband,
+            hysteresis_ratio=single_axis_hysteresis_ratio,
+            prev_axis=prev_axis,
+        )
+    else:
+        if preferred_axis not in (0, 1, 2):
+            raise ValueError(f"preferred_axis must be 0, 1, 2, or None, got {preferred_axis}")
+        selector = mask_planar_twist_for_base_dofs(
+            shaped,
+            base_dofs=base_dofs,
+            allow_yaw_hold=allow_yaw_hold,
+        )
+        cap = xy_max_vel if preferred_axis < 2 else yaw_max_vel
+        command = np.zeros(3, dtype=np.float64)
+        if abs(float(selector[preferred_axis])) / cap < single_axis_deadband:
+            axis = None
+        else:
+            command[preferred_axis] = float(selector[preferred_axis])
+            axis = preferred_axis
+    command = mask_planar_twist_for_base_dofs(
+        command,
+        base_dofs=base_dofs,
+        allow_yaw_hold=allow_yaw_hold,
+    )
+    return command, shaped, axis
 
 
 def within_tolerance(err_body: np.ndarray, pos_tolerance: float, yaw_tolerance: float) -> bool:

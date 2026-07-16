@@ -104,11 +104,10 @@ from omniteleop.wbc_stream import (
     HeadTargetPlanarDeadbandFilter,
     TargetInterpolator,
     _to_mat,
-    deadband_planar_twist_by_reference,
     vr_to_ee_targets,
     vr_to_head_target,
 )
-from omniteleop.wbc_teleop import VRJointSubscriber, VRTeleopConfig
+from omniteleop.wbc_teleop import VRJointSubscriber, VRTeleopConfig, bind_vr_teleop_args
 
 # Shared VR-follower control-loop tunables, loaded from the vr_teleop: block of
 # follower/wbik.yaml so this real-robot follower and the SAPIEN sim follower
@@ -342,11 +341,12 @@ class _TrajLog:
     _SCALAR_KEYS = (
         "t", "cmd_ns", "estop", "success", "held", "hold", "left_ee_error",
         "right_ee_error", "stability_margin", "clamp_max_over",
-        "odom_age", "odom_drive_ts_ns",
+        "odom_age", "odom_drive_ts_ns", "joystick_axis",
     )
     _VECTOR_KEYS = (
         "q", "base_pose", "base_twist", "base_pd_raw", "base_pd_err",
         "base_cmd", "odom_pose", "odom_steer", "odom_wvel",
+        "rx_chassis", "projected_chassis", "joystick_cmd_pose",
         "left_target", "right_target", "head_target",
         "cmd_torso", "cmd_left_arm", "cmd_right_arm", "cmd_head",
         "sent_torso", "sent_left_arm", "sent_right_arm", "sent_head",
@@ -1035,43 +1035,27 @@ class HardwareDriver:
         )
         raw = self._mask_base_twist(raw, allow_yaw_hold=allow_yaw_hold)
         pd_raw = np.asarray(raw, dtype=float).copy()  # pre-shaping PD/FF output (debug)
-        # Shape (deadband -> clamp -> slew) the FULL multi-axis command and keep that
-        # multi-axis result as the slew anchor (_prev_base_shaped), so EVERY axis stays
-        # "warm"; mask to the single dominant axis LAST. Order matters: if the single-axis
-        # projection ran FIRST, it would feed shape_twist a signal that drops to zero on every
-        # momentary axis switch (the QP/PD resolves leader noise into a brief off-axis win or a
-        # quiet tick ~20% of the time), the post-deadband would then hard-zero the dominant
-        # axis, and the slew limiter would re-ramp it from zero -- throttling the wheel command
-        # ~36-43% below the commanded speed, so the base lags and the arms fall behind the
-        # targets. Shaping first keeps the dominant axis at full slewed magnitude and low-passes
-        # the axis selection (far fewer spurious switches), while the chassis still receives a
-        # pure single-axis solver command. In xy mode, optional yaw-hold feedback remains in
-        # that same selector, so the final chassis command is still single-axis.
-        cmd = base_cl.shape_twist(
-            raw, self._prev_base_shaped, dt,
+        # Shared post-PD shaping keeps the full multi-axis slew anchor warm, then projects
+        # the dispatched command. No preferred axis here: WBC keeps its existing dominant
+        # post-PD selection with configured hysteresis.
+        cmd, self._prev_base_shaped, self._base_axis = base_cl.shape_project_twist(
+            raw,
+            self._prev_base_shaped,
+            dt,
+            base_dofs=self.cfg.base_dofs,
+            allow_yaw_hold=allow_yaw_hold,
             deadband_lin=self.args.base_deadband, deadband_ang=2.0 * self.args.base_deadband,
             max_lin_speed=max_lin, max_ang_speed=max_ang,
             max_lin_accel=self.args.base_accel, max_ang_accel=2.0 * self.args.base_accel,
+            post_linear_deadband=self.args.base_post_linear_deadband,
+            post_angular_deadband=self.args.base_post_angular_deadband,
+            enable_single_axis=self.cfg.enable_base_single_axis,
+            xy_max_vel=self.cfg.base_xy_max_vel,
+            yaw_max_vel=self.cfg.base_yaw_max_vel,
+            single_axis_deadband=self.cfg.base_single_axis_deadband,
+            single_axis_hysteresis_ratio=self.cfg.base_single_axis_hysteresis_ratio,
+            prev_axis=self._base_axis,
         )
-        cmd = deadband_planar_twist_by_reference(
-            cmd,
-            reference_twist=raw,
-            linear_deadband=self.args.base_post_linear_deadband,
-            angular_deadband=self.args.base_post_angular_deadband,
-        )
-        cmd = self._mask_base_twist(cmd, allow_yaw_hold=allow_yaw_hold)
-        self._prev_base_shaped = cmd  # slew anchor stays multi-axis (every axis warm)
-        if self.cfg.enable_base_single_axis:
-            cmd, self._base_axis = base_cl.project_planar_twist_single_axis_for_base_dofs(
-                cmd,
-                base_dofs=self.cfg.base_dofs,
-                allow_yaw_hold=allow_yaw_hold,
-                xy_max_vel=self.cfg.base_xy_max_vel, yaw_max_vel=self.cfg.base_yaw_max_vel,
-                deadband=self.cfg.base_single_axis_deadband,
-                hysteresis_ratio=self.cfg.base_single_axis_hysteresis_ratio,
-                prev_axis=self._base_axis,
-            )
-            cmd = self._mask_base_twist(cmd, allow_yaw_hold=allow_yaw_hold)
         self._prev_base_cmd = cmd  # post-projection: the twist actually sent to the chassis
         # On a quiet (zero) tick, hold the current steering with ZERO drive for a short window
         # instead of set_velocity(0,0,0): a swerve base re-centers its wheels to 0deg on a zero
@@ -1273,11 +1257,16 @@ class HardwareDriver:
             "ntp": self._query_ntp_calibration(),
             "camera_ntp": self._query_camera_clock_calibrations(),
         }
+        static["meta"].update(self._recording_control_metadata())
         self._episode.set_static(static)
         print(f"[wbc_vr_robot] recording -> {self.args.save_dir} "
               f"(episode_{self._episode.episode_id}, {self.args.record_rate:g}Hz, "
               "head_left_rgb+head_depth+left_wrist_rgb, +torso action, +gripper obs/action, "
               "+base pose obs, +frame capture stamps)")
+
+    def _recording_control_metadata(self) -> dict:
+        """Mode-specific static episode metadata; base WBC behavior adds nothing."""
+        return {}
 
     def _query_ntp_calibration(self) -> dict:
         """Robot->workstation clock offset, stored once per run as ``meta/ntp``.
@@ -2212,20 +2201,7 @@ def main() -> None:
     # already does for --debug-dir -- so run_loop / HardwareDriver / the /debug meta read
     # one namespace and YAML stays the single source. VRTeleopConfig.from_yaml already
     # validated each value (finite, >= 0, or > 0 for replay_speed/ik_rate).
-    args.speed = DEFAULT_SPEED
-    args.ik_rate = DEFAULT_IK_RATE
-    args.cmd_rate = DEFAULT_CMD_RATE
-    args.head_lpf_tau = DEFAULT_HEAD_LPF_TAU
-    args.head_planar_pos_deadband = DEFAULT_HEAD_PLANAR_POS_DEADBAND
-    args.head_planar_yaw_deadband = DEFAULT_HEAD_PLANAR_YAW_DEADBAND
-    args.base_kp_xy = DEFAULT_BASE_KP_XY
-    args.base_kp_yaw = DEFAULT_BASE_KP_YAW
-    args.base_yaw_hold_in_xy = DEFAULT_BASE_YAW_HOLD_IN_XY
-    args.base_deadband = DEFAULT_BASE_DEADBAND
-    args.base_accel = DEFAULT_BASE_ACCEL
-    args.base_max_speed = DEFAULT_BASE_MAX_SPEED
-    args.base_post_linear_deadband = DEFAULT_BASE_POST_LINEAR_DEADBAND
-    args.base_post_angular_deadband = DEFAULT_BASE_POST_ANGULAR_DEADBAND
+    bind_vr_teleop_args(args, _VR_TELEOP)
 
     for flag, val in (("--home-tol", args.home_tol), ("--max-joint-step", args.max_joint_step),
                       ("--home-settle", args.home_settle),

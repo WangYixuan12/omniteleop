@@ -65,7 +65,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).with_name("wbik.yaml")
 # OTHER loaders from the same single-source-of-truth file (``vr_teleop`` -> the VR
 # follower control-loop tunables, loaded by ``omniteleop.wbc_teleop.VRTeleopConfig``).
 # ``from_yaml`` drops them before validation so they don't trip the unknown-key guard.
-_NON_WBC_SECTIONS = frozenset({"vr_teleop"})
+_NON_WBC_SECTIONS = frozenset({"vr_teleop", "joystick_teleop"})
 
 
 def _load_config_yaml(path: Union[str, Path]) -> Dict:

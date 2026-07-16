@@ -131,9 +131,9 @@ from omniteleop.leader.wbc_reference_alignment import (
 )
 from omniteleop.wbc_teleop import VRTeleopConfig
 
-# Command publish rate comes SOLELY from follower/wbik.yaml's vr_teleop.cmd_rate (no CLI
-# flag), so the leader publishes at exactly the rate the followers interpolate up from --
-# they cannot drift. The Vega URDF likewise comes from WBCConfig (wbik.yaml urdf_path).
+# Command publish rate and thumbstick mapping come solely from follower/wbik.yaml (no CLI
+# flags). The Vega URDF likewise comes from
+# WBCConfig (wbik.yaml urdf_path).
 _VR_TELEOP = VRTeleopConfig.from_yaml()
 DEFAULT_RATE = _VR_TELEOP.cmd_rate  # leader publish rate = follower cmd_rate (Hz)
 
@@ -366,13 +366,20 @@ class _VRLog:
 class WBCVRLeader:
     """Reads Quest poses, calibrates once, and streams Cartesian EEF targets."""
 
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        *,
+        wbc_config: Optional[WBCConfig] = None,
+        teleop_config: Optional[VRTeleopConfig] = None,
+    ) -> None:
         self.rate = args.rate
         self.hold_seconds = args.hold_seconds
-        self.stick_max_vx = args.stick_max_vx
-        self.stick_max_vy = args.stick_max_vy
-        self.stick_max_wz = args.stick_max_wz
-        self.stick_deadzone = args.stick_deadzone
+        stick_cfg = _VR_TELEOP if teleop_config is None else teleop_config
+        self.stick_max_vx = stick_cfg.stick_max_vx
+        self.stick_max_vy = stick_cfg.stick_max_vy
+        self.stick_max_wz = stick_cfg.stick_max_wz
+        self.stick_deadzone = stick_cfg.stick_deadzone
         # EEF target POSITION is yaw-only HEAD-RELATIVE (see _bprime_pos): the hand rides
         # the robot's live head-yaw frame, so a head+hands turn keeps the hands centered in
         # the camera (the base/camera yaw follows the head) while a head-only look-around
@@ -419,7 +426,10 @@ class WBCVRLeader:
         # posture (NOT the legacy INIT_JOINT constants). At nominal the planar base
         # is at the world origin, so frame_pose() values are already in the base
         # frame, and they match exactly what wbc_vr_record's VegaWholeBodyIK uses.
-        cfg = WBCConfig()  # all WBC tunables come from wbik.yaml (no CLI override)
+        # The base VR entry point passes no override, preserving its canonical-config
+        # behavior. Specialized subclasses may pass the exact config they already loaded
+        # so nominal FK and follower policy cannot come from different files.
+        cfg = WBCConfig() if wbc_config is None else wbc_config
         ik = VegaWholeBodyIK(cfg)
         ik.reset()
         self.T_base_head = _to_mat(ik.frame_pose(HEAD_FRAME))
@@ -1108,13 +1118,6 @@ def main() -> None:
     parser.add_argument("--key", default=DEFAULT_KEY, help="TLS key for the WebXR server.")
     parser.add_argument("--hold-seconds", type=float, default=1.0,
                         help="right-grip hold time to calibrate/start (default 1.0).")
-    parser.add_argument("--stick-max-vx", type=float, default=0.3)
-    parser.add_argument("--stick-max-vy", type=float, default=0.2)
-    parser.add_argument("--stick-max-wz", type=float, default=0.5)
-    parser.add_argument("--stick-deadzone", type=float, default=0.1,
-                        help="per-axis thumbstick deadzone applied independently before "
-                             "publishing chassis_vx, chassis_vy, and chassis_wz "
-                             "(default 0.1).")
     parser.add_argument("--headset-hud", action=argparse.BooleanOptionalAction, default=True,
                         help="show the robot camera/status HUD in the Quest headset "
                              "(default: enabled). Use --no-headset-hud to disable.")
