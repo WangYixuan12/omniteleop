@@ -86,6 +86,7 @@ class MoFBundle:
     # cross-checks this against --position-condition.
     position_condition_mode = "none"
     use_env_state = False
+    env_state_dim = 0
     # The MoF policy consumes WORLD-frame entity poses (its runtime path
     # re-expresses them per frame internally).
     state_frame = "world"
@@ -263,15 +264,23 @@ class MoFBundle:
         """v1 checkpoints are unconditioned; the shared rollout must not call this."""
         raise RuntimeError("v1 MoF checkpoints are unconditioned; drop --position-condition")
 
-    def predict_chunk(self, obs_history: "list[MoFObservation]") -> np.ndarray:
+    def predict_chunk(self, obs_history: "list") -> np.ndarray:
         """Oldest-first observation history -> ``(n_action_steps, 29)`` world chunk.
 
-        A shorter history is left-padded by repeating the oldest sample (the
-        same episode-start bootstrap as the sibling bundles). The output is
-        COLUMN-convention rot6d, exactly the recorded action format
-        ``split_policy_action`` decodes.
+        Accepts either prebuilt :class:`MoFObservation` items (the offline vis
+        path) or the shared inference worker's raw observations (anything with
+        ``.state`` / ``.head_rgb`` / ``.wrist_rgb``), which are converted with
+        :meth:`obs_from_live`. A shorter history is left-padded by repeating the
+        oldest sample (the same episode-start bootstrap as the sibling
+        bundles). The output is COLUMN-convention rot6d, exactly the recorded
+        action format ``split_policy_action`` decodes.
         """
-        history = list(obs_history)
+        history = [
+            o
+            if isinstance(o, MoFObservation)
+            else self.obs_from_live(o.state, o.head_rgb, o.wrist_rgb)
+            for o in obs_history
+        ]
         if not 1 <= len(history) <= self.n_obs_steps:
             raise ValueError(
                 f"obs_history must hold 1..{self.n_obs_steps} samples, got {len(history)}"
