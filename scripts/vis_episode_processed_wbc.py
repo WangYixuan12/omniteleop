@@ -6,13 +6,11 @@ Two processed formats of the SAME raw takes, selected by which flag you pass:
     (head/wrist RGB video + depth/calib sidecars). The default when ``--zarr`` is
     not given.
 ``--zarr``         the ManiFlow point-cloud zarr written by
-    ``scripts/port_wbc_mobile_zarr.py``. Renders the STORED world-frame cloud --
-    exactly the ``(num_points, 6)`` tensor the 3D policy will train on, after the
-    workspace crop and farthest-point sampling -- so you can eyeball the actual
-    network input before launching training. Head RGB / depth and Wrist RGB panels
-    are filled from the sibling LeRobot dataset (same processed episode index;
-    auto-resolved as ``<processed_wbc>/<split>/dexmate_wbc_eef_head``, or pass
-    ``--dataset_dir`` to override).
+    ``scripts/port_wbc_mobile_zarr.py``. Requires ``--maniflow-run-dir`` and renders
+    both the stored 1024-point cloud and the exact policy selection configured in the
+    run's ``.hydra/config.yaml``. Head/Wrist RGB, depth and the full SAM3.1 mask come
+    directly from the raw HDF5/mask NPZ through the zarr episode manifest; this mode
+    never opens a sibling LeRobot dataset.
 
 Sibling to ``scripts/vis_episode_processed.py`` (the arm-only tabletop viewer);
 same rendering structure, schema ``omniteleop.wbc_policy_format``.
@@ -58,8 +56,10 @@ Panels:
     the mobile base triad + its full odometry path (gold), optional
     ``observation.environment_state`` position-condition markers, and the head
     camera pinhole/frustum.
-  * Head RGB / depth -- ``observation.images.head_rgb`` + depth sidecar, overlaid
-    with the projected achieved (blue) and commanded (red) EEF pixels.
+  * Zarr policy comparison -- Stored RGB 3D, Policy RGB 3D and (only when consumed)
+    Policy masks 3D, with identical initial cameras and shared world context.
+  * Head RGB + full SAM3.1 mask. Depth and projected EEF pixels are logged but hidden
+    from the automatic blueprint, so they can be enabled from the Rerun sidebar.
   * Wrist RGB -- ``observation.images.wrist_rgb`` (plain 2D; no calibration/depth).
   * Gripper time series (left, right) -- red = ``action`` (binary command),
     blue = ``observation.state`` (raw reading).
@@ -84,30 +84,34 @@ Usage::
         --episode_index 0
 
     python scripts/vis_episode_processed_wbc.py \\
-        --zarr /home/yixuan/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_train.zarr \\
+        --zarr /home/yixuan/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_test.zarr \\
+        --maniflow-run-dir /home/yixuan/ManiFlow_Policy/ManiFlow/data/outputs/RUN \\
         --episode_index 0
 
     # headless over SSH -> open later with `rerun FILE.rrd`:
     python scripts/vis_episode_processed_wbc.py --save /tmp/wbc_ep0.rrd
 
-``--dataset_dir`` needs ``lerobot`` (``dexmate_lerobot``). ``--zarr`` needs ``zarr``
-plus ``lerobot`` for the Head/Wrist camera panels (run in ``dexmate_lerobot``, or
-any env with both).
+``--dataset_dir`` needs ``lerobot`` (``dexmate_lerobot``). Config-faithful zarr mode
+needs ``dexmate_maniflow`` (PyTorch3D + Rerun + OmegaConf + h5py).
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
+import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 import torch
 import zarr
+from omegaconf import OmegaConf
 
 from omniteleop.wbc_policy_format import (
     ACTION_AXES,
@@ -142,12 +146,19 @@ _COLOR_BASE   = (230, 190, 0)  # gold — mobile base odometry
 _COLOR_BASE_X = (230, 60, 60)
 _COLOR_BASE_Y = (60, 200, 60)
 _COLOR_BASE_YAW = (80, 120, 255)
+_COLOR_MASK_SRC = (255, 140, 0)   # orange
+_COLOR_MASK_DST = (0, 220, 255)   # cyan
+_COLOR_MASK_BG = (120, 120, 120)  # gray
 OBS_ENV_STATE_KEY = "observation.environment_state"
 
 _GRIPPER_Y_MIN = -0.2
 _GRIPPER_Y_MAX = 1.1
 _POS_COND_RADIUS_3D = 0.018
 _HEAD_DEPTH_ENTITY = "/world/camera/depth"
+_HEAD_EEF_STATE_ENTITY = "/world/camera/eef_state_2d"
+_HEAD_EEF_ACTION_ENTITY = "/world/camera/eef_action_2d"
+_MASK_LEGEND = "0=background 1=box(src) 2=cloth(dst)"
+_NOMINAL_MASK_QUOTAS = {1: 64, 2: 64, 0: 128}
 
 
 # ── Generic helpers copied verbatim from vis_episode_processed.py so the two
@@ -221,9 +232,16 @@ def _rgb_to_hwc(t) -> np.ndarray:
     return a
 
 
-def head_depth_hidden_overrides() -> dict[str, rrb.EntityBehavior]:
-    """Hide head depth by default while keeping it toggleable in the sidebar."""
-    return {_HEAD_DEPTH_ENTITY: rrb.EntityBehavior(visible=False)}
+def head_optional_hidden_overrides() -> dict[str, rrb.EntityBehavior]:
+    """Keep depth/projected EEF entities sidebar-toggleable but hidden by default."""
+    return {
+        path: rrb.EntityBehavior(visible=False)
+        for path in (
+            _HEAD_DEPTH_ENTITY,
+            _HEAD_EEF_STATE_ENTITY,
+            _HEAD_EEF_ACTION_ENTITY,
+        )
+    }
 
 
 def load_processed_wbc_position_condition(dataset) -> dict[str, np.ndarray | list[str]] | None:
@@ -351,64 +369,163 @@ def load_lerobot_episode(dataset_root: Path, episode_index: int) -> dict:
     }
 
 
-def resolve_lerobot_camera_dir_for_zarr(
-    zarr_path: Path, meta: dict, dataset_dir: str | None
-) -> Path:
-    """Sibling LeRobot root that carries head/wrist RGB + depth/calib for a zarr episode.
+def load_maniflow_run(run_dir: Path) -> dict:
+    """Resolve the policy switches that define the input shown by the zarr viewer."""
+    config_path = run_dir / ".hydra" / "config.yaml"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"--maniflow-run-dir has no .hydra/config.yaml: {run_dir}")
+    cfg = OmegaConf.load(config_path)
+    required = (
+        "point_sampling_mode", "mask_channels", "position_condition_mode", "object_nums"
+    )
+    missing = [key for key in required if key not in cfg]
+    if missing:
+        raise ValueError(
+            f"{config_path}: missing explicit policy switch(es) {missing}; legacy run "
+            "configs are rejected rather than assigned inferred defaults"
+        )
+    sampling = str(cfg.point_sampling_mode)
+    position = str(cfg.position_condition_mode)
+    if sampling not in ("fps", "mask_stratified"):
+        raise ValueError(f"{config_path}: unsupported point_sampling_mode={sampling!r}")
+    if position not in ("none", "concat", "grounding_tokens"):
+        raise ValueError(f"{config_path}: unsupported position_condition_mode={position!r}")
+    mask_channels = bool(cfg.mask_channels)
+    object_nums = int(cfg.object_nums)
+    needs_point_mask = sampling == "mask_stratified" or mask_channels
+    if needs_point_mask and object_nums != 2:
+        raise ValueError(f"mask modes require object_nums=2, got {object_nums}")
+    if not bool(cfg.policy.downsample_points):
+        raise ValueError(f"{config_path}: viewer requires policy.downsample_points=true")
+    return {
+        "run_dir": run_dir,
+        "config_path": config_path,
+        "point_sampling_mode": sampling,
+        "mask_channels": mask_channels,
+        "needs_point_mask": needs_point_mask,
+        "position_condition_mode": position,
+        "object_nums": object_nums,
+        "visual_cond_len": int(cfg.policy.visual_cond_len),
+        "use_pc_color": bool(cfg.policy.use_pc_color),
+        "device": str(cfg.training.device),
+        "train_zarr": Path(str(cfg.robotwin_task.dataset.zarr_path)).expanduser(),
+        "position_dino_dim": int(cfg.policy.get("position_dino_dim", 1280)),
+    }
 
-    Both porters share ``split.csv`` / ``processed_data_index``, so episode ``i`` in
-    ``dexmate_wbc_{split}.zarr`` is episode ``i`` in ``<processed_wbc>/<split>/dexmate_wbc_eef_head``.
-    """
-    if dataset_dir is not None:
-        root = Path(dataset_dir).expanduser()
-        if not root.is_dir():
-            raise FileNotFoundError(
-                f"--dataset_dir not a directory (needed for zarr Head/Wrist panels): {root}"
+
+def import_run_sampler(run_dir: Path):
+    """Import the active checkout's point_process.py, never a viewer-side copy."""
+    checkout = next(
+        (
+            parent for parent in (run_dir, *run_dir.parents)
+            if (parent / "maniflow/model/vision_3d/point_process.py").is_file()
+        ),
+        None,
+    )
+    if checkout is not None:
+        sys.path.insert(0, str(checkout))
+    module = importlib.import_module("maniflow.model.vision_3d.point_process")
+    module_path = Path(module.__file__).resolve()
+    if checkout is None:
+        checkout = module_path.parents[3]
+    if not module_path.is_relative_to(checkout.resolve()):
+        raise RuntimeError(f"imported sampler {module_path} instead of checkout {checkout}")
+    return module, checkout
+
+
+def require_policy_device(device_name: str) -> torch.device:
+    device = torch.device(device_name)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"run was configured for {device}, but CUDA is unavailable")
+        index = torch.cuda.current_device() if device.index is None else device.index
+        if index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"run was configured for {device}, but only {torch.cuda.device_count()} "
+                "CUDA device(s) are visible"
             )
-        return root
-    split = meta.get("split")
-    if not isinstance(split, str) or not split:
-        raise ValueError(
-            f"{zarr_path.with_suffix('.meta.json')}: missing string 'split'; "
-            "cannot auto-resolve the sibling LeRobot dataset. Pass --dataset_dir."
-        )
-    # .../processed_wbc/maniflow/dexmate_wbc_train.zarr -> .../processed_wbc/<split>/dexmate_wbc_eef_head
-    auto = zarr_path.resolve().parent.parent / split / "dexmate_wbc_eef_head"
-    if not auto.is_dir():
+    return device
+
+
+def load_zarr_meta(zarr_path: Path) -> dict:
+    meta_path = zarr_path.with_suffix(".meta.json")
+    if not meta_path.is_file():
         raise FileNotFoundError(
-            f"Sibling LeRobot dataset for zarr camera panels not found at {auto}. "
-            "Pass --dataset_dir pointing at the matching dexmate_wbc_eef_head root."
+            f"{meta_path} missing; rebuild with scripts/port_wbc_mobile_zarr.py --overwrite"
         )
-    return auto
-
-
-def attach_lerobot_camera_streams(source: dict, dataset_root: Path, episode_index: int) -> dict:
-    """Merge LeRobot head/wrist RGB + depth/calib into a zarr source (same episode index)."""
-    cam = load_lerobot_episode(dataset_root, episode_index)
-    if cam["N"] != source["N"]:
+    meta = json.loads(meta_path.read_text())
+    if meta.get("schema") != "wbc_maniflow_pointcloud_v2":
         raise ValueError(
-            f"zarr episode {episode_index} has {source['N']} frames but LeRobot "
-            f"{dataset_root} episode {episode_index} has {cam['N']} frames "
-            "(porters must share the same split / processed_data_index ordering)"
+            f"{meta_path}: schema {meta.get('schema')!r} lacks the raw-frame episode "
+            "manifest; rebuild the zarr with the current porter"
         )
-    source = dict(source)
-    source["label"] = f"{source['label']} + cameras from {dataset_root}"
-    source["dataset"] = cam["dataset"]
-    source["depth"] = cam["depth"]
-    source["extrinsic"] = cam["extrinsic"]
-    source["intrinsic"] = cam["intrinsic"]
-    source["hw"] = cam["hw"]
-    return source
+    return meta
 
 
-def load_maniflow_zarr_episode(zarr_path: Path, episode_index: int) -> dict:
+def validate_preprocessing_match(view_meta: dict, train_meta: dict, *,
+                                 needs_point_mask: bool,
+                                 position_condition_mode: str) -> None:
+    """Reject a train/view pair that was not built by the same preprocessing path."""
+    keys = (
+        "schema", "num_points", "point_channels", "point_frame", "crop_min", "crop_max",
+        "min_depth_m", "max_depth_m", "pool_size", "downsample", "sampler", "kdline_h",
+        "start_idx", "fpsample_version", "state_axes", "state_frame", "action_axes",
+        "action_frame", "fps", "seed",
+    )
+    for key in keys:
+        if view_meta.get(key) != train_meta.get(key):
+            raise ValueError(
+                f"view/train zarr preprocessing mismatch at {key}: "
+                f"{view_meta.get(key)!r} != {train_meta.get(key)!r}"
+            )
+    if needs_point_mask and view_meta.get("point_mask") != train_meta.get("point_mask"):
+        raise ValueError("view/train zarr point_mask provenance differs")
+    if (position_condition_mode != "none" and
+            view_meta.get("env_state") != train_meta.get("env_state")):
+        raise ValueError("view/train zarr env_state provenance differs")
+    if (position_condition_mode == "grounding_tokens" and
+            view_meta.get("env_dino") != train_meta.get("env_dino")):
+        raise ValueError("view/train zarr env_dino provenance differs")
+
+
+def _episode_manifest_entry(meta: dict, episode_index: int, start: int, end: int,
+                            needs_point_mask: bool) -> dict:
+    manifest = meta.get("episode_manifest")
+    if not isinstance(manifest, list) or len(manifest) != int(meta.get("episodes", -1)):
+        raise ValueError("zarr metadata has an invalid episode_manifest")
+    if not 0 <= episode_index < len(manifest):
+        raise ValueError(f"episode manifest has no index {episode_index}")
+    entry = manifest[episode_index]
+    expected = {
+        "zarr_episode_index": episode_index,
+        "zarr_frame_start": start,
+        "zarr_frame_end_exclusive": end,
+    }
+    for key, value in expected.items():
+        if entry.get(key) != value:
+            raise ValueError(f"episode manifest {key}={entry.get(key)!r}, expected {value}")
+    raw_start = int(entry.get("raw_frame_start", -1))
+    raw_end = int(entry.get("raw_frame_end_exclusive", -1))
+    if raw_start < 0 or raw_end - raw_start != end - start:
+        raise ValueError(
+            f"episode manifest raw range [{raw_start},{raw_end}) does not match "
+            f"zarr range [{start},{end})"
+        )
+    hdf5_path = Path(str(entry.get("hdf5_path", "")))
+    if not hdf5_path.is_file():
+        raise FileNotFoundError(f"manifest HDF5 not found: {hdf5_path}")
+    if needs_point_mask:
+        mask_path = Path(str(entry.get("mask_npz_path", "")))
+        if not mask_path.is_file():
+            raise FileNotFoundError(f"manifest SAM3.1 mask NPZ not found: {mask_path}")
+    return entry
+
+
+def load_maniflow_zarr_episode(zarr_path: Path, episode_index: int, policy: dict) -> dict:
     """One episode of the ManiFlow point-cloud zarr (``scripts/port_wbc_mobile_zarr.py``).
 
-    Returns the STORED ``(N, num_points, 6)`` world XYZ+RGB cloud verbatim -- the exact
-    network input, post-crop and post-farthest-point-sampling -- rather than re-deriving
-    it, so what you see is what the policy trains on. The sibling ``.meta.json`` supplies
-    ``state_frame`` (``world`` by default here, unlike the LeRobot porter's ``base``).
-    Camera panels are attached separately via ``attach_lerobot_camera_streams``.
+    Returns the STORED ``(N, num_points, 6)`` world XYZ+RGB cloud verbatim. Policy
+    downsampling is reproduced separately after applying the training-zarr normalizer.
     """
     root = zarr.open(str(zarr_path), mode="r")
     for key in ("data/point_cloud", "data/state", "data/action", "meta/episode_ends"):
@@ -424,26 +541,208 @@ def load_maniflow_zarr_episode(zarr_path: Path, episode_index: int) -> dict:
     if n <= 0:
         raise ValueError(f"{zarr_path}: episode {episode_index} is empty ([{start}, {end}))")
 
+    meta = load_zarr_meta(zarr_path)
+    manifest_entry = _episode_manifest_entry(
+        meta, episode_index, start, end, policy["needs_point_mask"]
+    )
     point_cloud = np.asarray(root["data/point_cloud"][start:end], dtype=np.float32)
     state = np.asarray(root["data/state"][start:end], dtype=np.float64)
     action = np.asarray(root["data/action"][start:end], dtype=np.float64)
     if point_cloud.ndim != 3 or point_cloud.shape[2] != 6:
         raise ValueError(f"{zarr_path}: point_cloud must be (T, P, 6), got {point_cloud.shape}")
 
-    meta_path = zarr_path.with_suffix(".meta.json")
-    if not meta_path.exists():
-        raise FileNotFoundError(
-            f"{meta_path} missing: it records state_frame/crop/fps. Re-run "
-            "scripts/port_wbc_mobile_zarr.py --overwrite.")
-    meta = json.loads(meta_path.read_text())
     state_frame = meta.get("state_frame", "world")
     if state_frame not in ("base", "world"):
-        raise ValueError(f"unexpected state_frame {state_frame!r} in {meta_path}")
+        raise ValueError(f"unexpected state_frame {state_frame!r} in zarr metadata")
+    point_mask = None
+    if policy["needs_point_mask"]:
+        if "data/point_mask" not in root:
+            raise ValueError(f"{zarr_path}: configured mask mode needs data/point_mask")
+        point_mask = np.asarray(root["data/point_mask"][start:end])
+        if point_mask.dtype != np.int8 or point_mask.shape != point_cloud.shape[:2]:
+            raise ValueError(
+                f"{zarr_path}: point_mask {point_mask.shape} {point_mask.dtype} does not "
+                f"match {point_cloud.shape[:2]} int8"
+            )
+        if point_mask.min() < 0 or point_mask.max() > 2:
+            raise ValueError(f"{zarr_path}: point_mask labels outside {{0,1,2}}")
+
+    position_condition = None
+    if policy["position_condition_mode"] != "none":
+        if "data/env_state" not in root:
+            raise ValueError(f"{zarr_path}: configured position mode needs data/env_state")
+        env_state = np.asarray(root["data/env_state"][start:end], dtype=np.float32)
+        expected = policy["object_nums"] * 3
+        if env_state.shape != (n, expected) or not np.all(np.isfinite(env_state)):
+            raise ValueError(f"{zarr_path}: env_state must be finite ({n}, {expected})")
+        if not np.all(np.abs(env_state - env_state[0]) <= 1e-6):
+            raise ValueError(f"{zarr_path}: env_state varies within episode {episode_index}")
+        axes = meta.get("env_state", {}).get("axes")
+        labels = _raw_vis_episode.position_condition_labels(axes, policy["object_nums"])
+        position_condition = {
+            "points": env_state.reshape(n, policy["object_nums"], 3),
+            "labels": labels,
+        }
+    if policy["position_condition_mode"] == "grounding_tokens":
+        if "data/env_dino" not in root:
+            raise ValueError(f"{zarr_path}: grounding_tokens needs data/env_dino")
+        env_dino = np.asarray(root["data/env_dino"][start:end], dtype=np.float32)
+        expected = policy["object_nums"] * policy["position_dino_dim"]
+        if env_dino.shape != (n, expected) or not np.all(np.isfinite(env_dino)):
+            raise ValueError(f"{zarr_path}: env_dino must be finite ({n}, {expected})")
+        if not np.all(env_dino == env_dino[0]):
+            raise ValueError(f"{zarr_path}: env_dino varies within episode {episode_index}")
     return {
         "kind": "zarr", "label": f"{zarr_path} [episode {episode_index}: frames {start}..{end})",
         "N": n, "fps": float(meta.get("fps", 10)),
         "state": state, "action": action, "state_frame": state_frame,
-        "point_cloud": point_cloud, "meta": meta, "position_condition": None,
+        "point_cloud": point_cloud, "point_mask": point_mask,
+        "meta": meta, "manifest_entry": manifest_entry,
+        "position_condition": position_condition,
+    }
+
+
+def attach_raw_camera_streams(source: dict, *, needs_point_mask: bool) -> dict:
+    """Load only the requested raw camera streams using the exact manifest window."""
+    entry = source["manifest_entry"]
+    start = int(entry["raw_frame_start"])
+    end = int(entry["raw_frame_end_exclusive"])
+    hdf5_path = Path(entry["hdf5_path"])
+    keys = {
+        "head_rgb": "obs/images/head_left_rgb",
+        "depth": "obs/images/head_depth",
+        "wrist_rgb": "obs/images/left_wrist_rgb",
+        "intrinsic": "obs/images/intrinsic",
+    }
+    with h5py.File(hdf5_path, "r") as raw:
+        for key in keys.values():
+            if key not in raw:
+                raise ValueError(f"{hdf5_path}: missing {key}")
+        raw_frames = int(raw[keys["head_rgb"]].shape[0])
+        if not 0 <= start < end <= raw_frames:
+            raise ValueError(
+                f"{hdf5_path}: manifest raw range [{start},{end}) outside {raw_frames} frames"
+            )
+        head_rgb = np.asarray(raw[keys["head_rgb"]][start:end])
+        depth = np.asarray(raw[keys["depth"]][start:end])
+        wrist_rgb = np.asarray(raw[keys["wrist_rgb"]][start:end])
+        intrinsic_raw = np.asarray(raw[keys["intrinsic"]])
+    n = source["N"]
+    if head_rgb.shape[0] != n or depth.shape[0] != n or wrist_rgb.shape[0] != n:
+        raise ValueError(f"{hdf5_path}: manifest camera slice does not have {n} frames")
+    if head_rgb.dtype != np.uint8 or wrist_rgb.dtype != np.uint8 or depth.dtype != np.uint16:
+        raise ValueError(f"{hdf5_path}: expected uint8 RGB and uint16 depth")
+    if intrinsic_raw.shape == (3, 3):
+        intrinsic = np.repeat(intrinsic_raw[None], n, axis=0)
+    elif intrinsic_raw.shape[0] >= end and intrinsic_raw.shape[1:] == (3, 3):
+        intrinsic = intrinsic_raw[start:end]
+    else:
+        raise ValueError(f"{hdf5_path}: unsupported intrinsic shape {intrinsic_raw.shape}")
+
+    mask_image = None
+    if needs_point_mask:
+        mask_path = Path(entry["mask_npz_path"])
+        with np.load(mask_path, allow_pickle=False) as data:
+            for key in ("masks", "legend", "n_frames"):
+                if key not in data.files:
+                    raise ValueError(f"{mask_path}: missing {key!r}")
+            if str(data["legend"]) != _MASK_LEGEND:
+                raise ValueError(f"{mask_path}: unexpected legend {str(data['legend'])!r}")
+            masks = np.asarray(data["masks"])
+            n_frames = int(data["n_frames"])
+            raw_hdf5 = str(data["raw_hdf5"]) if "raw_hdf5" in data.files else None
+        if (masks.dtype != np.uint8 or masks.ndim != 3 or
+                n_frames != masks.shape[0] or n_frames != raw_frames):
+            raise ValueError(f"{mask_path}: invalid full-frame SAM3.1 mask tensor")
+        if raw_hdf5 is not None and Path(raw_hdf5).resolve() != hdf5_path.resolve():
+            raise ValueError(f"{mask_path}: raw_hdf5={raw_hdf5!r} != {hdf5_path}")
+        mask_image = masks[start:end]
+        if mask_image.shape != depth.shape:
+            raise ValueError(
+                f"{mask_path}: mask slice {mask_image.shape} != depth {depth.shape}"
+            )
+    source = dict(source)
+    source.update({
+        "head_rgb": head_rgb,
+        "depth": depth,
+        "wrist_rgb": wrist_rgb,
+        "intrinsic": intrinsic.astype(np.float64),
+        "hw": head_rgb.shape[1:3],
+        "mask_image": mask_image,
+    })
+    return source
+
+
+def point_cloud_limits(train_zarr: Path) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reproduce the limits normalizer's float32 scale/offset without loading all data."""
+    root = zarr.open(str(train_zarr), mode="r")
+    if "data/point_cloud" not in root:
+        raise ValueError(f"{train_zarr}: missing data/point_cloud")
+    points = root["data/point_cloud"]
+    if points.ndim != 3 or points.shape[-1] != 6 or points.dtype != np.float32:
+        raise ValueError(f"{train_zarr}: expected float32 point_cloud (T,N,6), got {points}")
+    chunk_frames = points.chunks[0] if points.chunks else 32
+    input_min = np.full(6, np.inf, dtype=np.float32)
+    input_max = np.full(6, -np.inf, dtype=np.float32)
+    for start in range(0, points.shape[0], chunk_frames):
+        block = np.asarray(points[start:start + chunk_frames], dtype=np.float32)
+        input_min = np.minimum(input_min, block.min(axis=(0, 1)))
+        input_max = np.maximum(input_max, block.max(axis=(0, 1)))
+    minimum = torch.from_numpy(input_min)
+    maximum = torch.from_numpy(input_max)
+    input_range = maximum - minimum
+    ignore = input_range < 1e-4
+    input_range[ignore] = 2.0
+    scale = 2.0 / input_range
+    offset = -1.0 - scale * minimum
+    offset[ignore] = -minimum[ignore]
+    return scale, offset
+
+
+def select_policy_points(source: dict, policy: dict, sampler, device: torch.device,
+                         scale: torch.Tensor, offset: torch.Tensor) -> dict:
+    """Run the configured deterministic sampler in batches and return raw-world picks."""
+    stored = source["point_cloud"]
+    labels = source["point_mask"]
+    target = policy["visual_cond_len"]
+    if stored.shape[1] < target:
+        raise ValueError(f"stored point count {stored.shape[1]} < visual_cond_len {target}")
+    picked_points: list[np.ndarray] = []
+    picked_indices: list[np.ndarray] = []
+    picked_labels: list[np.ndarray] = []
+    xyz_scale = scale[:3].to(device)
+    xyz_offset = offset[:3].to(device)
+    for start in range(0, source["N"], 128):
+        raw = torch.from_numpy(stored[start:start + 128]).to(device)
+        xyz = raw[..., :3] * xyz_scale + xyz_offset
+        batch_labels = None
+        if labels is not None:
+            batch_labels = torch.from_numpy(labels[start:start + 128]).to(device)
+        if policy["point_sampling_mode"] == "mask_stratified":
+            _, selected_labels, indices, _ = sampler.mask_stratified_sample(
+                xyz, batch_labels, num_points=target
+            )
+        elif stored.shape[1] > target:
+            _, indices = sampler.fps_torch(xyz, num_points=target)
+            selected_labels = None if batch_labels is None else torch.gather(
+                batch_labels, 1, indices.long()
+            )
+        else:
+            indices = torch.arange(stored.shape[1], device=device, dtype=torch.long)
+            indices = indices.unsqueeze(0).expand(raw.shape[0], -1)
+            selected_labels = batch_labels
+        if indices.dtype != torch.long:
+            raise RuntimeError(f"sampler returned index dtype {indices.dtype}, expected long")
+        indices_np = indices.cpu().numpy()
+        raw_np = stored[start:start + len(indices_np)]
+        picked_points.append(raw_np[np.arange(len(indices_np))[:, None], indices_np])
+        picked_indices.append(indices_np)
+        if selected_labels is not None:
+            picked_labels.append(selected_labels.cpu().numpy().astype(np.int8))
+    return {
+        "points": np.concatenate(picked_points),
+        "indices": np.concatenate(picked_indices),
+        "labels": np.concatenate(picked_labels) if picked_labels else None,
     }
 
 
@@ -593,17 +892,22 @@ def main() -> None:
         default=None,
         help="Processed WBC LeRobot variant root (dexmate_wbc_eef_head from "
              "scripts/port_wbc_mobile_hdf5.py). Default when --zarr is omitted: "
-             f"{_DEFAULT_DATASET_DIR}. With --zarr, overrides the auto-resolved "
-             "sibling used for Head RGB/depth + Wrist RGB panels.",
+             f"{_DEFAULT_DATASET_DIR}. Mutually exclusive with --zarr.",
     )
     parser.add_argument(
         "--zarr",
         type=str,
         default=None,
         help="ManiFlow point-cloud zarr (scripts/port_wbc_mobile_zarr.py), e.g. "
-             "~/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_train.zarr. Renders the "
-             "STORED world-frame cloud the 3D policy trains on; Head/Wrist panels come "
-             "from the sibling LeRobot dataset (auto or --dataset_dir). Needs zarr + lerobot.",
+             "~/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_test.zarr. "
+             "Requires --maniflow-run-dir and v2 episode-manifest metadata.",
+    )
+    parser.add_argument(
+        "--maniflow-run-dir",
+        type=str,
+        default=None,
+        help="Training run containing .hydra/config.yaml. Zarr mode reads the active "
+             "sampler/mask/grounding switches and training-zarr path only from here.",
     )
     parser.add_argument("--episode_index", type=int, default=0)
     parser.add_argument(
@@ -642,20 +946,55 @@ def main() -> None:
         raise ValueError(f"--stride must be >= 1, got {args.stride}")
     if args.connect is not None and args.save is not None:
         parser.error("--connect and --save are mutually exclusive")
+    if args.zarr is not None and args.maniflow_run_dir is None:
+        parser.error("--zarr requires --maniflow-run-dir")
+    if args.zarr is None and args.maniflow_run_dir is not None:
+        parser.error("--maniflow-run-dir is only valid with --zarr")
+    if args.zarr is not None and args.dataset_dir is not None:
+        parser.error("--dataset_dir is LeRobot-only and cannot be combined with --zarr")
 
+    policy = None
+    policy_selection = None
     if args.zarr is not None:
         zarr_path = Path(args.zarr).expanduser()
-        source = load_maniflow_zarr_episode(zarr_path, args.episode_index)
-        cam_root = resolve_lerobot_camera_dir_for_zarr(zarr_path, source["meta"], args.dataset_dir)
-        source = attach_lerobot_camera_streams(source, cam_root, args.episode_index)
+        run_dir = Path(args.maniflow_run_dir).expanduser().resolve()
+        policy = load_maniflow_run(run_dir)
+        sampler, checkout = import_run_sampler(run_dir)
+        policy_device = require_policy_device(policy["device"])
+        source = load_maniflow_zarr_episode(zarr_path, args.episode_index, policy)
+        train_meta = load_zarr_meta(policy["train_zarr"])
+        validate_preprocessing_match(
+            source["meta"], train_meta,
+            needs_point_mask=policy["needs_point_mask"],
+            position_condition_mode=policy["position_condition_mode"],
+        )
+        source = attach_raw_camera_streams(
+            source, needs_point_mask=policy["needs_point_mask"]
+        )
+        scale, offset = point_cloud_limits(policy["train_zarr"])
+        policy_selection = select_policy_points(
+            source, policy, sampler, policy_device, scale, offset
+        )
+        print("ManiFlow policy input configuration:")
+        print(f"  run: {run_dir}")
+        print(f"  sampler implementation: {Path(sampler.__file__).resolve()}")
+        print(f"  point_sampling_mode: {policy['point_sampling_mode']}")
+        print(f"  mask_channels: {policy['mask_channels']}")
+        print(f"  needs_point_mask: {policy['needs_point_mask']}")
+        print(f"  position_condition_mode: {policy['position_condition_mode']}")
+        print(f"  visual_cond_len: {policy['visual_cond_len']}")
+        print(f"  use_pc_color: {policy['use_pc_color']} (viewer uses unaugmented RGB)")
+        print(f"  device: {policy_device}")
+        print(f"  training zarr normalizer: {policy['train_zarr']}")
+        print(f"  ManiFlow checkout: {checkout}")
     else:
         dataset_root = Path(args.dataset_dir or _DEFAULT_DATASET_DIR).expanduser()
         if not dataset_root.is_dir():
             raise FileNotFoundError(f"--dataset_dir not a directory: {dataset_root}")
         source = load_lerobot_episode(dataset_root, args.episode_index)
 
-    has_camera = "dataset" in source
     is_zarr = source["kind"] == "zarr"
+    has_camera = is_zarr or "dataset" in source
     N = source["N"]
     state = source["state"]
     action = source["action"]
@@ -674,16 +1013,23 @@ def main() -> None:
     if position_condition is not None:
         position_condition_points = np.asarray(position_condition["points"], dtype=np.float32)
         position_condition_labels = list(position_condition["labels"])
-        position_condition_colors = _raw_vis_episode.position_condition_colors(
-            position_condition_labels
-        )
+        if is_zarr:
+            position_condition_colors = np.asarray([
+                _COLOR_MASK_SRC if "src" in label.lower() else _COLOR_MASK_DST
+                for label in position_condition_labels
+            ], dtype=np.uint8)
+        else:
+            position_condition_colors = _raw_vis_episode.position_condition_colors(
+                position_condition_labels
+            )
 
     if has_camera:
-        dataset = source["dataset"]
         depth_stack = source["depth"]
-        extrinsic_stack = source["extrinsic"]
         intrinsic_stack = source["intrinsic"]
         H, W = source["hw"]
+        if not is_zarr:
+            dataset = source["dataset"]
+            extrinsic_stack = source["extrinsic"]
     if is_zarr:
         point_cloud_stack = source["point_cloud"]   # (N, num_points, 6) world XYZ + RGB[0,1]
 
@@ -703,6 +1049,9 @@ def main() -> None:
         for side in _ARM_SIDES
     }                                                                                     # (N, 4, 4)
     state_world_head = np.stack([_to_world(_HEAD_BLOCK, i) for i in range(N)])             # == extrinsic
+    if is_zarr:
+        # The zarr's world-frame head state is the camera extrinsic used by its porter.
+        extrinsic_stack = state_world_head
     action_mat = {
         side: np.stack([pos6d_to_mat(action[i, _EEF_BLOCK[side]]) for i in range(N)])
         for side in _ARM_SIDES
@@ -714,7 +1063,7 @@ def main() -> None:
     base_yaw = state[:, 31]
 
     dt_s = 1.0 / source["fps"]
-    if has_camera:
+    if has_camera and not is_zarr:
         # Sanity: reconstructed world_T_zed must equal the porter's calib extrinsic.
         head_err = float(np.abs(state_world_head - extrinsic_stack).max())
         if head_err > 1e-4:
@@ -724,11 +1073,19 @@ def main() -> None:
             )
         print(f"episode {args.episode_index}: {N} frames | rgb {H}x{W} | "
               f"fps {source['fps']:g} | head→world vs calib max err {head_err:.2e} m")
+    elif is_zarr:
+        entry = source["manifest_entry"]
+        print(
+            f"episode {args.episode_index}: {N} frames | raw RGB {H}x{W} | "
+            f"fps {source['fps']:g} | {entry['source']}/episode_{entry['raw_index']} "
+            f"raw[{entry['raw_frame_start']}:{entry['raw_frame_end_exclusive']}]"
+        )
     if is_zarr:
         # The stored cloud is world-frame, so the camera never moves it: the only cross
         # check available here is that every point sits inside the recorded crop box.
         meta = source["meta"]
-        lo = np.asarray(meta["crop_min"]); hi = np.asarray(meta["crop_max"])
+        lo = np.asarray(meta["crop_min"])
+        hi = np.asarray(meta["crop_max"])
         xyz = point_cloud_stack[..., :3]
         if not np.all((xyz > lo) & (xyz < hi)):
             raise ValueError(f"point_cloud escapes the crop {meta['crop_min']}..{meta['crop_max']} "
@@ -756,11 +1113,12 @@ def main() -> None:
     # ── Matplotlib figures (EEF xyz per arm + base top-down). ────────────────
     t_s = np.arange(N, dtype=np.float64) * dt_s
     figs: list[plt.Figure] = []
-    for side in _ARM_SIDES:
-        figs += _build_eef_xyz_figs(t_s, action_pos[side], state_world_pos[side], dt_s,
-                                    prefix=f"{side} ")
-    figs.append(_build_base_path_fig(base_xy, base_yaw))
-    print(f"built {len(figs)} matplotlib figures (6 EEF xyz + 1 base path)")
+    if not is_zarr:
+        for side in _ARM_SIDES:
+            figs += _build_eef_xyz_figs(t_s, action_pos[side], state_world_pos[side], dt_s,
+                                        prefix=f"{side} ")
+        figs.append(_build_base_path_fig(base_xy, base_yaw))
+        print(f"built {len(figs)} matplotlib figures (6 EEF xyz + 1 base path)")
 
     # ── rerun setup ──────────────────────────────────────────────────────────
     rr.init("vis_episode_processed_wbc", spawn=args.save is None and args.connect is None)
@@ -775,7 +1133,8 @@ def main() -> None:
     playback_fps = source["fps"]
     lookback = max(400, min(N, 5000))
     lookahead = min(80, max(1, N // 50 + 5))
-    depth_override = head_depth_hidden_overrides()
+    hidden_head_entities = head_optional_hidden_overrides()
+    hidden_depth_only = {_HEAD_DEPTH_ENTITY: rrb.EntityBehavior(visible=False)}
 
     def _cursor_range(origin: str, name: str, y_range=None) -> rrb.TimeSeriesView:
         axis_y = (
@@ -792,44 +1151,92 @@ def main() -> None:
             ],
         )
 
-    # Zarr 3D view uses the stored policy cloud; LeRobot unprojects depth. Both show
-    # Head RGB / depth + Wrist RGB when camera streams are attached.
-    world_name = (
-        f"World (stored {point_cloud_stack.shape[1]}-pt cloud + EEF + base odom)"
-        if is_zarr else "World (pcd + EEF + base odom)"
+    bottom_row = rrb.Horizontal(
+        _cursor_range("plots/gripper_left", "Left gripper",
+                      (_GRIPPER_Y_MIN, _GRIPPER_Y_MAX)),
+        _cursor_range("plots/gripper_right", "Right gripper",
+                      (_GRIPPER_Y_MIN, _GRIPPER_Y_MAX)),
+        _cursor_range("plots/base_pose", "Base pose"),
+        column_shares=[1.0, 1.0, 1.0],
     )
-    world_view = (
-        rrb.Spatial3DView(origin="world", name=world_name, overrides=depth_override)
-        if has_camera else
-        rrb.Spatial3DView(origin="world", name=world_name)
-    )
-    top_row = (
-        rrb.Horizontal(
-            world_view,
-            rrb.Spatial2DView(
-                origin="world/camera",
-                name="Head RGB / depth",
-                overrides=depth_override,
-            ),
-            rrb.Spatial2DView(origin="wrist", name="Wrist RGB"),
-            column_shares=[2.0, 1.3, 1.3],
+    if is_zarr:
+        common_3d = [
+            "/world/action/**", "/world/state/**", "/world/base/**",
+            "/world/base_path/**", "/world/position_condition/**", "/world/camera",
+        ]
+        center = (lo + hi) / 2.0
+        eye_controls = rrb.EyeControls3D(
+            position=(center + np.array([-2.0, -2.0, 1.5])).tolist(),
+            look_target=center.tolist(),
+            eye_up=(0.0, 0.0, 1.0),
         )
-        if has_camera else world_view
-    )
+        views_3d = [
+            rrb.Spatial3DView(
+                origin="world", name="Stored RGB 3D",
+                contents=[*common_3d, "/world/stored/**"],
+                eye_controls=eye_controls,
+            ),
+            rrb.Spatial3DView(
+                origin="world", name="Policy RGB 3D",
+                contents=[*common_3d, "/world/policy_rgb/**"],
+                eye_controls=eye_controls,
+            ),
+        ]
+        if policy["needs_point_mask"]:
+            views_3d.append(rrb.Spatial3DView(
+                origin="world", name="Policy masks 3D",
+                contents=[*common_3d, "/world/policy_masks/**"],
+                eye_controls=eye_controls,
+            ))
+        head_contents = [
+            "/world/camera/rgb", _HEAD_DEPTH_ENTITY,
+            _HEAD_EEF_STATE_ENTITY, _HEAD_EEF_ACTION_ENTITY,
+        ]
+        if policy["needs_point_mask"]:
+            head_contents.append("/world/camera/mask")
+        views_2d = rrb.Grid(
+            contents=[
+                rrb.Spatial2DView(
+                    origin="world/camera", name="Head RGB+mask",
+                    contents=head_contents,
+                    overrides=hidden_head_entities,
+                ),
+                rrb.Spatial2DView(origin="wrist", name="Wrist RGB"),
+            ],
+            grid_columns=3,
+            column_shares=[1.0, 1.0, 1.0],
+        )
+        layout = rrb.Vertical(
+            rrb.Grid(
+                contents=views_3d,
+                grid_columns=3,
+                column_shares=[1.0, 1.0, 1.0],
+            ),
+            views_2d,
+            bottom_row,
+            row_shares=[2.2, 1.2, 1.0],
+        )
+    else:
+        world_view = rrb.Spatial3DView(
+            origin="world", name="World (pcd + EEF + base odom)",
+            overrides=hidden_depth_only,
+        )
+        top_row = (
+            rrb.Horizontal(
+                world_view,
+                rrb.Spatial2DView(
+                    origin="world/camera", name="Head RGB / depth",
+                    overrides=hidden_depth_only,
+                ),
+                rrb.Spatial2DView(origin="wrist", name="Wrist RGB"),
+                column_shares=[2.0, 1.3, 1.3],
+            )
+            if has_camera else world_view
+        )
+        layout = rrb.Vertical(top_row, bottom_row, row_shares=[2.2, 1.0])
     rr.send_blueprint(
         rrb.Blueprint(
-            rrb.Vertical(
-                top_row,
-                rrb.Horizontal(
-                    _cursor_range("plots/gripper_left", "Left gripper",
-                                  (_GRIPPER_Y_MIN, _GRIPPER_Y_MAX)),
-                    _cursor_range("plots/gripper_right", "Right gripper",
-                                  (_GRIPPER_Y_MIN, _GRIPPER_Y_MAX)),
-                    _cursor_range("plots/base_pose", "Base pose (x,y,yaw)"),
-                    column_shares=[1.0, 1.0, 1.4],
-                ),
-                row_shares=[2.2, 1.0],
-            ),
+            layout,
             rrb.TimePanel(timeline="frame", fps=playback_fps),
         )
     )
@@ -862,6 +1269,16 @@ def main() -> None:
            static=True)
     rr.log("world/base_path/pts", rr.Points3D(base_path_xyz, colors=[_COLOR_BASE], radii=0.006),
            static=True)
+    if is_zarr and policy["needs_point_mask"]:
+        rr.log(
+            "world/camera",
+            rr.AnnotationContext([
+                (0, "background", (0, 0, 0, 0)),
+                (1, "source", (*_COLOR_MASK_SRC, 255)),
+                (2, "destination", (*_COLOR_MASK_DST, 255)),
+            ]),
+            static=True,
+        )
 
     # ── Per-frame loop ───────────────────────────────────────────────────────
     for idx in list(range(0, N, args.stride)) + [N]:
@@ -872,6 +1289,11 @@ def main() -> None:
             rr.log("world/state", rr.Clear(recursive=True))
             rr.log("world/base", rr.Clear(recursive=True))
             rr.log("world/position_condition", rr.Clear(recursive=True))
+            if is_zarr:
+                rr.log("world/stored", rr.Clear(recursive=True))
+                rr.log("world/policy_rgb", rr.Clear(recursive=True))
+                if policy["needs_point_mask"]:
+                    rr.log("world/policy_masks", rr.Clear(recursive=True))
             if has_camera:
                 rr.log("world/camera/eef_state_2d", rr.Clear(recursive=False))
                 rr.log("world/camera/eef_action_2d", rr.Clear(recursive=False))
@@ -922,15 +1344,24 @@ def main() -> None:
                rr.Points3D(sh[None, :3, 3], colors=[_COLOR_STATE], radii=0.02))
 
         if has_camera:
-            frame = dataset[idx]
-            # Head RGB (parquet) + depth (sidecar), both under world/camera.
-            rgb = _rgb_to_hwc(frame["observation.images.head_rgb"])
+            if is_zarr:
+                rgb = source["head_rgb"][idx]
+                wrist_rgb = source["wrist_rgb"][idx]
+            else:
+                frame = dataset[idx]
+                rgb = _rgb_to_hwc(frame["observation.images.head_rgb"])
+                wrist_rgb = _rgb_to_hwc(frame["observation.images.wrist_rgb"])
             depth_mm = depth_stack[idx]
             rr.log("world/camera/rgb", rr.Image(rgb))
             rr.log("world/camera/depth", rr.DepthImage(depth_mm, meter=1000.0))
+            if is_zarr and policy["needs_point_mask"]:
+                rr.log(
+                    "world/camera/mask",
+                    rr.SegmentationImage(source["mask_image"][idx], opacity=0.5),
+                )
 
             # Wrist RGB: plain 2D panel (no calibration/depth for the wrist camera).
-            rr.log("wrist/rgb", rr.Image(_rgb_to_hwc(frame["observation.images.wrist_rgb"])))
+            rr.log("wrist/rgb", rr.Image(wrist_rgb))
 
             # 2D overlays: project achieved (blue) + commanded (red) EEF into the head image.
             for tag, pos_map, color in (
@@ -946,16 +1377,58 @@ def main() -> None:
                     rr.log(f"world/camera/{tag}", rr.Clear(recursive=False))
 
         if is_zarr:
-            # The zarr already stores the cropped, farthest-point-sampled world cloud the
-            # policy consumes -- log it VERBATIM (no re-derivation, no downsample) so this
-            # view is the network input, not an approximation of it. Bigger radii: 1024
-            # points across the workspace are far sparser than the ~60k raw depth points.
+            # Stored is the porter's 1024-point tensor; policy_rgb is the exact configured
+            # normalized-XYZ sampler selection, rendered back at its raw world XYZ/RGB.
             cloud = point_cloud_stack[idx]
-            rr.log("world/pcd", rr.Points3D(
+            rr.log("world/stored/rgb", rr.Points3D(
                 cloud[:, :3],
                 colors=(np.clip(cloud[:, 3:], 0.0, 1.0) * 255.0).astype(np.uint8),
                 radii=0.006,
             ))
+            selected = policy_selection["points"][idx]
+            rr.log("world/policy_rgb/rgb", rr.Points3D(
+                selected[:, :3],
+                colors=(np.clip(selected[:, 3:], 0.0, 1.0) * 255.0).astype(np.uint8),
+                radii=0.006,
+            ))
+            selected_labels = policy_selection["labels"]
+            if selected_labels is not None:
+                frame_labels = selected_labels[idx]
+                mask_colors = np.empty((len(frame_labels), 3), dtype=np.uint8)
+                mask_colors[frame_labels == 0] = _COLOR_MASK_BG
+                mask_colors[frame_labels == 1] = _COLOR_MASK_SRC
+                mask_colors[frame_labels == 2] = _COLOR_MASK_DST
+                rr.log("world/policy_masks/labels", rr.Points3D(
+                    selected[:, :3], colors=mask_colors, radii=0.006,
+                ))
+                if policy["point_sampling_mode"] == "mask_stratified":
+                    counts = {
+                        label: int((frame_labels == label).sum())
+                        for label in (1, 2, 0)
+                    }
+                    quota_text = (
+                        f"q_src={counts[1]} | q_dst={counts[2]} | "
+                        f"q_bg={counts[0]} | total={len(frame_labels)}"
+                    )
+                    names = {1: "src", 2: "dst", 0: "bg"}
+                    shortfalls = [
+                        f"{names[label]}={counts[label]}/{nominal}"
+                        for label, nominal in _NOMINAL_MASK_QUOTAS.items()
+                        if counts[label] < nominal
+                    ]
+                    warning = bool(shortfalls)
+                    if warning:
+                        quota_text += "\n⚠ QUOTA SHORTFALL: " + ", ".join(shortfalls)
+                    anchor = np.asarray(
+                        [[lo[0], hi[1], hi[2]]], dtype=np.float32
+                    )
+                    rr.log("world/policy_masks/quota", rr.Points3D(
+                        anchor,
+                        colors=[_COLOR_ACTION if warning else (255, 255, 255)],
+                        radii=0.004,
+                        labels=[quota_text],
+                        show_labels=True,
+                    ))
         elif has_camera:
             # Point cloud (manual unproject + voxel downsample), world frame.
             depth_m = depth_mm.astype(np.float32) / 1000.0

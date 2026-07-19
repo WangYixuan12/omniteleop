@@ -451,7 +451,6 @@ point_cloud (B*To, 1024, 6) + optional point_mask (B*To, 1024)
 point_feat (B*To, 256, 128)
 ```
 
-
 Mask sampling / `mask_channels` are orthogonal to the mode below and may be on in any of them.
 
 #### `position_condition_mode=none`
@@ -622,23 +621,50 @@ python scripts/port_wbc_mobile_zarr.py \
 # --positions-dir -> data/env_state (T, 6) float32, constant per episode
 # --dino          -> data/env_dino (T, 2560) float32, constant per episode
 # --masks-dir     -> data/point_mask (T, 1024) int8, exact stored-point lineage
+# each .meta.json also records the ordered raw HDF5/mask NPZ episode manifest and
+# half-open raw/zarr frame windows used for exact camera/mask visualization
 ```
 
 The optional arrays are additive: each policy mode loads only the keys it consumes. Thus the same
 enriched zarr supports the complete experiment ladder, including the unconditioned control. The
-sibling `.meta.json` records crop/depth/frame/sampler plus mask/DINO provenance; it remains the source
-of truth for live preprocessing.
+sibling `.meta.json` records crop/depth/frame/sampler, mask/DINO provenance (including
+`env_dino.dino_input_scale: "[0,1]"` — the porter rejects sidecars, and the ManiFlow dataset rejects
+zarrs, from before the 2026-07-18 DINO input-scale fix), and an ordered per-episode
+raw-frame manifest; it remains the source of truth for live preprocessing and visualization.
 
-**2.** Look at the actual network input before training — the STORED cloud, post-crop and post-FPS,
-with the EEF/base overlays (no RGB/depth/wrist panels; that format has none):
+**2.** Inspect the configured policy input. Zarr mode requires both the viewed zarr and a training run;
+it reads `point_sampling_mode`, `mask_channels`, `position_condition_mode`, `visual_cond_len`, CUDA
+device, and the training-zarr normalizer strictly from `<run>/.hydra/config.yaml`. There are no manual
+sampler overrides and no `--compare-sampling` mode:
 
 ```bash
-conda activate dexmate_maniflow && cd ~/omniteleop
-python scripts/vis_episode_processed_wbc.py \
-  --zarr ~/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_train.zarr \
-  --episode_index 0
-# the same script renders the LeRobot dataset via --dataset_dir; both modes work here
+(dexmate_maniflow) python scripts/vis_episode_processed_wbc.py     --zarr /home/yixuan/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_test.zarr     --maniflow-run-dir /home/yixuan/Dexmate/model/maniflow/dexmate_wbc-maniflow_pointcloud_policy_dexmate-smoke-full_seed0     --episode_index 0
 ```
+
+The automatic Rerun blueprint is:
+
+```text
+Stored RGB 3D | Policy RGB 3D | Policy masks 3D (only when point_mask is consumed)
+Head RGB+mask | Wrist RGB     | empty
+Left gripper  | Right gripper | Base pose (x, y, yaw)
+```
+
+`Stored RGB 3D` shows all 1024 porter points. `Policy RGB 3D` shows only the exact deterministic
+selection produced by the run's sampler on training-normalized XYZ, rendered back at raw world
+XYZ/RGB. `Policy masks 3D` colors the selected labels source=orange, destination=cyan,
+background=gray. Mask-stratified frames label the final `q_src/q_dst/q_bg/total` and show a warning
+whenever any final count falls below the nominal `64/64/128` allocation. The full-resolution SAM3.1
+mask overlays Head RGB with the same source/destination colors and transparent background; no stored
+mask or dynamic centroid is rendered.
+
+Head RGB/depth, Wrist RGB, and the full mask are loaded directly from the raw HDF5/mask NPZ through
+the manifest—zarr mode never opens the sibling LeRobot dataset. Head depth and projected action/state
+EEF pixels are recorded but hidden from automatic views, so enable them from the Rerun sidebar when
+needed. The three 3D views have identical initial camera/world context (Rerun 0.34 does not link later
+manual camera motion across separate views). The script prints the active sampler/mask/grounding mode
+at startup, rejects legacy configs missing the three explicit switches, rejects train/view preprocessing
+mismatches, and does not apply training-only color jitter. Legacy `--dataset_dir` mode remains available
+unchanged; zarr mode suppresses the post-view Matplotlib diagnostics.
 
 **3.** Train. `train_maniflow_robotwin_workspace.py` is ManiFlow's only **env-runner-free** trainer
 (`env_runner = None`, `RUN_ROLLOUT = False`, `RUN_VALIDATION = True` are hardcoded) — which is why our
@@ -674,6 +700,8 @@ it is RoboTwin.
 # override it with ZARR_PATH=/other/train.zarr
 ```
 
+
+
 **How many epochs?** The diffusion policy that rolled out successfully did 100k steps × batch 32 =
 **3.2M samples** over 17,951 frames — 178 epochs-equivalent. ManiFlow has 16,659 train windows at
 batch 64 → **261 steps/epoch**:
@@ -694,8 +722,6 @@ samples ≈ 1.17x DP's whole budget. Watch `val_loss` (every 5 epochs) and `trai
 > ⚠️ `num_epochs` sets the **cosine LR horizon** (`num_training_steps = steps_per_epoch * num_epochs`,
 > workspace line 150). Killing a 1010-epoch run at epoch 300 is **not** the same as training for 300 —
 > the LR would still sit at ~79% of peak, never annealed. Choose it at launch.
-
-
 
 The old 512-token timing is not the estimate for this ladder; every current cell runs at 256. Two
 full-size one-epoch runs (`none+fps` and full grounding) have completed training and checkpointing.
