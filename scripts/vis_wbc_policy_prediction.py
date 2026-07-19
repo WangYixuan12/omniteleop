@@ -37,7 +37,9 @@ Panels:
   * Head RGB / depth -- overlaid with the projected GT (red) and predicted
     (magenta) EEF pixels.
   * Wrist RGB -- plain 2D (no calibration/depth).
-  * Gripper time series (left, right) -- GT (red) vs prediction (magenta).
+  * Gripper time series (left, right) -- GT (red) vs prediction (magenta),
+    both as the {0,1} commands after ``split_policy_action`` binarization
+    (same threshold as the live rollout), not the soft policy logits.
 
 Matplotlib: per entity, x/y/z position + geodesic rotation-error curves, GT vs
 prediction, annotated with translation MAE (mm) and rotation MAE (deg).
@@ -49,9 +51,9 @@ Run in the ``dexmate_lerobot`` env (needs lerobot + rerun + the checkpoint deps)
 
 Usage::
 
-    python scripts/vis_wbc_policy_prediction.py \\
-        --policy-path /home/yixuan/Dexmate/model/dp/dexmate_wbc_eef_head_toy/checkpoints/last/pretrained_model \\
-        --dataset_dir /home/yixuan/Dexmate/data/processed_wbc/dexmate_wbc_eef_head \\
+    python scripts/vis_wbc_policy_prediction.py \
+        --policy-path /home/yixuan/Dexmate/model/dp/dexmate_wbc_eef_head_toy/checkpoints/last/pretrained_model \
+        --dataset_dir /home/yixuan/Dexmate/data/processed_wbc/dexmate_wbc_eef_head \
         --episode_index 0
     # headless over SSH: add --save /tmp/wbc_pred.rrd  (open later: rerun FILE.rrd)
 """
@@ -190,8 +192,10 @@ def run_inference(bundle, split_policy_action, dataset, N: int,
     Each prediction is pushed through the rollout's OWN ``split_policy_action`` so
     this offline gate exercises the EXACT decode the robot runs at
     ``wbc_policy_rollout.py`` (finiteness validation + ``pos6d_to_mat`` rotation
-    decode). If the policy emits an action the hardware rollout would reject, this
-    validation aborts here instead of on the robot.
+    decode + gripper binarization at ``GRIPPER_BINARY_THRESHOLD``). Gripper dims
+    9/19 in the returned array are the commanded {0,1} values, not the soft
+    policy output. If the policy emits an action the hardware rollout would
+    reject, this validation aborts here instead of on the robot.
     """
     bundle.reset()
     preds = np.empty((N, len(ACTION_AXES)), dtype=np.float32)
@@ -205,8 +209,12 @@ def run_inference(bundle, split_policy_action, dataset, N: int,
         action = bundle.select_action(state, head, wrist)
         infer_ms[i] = (time.perf_counter() - t0) * 1000.0
         # Same decode path the rollout commands at each 10 Hz tick; raises on a
-        # non-finite / malformed action exactly as the robot would.
-        split_policy_action(action)
+        # non-finite / malformed action exactly as the robot would. Overwrite
+        # gripper dims with the binarized commands the robot actually receives.
+        decoded = split_policy_action(action)
+        action = np.asarray(action, dtype=np.float32).copy()
+        action[_ENTITIES["left"]["grip"]] = decoded["left_gripper"]
+        action[_ENTITIES["right"]["grip"]] = decoded["right_gripper"]
         preds[i] = action
         if (i + 1) % 50 == 0:
             print(f"  inference {i + 1}/{N}", end="\r")
@@ -215,7 +223,7 @@ def run_inference(bundle, split_policy_action, dataset, N: int,
 
 
 def print_metrics(gt: np.ndarray, pred: np.ndarray) -> None:
-    """Per-entity translation/rotation error + gripper accuracy."""
+    """Per-entity translation/rotation error + binary gripper accuracy."""
     print("\n=== prediction vs ground-truth action (open-loop, teacher-forced obs) ===")
     for name, cols in _ENTITIES.items():
         p, r = cols["pos"], cols["rot"]
@@ -225,8 +233,9 @@ def print_metrics(gt: np.ndarray, pred: np.ndarray) -> None:
                 f"  |  rot MAE {rot.mean():5.1f} deg")
         if cols["grip"] is not None:
             g = cols["grip"]
+            # pred grippers are already the rollout's {0,1} commands (see run_inference).
             gmae = float(np.abs(gt[:, g] - pred[:, g]).mean())
-            gacc = float(((gt[:, g] >= 0.5) == (pred[:, g] >= 0.5)).mean())
+            gacc = float((gt[:, g] == pred[:, g]).mean())
             line += f"  |  grip MAE {gmae:.3f} acc {gacc * 100:4.0f}%"
         print(line)
 
@@ -413,9 +422,11 @@ def main() -> None:
         rr.log("world/camera", rr.Pinhole(image_from_camera=K.astype(np.float32), width=W, height=H))
 
         # Mobile base triad (odometry pose) — context for the moving world scene.
+        # Rerun >=0.34: axes are a sibling TransformAxes3D, not Transform3D(axis_length=...).
         base_tf = world_t_base[idx]
-        rr.log("world/base", rr.Transform3D(translation=base_tf[:3, 3], mat3x3=base_tf[:3, :3],
-                                            axis_length=0.25))
+        rr.log("world/base",
+               rr.Transform3D(translation=base_tf[:3, 3], mat3x3=base_tf[:3, :3]),
+               rr.TransformAxes3D(axis_length=0.25))
 
         # Per-entity current GT (red) vs predicted (magenta) pose + error line.
         for name, cols in _ENTITIES.items():
@@ -424,13 +435,13 @@ def main() -> None:
             rr.log(f"world/gt/{name}/cur", rr.Points3D(g_pos[None], colors=[_COLOR_GT], radii=0.012))
             rr.log(f"world/gt/{name}/cur/frame",
                    rr.Transform3D(translation=g_pos,
-                                  mat3x3=gram_schmidt_6d_to_R(gt_action[idx, r:r + 6]),
-                                  axis_length=0.07))
+                                  mat3x3=gram_schmidt_6d_to_R(gt_action[idx, r:r + 6])),
+                   rr.TransformAxes3D(axis_length=0.07))
             rr.log(f"world/pred/{name}/cur", rr.Points3D(p_pos[None], colors=[_COLOR_PRED], radii=0.012))
             rr.log(f"world/pred/{name}/cur/frame",
                    rr.Transform3D(translation=p_pos,
-                                  mat3x3=gram_schmidt_6d_to_R(pred_action[idx, r:r + 6]),
-                                  axis_length=0.07))
+                                  mat3x3=gram_schmidt_6d_to_R(pred_action[idx, r:r + 6])),
+                   rr.TransformAxes3D(axis_length=0.07))
             rr.log(f"world/err/{name}",
                    rr.LineStrips3D([np.stack([g_pos, p_pos])], colors=[_COLOR_ERR], radii=0.0015))
 

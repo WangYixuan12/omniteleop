@@ -7,3 +7,5 @@ geriyoco.vscode-image-gallery-1.2.1.vsix
 PIPELINE_WBC.md
 legacy/LiDAR
 legacy/VSLAM
+.scratch/
+docs/

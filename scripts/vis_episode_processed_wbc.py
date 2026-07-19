@@ -3,13 +3,16 @@
 Two processed formats of the SAME raw takes, selected by which flag you pass:
 
 ``--dataset_dir``  the LeRobotDataset written by ``scripts/port_wbc_mobile_hdf5.py``
-    (head/wrist RGB video + depth/calib sidecars). The default.
+    (head/wrist RGB video + depth/calib sidecars). The default when ``--zarr`` is
+    not given.
 ``--zarr``         the ManiFlow point-cloud zarr written by
     ``scripts/port_wbc_mobile_zarr.py``. Renders the STORED world-frame cloud --
     exactly the ``(num_points, 6)`` tensor the 3D policy will train on, after the
     workspace crop and farthest-point sampling -- so you can eyeball the actual
-    network input before launching training. There is no RGB/depth/wrist stream in
-    this format, so those panels are omitted.
+    network input before launching training. Head RGB / depth and Wrist RGB panels
+    are filled from the sibling LeRobot dataset (same processed episode index;
+    auto-resolved as ``<processed_wbc>/<split>/dexmate_wbc_eef_head``, or pass
+    ``--dataset_dir`` to override).
 
 Sibling to ``scripts/vis_episode_processed.py`` (the arm-only tabletop viewer);
 same rendering structure, schema ``omniteleop.wbc_policy_format``.
@@ -87,8 +90,9 @@ Usage::
     # headless over SSH -> open later with `rerun FILE.rrd`:
     python scripts/vis_episode_processed_wbc.py --save /tmp/wbc_ep0.rrd
 
-``--dataset_dir`` needs ``lerobot`` (``dexmate_lerobot``); ``--zarr`` needs ``zarr``
-(available in both ``dexmate`` and ``dexmate_lerobot``).
+``--dataset_dir`` needs ``lerobot`` (``dexmate_lerobot``). ``--zarr`` needs ``zarr``
+plus ``lerobot`` for the Head/Wrist camera panels (run in ``dexmate_lerobot``, or
+any env with both).
 """
 
 from __future__ import annotations
@@ -347,6 +351,56 @@ def load_lerobot_episode(dataset_root: Path, episode_index: int) -> dict:
     }
 
 
+def resolve_lerobot_camera_dir_for_zarr(
+    zarr_path: Path, meta: dict, dataset_dir: str | None
+) -> Path:
+    """Sibling LeRobot root that carries head/wrist RGB + depth/calib for a zarr episode.
+
+    Both porters share ``split.csv`` / ``processed_data_index``, so episode ``i`` in
+    ``dexmate_wbc_{split}.zarr`` is episode ``i`` in ``<processed_wbc>/<split>/dexmate_wbc_eef_head``.
+    """
+    if dataset_dir is not None:
+        root = Path(dataset_dir).expanduser()
+        if not root.is_dir():
+            raise FileNotFoundError(
+                f"--dataset_dir not a directory (needed for zarr Head/Wrist panels): {root}"
+            )
+        return root
+    split = meta.get("split")
+    if not isinstance(split, str) or not split:
+        raise ValueError(
+            f"{zarr_path.with_suffix('.meta.json')}: missing string 'split'; "
+            "cannot auto-resolve the sibling LeRobot dataset. Pass --dataset_dir."
+        )
+    # .../processed_wbc/maniflow/dexmate_wbc_train.zarr -> .../processed_wbc/<split>/dexmate_wbc_eef_head
+    auto = zarr_path.resolve().parent.parent / split / "dexmate_wbc_eef_head"
+    if not auto.is_dir():
+        raise FileNotFoundError(
+            f"Sibling LeRobot dataset for zarr camera panels not found at {auto}. "
+            "Pass --dataset_dir pointing at the matching dexmate_wbc_eef_head root."
+        )
+    return auto
+
+
+def attach_lerobot_camera_streams(source: dict, dataset_root: Path, episode_index: int) -> dict:
+    """Merge LeRobot head/wrist RGB + depth/calib into a zarr source (same episode index)."""
+    cam = load_lerobot_episode(dataset_root, episode_index)
+    if cam["N"] != source["N"]:
+        raise ValueError(
+            f"zarr episode {episode_index} has {source['N']} frames but LeRobot "
+            f"{dataset_root} episode {episode_index} has {cam['N']} frames "
+            "(porters must share the same split / processed_data_index ordering)"
+        )
+    source = dict(source)
+    source["label"] = f"{source['label']} + cameras from {dataset_root}"
+    source["dataset"] = cam["dataset"]
+    source["depth"] = cam["depth"]
+    source["extrinsic"] = cam["extrinsic"]
+    source["intrinsic"] = cam["intrinsic"]
+    source["hw"] = cam["hw"]
+    return source
+
+
 def load_maniflow_zarr_episode(zarr_path: Path, episode_index: int) -> dict:
     """One episode of the ManiFlow point-cloud zarr (``scripts/port_wbc_mobile_zarr.py``).
 
@@ -354,6 +408,7 @@ def load_maniflow_zarr_episode(zarr_path: Path, episode_index: int) -> dict:
     network input, post-crop and post-farthest-point-sampling -- rather than re-deriving
     it, so what you see is what the policy trains on. The sibling ``.meta.json`` supplies
     ``state_frame`` (``world`` by default here, unlike the LeRobot porter's ``base``).
+    Camera panels are attached separately via ``attach_lerobot_camera_streams``.
     """
     root = zarr.open(str(zarr_path), mode="r")
     for key in ("data/point_cloud", "data/state", "data/action", "meta/episode_ends"):
@@ -535,9 +590,11 @@ def main() -> None:
     parser.add_argument(
         "--dataset_dir",
         type=str,
-        default=_DEFAULT_DATASET_DIR,
-        help="Processed WBC variant root (the dexmate_wbc_eef_head dataset produced "
-             "by scripts/port_wbc_mobile_hdf5.py). Ignored when --zarr is given.",
+        default=None,
+        help="Processed WBC LeRobot variant root (dexmate_wbc_eef_head from "
+             "scripts/port_wbc_mobile_hdf5.py). Default when --zarr is omitted: "
+             f"{_DEFAULT_DATASET_DIR}. With --zarr, overrides the auto-resolved "
+             "sibling used for Head RGB/depth + Wrist RGB panels.",
     )
     parser.add_argument(
         "--zarr",
@@ -545,8 +602,8 @@ def main() -> None:
         default=None,
         help="ManiFlow point-cloud zarr (scripts/port_wbc_mobile_zarr.py), e.g. "
              "~/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_train.zarr. Renders the "
-             "STORED world-frame cloud the 3D policy trains on; no RGB/depth/wrist panels. "
-             "Run in the dexmate env (zarr + rerun).",
+             "STORED world-frame cloud the 3D policy trains on; Head/Wrist panels come "
+             "from the sibling LeRobot dataset (auto or --dataset_dir). Needs zarr + lerobot.",
     )
     parser.add_argument("--episode_index", type=int, default=0)
     parser.add_argument(
@@ -587,14 +644,18 @@ def main() -> None:
         parser.error("--connect and --save are mutually exclusive")
 
     if args.zarr is not None:
-        source = load_maniflow_zarr_episode(Path(args.zarr), args.episode_index)
+        zarr_path = Path(args.zarr).expanduser()
+        source = load_maniflow_zarr_episode(zarr_path, args.episode_index)
+        cam_root = resolve_lerobot_camera_dir_for_zarr(zarr_path, source["meta"], args.dataset_dir)
+        source = attach_lerobot_camera_streams(source, cam_root, args.episode_index)
     else:
-        dataset_root = Path(args.dataset_dir)
+        dataset_root = Path(args.dataset_dir or _DEFAULT_DATASET_DIR).expanduser()
         if not dataset_root.is_dir():
             raise FileNotFoundError(f"--dataset_dir not a directory: {dataset_root}")
         source = load_lerobot_episode(dataset_root, args.episode_index)
 
-    has_camera = source["kind"] == "lerobot"
+    has_camera = "dataset" in source
+    is_zarr = source["kind"] == "zarr"
     N = source["N"]
     state = source["state"]
     action = source["action"]
@@ -623,7 +684,7 @@ def main() -> None:
         extrinsic_stack = source["extrinsic"]
         intrinsic_stack = source["intrinsic"]
         H, W = source["hw"]
-    else:
+    if is_zarr:
         point_cloud_stack = source["point_cloud"]   # (N, num_points, 6) world XYZ + RGB[0,1]
 
     # ── Achieved (state) EEF/head poses in WORLD frame. "base" datasets store them
@@ -663,7 +724,7 @@ def main() -> None:
             )
         print(f"episode {args.episode_index}: {N} frames | rgb {H}x{W} | "
               f"fps {source['fps']:g} | head→world vs calib max err {head_err:.2e} m")
-    else:
+    if is_zarr:
         # The stored cloud is world-frame, so the camera never moves it: the only cross
         # check available here is that every point sits inside the recorded crop box.
         meta = source["meta"]
@@ -675,9 +736,10 @@ def main() -> None:
         rgb_min, rgb_max = float(point_cloud_stack[..., 3:].min()), float(point_cloud_stack[..., 3:].max())
         if not (0.0 <= rgb_min and rgb_max <= 1.0):
             raise ValueError(f"point_cloud rgb outside [0,1]: [{rgb_min}, {rgb_max}]")
-        print(f"episode {args.episode_index}: {N} frames | fps {source['fps']:g} | "
-              f"point_cloud {point_cloud_stack.shape[1]} pts x 6 (world XYZ + RGB) | "
+        print(f"  point_cloud {point_cloud_stack.shape[1]} pts x 6 (world XYZ + RGB) | "
               f"crop {meta['crop_min']}..{meta['crop_max']}")
+    if not has_camera and not is_zarr:
+        raise ValueError(f"unsupported source kind {source['kind']!r}")
     for side in _ARM_SIDES:
         d = np.linalg.norm(action_pos[side] - state_world_pos[side], axis=1)
         print(f"  {side} EEF |action - state→world| mean {d.mean()*1000:.1f} mm, "
@@ -730,12 +792,16 @@ def main() -> None:
             ],
         )
 
-    # The zarr format carries no camera streams, so its top row is the 3D view alone.
-    world_view = rrb.Spatial3DView(
-        origin="world",
-        name=("World (pcd + EEF + base odom)" if has_camera
-              else f"World (stored {point_cloud_stack.shape[1]}-pt cloud + EEF + base odom)"),
-        overrides=depth_override,
+    # Zarr 3D view uses the stored policy cloud; LeRobot unprojects depth. Both show
+    # Head RGB / depth + Wrist RGB when camera streams are attached.
+    world_name = (
+        f"World (stored {point_cloud_stack.shape[1]}-pt cloud + EEF + base odom)"
+        if is_zarr else "World (pcd + EEF + base odom)"
+    )
+    world_view = (
+        rrb.Spatial3DView(origin="world", name=world_name, overrides=depth_override)
+        if has_camera else
+        rrb.Spatial3DView(origin="world", name=world_name)
     )
     top_row = (
         rrb.Horizontal(
@@ -879,13 +945,7 @@ def main() -> None:
                 else:
                     rr.log(f"world/camera/{tag}", rr.Clear(recursive=False))
 
-            # Point cloud (manual unproject + voxel downsample), world frame.
-            depth_m = depth_mm.astype(np.float32) / 1000.0
-            pts, mask = unproject_depth(depth_m, K, world_t_cam)
-            cols = rgb[mask]
-            pts, cols = voxel_downsample(pts, cols, args.voxel)
-            rr.log("world/pcd", rr.Points3D(pts, colors=cols, radii=0.003))
-        else:
+        if is_zarr:
             # The zarr already stores the cropped, farthest-point-sampled world cloud the
             # policy consumes -- log it VERBATIM (no re-derivation, no downsample) so this
             # view is the network input, not an approximation of it. Bigger radii: 1024
@@ -896,6 +956,15 @@ def main() -> None:
                 colors=(np.clip(cloud[:, 3:], 0.0, 1.0) * 255.0).astype(np.uint8),
                 radii=0.006,
             ))
+        elif has_camera:
+            # Point cloud (manual unproject + voxel downsample), world frame.
+            depth_m = depth_mm.astype(np.float32) / 1000.0
+            pts, mask = unproject_depth(depth_m, K, world_t_cam)
+            cols = rgb[mask]
+            pts, cols = voxel_downsample(pts, cols, args.voxel)
+            rr.log("world/pcd", rr.Points3D(pts, colors=cols, radii=0.003))
+        else:
+            raise ValueError(f"unsupported source kind {source['kind']!r}")
 
         # Optional processed SceneDiff position condition, already in the same
         # engage-origin world frame as action and base odometry.

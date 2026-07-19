@@ -344,8 +344,8 @@ Validate the checkpoint OFFLINE before any hardware rollout — run the rollout'
 
 ```bash
 (dexmate_lerobot) python scripts/vis_wbc_policy_prediction.py \
-  --policy-path ~/Dexmate/model/dp/dexmate_wbc_eef_head/checkpoints/last/pretrained_model \
-  --dataset_dir ~/Dexmate/data/processed_wbc/test/dexmate_wbc_eef_head \
+  --policy-path ~/Dexmate/model/dp/nopos_abs_minmax/checkpoints/last/pretrained_model \
+  --dataset_dir ~/Dexmate/data/box2cloth/processed_wbc/test/dexmate_wbc_eef_head \
   --episode_index 0
 ```
 
@@ -395,7 +395,7 @@ python scripts/vis_episode.py --hdf5 /home/yixuan/Dexmate/data/rollout/concat_ab
 
 
 
-## Maniflow
+## ManiFlow
 
 [ManiFlow](https://maniflow-policy.github.io/) (CoRL 2025) trained on the **same raw takes** as the
 diffusion/ACT pipeline above, as a **3D point-cloud** policy. Repo: `/home/yixuan/ManiFlow_Policy`.
@@ -406,6 +406,9 @@ but defaulted to world frame (see table). Visual obs is a world-frame head point
 data/point_cloud  (T, 1024, 6) float32   engage-origin WORLD XYZ + RGB[0,1]
 data/state        (T, 32)      float32   agent_pos  (WORLD frame by default)
 data/action       (T, 29)      float32   verbatim ik.solve targets (WORLD)
+data/env_state    (T, 6)       float32   optional constant [box(src), cloth(dst)] XYZ
+data/env_dino     (T, 2560)    float32   optional frame-0 DINOv3 features, task-slot order
+data/point_mask   (T, 1024)    int8      optional 0=background, 1=box/src, 2=cloth/dst
 meta/episode_ends (E,)         int64
 ```
 
@@ -422,71 +425,131 @@ meta/episode_ends (E,)         int64
 | Frame override                                 | `--relative-actions` → state in **world** (needed for relative training) | `--state-frame base` → egocentric state (LeRobot-style) |
 
 
+
+
+### Model pipeline
+
+Shared dimensions: batch `B=64`, observation steps `To=2`, stored points `N=1024`, policy points `P=256`, task slots `K=2`, XYZRGB channels `C=6` (or 8 with mask painting), point feature width `Fp=128`, state feature width `Fs=64`, visual width `Do=192`, DiTX width `D=768`.
+
+```diff
+point_cloud (B*To, 1024, 6) + optional point_mask (B*To, 1024)
+ --normalize XYZ (dataset min/max, mode=limits; sampling runs here)-->
++ --point_sampling_mode-->
++   ├─ fps: pytorch3d scene-wide FPS -> 256
++   └─ mask_stratified (requires point_mask):
++        1. split 1024 into src / dst / background by point_mask
++        2. target quotas 64 / 64 / 128
++        3. unused object quota -> other object, then background;
++           if background is short, give leftover slots back to src then dst
++        4. FPS inside each group
++        5. merge picks and sort indices back to stored-point order
++ -> selected points (B*To, 256, 6) + selected mask labels when point_mask is present
++ --mask_channels-->
++   ├─ false: keep XYZRGB -> (B*To, 256, 6)
++   └─ true (requires point_mask): append [is_src, is_dst] -> (B*To, 256, 8)
+  --PointNet pointwise-->
+point_feat (B*To, 256, 128)
+```
+
+
+Mask sampling / `mask_channels` are orthogonal to the mode below and may be on in any of them.
+
+#### `position_condition_mode=none`
+
+No additional task specification.
+
+```text
+point_feat (B*To, 256, 128)
+agent_pos (B*To, 32)
+  --state MLP + repeat over points--> state_feat (B*To, 256, 64)
+
+cat(point_feat, state_feat)
+  -> visual (B*To, 256, 192)
+  -> vis_cond (B, To*P=512, 192)
+  -> DiTX visual context (B, 512, 768)
+```
+
+
+
+#### `position_condition_mode=concat`
+
+Cheap position-only comparison; **only currently deployable** conditioned mode.
+Normalized `env_state=[src_xyz,dst_xyz]` widens `agent_pos` 32→38 before the state MLP.
+
+```diff
+point_feat (B*To, 256, 128)
+agent_pos (B*To, 32)
++ --concat normalized env_state=[src_xyz,dst_xyz]--> (B*To, 38)
+  --state MLP + repeat over points--> state_feat (B*To, 256, 64)
+
+cat(point_feat, state_feat)
+  -> visual (B*To, 256, 192)
+  -> vis_cond (B, To*P=512, 192)
+  -> DiTX visual context (B, 512, 768)
+```
+
+
+
+#### `position_condition_mode=grounding_tokens`
+
+Pinned to `object_nums=2`. Validates per-episode constancy, takes frame 0, and appends two
+role-tagged tokens after the visual context (no observation-step embedding — they name the
+episode's source/destination). In the full ladder cell, current object evidence still comes from
+the tracked mask on the point cloud; this mode can also be ablated with plain FPS and no mask
+channels.
+
+```diff
+point_feat (B*To, 256, 128)
+agent_pos (B*To, 32)
+  --state MLP + repeat over points--> state_feat (B*To, 256, 64)
+
+cat(point_feat, state_feat)
+  -> visual (B*To, 256, 192)
+  -> vis_cond (B, To*P=512, 192)
+  -> DiTX visual context (B, 512, 768)
+
++ env_dino+env_state frame-0 slots --> raw [DINOv3_1280 | xyz_3] × K=2
++   --LayerNorm(1280)→Linear(1280,64), cat XYZ, project D=768-->
++   --+ src/dst role embeddings + normalize-->
++   --append after visual tokens--> DiTX context (B, 514, 768)
+```
+
+The wide `env_state`/`env_dino` constants are removed before encoder flattening in both training and
+inference. Mask consumers accept only labels `{0,1,2}`. `position_condition_dropout` stays zero: the
+pipeline has no classifier-free-guidance inference path, and nonzero dropout would also mismatch the
+training student with the eval-mode EMA teacher.
+
 Other deliberate deviations from the LeRobot pipeline:
 
 - **Workspace crop, measured not guessed:** `x∈[0.20,1.70] y∈[-0.90,1.05] z∈[0.60,1.32]` (world,
 `src/omniteleop/wbc_pointcloud.py`). FPS spreads a fixed budget ~uniformly in space, so every cubic
 metre of room the crop keeps is budget stolen from the two small objects. **Task-specific** — a new
 object layout needs new `--crop-min/--crop-max`.
-- **Normalization is ManiFlow's** `mode='limits'` (per-dim min–max) on *all* dims incl. the 6-D
-rotations (same scale family as DP/ACT `MIN_MAX`, but ManiFlow also normalizes the rotation dims).
-
-
-
-### Point-cloud density: what the network actually sees
-
-Measured with the real SceneDiff per-object masks, so "points on the box" is exact. Two knobs
-dominate, and they compound:
-
-
-|                                                         | box pts | cloth pts |
-| ------------------------------------------------------- | ------- | --------- |
-| old crop, `visual_cond_len=128`                         | 5       | 4         |
-| **new crop**, stored 1024                               | 83      | 74        |
-| **new crop**, `visual_cond_len=512` (what the net sees) | ~40     | ~30       |
-
-
-`DP3Encoder` farthest-point-samples the stored 1024 down to `visual_cond_len` before the transformer
-sees anything — so *that* number, not the zarr's `num_points`, is the real budget. RoboTwin's 128 is
-tuned for a tabletop crop; here it left ~5 points on the box. 512 costs ~3x the step time and forces
-`batch_size 64` (10.6 GB; 128 needs 19.8 GB). 1024 (`downsample_points: false`) would give the full
-83/74 but OOMs above batch 64.
+- **Normalization is ManiFlow's** `mode='limits'` (per-dim min–max) for point cloud, state and
+action, including the 6-D rotations. `env_state` deliberately reuses the point-cloud XYZ affine
+(tiled once per task slot); `env_dino` and integer mask labels use identity normalizers. DiTX applies
+LayerNorm to the DINO block in-graph.
+- **Online augmentation is RGB-only:** when `use_pc_color=true`, 20% of training windows receive one
+temporally consistent brightness/contrast/saturation/hue transform (`[0.3, 0.4, 0.5, 0.08]`). It is
+applied before normalization and disabled for validation. XYZ, state, action, masks, `env_state` and
+`env_dino` are not augmented; there is no online crop, rotation, translation or point jitter.
 
 Two crop bounds are **not** free to tighten:
 
 - `x_min` ≤ ~0.30 — the box is carried **back toward the robot** to `x = 0.334` before being placed
 (bimanual EEF midpoint while both grippers are closed). `x_min = 0.45` crops the grasped box out of
 the observation on 17% of transport frames; `x_min = 0.60` on 42%.
-- `z_min` ≤ ~0.62 — bounded by the **cloth** (`z ≈ 0.66–0.70`), not the box. `z_min = 0.70` halves the
+- `z_min` ≤ ~0.62 — bounded by the **cloth** (`z ≈ 0.66–0.70`), not the box. `z_min = 0.70` halves the  
 cloth's points (40 → 22) while helping the box.
-
-
-
-### Ported from the DemoGen-style `pcd_tmp.py`, and what was rejected
-
-- **Tighter workspace crop** — adopted. This is the real lesson of those pipelines (their workspace is
-0.65 × 0.90 × 0.44 m); ours was the whole room. Box 48 → 83 points, cloth 40 → 74, zero latency cost.
-- `fpsample` **bucket-FPS** — adopted (`h=5`, `start_idx=0`). Same object coverage as an exact CUDA FPS
-(box 86 vs 83) and the same 0.044 m mean nearest-neighbour spread, but **2.0 ms/frame instead of
-16.2**: the live rollout samples one frame at a time, where a CUDA FPS is kernel-launch bound and
-cannot amortise over a batch. Live preprocessing 97 ms → **19 ms** for both obs steps; conversion
-runs in 2m55s and no longer needs a GPU.
-  > ⚠️ `start_idx` **must** stay pinned. fpsample's default seeds from a *random* point, which would
-  > make the training data irreproducible and silently skew the live cloud away from the trained one.
-  > `meta.json` records `sampler`/`kdline_h`/`start_idx`/`fpsample_version`; `wbc_maniflow_rollout.py`
-  > refuses to load on a mismatch and warns on a version drift.
-- **DBSCAN / radius-outlier removal (**`pcd_cluster`**)** — *rejected, measured*. It deletes 3–4% of points
-overall but ~~10% of the **box's** — whose far, thin surface is genuinely sparse — and so *lowers* box
-coverage (37 → 30 at 512 tokens) while costing ~6 ms/frame. FPS does over-select sparse regions (~~15%
-of its picks have <6 neighbours within 3 cm, ~4x their share of the cloud), but on real ZED depth
-those picks are mostly true object edges, not sensor noise. Their sim depth is clean; ours is not.
 
 
 
 ### Environments
 
-**One env for the whole pipeline:** `dexmate_maniflow`**.** Build the zarr, visualize it, train, and roll
-out on hardware — all in the same interpreter, so train/deploy can never drift on a library version.
+**One env for the ManiFlow stages:** `dexmate_maniflow`**.** Build/inspect the zarr, train, and run the
+currently supported live modes in the same interpreter, so those stages cannot drift on a library
+version. SceneDiff DINO extraction and SAM3.1 mask tracking run separately in `lerobot` and
+`dexmate_lerobot`, respectively, before the zarr build.
 
 It is a clone of `dexmate_lerobot` (which keeps the *editable* dexcontrol/omniteleop installs pointing
 at the same sources, plus pinocchio/pink, lerobot, rerun, `fpsample`), with a small delta:
@@ -519,35 +582,52 @@ export TORCH_CUDA_ARCH_LIST=8.9 FORCE_CUDA=1 MAX_JOBS=$(nproc) CUDA_HOME=/usr   
 $P -m pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@main"
 ```
 
-Verified in this one env: the converter writes clouds **bit-identical** to the reference zarr; both
-`vis_episode_processed_wbc.py` modes render; training reaches the **same** `val_loss 2.519692897796631`
-as a run under upstream's pinned torch 2.4.1 / numpy 1.26.4; and the rollout loads the resulting
-`latest.ckpt` and rebuilds a live cloud bit-identical to the training one.
+Verified in this stack: enriching a zarr with masks and DINO leaves `point_cloud`, `state`, `action`
+and `env_state` bit-identical to the pre-mask build; the porter also recomputes frame 0 and checks the
+cloud plus mask labels through the same row lineage. The current rollout rebuilds the maskless live
+cloud bit-identically to training for the modes it supports (see the rollout limitation below).
 
 Upstream's own `requirements.txt` is unsatisfiable as written (`numpy==1.23.5` vs its own
 `numba==0.61.2`, which needs numpy ≥1.24), and its sim/cloud deps (`sapien`, `mplib`, `dm_control`,
 `open3d`, `azure`, `deepspeed`) are not needed here. `transformers`/`yacs`/`diffusers` are pulled in by
 the clone already or unused.
 
-**1.** Build the zarr. Splits reuse `raw_data/split.csv`; each split gets its own zarr. The sibling `<name>_<split>.meta.json`
-records the crop/depth/frame and is the **single source of truth** the live rollout re-reads.
+**1.** Build the mask-grounded artifacts and zarr. Run these after the position extractor has written
+`positions/{raw,recovery}/episode_<N>.npz`. DINO is a sibling sidecar tied to the positions NPZ by
+SHA-256; masks cover the full untrimmed episode and carry the same provenance hash. A stale sidecar or
+mask is rejected before the porter writes anything.
 
 ```bash
-conda activate dexmate_maniflow && cd ~/omniteleop
+(lerobot) cd ~/scene_diff
+python scripts/extract_object_dino_feats.py \
+  --scenediff-root ~/Dexmate/data/box2cloth/scene_diff
+
+(dexmate_lerobot) cd ~/scene_diff
+python scripts/build_wbc_masks.py \
+  --scenediff-root ~/Dexmate/data/box2cloth/scene_diff
+# inspect masks/qc_summary.json and masks/viz/ before porting
+
+(dexmate_maniflow) cd ~/omniteleop
 python scripts/port_wbc_mobile_zarr.py \
-  --raw-dir ~/Dexmate/data/raw_data \
-  --out-root ~/Dexmate/data/processed_wbc/maniflow \
+  --raw-dir ~/Dexmate/data/box2cloth/raw_data \
+  --out-root ~/Dexmate/data/box2cloth/processed_wbc/maniflow \
   --name dexmate_wbc --num-points 1024 \
-  --include-recovery-data ~/Dexmate/data/raw_data/recovery --overwrite \
-  --positions-dir ~/Dexmate/data/scene_diff/positions
+  --include-recovery-data ~/Dexmate/data/box2cloth/raw_data/recovery \
+  --positions-dir ~/Dexmate/data/box2cloth/scene_diff/positions \
+  --masks-dir ~/Dexmate/data/box2cloth/scene_diff/masks \
+  --dino --overwrite
 # ~3 min, CPU only. -> dexmate_wbc_{train,test}.zarr (46 / 2 episodes; 17,951 / 604 frames)
-# The encoder farthest-point-samples the stored 1024 down to policy.visual_cond_len (512),
+# The encoder downsamples stored 1024 to policy.visual_cond_len (active baseline: 256),
 # so raising --num-points only helps if you also raise visual_cond_len.
-# --positions-dir adds data/env_state (T, 6): the SceneDiff [box, cloth] world positions
-# (positions/<raw|recovery>/episode_<N>.npz, same loading + (source, raw_index) keying as
-# the LeRobot porter), validated up front and broadcast per frame. Purely additive -- a
-# position_condition_mode=none run on this zarr trains bit-identically to one without it.
+# --positions-dir -> data/env_state (T, 6) float32, constant per episode
+# --dino          -> data/env_dino (T, 2560) float32, constant per episode
+# --masks-dir     -> data/point_mask (T, 1024) int8, exact stored-point lineage
 ```
+
+The optional arrays are additive: each policy mode loads only the keys it consumes. Thus the same
+enriched zarr supports the complete experiment ladder, including the unconditioned control. The
+sibling `.meta.json` records crop/depth/frame/sampler plus mask/DINO provenance; it remains the source
+of truth for live preprocessing.
 
 **2.** Look at the actual network input before training — the STORED cloud, post-crop and post-FPS,
 with the EEF/base overlays (no RGB/depth/wrist panels; that format has none):
@@ -555,7 +635,8 @@ with the EEF/base overlays (no RGB/depth/wrist panels; that format has none):
 ```bash
 conda activate dexmate_maniflow && cd ~/omniteleop
 python scripts/vis_episode_processed_wbc.py \
-  --zarr ~/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_train.zarr --episode_index 0
+  --zarr ~/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_train.zarr \
+  --episode_index 0
 # the same script renders the LeRobot dataset via --dataset_dir; both modes work here
 ```
 
@@ -565,17 +646,32 @@ task config lives under `config/robotwin_task/`: a Hydra group name *is* the con
 it is RoboTwin.
 
 ```bash
-(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh pc1024 0 0 \
-  training.num_epochs=200 training.checkpoint_every=10 training.val_every=5
-# args: <addition_info> <seed> <gpu_id> [hydra overrides...]
-# checkpoints → ~/Dexmate/model/maniflow/<exp>_seed<seed>/checkpoints/
+(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh control_256 \
+  point_sampling_mode=fps mask_channels=false position_condition_mode=none \
+  training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
 
-# position-conditioned variants (zarr must have data/env_state; one switch drives
-# dataset + policy — see "Position conditioning" below):
-(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh concat 0 0 \
-  position_condition_mode=concat training.num_epochs=200 training.checkpoint_every=10 training.val_every=5
-(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh sqrt 0 0 \
-  position_condition_mode=scene_query_tokens training.num_epochs=200 training.checkpoint_every=10 training.val_every=5
+(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh stratified_256 \
+  point_sampling_mode=mask_stratified mask_channels=false position_condition_mode=none \
+  training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
+
+(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh channels_256 \
+  point_sampling_mode=mask_stratified mask_channels=true position_condition_mode=none \
+  training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
+
+(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh grounding_256 \
+  point_sampling_mode=mask_stratified mask_channels=true \
+  position_condition_mode=grounding_tokens \
+  training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
+
+# Cheap position-only comparison (no mask consumer):
+(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh concat_256 \
+  point_sampling_mode=fps mask_channels=false position_condition_mode=concat \
+  training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
+
+# args: <addition_info> [seed] [gpu_id] [hydra overrides...]
+# checkpoints → ~/Dexmate/model/maniflow/<exp>_seed<seed>/checkpoints/
+# default zarr: ~/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_train.zarr
+# override it with ZARR_PATH=/other/train.zarr
 ```
 
 **How many epochs?** The diffusion policy that rolled out successfully did 100k steps × batch 32 =
@@ -583,11 +679,11 @@ it is RoboTwin.
 batch 64 → **261 steps/epoch**:
 
 
-| `num_epochs`       | steps      | samples   | vs DP     | wall time |
-| ------------------ | ---------- | --------- | --------- | --------- |
-| 192                | 50,112     | 3.20M     | 1.00x     | 4.7 h     |
-| **300**            | **78,300** | **5.00M** | **1.56x** | **7.3 h** |
-| 1010 (cfg default) | 263,610    | 16.8M     | 5.26x     | 24.7 h    |
+| `num_epochs`       | steps      | samples   | vs DP     |
+| ------------------ | ---------- | --------- | --------- |
+| 192                | 50,112     | 3.20M     | 1.00x     |
+| **300**            | **78,300** | **5.00M** | **1.56x** |
+| 1010 (cfg default) | 263,610    | 16.8M     | 5.26x     |
 
 
 Use **300**, not the sample-matched 192: ManiFlow splits every batch 75% flow / 25% consistency
@@ -599,21 +695,24 @@ samples ≈ 1.17x DP's whole budget. Watch `val_loss` (every 5 epochs) and `trai
 > workspace line 150). Killing a 1010-epoch run at epoch 300 is **not** the same as training for 300 —
 > the LR would still sit at ~79% of peak, never annealed. Choose it at launch.
 
-Measured on the RTX 4090 (`batch_size: 64`, `visual_cond_len: 512`): 337 ms/step (2.97 it/s), ~88 s/epoch,
-~12.6 GB peak. Each checkpoint is **2.7 GB** (model + EMA + optimizer); `checkpoint_every: 50` would put
-the first `latest.ckpt` 73 min in, hence `=20` above. `training.resume: True`, so relaunching with the
-same `<addition_info>` and `<seed>` resumes from that run dir's `latest.ckpt` — use a new tag for a fresh
-run. `ZARR_PATH=...` overrides the dataset. Do **not** use `training.debug=True` as a smoke test: the
-workspace rewrites it to 100 epochs × 10 steps, which is slower than the real short run above.
 
-Files added: `maniflow/dataset/dexmate_wbc_dataset.py` (subclasses `RoboTwinDataset`, pins the 32/29
-schema, handles `env_state`), `maniflow/config/robotwin_task/dexmate_wbc_pointcloud.yaml`,
-`maniflow/config/maniflow_pointcloud_policy_dexmate.yaml`, `scripts/train_dexmate_wbc.sh`.
-Upstream ManiFlow edits (all additive and gated behind `position_condition_mode`; with the default
-`none`, model behavior and state-dict keys are unchanged — verified by a `strict=True` load of the
-pre-edit `pc1024` checkpoint): `robotwin_dataset.py` (`extra_buffer_keys` arg),
-`pointnet_extractor.py` (DP3Encoder scene-query branch), `ditx.py` (SQRT context tokens),
-`maniflow_pointcloud_policy.py` (mode plumbing + env-state normalization).
+
+The old 512-token timing is not the estimate for this ladder; every current cell runs at 256. Two
+full-size one-epoch runs (`none+fps` and full grounding) have completed training and checkpointing.
+The sampler tests cover quota/spill/shortage/over-segmentation/empty/determinism, and every ladder
+cell has run `compute_loss + backward + predict_action` on the real zarr.
+
+`training.resume: true`, so relaunching the same `<addition_info>` and seed resumes from its
+`latest.ckpt`; use a new tag for a fresh run. The epoch-end workspace now explicitly returns the
+student to train mode while keeping the EMA teacher in eval mode. `position_condition_dropout` is
+retired and must remain `0.0`; any nonzero value fails at policy construction. Do not use
+`training.debug=true` as a smoke test—the workspace rewrites it to 100 epochs × 10 steps.
+
+Active implementation files: `point_process.py` (batched mask-stratified sampler),
+`pointnet_extractor.py` (mask-aware sampling/channels), `ditx.py` (grounding tokens),
+`maniflow_pointcloud_policy.py` (mode plumbing), `dexmate_wbc_dataset.py` (schema and normalizers),
+the Dexmate task/policy YAMLs, the Robotwin workspace EMA-mode fix, and
+`scripts/train_dexmate_wbc.sh`.
 
 **4.** Live rollout. `scripts/wbc_maniflow_rollout.py` does **not** fork the hardware loop: it imports
 `wbc_policy_rollout.py` and swaps in a ManiFlow bundle + observation worker via
@@ -623,8 +722,8 @@ the same code. `--replay-episode` works identically.
 
 ```bash
 (dexmate_maniflow) python scripts/wbc_maniflow_rollout.py \
-  --policy-path /home/yixuan/Dexmate/model/maniflow/dexmate_wbc-maniflow_pointcloud_policy_dexmate-pc1024_seed0/checkpoints/latest.ckpt \
-  --save-dir ~/Dexmate/data/rollout/maniflow \
+  --policy-path /home/yixuan/Dexmate/model/maniflow/<exp>_seed0/checkpoints/latest.ckpt \
+  --save-dir ~/Dexmate/data/box2cloth/rollout/maniflow \
   --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5 \
   --num-inference-steps 2 --policy-interval 0.3 --max-seconds 85
 ```
@@ -640,93 +739,94 @@ Verified **bit-identical** to the stored training cloud on raw `episode_1` frame
 - The `n_obs_steps` head frames are grabbed at the dataset period **first**, then both clouds are built
 in one batched farthest-point call (~97 ms for 2 frames). Building inline would stretch the
 observation spacing past the 0.1 s the policy was trained on.
-- `--position-condition` works exactly like the LeRobot rollout (same shared code path): a checkpoint
-trained with `position_condition_mode` ≠ `none` declares `env_state`, the rollout captures one head
-frame at the start pose, runs SceneDiff against the fixed reference, and pins the arranged
-`[box, cloth]` world vector for the whole episode. Both directions are enforced up front — a
-conditioned checkpoint without the flag and vice versa exit before engage.
+- `--position-condition` is currently valid for the active `concat` mode: the shared rollout runs
+SceneDiff once and pins `[box, cloth]` `env_state` for the episode. Both directions are checked before
+engage—a concat checkpoint without the flag, or the flag with an unconditioned checkpoint, exits.
+
+> **Live limitation:** `wbc_maniflow_rollout.py` does not yet supply `point_mask` or `env_dino`, and
+> its mode gate predates `grounding_tokens`. Therefore only `none` and `concat` checkpoints are
+> deployable through this script today. Do not deploy `mask_stratified`, `mask_channels=true`, or
+> `grounding_tokens` checkpoints until the planned causal SAM3.1 tracking integration is complete.
+> The future worker must advance masks only on policy-consumed RGB frames and expose an explicit
+> `--mask-condition` contract.
 
 
 
-### Position conditioning (implemented)
+## MoF (Mixture of Frames)
 
-**Current tensor pipeline.** Dimensions: batch `B=64`, observation steps `To=2`, stored points
-`N=1024`, visual/FPS points per observation `P=512`, object slots `K=2`, input channels `C=6`
-(XYZRGB), point features `Fp=128`, state features `Fs=64`, visual features `Do=Fp+Fs=192`,
-SQRT anchor width `A=135`, and DiTX width `D=768`.
+[MoF](https://mofpo.github.io/) trained on the **same box2cloth raw takes** as the
+diffusion/ACT/ManiFlow pipelines above, as a fourth policy family. Repo: the
+`wbc` branch of `[Crdr2/mofpo](https://github.com/Crdr2/mofpo)` at `/home/yixuan/mofpo`
+(fork of the paper code; upstream `pointW/mofpo`). MoF denoises the 29-D world
+action in **five reference frames at once** (`base`, `base_rel_trans`, `left`,
+`right`, `rel_traj` — the head is a third pose entity in every frame but not a
+frame itself) and fuses the predictions with a learned per-timestep router,
+canonical space `base_rel_trans`. Decisions/ADR in `.scratch/mof-wbc-integration/`
+and `docs/adr/0001-mof-sim-stack-for-wbc.md` (both gitignored, local).
 
-```text
-none / concat:
-  point_cloud (B*To=128, N=1024, C=6) XYZRGB
-    --FPS on XYZ--> sampled_cloud (B*To=128, P=512, C=6)
-    --PointNetEncoderXYZRGB, pointwise--> point_feat (B*To=128, P=512, Fp=128)
+**Frame conventions:** actions verbatim world-frame column rot6d (the checkpoint
+sets `external_rot6d_convention: column`, so predictions come out in exactly the
+recorded action format — no row-convention pass); obs are per-entity world
+pos + wxyz quats derived from the world-frame 32-D state blocks; images are the
+**224×224 anisotropic squash** of the 240×320 frames (full FOV kept).
 
-scene_query_tokens (SQRT):
-  point_cloud (B*To=128, N=1024, C=6) XYZRGB
-    --PointNetEncoderXYZRGB on ALL points-->
-       full_feat (B*To=128, N=1024, Fp=128)
-      |--3-NN queries interpolate local_feat from the full pre-FPS field
-      `--FPS on XYZ + gather features-->
-         point_feat (B*To=128, P=512, Fp=128)
+**1.** Port raw takes to MoF safetensors (env `dexmate_lerobot`; SceneDiff
+positions are ALWAYS attached — a conditioned run later is a train-config flip):
 
-agent_pos:
-  none / SQRT: agent_pos (B*To=128, state_dim=32)
-  concat: cat(agent_pos (B*To=128, state_dim=32),
-              env_state (B*To=128, 3*K=6))
-          -> conditioned_state (B*To=128, state_dim+3*K=38)
-  --state_mlp--> state_feat (B*To=128, Fs=64)
-
-cat(point_feat, state_feat repeated over P=512 points)
-  -> visual (B*To=128, P=512, Do=192)
-  --reshape observations--> vis_cond (B=64, To*P=1024, Do=192)
-  --Linear(Do=192,D=768) + visual position embedding-->
-     visual_context (B=64, To*P=1024, D=768)
-
-SQRT only:
-  anchor_raw = cat feature axis [local_feat(Fp=128), query_xyz(xyz=3),
-                                 pair_delta(xyz=3), nearest_distance_m(1)]
-             -> (B*To=128, K=2, A=135)
-             -> reshape (B=64, To=2, K=2, A=135)
-  --Linear(A=135,D=768) + role/obs-step embeddings + LayerNorm-->
-     position_tokens (B=64, To*K=4, D=768)
-  cat([visual_context, position_tokens], dim=1)
-    -> context_c (B=64, To*P+To*K=1028, D=768)
+```bash
+(dexmate_lerobot) python scripts/port_wbc_mobile_mof.py \
+  --raw-dir ~/Dexmate/data/box2cloth/raw_data \
+  --out-root ~/Dexmate/data/box2cloth/processed_wbc/mof \
+  --include-recovery-data ~/Dexmate/data/box2cloth/raw_data/recovery \
+  --positions-dir ~/Dexmate/data/box2cloth/scene_diff/positions
+# -> dexmate_wbc_mof/{train,test}/episode_<i>.safetensors + meta.json
+#    (46 train / 2 test episodes, 18,555 frames == the LeRobot dataset;
+#     meta.json enumerates the tensor schema and is the deploy source of truth)
 ```
 
-`query_xyz` and `pair_delta = dst - src` use the same normalized XYZ coordinates as the cloud;
-`nearest_distance_m` is in metres. The 3-NN local feature is blanked when the nearest observed point
-is farther than `position_condition_max_query_dist` (currently 0.1 m), while the other anchor fields
-remain available.
+**2.** Train in mofpo (env `mof`; no simulator — `task.env_runner: null` skips
+rollout eval and top-k checkpoints on `val_loss`):
 
-Motivation: the unconditioned `pc1024` rollout grasped the box but placed it **left of the cloth** —
-the policy needed to be told *where* to place. The condition is the per-episode-constant 6-D
-`env_state` = SceneDiff `[box_xyz, cloth_xyz]` in the engage-origin world frame (the same frame as
-the cloud, state and action). One config switch, `position_condition_mode`, drives dataset + policy:
+```bash
+(mof) cd ~/mofpo && python train.py --config-name=train_mof_moe_wbc \
+  logging.mode=offline hydra.run.dir=data/outputs/wbc_v1_mof_moe_500ep
+# paper recipe: batch 128, DDIM 50/16, EMA, 500 epochs (~30 s/epoch + val on the
+# 4090, ~14 GB), horizon 16 / 8 action steps @ 10 Hz. training.resume=True:
+# relaunching the same run dir resumes from latest.ckpt.
+```
 
-- `none` (default) — baseline; checkpoints byte-compatible with pre-feature code.
-- `concat` — `env_state` appended to `agent_pos` (32→38) before the encoder. The trivial
-baseline: 6 numbers pushed through the shared 64-D state MLP and smeared over every visual token.
-- `scene_query_tokens` (SQRT, designed by Codex from the `o2oafford/` reference —
-`~/ManiFlow_Policy/docs/sqrt_position_conditioning.md` is the full design doc) — each object
-position becomes a **role token**: the DP3 per-point feature field (all 1024 pre-FPS points, so the
-condition does not inherit FPS's small-object coverage loss) is interpolated at the box/cloth
-positions O2O-Afford-style (3-NN inverse-distance), concatenated with the query xyz, the signed
-src→dst displacement and the nearest-point distance, projected to 768-D, tagged
-with learned source/target role + obs-step embeddings, then appended to DiTX's cross-attention
-context (4 extra tokens on top of 1024). Every action token can attend
-directly to "box here", "cloth here", "move this way". ~109k extra params, <0.3 GB extra train memory.
+**3.** Validate OFFLINE before any hardware run (env `dexmate_mof` — a
+`dexmate_lerobot` clone + `mofpo_root.pth` + `pip install --no-deps threadpoolctl robomimic==<install.sh pin>` + the ManiFlow env's pytorch3d;
+mofpo has no `__init__.py`, so the `.pth` does what `pip install -e` cannot):
 
-Normalization (both modes): `env_state` reuses the **point-cloud XYZ affine** (tiled per slot), not
-independently fitted stats, so queries and cloud share one normalized coordinate system. Ablate
-`none` vs `concat` vs `scene_query_tokens` on the signed **lateral placement error** of the
-placing-hand actions in the post-grasp segment (val_loss barely separates these; see the design doc's
-ablation section for the counterfactual target-shift probe).
+```bash
+(dexmate_mof) python scripts/vis_wbc_mof_prediction.py \
+  --policy-path ~/mofpo/data/outputs/wbc_v1_mof_moe_500ep/checkpoints/latest.ckpt \
+  --episode ~/Dexmate/data/box2cloth/processed_wbc/mof/dexmate_wbc_mof/test/episode_0.safetensors \
+  --output ~/Dexmate/data/visualization/mof_pred_test0.png
+# per-entity translation/rotation MAE + gripper accuracy + GT-vs-pred overlays,
+# through the deploy bundle's exact inference path (load-time gates included)
+```
 
-Before trusting a conditioned run, sanity-check the SceneDiff positions: the `obj_num` forced
-bijection can promote a runner-up region when the real object fails the visibility gate. All 48
-current npz files (41 raw + 7 recovery) pass `valid == 1`; median per-episode worst `matched_dist`
-is 0.098 m. The one outlier, `raw/episode_61` at **0.382 m**, is already the held-out *test*
-episode (split.csv), so it never trains — the training set's worst match is 0.168 m.
+**4.** Roll out on the robot — the same shared hardware loop as every policy
+(`wbc_policy_rollout.py` via `policy_factory`; not even the inference worker is
+forked):
+
+```bash
+(dexmate_mof) python scripts/wbc_mof_rollout.py \
+  --policy-path ~/mofpo/data/outputs/wbc_v1_mof_moe_500ep/checkpoints/latest.ckpt \
+  --save-dir ~/Dexmate/data/rollout/mof \
+  --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5 \
+  --policy-interval 0.6 --max-seconds 100
+# 16-step DDIM x 5 experts measured ~0.6 s/chunk with the GPU shared by a
+# training job (chunk covers 0.8 s): keep --policy-interval >= inference time,
+# or pass --num-inference-steps 8. --replay-episode works identically.
+```
+
+The bundle refuses to load (before engage): a non-WBC or row-convention
+checkpoint, a missing/mismatched port `meta.json`, or a normalizer without
+fitted stats. v1 checkpoints are unconditioned — do not pass
+`--position-condition`.
 
 # Debug
 

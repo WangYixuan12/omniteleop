@@ -155,9 +155,7 @@ def episode_index_from_path(path: Path) -> int:
     """Integer N parsed from an ``episode_<N>.hdf5`` filename (for numeric sort)."""
     match = _EPISODE_RE.match(Path(path).name)
     if match is None:
-        raise RuntimeError(
-            f"episode filename does not match episode_<int>.hdf5: {Path(path).name}"
-        )
+        raise RuntimeError(f"episode filename does not match episode_<int>.hdf5: {Path(path).name}")
     return int(match.group(1))
 
 
@@ -241,8 +239,9 @@ def load_trim_spec(recovery_dir: Path) -> dict[int, tuple[int, int]]:
     return spec
 
 
-def _resolve_window(frame_count: int, t0: int, trim: tuple[int, int] | None,
-                    source: str | Path) -> tuple[int, int]:
+def _resolve_window(
+    frame_count: int, t0: int, trim: tuple[int, int] | None, source: str | Path
+) -> tuple[int, int]:
     """The half-open ``[start, end)`` frame window an episode contributes.
 
     ``trim is None`` (raw episode): ``[t0, frame_count)`` -- the porter's usual
@@ -263,8 +262,9 @@ def _resolve_window(frame_count: int, t0: int, trim: tuple[int, int] | None,
     return frame_start, end_incl + 1
 
 
-def _validate_finite(name: str, arr: np.ndarray, source: str | Path,
-                     *, check_finite: bool = True) -> None:
+def _validate_finite(
+    name: str, arr: np.ndarray, source: str | Path, *, check_finite: bool = True
+) -> None:
     if arr.size == 0:
         raise RuntimeError(f"{source}: {name} is empty (shape={arr.shape})")
     if arr.dtype.kind not in "biufc":
@@ -277,8 +277,9 @@ def _validate_finite(name: str, arr: np.ndarray, source: str | Path,
         )
 
 
-def read_required_array(f: h5py.File, key: str, source: str | Path,
-                        *, check_finite: bool = True) -> np.ndarray:
+def read_required_array(
+    f: h5py.File, key: str, source: str | Path, *, check_finite: bool = True
+) -> np.ndarray:
     """Load a required dataset; RuntimeError names the missing path (PLAN.md)."""
     if key not in f:
         raise RuntimeError(
@@ -301,8 +302,7 @@ _CAMERA_NTP_INT_KEYS = ("offset_ns", "rtt_ns", "queried_at_ns")
 _CAMERA_NTP_STR_KEYS = ("sensor_id", "source")
 
 
-def load_episode_timing(f: h5py.File, source: str | Path,
-                        frame_count: int) -> dict | None:
+def load_episode_timing(f: h5py.File, source: str | Path, frame_count: int) -> dict | None:
     """Optional per-frame capture-stamp block written by the timing-aware recorder.
 
     Returns None for takes predating the timing fields (pre-2026-07 recorder).
@@ -361,16 +361,12 @@ def load_episode_timing(f: h5py.File, source: str | Path,
         if np.any(arr <= 0):
             raise RuntimeError(f"{source}: obs/images/{key} has non-positive stamps")
         if arr.shape[0] > 1 and np.any(np.diff(arr) < 0):
-            raise RuntimeError(
-                f"{source}: obs/images/{key} is not monotonic -- corrupt take"
-            )
+            raise RuntimeError(f"{source}: obs/images/{key} is not monotonic -- corrupt take")
         timing[key] = arr
     ntp_present = [key for key in _NTP_KEYS if f"meta/ntp/{key}" in f]
     if ntp_present and len(ntp_present) != len(_NTP_KEYS):
         missing = sorted(set(_NTP_KEYS) - set(ntp_present))
-        raise RuntimeError(
-            f"{source}: partial meta/ntp -- has {ntp_present}, missing {missing}"
-        )
+        raise RuntimeError(f"{source}: partial meta/ntp -- has {ntp_present}, missing {missing}")
     for key in ntp_present:
         val = np.asarray(f[f"meta/ntp/{key}"][()])
         if val.shape != () or val.dtype != np.int64:
@@ -402,9 +398,7 @@ def load_episode_timing(f: h5py.File, source: str | Path,
                     f"{val.shape} {val.dtype}"
                 )
             if key != "offset_ns" and int(val) <= 0:
-                raise RuntimeError(
-                    f"{source}: {group_path}/{key} must be positive, got {int(val)}"
-                )
+                raise RuntimeError(f"{source}: {group_path}/{key} must be positive, got {int(val)}")
             timing[f"camera_ntp_{label}_{key}"] = val
         for key in _CAMERA_NTP_STR_KEYS:
             val = np.asarray(f[f"{group_path}/{key}"][()])
@@ -433,8 +427,9 @@ def _validate_target_batch(name: str, mats: np.ndarray, source: str | Path) -> N
             )
 
 
-def first_valid_frame(gripper_left: np.ndarray, gripper_right: np.ndarray,
-                      source: str | Path) -> int:
+def first_valid_frame(
+    gripper_left: np.ndarray, gripper_right: np.ndarray, source: str | Path
+) -> int:
     """First index where BOTH obs grippers are finite; leading NaNs are dropped.
 
     ``obs/gripper`` is NaN until the FC03 monitor's first reply. A NaN AFTER the
@@ -471,14 +466,18 @@ def load_action_targets_world(raw: h5py.File, t: int) -> tuple[dict[str, np.ndar
                 "updated wbc_vr_robot.py recorder (debug files are never a substitute)"
             )
     out: dict[str, np.ndarray] = {}
-    for name, key in (("left", "action/eef/left"), ("right", "action/eef/right"),
-                      ("head", "action/head")):
+    for name, key in (
+        ("left", "action/eef/left"),
+        ("right", "action/eef/right"),
+        ("head", "action/head"),
+    ):
         ds = raw[key]
         if ds.ndim != 3 or ds.shape[1:] != (4, 4):
             raise RuntimeError(f"{source}: {key} must be (T,4,4), got {ds.shape}")
         if not 0 <= t < ds.shape[0]:
-            raise RuntimeError(f"{source}: frame index {t} out of range for {key} "
-                               f"(T={ds.shape[0]})")
+            raise RuntimeError(
+                f"{source}: frame index {t} out of range for {key} " f"(T={ds.shape[0]})"
+            )
         mat = np.asarray(ds[t], dtype=np.float64)
         _validate_target_batch(key, mat[None], source)
         out[name] = mat
@@ -514,8 +513,10 @@ def compute_frame_state_action(
         return arr
 
     poses = fk.base_frame_poses(
-        at("obs/joint/torso"), at("obs/joint/left_arm"),
-        at("obs/joint/right_arm"), at("obs/joint/head"),
+        at("obs/joint/torso"),
+        at("obs/joint/left_arm"),
+        at("obs/joint/right_arm"),
+        at("obs/joint/head"),
     )
     base_pose = at("obs/base/pose")
     if base_pose.shape != (3,):
@@ -525,15 +526,18 @@ def compute_frame_state_action(
     grip_act_r = float(float(at("action/gripper/right")) >= GRIPPER_BINARY_THRESHOLD)
 
     state = build_state_vector(poses, base_pose, grip_obs_l, grip_obs_r, state_frame=state_frame)
-    action = np.concatenate([
-        mat_to_pos6d(action_eef["left"]), [grip_act_l],
-        mat_to_pos6d(action_eef["right"]), [grip_act_r],
-        mat_to_pos6d(action_head),
-    ]).astype(np.float32)
+    action = np.concatenate(
+        [
+            mat_to_pos6d(action_eef["left"]),
+            [grip_act_l],
+            mat_to_pos6d(action_eef["right"]),
+            [grip_act_r],
+            mat_to_pos6d(action_head),
+        ]
+    ).astype(np.float32)
     if action.shape != (len(ACTION_AXES),):
         raise RuntimeError(
-            f"{source}: frame {t} built action {action.shape}, "
-            f"expected ({len(ACTION_AXES)},)"
+            f"{source}: frame {t} built action {action.shape}, " f"expected ({len(ACTION_AXES)},)"
         )
     return state, action
 
@@ -559,8 +563,7 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
         }
         base_pose = read_required_array(f, "obs/base/pose", hdf5_path)
         gripper_obs = {
-            side: read_required_array(f, f"obs/gripper/{side}", hdf5_path,
-                                      check_finite=False)
+            side: read_required_array(f, f"obs/gripper/{side}", hdf5_path, check_finite=False)
             for side in ("left", "right")
         }
         gripper_act = {
@@ -574,17 +577,22 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
         timing = load_episode_timing(f, hdf5_path, rgb.shape[0])
 
     if rgb.ndim != 4 or rgb.shape[-1] != 3 or rgb.dtype != np.uint8:
-        raise RuntimeError(f"{hdf5_path}: expected (T,H,W,3) uint8 head RGB, got "
-                           f"{rgb.shape} {rgb.dtype}")
+        raise RuntimeError(
+            f"{hdf5_path}: expected (T,H,W,3) uint8 head RGB, got " f"{rgb.shape} {rgb.dtype}"
+        )
     if wrist_rgb.ndim != 4 or wrist_rgb.shape[-1] != 3 or wrist_rgb.dtype != np.uint8:
-        raise RuntimeError(f"{hdf5_path}: expected (T,H,W,3) uint8 wrist RGB, got "
-                           f"{wrist_rgb.shape} {wrist_rgb.dtype}")
+        raise RuntimeError(
+            f"{hdf5_path}: expected (T,H,W,3) uint8 wrist RGB, got "
+            f"{wrist_rgb.shape} {wrist_rgb.dtype}"
+        )
     if depth.ndim != 3 or depth.dtype != np.uint16:
-        raise RuntimeError(f"{hdf5_path}: expected (T,H,W) uint16 depth, got "
-                           f"{depth.shape} {depth.dtype}")
+        raise RuntimeError(
+            f"{hdf5_path}: expected (T,H,W) uint16 depth, got " f"{depth.shape} {depth.dtype}"
+        )
     if depth.shape[1:] != rgb.shape[1:3]:
-        raise RuntimeError(f"{hdf5_path}: depth/rgb spatial mismatch: "
-                           f"{depth.shape[1:]} vs {rgb.shape[1:3]}")
+        raise RuntimeError(
+            f"{hdf5_path}: depth/rgb spatial mismatch: " f"{depth.shape[1:]} vs {rgb.shape[1:3]}"
+        )
     # This recorder stores the head intrinsic ONCE (static (3,3)), not per frame.
     if intrinsic.shape != (3, 3):
         raise RuntimeError(
@@ -594,9 +602,12 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
 
     frame_count = rgb.shape[0]
     checks: list[tuple[str, np.ndarray]] = [
-        ("obs/images/left_wrist_rgb", wrist_rgb), ("obs/images/head_depth", depth),
-        ("obs/base/pose", base_pose), ("timestamp_ns", timestamp_ns),
-        ("action/eef/left", eef_left), ("action/eef/right", eef_right),
+        ("obs/images/left_wrist_rgb", wrist_rgb),
+        ("obs/images/head_depth", depth),
+        ("obs/base/pose", base_pose),
+        ("timestamp_ns", timestamp_ns),
+        ("action/eef/left", eef_left),
+        ("action/eef/right", eef_right),
         ("action/head", head_target),
     ]
     checks += [(f"obs/joint/{g}", a) for g, a in joints_obs.items()]
@@ -611,12 +622,16 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
     expected_joint_dims = {"torso": 3, "left_arm": 7, "right_arm": 7, "head": 3}
     for grp, dim in expected_joint_dims.items():
         if joints_obs[grp].ndim != 2 or joints_obs[grp].shape[1] != dim:
-            raise RuntimeError(f"{hdf5_path}: obs/joint/{grp} must be (T,{dim}), got "
-                               f"{joints_obs[grp].shape}")
+            raise RuntimeError(
+                f"{hdf5_path}: obs/joint/{grp} must be (T,{dim}), got " f"{joints_obs[grp].shape}"
+            )
     if base_pose.ndim != 2 or base_pose.shape[1] != 3:
         raise RuntimeError(f"{hdf5_path}: obs/base/pose must be (T,3), got {base_pose.shape}")
-    for name, arr in (("action/eef/left", eef_left), ("action/eef/right", eef_right),
-                      ("action/head", head_target)):
+    for name, arr in (
+        ("action/eef/left", eef_left),
+        ("action/eef/right", eef_right),
+        ("action/head", head_target),
+    ):
         _validate_target_batch(name, arr, hdf5_path)
 
     # Record cadence: the recorder throttles to --record-rate (= dataset fps), but
@@ -634,18 +649,27 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
             )
         gaps = int(np.sum(dt > 1.5 / fps))
         if gaps:
-            logging.warning("%s: %d hold gap(s) > %.0f ms in the 10 Hz stream",
-                            hdf5_path.name, gaps, 1500.0 / fps)
+            logging.warning(
+                "%s: %d hold gap(s) > %.0f ms in the 10 Hz stream",
+                hdf5_path.name,
+                gaps,
+                1500.0 / fps,
+            )
 
     t0 = first_valid_frame(gripper_obs["left"], gripper_obs["right"], hdf5_path)
     if t0 > 0:
-        logging.info("%s: dropping %d leading frame(s) with NaN obs/gripper",
-                     hdf5_path.name, t0)
+        logging.info("%s: dropping %d leading frame(s) with NaN obs/gripper", hdf5_path.name, t0)
 
     return {
-        "rgb": rgb, "wrist_rgb": wrist_rgb, "depth": depth, "intrinsic": intrinsic,
-        "base_pose": base_pose, "frame_count": frame_count, "t0": t0,
-        "timestamp_ns": ts, "timing": timing,
+        "rgb": rgb,
+        "wrist_rgb": wrist_rgb,
+        "depth": depth,
+        "intrinsic": intrinsic,
+        "base_pose": base_pose,
+        "frame_count": frame_count,
+        "t0": t0,
+        "timestamp_ns": ts,
+        "timing": timing,
     }
 
 
@@ -681,8 +705,9 @@ def env_state_axes(object_nums: int) -> list[str]:
     """
     n_stages, rem = divmod(object_nums, len(STAGE_ROLES))
     if rem == 0:
-        return [f"s{s + 1}_{role}_{a}"
-                for s in range(n_stages) for role in STAGE_ROLES for a in "xyz"]
+        return [
+            f"s{s + 1}_{role}_{a}" for s in range(n_stages) for role in STAGE_ROLES for a in "xyz"
+        ]
     return [f"obj{i}_{a}" for i in range(object_nums) for a in "xyz"]
 
 
@@ -691,8 +716,9 @@ def build_env_state_vector(positions: np.ndarray, order: list[int]) -> np.ndarra
     return positions[order].reshape(-1).astype(np.float32)
 
 
-def load_episode_positions(positions_dir: Path, source: str, raw_index: int,
-                           object_nums: int) -> np.ndarray:
+def load_episode_positions(
+    positions_dir: Path, source: str, raw_index: int, object_nums: int
+) -> np.ndarray:
     """``<positions-dir>/<source>/episode_<N>.npz`` -> ARRANGED env-state (object_nums*3,).
 
     Keyed by ``(source, raw_index)`` -- the source subdir ({raw, recovery}) disambiguates a
@@ -735,8 +761,9 @@ def load_episode_positions(positions_dir: Path, source: str, raw_index: int,
     return vector
 
 
-def validate_all_episode_positions(positions_dir: Path, work: list[dict],
-                                   object_nums: int) -> dict[tuple[str, int], np.ndarray]:
+def validate_all_episode_positions(
+    positions_dir: Path, work: list[dict], object_nums: int
+) -> dict[tuple[str, int], np.ndarray]:
     """Load + validate EVERY work item's env-state up front; fail before any dataset write.
 
     Returns ``{(source, raw_index): env_state_vector}``. Aggregates ALL per-episode failures
@@ -748,13 +775,15 @@ def validate_all_episode_positions(positions_dir: Path, work: list[dict],
         key = (item["source"], item["raw_index"])
         try:
             env_state_by_key[key] = load_episode_positions(
-                positions_dir, item["source"], item["raw_index"], object_nums)
+                positions_dir, item["source"], item["raw_index"], object_nums
+            )
         except Exception as exc:
             failures.append(f"- {item['source']}/episode_{item['raw_index']}: {exc}")
     if failures:
         raise RuntimeError(
             "Changed-object position validation failed; no dataset was written:\n"
-            + "\n".join(failures))
+            + "\n".join(failures)
+        )
     return env_state_by_key
 
 
@@ -814,20 +843,31 @@ def timing_sidecar_arrays(ep: dict, start: int, end: int) -> dict[str, np.ndarra
     return arrays
 
 
-def _scaled_intrinsic(intrinsic: np.ndarray, raw_hw: tuple[int, int],
-                      out_hw: tuple[int, int]) -> np.ndarray:
+def _scaled_intrinsic(
+    intrinsic: np.ndarray, raw_hw: tuple[int, int], out_hw: tuple[int, int]
+) -> np.ndarray:
     """Static (3,3) intrinsic rescaled from the raw frame size to the output size."""
     k = np.asarray(intrinsic, dtype=np.float32).copy()
-    k[0, :] *= out_hw[1] / raw_hw[1]   # fx, 0, cx scale with width
-    k[1, :] *= out_hw[0] / raw_hw[0]   # 0, fy, cy scale with height
+    k[0, :] *= out_hw[1] / raw_hw[1]  # fx, 0, cx scale with width
+    k[1, :] *= out_hw[0] / raw_hw[0]  # 0, fy, cy scale with height
     return k
 
 
-def add_episode(dataset, hdf5_path: Path, fk: WBCPolicyFK, resize_h: int,
-                resize_w: int, task: str, variant_root: Path, episode_idx: int,
-                fps: int, state_frame: str = "base",
-                *, trim: tuple[int, int] | None = None,
-                env_state_vec: np.ndarray | None = None) -> tuple[int, int]:
+def add_episode(
+    dataset,
+    hdf5_path: Path,
+    fk: WBCPolicyFK,
+    resize_h: int,
+    resize_w: int,
+    task: str,
+    variant_root: Path,
+    episode_idx: int,
+    fps: int,
+    state_frame: str = "base",
+    *,
+    trim: tuple[int, int] | None = None,
+    env_state_vec: np.ndarray | None = None,
+) -> tuple[int, int]:
     """Port one raw episode; returns ``(num_frames_before, num_frames_after)``.
 
     ``num_frames_before`` is the raw take length; ``num_frames_after`` is the number
@@ -869,13 +909,14 @@ def add_episode(dataset, hdf5_path: Path, fk: WBCPolicyFK, resize_h: int,
             base_extrinsic[i] = base_t_zed.astype(np.float32)
             extrinsic[i] = world_t_zed.astype(np.float32)
 
-            rgb_resized = cv2.resize(rgb[t], (resize_w, resize_h),
-                                     interpolation=cv2.INTER_AREA)
-            wrist_resized = cv2.resize(wrist_rgb[t], (resize_w, resize_h),
-                                       interpolation=cv2.INTER_AREA)
+            rgb_resized = cv2.resize(rgb[t], (resize_w, resize_h), interpolation=cv2.INTER_AREA)
+            wrist_resized = cv2.resize(
+                wrist_rgb[t], (resize_w, resize_h), interpolation=cv2.INTER_AREA
+            )
             # INTER_NEAREST keeps uint16 millimeter depth exact across edges.
-            depth_resized[i] = cv2.resize(depth[t], (resize_w, resize_h),
-                                          interpolation=cv2.INTER_NEAREST)
+            depth_resized[i] = cv2.resize(
+                depth[t], (resize_w, resize_h), interpolation=cv2.INTER_NEAREST
+            )
 
             frame = {
                 "observation.images.head_rgb": rgb_resized,
@@ -894,9 +935,7 @@ def add_episode(dataset, hdf5_path: Path, fk: WBCPolicyFK, resize_h: int,
     depth_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(depth_path, depth=depth_resized)
 
-    intrinsic_resized = _scaled_intrinsic(
-        ep["intrinsic"], rgb.shape[1:3], (resize_h, resize_w)
-    )
+    intrinsic_resized = _scaled_intrinsic(ep["intrinsic"], rgb.shape[1:3], (resize_h, resize_w))
     calib_path = _sidecar_path(variant_root, "calib", episode_idx)
     calib_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -910,9 +949,17 @@ def add_episode(dataset, hdf5_path: Path, fk: WBCPolicyFK, resize_h: int,
     timing_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(timing_path, **timing_sidecar_arrays(ep, start, end))
 
-    logging.info("Ported %s: %d frames [%d,%d) of %d, sidecars %s / %s / %s",
-                 hdf5_path.name, kept, start, end, frame_count,
-                 depth_path.name, calib_path.name, timing_path.name)
+    logging.info(
+        "Ported %s: %d frames [%d,%d) of %d, sidecars %s / %s / %s",
+        hdf5_path.name,
+        kept,
+        start,
+        end,
+        frame_count,
+        depth_path.name,
+        calib_path.name,
+        timing_path.name,
+    )
     return frame_count, kept
 
 
@@ -952,8 +999,7 @@ def build_work_list(raw_dir: Path, include_recovery_data: Path | None) -> list[d
         )
     for p in recovery_files:
         idx = episode_index_from_path(p)
-        work.append({"source": "recovery", "path": p, "raw_index": idx,
-                     "trim": trim_spec[idx]})
+        work.append({"source": "recovery", "path": p, "raw_index": idx, "trim": trim_spec[idx]})
     return work
 
 
@@ -1019,8 +1065,11 @@ def parse_split_csv(split_csv: Path) -> dict[tuple[str, int], str]:
     return spec
 
 
-def assign_splits(work: list[dict], split_map: Mapping[tuple[str, int], str],
-                  include_recovery_data: Path | None = None) -> dict[str, list[dict]]:
+def assign_splits(
+    work: list[dict],
+    split_map: Mapping[tuple[str, int], str],
+    include_recovery_data: Path | None = None,
+) -> dict[str, list[dict]]:
     """Partition the ordered work list into ``{split: [items...]}`` per ``split_map``.
 
     Items not named in ``split_map`` go to :data:`DEFAULT_SPLIT` (``"train"``). Within
@@ -1032,8 +1081,11 @@ def assign_splits(work: list[dict], split_map: Mapping[tuple[str, int], str],
     unknown = sorted(set(split_map) - keys)
     if unknown:
         refs = ", ".join(f"recovery/{i}" if s == "recovery" else str(i) for s, i in unknown)
-        hint = ("" if include_recovery_data is not None
-                else " (recovery episodes require --include_recovery_data)")
+        hint = (
+            ""
+            if include_recovery_data is not None
+            else " (recovery episodes require --include_recovery_data)"
+        )
         raise RuntimeError(f"split csv references episodes not in the port plan: {refs}{hint}")
     buckets: dict[str, list[dict]] = {s: [] for s in ALL_SPLITS}
     for w in work:
@@ -1053,23 +1105,47 @@ def write_log_index(log_index_path: Path, rows: list[dict]) -> None:
     log_index_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_index_path, "w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["split", "source", "raw_data_index", "processed_data_index",
-                         "num_frames_before", "num_frames_after"])
+        writer.writerow(
+            [
+                "split",
+                "source",
+                "raw_data_index",
+                "processed_data_index",
+                "num_frames_before",
+                "num_frames_after",
+            ]
+        )
         for r in rows:
-            writer.writerow([r["split"], r["source"], r["raw_index"], r["processed_index"],
-                             r["num_before"], r["num_after"]])
+            writer.writerow(
+                [
+                    r["split"],
+                    r["source"],
+                    r["raw_index"],
+                    r["processed_index"],
+                    r["num_before"],
+                    r["num_after"],
+                ]
+            )
     logging.info("Wrote index log %s (%d episode(s))", log_index_path, len(rows))
 
 
-def _write_meta(variant_root: Path, split: str, state_frame: str, fps: int,
-                resize_h: int, resize_w: int, task: str,
-                object_nums: int | None = None) -> None:
+def _write_meta(
+    variant_root: Path,
+    split: str,
+    state_frame: str,
+    fps: int,
+    resize_h: int,
+    resize_w: int,
+    task: str,
+    object_nums: int | None = None,
+) -> None:
     """Write the ``dexmate_meta.json`` sidecar describing this split's schema."""
     relative_ready = state_frame == "world"
     meta = {
         "schema": "wbc_eef_head_v1",
         "split": split,
-        "state_axes": list(STATE_AXES), "action_axes": list(ACTION_AXES),
+        "state_axes": list(STATE_AXES),
+        "action_axes": list(ACTION_AXES),
         # "base": egocentric achieved FK (absolute-action default). "world": composed
         # to engage-origin world so state shares the action frame -- for use_relative_actions.
         "state_frame": state_frame,
@@ -1078,14 +1154,16 @@ def _write_meta(variant_root: Path, split: str, state_frame: str, fps: int,
         # (LeRobot's relative step subtracts observation.state[:29] from the world action).
         "relative_actions_ready": relative_ready,
         "relative_exclude_dims": RELATIVE_EXCLUDE_DIMS if relative_ready else None,
-        # 6-D rotation dims ride raw under QUANTILES normalization (README step 3).
         "skip_normalization_dims": SKIP_NORMALIZATION_DIMS,
-        "fps": fps, "resize_h": resize_h, "resize_w": resize_w,
-        "task": task, "robot_type": ROBOT_TYPE,
+        "fps": fps,
+        "resize_h": resize_h,
+        "resize_w": resize_w,
+        "task": task,
+        "robot_type": ROBOT_TYPE,
         "gripper_binary_threshold": GRIPPER_BINARY_THRESHOLD,
     }
-    # Constant ENV-state conditioning (only when --positions-dir was used). The env-state
-    # is world-frame and per-episode CONSTANT, so the train command normalizes it MIN_MAX.
+    # Constant ENV-state conditioning (only when --positions-dir was used).
+    # Env-state is world-frame and per-episode CONSTANT.
     if object_nums is not None:
         meta["env_state_key"] = OBS_ENV_STATE_KEY
         meta["object_nums"] = object_nums
@@ -1094,9 +1172,18 @@ def _write_meta(variant_root: Path, split: str, state_frame: str, fps: int,
     (variant_root / "dexmate_meta.json").write_text(json.dumps(meta, indent=2))
 
 
-def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: int,
-           fps: int, state_frame: str, variant_root: Path, split: str,
-           env_state_vec: np.ndarray | None = None) -> None:
+def verify(
+    dataset,
+    first_item: dict,
+    fk: WBCPolicyFK,
+    resize_h: int,
+    resize_w: int,
+    fps: int,
+    state_frame: str,
+    variant_root: Path,
+    split: str,
+    env_state_vec: np.ndarray | None = None,
+) -> None:
     """Re-open a written split dataset and cross-check frame 0 against a fresh build.
 
     Confirms ``observation.state``/``action`` for the split's first episode first kept
@@ -1106,12 +1193,22 @@ def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: 
     only the real conversion calls it (the dexmate-only unit tests never do).
     """
     meta = dataset.meta
-    logging.info("verify[%s]: fps=%s episodes=%s frames=%s robot=%s", split,
-                 meta.fps, meta.total_episodes, meta.total_frames, meta.robot_type)
+    logging.info(
+        "verify[%s]: fps=%s episodes=%s frames=%s robot=%s",
+        split,
+        meta.fps,
+        meta.total_episodes,
+        meta.total_frames,
+        meta.robot_type,
+    )
 
-    for forbidden in ("observation.images.head_depth", "observation.images.depth",
-                      "observation.extrinsic", "observation.intrinsic",
-                      "observation.base_extrinsic"):
+    for forbidden in (
+        "observation.images.head_depth",
+        "observation.images.depth",
+        "observation.extrinsic",
+        "observation.intrinsic",
+        "observation.base_extrinsic",
+    ):
         if forbidden in meta.features:
             raise RuntimeError(
                 f"verify[{split}]: {forbidden} must NOT be a dataset feature -- it belongs "
@@ -1124,8 +1221,10 @@ def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: 
     action = item["action"].cpu().numpy()
     for cam_key, cam in (("head_rgb", head_rgb), ("wrist_rgb", wrist_rgb)):
         if tuple(cam.shape) != (3, resize_h, resize_w):
-            raise RuntimeError(f"verify[{split}]: {cam_key} shape {tuple(cam.shape)} != "
-                               f"(3, {resize_h}, {resize_w})")
+            raise RuntimeError(
+                f"verify[{split}]: {cam_key} shape {tuple(cam.shape)} != "
+                f"(3, {resize_h}, {resize_w})"
+            )
     if state.shape != (len(STATE_AXES),):
         raise RuntimeError(f"verify[{split}]: state shape {state.shape} != ({len(STATE_AXES)},)")
     if action.shape != (len(ACTION_AXES),):
@@ -1137,26 +1236,31 @@ def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: 
     if env_state_vec is not None:
         if OBS_ENV_STATE_KEY not in meta.features:
             raise RuntimeError(
-                f"verify[{split}]: {OBS_ENV_STATE_KEY} missing though positions were requested")
+                f"verify[{split}]: {OBS_ENV_STATE_KEY} missing though positions were requested"
+            )
         env_item = item[OBS_ENV_STATE_KEY].cpu().numpy()
         if env_item.shape != env_state_vec.shape:
             raise RuntimeError(
-                f"verify[{split}]: env_state shape {env_item.shape} != {env_state_vec.shape}")
+                f"verify[{split}]: env_state shape {env_item.shape} != {env_state_vec.shape}"
+            )
         if not np.allclose(env_item, env_state_vec, atol=1e-5):
             raise RuntimeError(f"verify[{split}]: stored env_state[0] != loaded positions vector")
     elif OBS_ENV_STATE_KEY in meta.features:
         raise RuntimeError(
-            f"verify[{split}]: {OBS_ENV_STATE_KEY} present but positions were not requested")
+            f"verify[{split}]: {OBS_ENV_STATE_KEY} present but positions were not requested"
+        )
 
     # Recompute the first stored frame independently (same FK) and pull the raw verbatim
     # targets to confirm the action is a straight copy (no base composition).
     ep = load_and_validate_episode(first_item["path"], fps)
-    start, end = _resolve_window(ep["frame_count"], ep["t0"], first_item["trim"],
-                                 first_item["path"])
+    start, end = _resolve_window(
+        ep["frame_count"], ep["t0"], first_item["trim"], first_item["path"]
+    )
     with h5py.File(first_item["path"], "r") as raw:
         action_eef, action_head = load_action_targets_world(raw, start)
         exp_state, exp_action = compute_frame_state_action(
-            raw, start, fk, action_eef, action_head, state_frame=state_frame)
+            raw, start, fk, action_eef, action_head, state_frame=state_frame
+        )
         raw_left = mat_to_pos6d(np.asarray(raw["action/eef/left"][start], dtype=np.float64))
         raw_head = mat_to_pos6d(np.asarray(raw["action/head"][start], dtype=np.float64))
         raw_base = np.asarray(raw["obs/base/pose"][start], dtype=np.float64)
@@ -1173,8 +1277,10 @@ def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: 
         raise RuntimeError(f"verify[{split}]: state base dims != obs/base/pose[{start}]")
     for idx in GRIPPER_DIMS:
         if float(action[idx]) not in (0.0, 1.0):
-            raise RuntimeError(f"verify[{split}]: action gripper dim {idx} is not binary "
-                               f"({float(action[idx])})")
+            raise RuntimeError(
+                f"verify[{split}]: action gripper dim {idx} is not binary "
+                f"({float(action[idx])})"
+            )
 
     # Depth sidecar roundtrip (episode 0, frame 0 == the window start).
     depth_path = _sidecar_path(variant_root, "depth", 0)
@@ -1183,8 +1289,10 @@ def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: 
     with np.load(depth_path) as data:
         depth_stack = data["depth"]
     if depth_stack.dtype != np.uint16 or depth_stack.shape[1:] != (resize_h, resize_w):
-        raise RuntimeError(f"verify[{split}]: depth sidecar {depth_stack.dtype} "
-                           f"{depth_stack.shape[1:]} != uint16 ({resize_h}, {resize_w})")
+        raise RuntimeError(
+            f"verify[{split}]: depth sidecar {depth_stack.dtype} "
+            f"{depth_stack.shape[1:]} != uint16 ({resize_h}, {resize_w})"
+        )
     expected_depth = cv2.resize(depth_start, (resize_w, resize_h), interpolation=cv2.INTER_NEAREST)
     if not np.array_equal(depth_stack[0], expected_depth):
         raise RuntimeError(f"verify[{split}]: depth sidecar[0] roundtrip mismatch")
@@ -1195,13 +1303,20 @@ def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: 
         raise RuntimeError(f"verify[{split}]: calib sidecar missing: {calib_path}")
     with np.load(calib_path) as data:
         extrinsic_sc, base_extrinsic_sc, intrinsic_sc = (
-            data["extrinsic"], data["base_extrinsic"], data["intrinsic"])
+            data["extrinsic"],
+            data["base_extrinsic"],
+            data["intrinsic"],
+        )
     if extrinsic_sc.shape[1:] != (4, 4) or base_extrinsic_sc.shape[1:] != (4, 4):
-        raise RuntimeError(f"verify[{split}]: calib extrinsics not (T,4,4): "
-                           f"{extrinsic_sc.shape}, {base_extrinsic_sc.shape}")
+        raise RuntimeError(
+            f"verify[{split}]: calib extrinsics not (T,4,4): "
+            f"{extrinsic_sc.shape}, {base_extrinsic_sc.shape}"
+        )
     if intrinsic_sc.shape[1:] != (3, 3):
         raise RuntimeError(f"verify[{split}]: calib intrinsic not (T,3,3): {intrinsic_sc.shape}")
-    expected_intrinsic = _scaled_intrinsic(ep["intrinsic"], ep["rgb"].shape[1:3], (resize_h, resize_w))
+    expected_intrinsic = _scaled_intrinsic(
+        ep["intrinsic"], ep["rgb"].shape[1:3], (resize_h, resize_w)
+    )
     if not np.allclose(intrinsic_sc[0], expected_intrinsic, atol=1e-4):
         raise RuntimeError(f"verify[{split}]: calib intrinsic[0] != rescaled static intrinsic")
 
@@ -1224,20 +1339,36 @@ def verify(dataset, first_item: dict, fk: WBCPolicyFK, resize_h: int, resize_w: 
 
     logging.info(
         "verify[%s] OK: head_rgb=%s wrist_rgb=%s state=%s action=%s depth=%s "
-        "calib=extrinsic%s+base%s+intrinsic%s timing=%s", split,
-        tuple(head_rgb.shape), tuple(wrist_rgb.shape), tuple(state.shape), tuple(action.shape),
-        tuple(depth_stack.shape), tuple(extrinsic_sc.shape), tuple(base_extrinsic_sc.shape),
-        tuple(intrinsic_sc.shape), sorted(timing_keys),
+        "calib=extrinsic%s+base%s+intrinsic%s timing=%s",
+        split,
+        tuple(head_rgb.shape),
+        tuple(wrist_rgb.shape),
+        tuple(state.shape),
+        tuple(action.shape),
+        tuple(depth_stack.shape),
+        tuple(extrinsic_sc.shape),
+        tuple(base_extrinsic_sc.shape),
+        tuple(intrinsic_sc.shape),
+        sorted(timing_keys),
     )
 
 
-def convert_dataset(raw_dir: Path, repo_id: str, fps: int, resize_h: int,
-                    resize_w: int, task: str, root: Path, overwrite: bool,
-                    state_frame: str = "base", include_recovery_data: Path | None = None,
-                    log_index: Path | None = None,
-                    split_map: Mapping[tuple[str, int], str] | None = None,
-                    positions_dir: Path | None = None,
-                    object_nums: int = DEFAULT_OBJECT_NUMS) -> dict:
+def convert_dataset(
+    raw_dir: Path,
+    repo_id: str,
+    fps: int,
+    resize_h: int,
+    resize_w: int,
+    task: str,
+    root: Path,
+    overwrite: bool,
+    state_frame: str = "base",
+    include_recovery_data: Path | None = None,
+    log_index: Path | None = None,
+    split_map: Mapping[tuple[str, int], str] | None = None,
+    positions_dir: Path | None = None,
+    object_nums: int = DEFAULT_OBJECT_NUMS,
+) -> dict:
     """Full conversion (needs lerobot + tqdm -- run in the dexmate_lerobot env).
 
     Splits the episodes per ``split_map`` (from split.csv) into
@@ -1250,16 +1381,19 @@ def convert_dataset(raw_dir: Path, repo_id: str, fps: int, resize_h: int,
     ``<positions_dir>/<source>/episode_<N>.npz`` -- pre-validated for ALL episodes before
     any dataset is created/overwritten (fail fast, keyed by ``(source, raw_index)``).
     """
-    from lerobot.datasets import LeRobotDataset, recompute_stats  # noqa: PLC0415
-    from tqdm import tqdm  # noqa: PLC0415
+    from lerobot.datasets import LeRobotDataset, recompute_stats
+    from tqdm import tqdm
 
     work = build_work_list(raw_dir, include_recovery_data)
     splits = assign_splits(work, split_map or {}, include_recovery_data)
     n_recovery = sum(item["source"] == "recovery" for item in work)
     logging.info(
         "Port plan: %d episode(s) = %d raw + %d recovery -> splits {%s} (state_frame=%s)",
-        len(work), len(work) - n_recovery, n_recovery,
-        ", ".join(f"{s}:{len(v)}" for s, v in splits.items()), state_frame,
+        len(work),
+        len(work) - n_recovery,
+        n_recovery,
+        ", ".join(f"{s}:{len(v)}" for s, v in splits.items()),
+        state_frame,
     )
 
     # ENV-state conditioning: validate EVERY episode's positions npz UP FRONT, before the
@@ -1268,8 +1402,13 @@ def convert_dataset(raw_dir: Path, repo_id: str, fps: int, resize_h: int,
     env_state_by_key: dict[tuple[str, int], np.ndarray] = {}
     if positions_dir is not None:
         env_state_by_key = validate_all_episode_positions(positions_dir, work, object_nums)
-        logging.info("ENV-state conditioning ON: object_nums=%d, loaded positions for %d "
-                     "episode(s) from %s", object_nums, len(env_state_by_key), positions_dir)
+        logging.info(
+            "ENV-state conditioning ON: object_nums=%d, loaded positions for %d "
+            "episode(s) from %s",
+            object_nums,
+            len(env_state_by_key),
+            positions_dir,
+        )
 
     # Fail fast on pre-existing split dirs BEFORE any heavy work / partial writes.
     variant_roots = {s: Path(root) / s / repo_id for s in splits}
@@ -1288,97 +1427,176 @@ def convert_dataset(raw_dir: Path, repo_id: str, fps: int, resize_h: int,
         for split, items in splits.items():
             variant_root = variant_roots[split]
             dataset = LeRobotDataset.create(
-                repo_id=repo_id, fps=fps,
+                repo_id=repo_id,
+                fps=fps,
                 features=build_features(
-                    resize_h, resize_w,
-                    object_nums if positions_dir is not None else None),
-                root=variant_root, robot_type=ROBOT_TYPE, use_videos=True,
+                    resize_h, resize_w, object_nums if positions_dir is not None else None
+                ),
+                root=variant_root,
+                robot_type=ROBOT_TYPE,
+                use_videos=True,
             )
             split_total = 0
             for processed_idx, item in enumerate(items):
-                env_vec = (env_state_by_key[(item["source"], item["raw_index"])]
-                           if positions_dir is not None else None)
+                env_vec = (
+                    env_state_by_key[(item["source"], item["raw_index"])]
+                    if positions_dir is not None
+                    else None
+                )
                 num_before, num_after = add_episode(
-                    dataset, item["path"], fk, resize_h, resize_w, task,
-                    variant_root=variant_root, episode_idx=processed_idx, fps=fps,
-                    state_frame=state_frame, trim=item["trim"], env_state_vec=env_vec)
+                    dataset,
+                    item["path"],
+                    fk,
+                    resize_h,
+                    resize_w,
+                    task,
+                    variant_root=variant_root,
+                    episode_idx=processed_idx,
+                    fps=fps,
+                    state_frame=state_frame,
+                    trim=item["trim"],
+                    env_state_vec=env_vec,
+                )
                 split_total += num_after
-                log_rows.append({"split": split, "source": item["source"],
-                                 "raw_index": item["raw_index"], "processed_index": processed_idx,
-                                 "num_before": num_before, "num_after": num_after})
+                log_rows.append(
+                    {
+                        "split": split,
+                        "source": item["source"],
+                        "raw_index": item["raw_index"],
+                        "processed_index": processed_idx,
+                        "num_before": num_before,
+                        "num_after": num_after,
+                    }
+                )
                 pbar.update(1)
             dataset.finalize()
             dataset = recompute_stats(dataset, skip_image_video=True)
-            _write_meta(variant_root, split, state_frame, fps, resize_h, resize_w, task,
-                        object_nums=object_nums if positions_dir is not None else None)
+            _write_meta(
+                variant_root,
+                split,
+                state_frame,
+                fps,
+                resize_h,
+                resize_w,
+                task,
+                object_nums=object_nums if positions_dir is not None else None,
+            )
             first = items[0]
-            first_env = (env_state_by_key[(first["source"], first["raw_index"])]
-                         if positions_dir is not None else None)
-            verify(dataset, first, fk, resize_h, resize_w, fps, state_frame,
-                   variant_root, split, env_state_vec=first_env)
+            first_env = (
+                env_state_by_key[(first["source"], first["raw_index"])]
+                if positions_dir is not None
+                else None
+            )
+            verify(
+                dataset,
+                first,
+                fk,
+                resize_h,
+                resize_w,
+                fps,
+                state_frame,
+                variant_root,
+                split,
+                env_state_vec=first_env,
+            )
             datasets[split] = dataset
             grand_total += split_total
-            logging.info("Split %s finalized: %d episode(s), %d frames", split,
-                         len(items), split_total)
+            logging.info(
+                "Split %s finalized: %d episode(s), %d frames", split, len(items), split_total
+            )
 
-    logging.info("Done: %d split(s), %d episode(s), %d frames total",
-                 len(splits), len(work), grand_total)
+    logging.info(
+        "Done: %d split(s), %d episode(s), %d frames total", len(splits), len(work), grand_total
+    )
     if log_index is not None:
         write_log_index(log_index, log_rows)
     return datasets
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--raw-dir", type=Path, default=DEFAULT_RAW_DIR)
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--fps", type=int, default=DEFAULT_FPS)
     parser.add_argument("--resize-h", type=int, default=DEFAULT_RESIZE_H)
     parser.add_argument("--resize-w", type=int, default=DEFAULT_RESIZE_W)
     parser.add_argument("--task", type=str, default=DEFAULT_TASK)
-    parser.add_argument("--repo-id", type=str, default=None,
-                        help=f"dataset repo-id (default {DEFAULT_REPO_ID}, or "
-                             f"{DEFAULT_REPO_ID}_rel with --relative-actions).")
-    parser.add_argument("--relative-actions", action="store_true",
-                        help="emit observation.state EEF/head in the WORLD frame "
-                             "(composed via obs/base/pose) so the dataset supports "
-                             "use_relative_actions=true training (LeRobot subtracts "
-                             "observation.state[:29] from the world action). Default: "
-                             "base-frame state (absolute-action, egocentric).")
-    parser.add_argument("--include-recovery-data", "--include_recovery_data",
-                        dest="include_recovery_data", type=Path, default=None,
-                        help="directory of extra recovery episode_<N>.hdf5 takes to "
-                             "APPEND after the raw episodes. Requires <dir>/trim.csv "
-                             "('episode, frame_start, frame_end' rows; ABSOLUTE INCLUSIVE "
-                             "raw-frame indices, frame_end=-1 -> last frame). Every "
-                             "recovery file must have exactly one trim row and vice-versa. "
-                             "The recovery dir is only read, never modified.")
-    parser.add_argument("--log-index", "--log_index", dest="log_index", type=Path,
-                        default=None,
-                        help="write a CSV mapping raw episode index -> processed dataset "
-                             "index (columns: split, source, raw_data_index, "
-                             "processed_data_index, num_frames_before, num_frames_after).")
-    parser.add_argument("--split-csv", "--split_csv", dest="split_csv", type=Path,
-                        default=None,
-                        help="CSV assigning episodes to train/val/test (default "
-                             "<raw-dir>/split.csv). Rows 'episode, split' where episode is "
-                             "'<N>' (raw) or 'recovery/<N>'; unlisted episodes -> train. Each "
-                             "split is written to <root>/<split>/<repo_id>/. If the DEFAULT "
-                             "file is absent all episodes -> train; an explicitly-passed "
-                             "missing file errors.")
-    parser.add_argument("--positions-dir", "--positions_dir", dest="positions_dir",
-                        type=Path, default=None,
-                        help="enable ENV-state conditioning: root of the SceneDiff positions "
-                             "with <source>/episode_<N>.npz (source in {raw, recovery}), e.g. "
-                             "~/Dexmate/data/scene_diff/positions. Each ported episode gets a "
-                             "CONSTANT observation.environment_state (object_nums*3,) of the "
-                             "arranged object WORLD positions. Every ported episode must have "
-                             "its npz (validated up front); off by default.")
-    parser.add_argument("--object_nums", "--object-nums", dest="object_nums", type=int,
-                        default=DEFAULT_OBJECT_NUMS,
-                        help=f"number of conditioned objects; env-state dim = object_nums*3 "
-                             f"(default {DEFAULT_OBJECT_NUMS}). Only used with --positions-dir.")
+    parser.add_argument(
+        "--repo-id",
+        type=str,
+        default=None,
+        help=f"dataset repo-id (default {DEFAULT_REPO_ID}, or "
+        f"{DEFAULT_REPO_ID}_rel with --relative-actions).",
+    )
+    parser.add_argument(
+        "--relative-actions",
+        action="store_true",
+        help="emit observation.state EEF/head in the WORLD frame "
+        "(composed via obs/base/pose) so the dataset supports "
+        "use_relative_actions=true training (LeRobot subtracts "
+        "observation.state[:29] from the world action). Default: "
+        "base-frame state (absolute-action, egocentric).",
+    )
+    parser.add_argument(
+        "--include-recovery-data",
+        "--include_recovery_data",
+        dest="include_recovery_data",
+        type=Path,
+        default=None,
+        help="directory of extra recovery episode_<N>.hdf5 takes to "
+        "APPEND after the raw episodes. Requires <dir>/trim.csv "
+        "('episode, frame_start, frame_end' rows; ABSOLUTE INCLUSIVE "
+        "raw-frame indices, frame_end=-1 -> last frame). Every "
+        "recovery file must have exactly one trim row and vice-versa. "
+        "The recovery dir is only read, never modified.",
+    )
+    parser.add_argument(
+        "--log-index",
+        "--log_index",
+        dest="log_index",
+        type=Path,
+        default=None,
+        help="write a CSV mapping raw episode index -> processed dataset "
+        "index (columns: split, source, raw_data_index, "
+        "processed_data_index, num_frames_before, num_frames_after).",
+    )
+    parser.add_argument(
+        "--split-csv",
+        "--split_csv",
+        dest="split_csv",
+        type=Path,
+        default=None,
+        help="CSV assigning episodes to train/val/test (default "
+        "<raw-dir>/split.csv). Rows 'episode, split' where episode is "
+        "'<N>' (raw) or 'recovery/<N>'; unlisted episodes -> train. Each "
+        "split is written to <root>/<split>/<repo_id>/. If the DEFAULT "
+        "file is absent all episodes -> train; an explicitly-passed "
+        "missing file errors.",
+    )
+    parser.add_argument(
+        "--positions-dir",
+        "--positions_dir",
+        dest="positions_dir",
+        type=Path,
+        default=None,
+        help="enable ENV-state conditioning: root of the SceneDiff positions "
+        "with <source>/episode_<N>.npz (source in {raw, recovery}), e.g. "
+        "~/Dexmate/data/scene_diff/positions. Each ported episode gets a "
+        "CONSTANT observation.environment_state (object_nums*3,) of the "
+        "arranged object WORLD positions. Every ported episode must have "
+        "its npz (validated up front); off by default.",
+    )
+    parser.add_argument(
+        "--object_nums",
+        "--object-nums",
+        dest="object_nums",
+        type=int,
+        default=DEFAULT_OBJECT_NUMS,
+        help=f"number of conditioned objects; env-state dim = object_nums*3 "
+        f"(default {DEFAULT_OBJECT_NUMS}). Only used with --positions-dir.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -1406,12 +1624,22 @@ def main() -> None:
         else:
             logging.info("No split csv at %s; all episodes -> %s", split_csv, DEFAULT_SPLIT)
             split_map = {}
-        convert_dataset(args.raw_dir, repo_id, args.fps, args.resize_h,
-                        args.resize_w, args.task, args.root, args.overwrite,
-                        state_frame=state_frame,
-                        include_recovery_data=args.include_recovery_data,
-                        log_index=args.log_index, split_map=split_map,
-                        positions_dir=args.positions_dir, object_nums=args.object_nums)
+        convert_dataset(
+            args.raw_dir,
+            repo_id,
+            args.fps,
+            args.resize_h,
+            args.resize_w,
+            args.task,
+            args.root,
+            args.overwrite,
+            state_frame=state_frame,
+            include_recovery_data=args.include_recovery_data,
+            log_index=args.log_index,
+            split_map=split_map,
+            positions_dir=args.positions_dir,
+            object_nums=args.object_nums,
+        )
     except Exception as exc:  # CLI boundary: name the failure, exit 1
         logging.error("%s", exc)
         sys.exit(1)

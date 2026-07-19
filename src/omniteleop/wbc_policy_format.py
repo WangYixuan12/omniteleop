@@ -25,21 +25,39 @@ from __future__ import annotations
 import numpy as np
 
 LEFT_EEF_AXES = [
-    "left_tx", "left_ty", "left_tz",
-    "left_r00", "left_r10", "left_r20",
-    "left_r01", "left_r11", "left_r21",
+    "left_tx",
+    "left_ty",
+    "left_tz",
+    "left_r00",
+    "left_r10",
+    "left_r20",
+    "left_r01",
+    "left_r11",
+    "left_r21",
     "left_gripper",
 ]
 RIGHT_EEF_AXES = [
-    "right_tx", "right_ty", "right_tz",
-    "right_r00", "right_r10", "right_r20",
-    "right_r01", "right_r11", "right_r21",
+    "right_tx",
+    "right_ty",
+    "right_tz",
+    "right_r00",
+    "right_r10",
+    "right_r20",
+    "right_r01",
+    "right_r11",
+    "right_r21",
     "right_gripper",
 ]
 HEAD_AXES = [
-    "head_tx", "head_ty", "head_tz",
-    "head_r00", "head_r10", "head_r20",
-    "head_r01", "head_r11", "head_r21",
+    "head_tx",
+    "head_ty",
+    "head_tz",
+    "head_r00",
+    "head_r10",
+    "head_r20",
+    "head_r01",
+    "head_r11",
+    "head_r21",
 ]
 BASE_AXES = ["base_x", "base_y", "base_yaw"]
 ACTION_AXES = LEFT_EEF_AXES + RIGHT_EEF_AXES + HEAD_AXES
@@ -73,12 +91,8 @@ GRIPPER_DIMS = [i for i, a in enumerate(ACTION_AXES) if a.endswith("_gripper")]
 # Base pose dims 29-31 live in the STATE only (never in the 29-D action).
 RELATIVE_EXCLUDE_DIMS = GRIPPER_DIMS
 
-# Normalization (README step 3): STATE/ACTION use NormalizationMode.QUANTILES
-# (1-99 percentile -> [-1, 1]) on the continuous dims, robust to teleop outliers.
-# The 6-D rotation dims ride RAW via skip_normalization_dims: absolute columns are
-# already unit-bounded, and relative rotation deltas concentrate near 0, where a
-# q01/q99 rescale would blow up low-variance components. Grippers and the state
-# base pose (dims 29-31) stay quantile-normalized.
+# 6-D rotation dims ride raw via skip_normalization_dims (absolute columns are
+# already unit-bounded; relative rotation deltas concentrate near 0).
 SKIP_NORMALIZATION_DIMS = ROTATION_DIMS
 
 
@@ -159,7 +173,7 @@ class WBCPolicyFK:
         ``ik``: the rollout's live solver (FKs on its own model); ``None`` builds a
         collision-free instance (porter).
         """
-        from omniteleop.follower.whole_body_ik import (  # noqa: PLC0415 -- heavy, lazy
+        from omniteleop.follower.whole_body_ik import (  # -- heavy, lazy
             HEAD_FRAME,
             HEAD_JOINTS,
             LEFT_ARM_JOINTS,
@@ -170,7 +184,7 @@ class WBCPolicyFK:
             VegaWholeBodyIK,
             WBCConfig,
         )
-        from omniteleop.wbc_robot_util import set_base_in_q  # noqa: PLC0415
+        from omniteleop.wbc_robot_util import set_base_in_q
 
         self.ik = VegaWholeBodyIK(WBCConfig(enable_collision_avoidance=False)) if ik is None else ik
         self.left_ee_frame = LEFT_EE_FRAME
@@ -202,9 +216,7 @@ class WBCPolicyFK:
         for group, names in self._groups:
             arr = np.asarray(values[group], dtype=float).reshape(-1)
             if arr.shape != (len(names),):
-                raise ValueError(
-                    f"{group} joints must have shape ({len(names)},), got {arr.shape}"
-                )
+                raise ValueError(f"{group} joints must have shape ({len(names)},), got {arr.shape}")
             if not np.all(np.isfinite(arr)):
                 raise ValueError(f"{group} joints contain non-finite values")
             for name, value in zip(names, arr, strict=True):
@@ -265,12 +277,16 @@ def build_state_vector(
             T = world_T_base @ T
         return mat_to_pos6d(T)
 
-    state = np.concatenate([
-        block("left"), [grip_left],
-        block("right"), [grip_right],
-        block("head"),
-        bp,
-    ]).astype(np.float32)
+    state = np.concatenate(
+        [
+            block("left"),
+            [grip_left],
+            block("right"),
+            [grip_right],
+            block("head"),
+            bp,
+        ]
+    ).astype(np.float32)
     if state.shape != (len(STATE_AXES),):
         raise ValueError(f"built state {state.shape}, expected ({len(STATE_AXES)},)")
     return state
