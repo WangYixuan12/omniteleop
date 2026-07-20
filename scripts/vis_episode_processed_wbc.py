@@ -1651,22 +1651,6 @@ def main() -> None:
                 )
             else:
                 rr.log("world/position_condition/points", rr.Clear(recursive=False))
-            strips, strip_colors, strip_labels = _raw_vis_episode.position_condition_link_strips(
-                pc_points, finite, position_condition_labels
-            )
-            if strips:
-                rr.log(
-                    "world/position_condition/links",
-                    rr.LineStrips3D(
-                        strips,
-                        colors=strip_colors,
-                        radii=np.full(len(strips), 0.006, dtype=np.float32),
-                        labels=strip_labels,
-                        show_labels=True,
-                    ),
-                )
-            else:
-                rr.log("world/position_condition/links", rr.Clear(recursive=False))
 
         if mof_reps is not None:
             for name, reps in mof_reps.items():
