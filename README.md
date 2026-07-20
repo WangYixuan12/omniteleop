@@ -402,6 +402,11 @@ diffusion/ACT pipeline above, as a **3D point-cloud** policy. Repo: `/home/yixua
 The zarr's `action` is **bit-identical** to the LeRobot dataset; `data/state` is the same 32-D layout
 but defaulted to world frame (see table). Visual obs is a world-frame head point cloud instead of RGB.
 
+Action-frame modeling is a config choice inside this policy family: `action_frame_mode=world` is the
+incumbent world-absolute ManiFlow path and remains the default; `action_frame_mode=mof` enables the
+integrated five-expert Mixture-of-Frames path. Both modes use the same zarr, trainer, checkpoint
+format, deployment bundle, and `dexmate_maniflow` environment.
+
 ```
 data/point_cloud  (T, 1024, 6) float32   engage-origin WORLD XYZ + RGB[0,1]
 data/state        (T, 32)      float32   agent_pos  (WORLD frame by default)
@@ -543,53 +548,15 @@ cloth's points (40 → 22) while helping the box.
 
 
 
-### Environments
+### Environment
 
-**One env for the ManiFlow stages:** `dexmate_maniflow`**.** Build/inspect the zarr, train, and run the
-currently supported live modes in the same interpreter, so those stages cannot drift on a library
-version. SceneDiff DINO extraction and SAM3.1 mask tracking run separately in `lerobot` and
-`dexmate_lerobot`, respectively, before the zarr build.
+Use `dexmate_maniflow` **for every integrated ManiFlow stage**: zarr build/inspection, world or MoF
+training, checkpoint inspection, offline inference, and supported live rollout. SceneDiff DINO extraction and SAM3.1
+mask tracking remain separate preprocessing stages in `lerobot` and `dexmate_lerobot`.
 
-It is a clone of `dexmate_lerobot` (which keeps the *editable* dexcontrol/omniteleop installs pointing
-at the same sources, plus pinocchio/pink, lerobot, rerun, `fpsample`), with a small delta:
-
-```bash
-conda create -n dexmate_maniflow --clone dexmate_lerobot -y
-P=~/miniforge3/envs/dexmate_maniflow/bin/python
-
-# 1. the rollout's policy import chain needs only timm on top of the clone.
-#    --no-deps: do NOT let it bump the pinned numpy 2.2.6 (lerobot caps <2.3.0).
-$P -m pip install --no-deps timm
-
-# 2. TRAINING additionally needs numba (maniflow.common.sampler) and **zarr 2**.
-#    ManiFlow's ReplayBuffer is bound to the zarr-v2 API in several places -- it calls
-#    zarr.open(path, mode) POSITIONALLY and zarr.group(read_only_store), both of which
-#    zarr 3 rejects -- so zarr 3 would need upstream ManiFlow edits. Nothing in the env
-#    depends on zarr 3 (it has no reverse dependencies), so downgrading is free.
-#    port_wbc_mobile_zarr.py itself is version-agnostic and always writes format-2 stores.
-$P -m pip install "zarr<3" numba
-
-# 3. `pip install -e ManiFlow` installs NOTHING importable (maniflow/ has no __init__.py;
-#    upstream only works because its trainers chdir into ManiFlow/). A .pth fixes that.
-echo /home/yixuan/ManiFlow_Policy/ManiFlow > ~/miniforge3/envs/dexmate_maniflow/lib/python3.12/site-packages/maniflow_root.pth
-
-# 4. pytorch3d is a hard import in pointnet_extractor and must be built from source.
-#    Build from `main`, NOT @stable: release 0.7.9 only claims torch <=2.4, but main
-#    compiles clean against torch 2.7.1+cu126 / py3.12. Its CUDA sample_farthest_points
-#    is what DP3Encoder calls on every forward.
-export TORCH_CUDA_ARCH_LIST=8.9 FORCE_CUDA=1 MAX_JOBS=$(nproc) CUDA_HOME=/usr   # RTX 4090 = sm_89
-$P -m pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@main"
-```
-
-Verified in this stack: enriching a zarr with masks and DINO leaves `point_cloud`, `state`, `action`
-and `env_state` bit-identical to the pre-mask build; the porter also recomputes frame 0 and checks the
-cloud plus mask labels through the same row lineage. The current rollout rebuilds the maskless live
-cloud bit-identically to training for the modes it supports (see the rollout limitation below).
-
-Upstream's own `requirements.txt` is unsatisfiable as written (`numpy==1.23.5` vs its own
-`numba==0.61.2`, which needs numpy ≥1.24), and its sim/cloud deps (`sapien`, `mplib`, `dm_control`,
-`open3d`, `azure`, `deepspeed`) are not needed here. `transformers`/`yacs`/`diffusers` are pulled in by
-the clone already or unused.
+The old generic `maniflow` environment has been retired. `dexmate_mof` is retained only for the
+legacy standalone mofpo reproduction documented at the end of this README. See
+[MANIFLOW_ENVIRONMENT.md](MANIFLOW_ENVIRONMENT.md) for the full bootstrap recipe.
 
 **1.** Build the mask-grounded artifacts and zarr. Run these after the position extractor has written
 `positions/{raw,recovery}/episode_<N>.npz`. DINO is a sibling sidecar tied to the positions NPZ by
@@ -628,26 +595,47 @@ python scripts/port_wbc_mobile_zarr.py \
 The optional arrays are additive: each policy mode loads only the keys it consumes. Thus the same
 enriched zarr supports the complete experiment ladder, including the unconditioned control. The
 sibling `.meta.json` records crop/depth/frame/sampler, mask/DINO provenance (including
-`env_dino.dino_input_scale: "[0,1]"` — the porter rejects sidecars, and the ManiFlow dataset rejects
-zarrs, from before the 2026-07-18 DINO input-scale fix), and an ordered per-episode
-raw-frame manifest; it remains the source of truth for live preprocessing and visualization.
+`env_dino.dino_input_scale: "[0,1]"`, and an ordered per-episode raw-frame manifest; it remains the source of truth for live preprocessing and visualization.
 
 **2.** Inspect the configured policy input. Zarr mode requires both the viewed zarr and a training run;
-it reads `point_sampling_mode`, `mask_channels`, `position_condition_mode`, `visual_cond_len`, CUDA
+it reads `point_sampling_mode`, `mask_channels`, `position_condition_mode`, `visual_cond_len`, CUDA 
 device, and the training-zarr normalizer strictly from `<run>/.hydra/config.yaml`. There are no manual
 sampler overrides and no `--compare-sampling` mode:
 
 ```bash
-(dexmate_maniflow) python scripts/vis_episode_processed_wbc.py     --zarr /home/yixuan/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_test.zarr     --maniflow-run-dir /home/yixuan/Dexmate/model/maniflow/dexmate_wbc-maniflow_pointcloud_policy_dexmate-smoke-full_seed0     --episode_index 0
+(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh smoke-mask-mof  \
+  action_frame_mode=mof \
+  point_sampling_mode=mask_stratified \
+  mask_channels=true \
+  position_condition_mode=grounding_tokens \
+  training.num_epochs=1
+
+(dexmate_maniflow) python scripts/vis_episode_processed_wbc.py \
+  --zarr ~/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_test.zarr \
+  --maniflow-run-dir ~/Dexmate/model/maniflow/maniflow_smoke-mask-mof_seed0 \
+  --episode_index 0
 ```
 
 The automatic Rerun blueprint is:
 
 ```text
-Stored RGB 3D | Policy RGB 3D | Policy masks 3D (only when point_mask is consumed)
-Head RGB+mask | Wrist RGB     | empty
-Left gripper  | Right gripper | Base pose (x, y, yaw)
+Scene tab:
+  Stored RGB 3D | Policy RGB 3D | Policy masks 3D (only when point_mask is consumed)
+  Head RGB+mask | Wrist RGB     | empty
+  Left gripper  | Right gripper | Base pose (x, y, yaw)
+
+MoF frames (GT action) tab — only when action_frame_mode=mof:
+  one 3D view per enabled expert (base / base_rel_trans / left / right / rel_traj / …)
 ```
+
+**Timeline:** Rerun `frame=t` is the same scrub for both tabs. **Scene** shows that single
+frame — point cloud, `state[t]`, `action[t]`, cameras/base. **MoF** anchors on the same `t`
+as the last obs step (`To−1`) and draws the training `horizon` GT action chunk (not
+`n_action_steps`): start `t−(n_obs_steps−1)`, length `horizon`, refs from `agent_pos[t]`,
+edge-replicated at episode bounds like SequenceSampler. With the usual `To=2`, `horizon=16`,
+that is `[t−1 … t+14]` re-expressed in each expert; triad marks the current step inside the
+chunk. This viewer has no checkpoint — GT representations only (see
+`vis_wbc_mof_prediction.py` for predicted/router overlays).
 
 `Stored RGB 3D` shows all 1024 porter points. `Policy RGB 3D` shows only the exact deterministic
 selection produced by the run's sampler on training-normalized XYZ, rendered back at raw world
@@ -672,17 +660,11 @@ task config lives under `config/robotwin_task/`: a Hydra group name *is* the con
 it is RoboTwin.
 
 ```bash
+# Incumbent world-absolute path (`action_frame_mode=world` is the default).
 (dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh control_256 \
   point_sampling_mode=fps mask_channels=false position_condition_mode=none \
   training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
 
-(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh stratified_256 \
-  point_sampling_mode=mask_stratified mask_channels=false position_condition_mode=none \
-  training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
-
-(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh channels_256 \
-  point_sampling_mode=mask_stratified mask_channels=true position_condition_mode=none \
-  training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
 
 (dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh grounding_256 \
   point_sampling_mode=mask_stratified mask_channels=true \
@@ -693,6 +675,13 @@ it is RoboTwin.
 (dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh concat_256 \
   point_sampling_mode=fps mask_channels=false position_condition_mode=concat \
   training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
+
+# Integrated MoF: same zarr, launcher, checkpoint format, and Conda environment.
+# The config default enables the five v1 experts; the launcher supplies MoF memory/checkpoint defaults.
+(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh mof_v1_500 \
+  action_frame_mode=mof point_sampling_mode=fps mask_channels=false \
+  position_condition_mode=none \
+  training.num_epochs=500 training.checkpoint_every=10 training.val_every=5
 
 # args: <addition_info> [seed] [gpu_id] [hydra overrides...]
 # checkpoints → ~/Dexmate/model/maniflow/<exp>_seed<seed>/checkpoints/
@@ -737,14 +726,18 @@ retired and must remain `0.0`; any nonzero value fails at policy construction. D
 Active implementation files: `point_process.py` (batched mask-stratified sampler),
 `pointnet_extractor.py` (mask-aware sampling/channels), `ditx.py` (grounding tokens),
 `maniflow_pointcloud_policy.py` (mode plumbing), `dexmate_wbc_dataset.py` (schema and normalizers),
-the Dexmate task/policy YAMLs, the Robotwin workspace EMA-mode fix, and
+`action_layout.py` and `frame_transforms.py` (MoF representations), `mof_mixture.py` (expert towers
+and router), the Dexmate task/policy YAMLs, the Robotwin workspace EMA-mode fix, and
 `scripts/train_dexmate_wbc.sh`.
 
 **4.** Live rollout. `scripts/wbc_maniflow_rollout.py` does **not** fork the hardware loop: it imports
 `wbc_policy_rollout.py` and swaps in a ManiFlow bundle + observation worker via
 `_run_rollout(..., policy_factory=, worker_factory=)`. Engage, `--align-reference`, the async chunk
 scheduler, stale-action drop, the 100 Hz WBC tick, the hold watchdog, recording and shutdown are all
-the same code. `--replay-episode` works identically.
+the same code. `--replay-episode` works identically. The bundle instantiates the checkpoint's policy
+configuration, so this same command loads either `action_frame_mode=world` or integrated
+`action_frame_mode=mof` checkpoints; do not use the legacy `wbc_mof_rollout.py` for an integrated
+ManiFlow checkpoint.
 
 ```bash
 (dexmate_maniflow) python scripts/wbc_maniflow_rollout.py \
@@ -778,17 +771,19 @@ engage—a concat checkpoint without the flag, or the flag with an unconditioned
 
 
 
-## MoF (Mixture of Frames)
+## Legacy standalone MoF reproduction
 
-[MoF](https://mofpo.github.io/) trained on the **same box2cloth raw takes** as the
-diffusion/ACT/ManiFlow pipelines above, as a fourth policy family. Repo: the
-`wbc` branch of `[Crdr2/mofpo](https://github.com/Crdr2/mofpo)` at `/home/yixuan/mofpo`
-(fork of the paper code; upstream `pointW/mofpo`). MoF denoises the 29-D world
-action in **five reference frames at once** (`base`, `base_rel_trans`, `left`,
-`right`, `rel_traj` — the head is a third pose entity in every frame but not a
-frame itself) and fuses the predictions with a learned per-timestep router,
-canonical space `base_rel_trans`. Decisions/ADR in `.scratch/mof-wbc-integration/`
-and `docs/adr/0001-mof-sim-stack-for-wbc.md` (both gitignored, local).
+The active MoF path is now `action_frame_mode=mof` inside ManiFlow above. This section preserves the
+older standalone [MoF](https://mofpo.github.io/) WBC v1 pipeline only, for reproducing its safetensor
+dataset, mofpo checkpoint, offline visualizer, and hardware bundle. It uses the `wbc` branch of
+[Crdr2/mofpo](https://github.com/Crdr2/mofpo) at `/home/yixuan/mofpo` (fork of the paper code;
+upstream `pointW/mofpo`) and its separate legacy environments.
+
+The standalone model denoises the 29-D world action in **five reference frames at once** (`base`,
+`base_rel_trans`, `left`, `right`, `rel_traj` — the head is a third pose entity in every frame but
+not a frame itself) and fuses the predictions with a learned per-timestep router, canonical space
+`base_rel_trans`. Decisions/ADR are in `.scratch/mof-wbc-integration/` and
+`docs/adr/0001-mof-sim-stack-for-wbc.md` (both gitignored, local).
 
 **Frame conventions:** actions verbatim world-frame column rot6d (the checkpoint
 sets `external_rot6d_convention: column`, so predictions come out in exactly the
@@ -814,7 +809,7 @@ positions are ALWAYS attached — a conditioned run later is a train-config flip
 rollout eval and top-k checkpoints on `val_loss`):
 
 ```bash
-(mof) cd ~/mofpo && python train.py --config-name=train_mof_moe_wbc \
+(dexmate_mof) cd ~/mofpo && python train.py --config-name=train_mof_moe_wbc \
   logging.mode=offline hydra.run.dir=data/outputs/wbc_v1_mof_moe_500ep
 # paper recipe: batch 128, DDIM 50/16, EMA, 500 epochs (~30 s/epoch + val on the
 # 4090, ~14 GB), horizon 16 / 8 action steps @ 10 Hz. training.resume=True:

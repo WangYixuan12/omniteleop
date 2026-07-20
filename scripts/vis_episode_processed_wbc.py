@@ -10,7 +10,8 @@ Two processed formats of the SAME raw takes, selected by which flag you pass:
     both the stored 1024-point cloud and the exact policy selection configured in the
     run's ``.hydra/config.yaml``. Head/Wrist RGB, depth and the full SAM3.1 mask come
     directly from the raw HDF5/mask NPZ through the zarr episode manifest; this mode
-    never opens a sibling LeRobot dataset.
+    never opens a sibling LeRobot dataset. Runs trained with ``action_frame_mode:
+    mof`` additionally get a MoF-frames tab (see Panels).
 
 Sibling to ``scripts/vis_episode_processed.py`` (the arm-only tabletop viewer);
 same rendering structure, schema ``omniteleop.wbc_policy_format``.
@@ -58,6 +59,14 @@ Panels:
     camera pinhole/frustum.
   * Zarr policy comparison -- Stored RGB 3D, Policy RGB 3D and (only when consumed)
     Policy masks 3D, with identical initial cameras and shared world context.
+  * MoF frames tab (zarr mode, runs trained with ``action_frame_mode: mof``) -- the
+    GT action window (``horizon`` steps, refs at the current frame = last obs step,
+    edge-replicated at episode bounds like the training sampler's padding)
+    re-expressed in every enabled expert representation through the run checkout's
+    own ``maniflow.model.common.frame_transforms`` (world hub), one 3D view per
+    expert, round-trip-checked back to world per episode. The sibling of
+    ``vis_wbc_mof_prediction.py``'s frames tab, minus router/predictions (this
+    viewer has no checkpoint).
   * Head RGB + full SAM3.1 mask. Depth and projected EEF pixels are logged but hidden
     from the automatic blueprint, so they can be enabled from the Rerun sidebar.
   * Wrist RGB -- ``observation.images.wrist_rgb`` (plain 2D; no calibration/depth).
@@ -397,6 +406,30 @@ def load_maniflow_run(run_dir: Path) -> dict:
         raise ValueError(f"mask modes require object_nums=2, got {object_nums}")
     if not bool(cfg.policy.downsample_points):
         raise ValueError(f"{config_path}: viewer requires policy.downsample_points=true")
+    # action_frame_mode postdates the conditioning switches. Unlike them, a config
+    # WITHOUT the key is not ambiguous: the key did not exist before MoF landed, and
+    # the incumbent path is byte-identical to today's world mode -- so "world" is a
+    # fact about such runs, not an inferred default.
+    frame_mode = str(cfg.get("action_frame_mode", "world"))
+    if frame_mode not in ("world", "mof"):
+        raise ValueError(f"{config_path}: unsupported action_frame_mode={frame_mode!r}")
+    mof = None
+    if frame_mode == "mof":
+        if "mof" not in cfg or cfg.mof is None:
+            raise ValueError(f"{config_path}: action_frame_mode=mof without a mof block")
+        experts = tuple(str(name) for name in cfg.mof.enabled_experts)
+        if not experts or len(set(experts)) != len(experts):
+            raise ValueError(
+                f"{config_path}: mof.enabled_experts must be non-empty and unique, "
+                f"got {list(experts)}"
+            )
+        mof = {
+            "enabled_experts": experts,
+            "canonical_space": str(cfg.mof.canonical_space),
+            "router_mode": str(cfg.mof.router_mode),
+            "horizon": int(cfg.horizon),
+            "n_obs_steps": int(cfg.n_obs_steps),
+        }
     return {
         "run_dir": run_dir,
         "config_path": config_path,
@@ -410,6 +443,8 @@ def load_maniflow_run(run_dir: Path) -> dict:
         "device": str(cfg.training.device),
         "train_zarr": Path(str(cfg.robotwin_task.dataset.zarr_path)).expanduser(),
         "position_dino_dim": int(cfg.policy.get("position_dino_dim", 1280)),
+        "action_frame_mode": frame_mode,
+        "mof": mof,
     }
 
 
@@ -431,6 +466,108 @@ def import_run_sampler(run_dir: Path):
     if not module_path.is_relative_to(checkout.resolve()):
         raise RuntimeError(f"imported sampler {module_path} instead of checkout {checkout}")
     return module, checkout
+
+
+def import_run_frame_transforms(checkout: Path):
+    """Import the run checkout's vendored MoF transforms, never a viewer-side copy.
+
+    ``import_run_sampler`` already put the checkout on ``sys.path``; this pulls the
+    world-hub transform module plus the WBC action layout and pins their provenance
+    the same way the sampler import does.
+    """
+    transforms = importlib.import_module("maniflow.model.common.frame_transforms")
+    layouts = importlib.import_module("maniflow.model.common.action_layout")
+    for module in (transforms, layouts):
+        module_path = Path(module.__file__).resolve()
+        if not module_path.is_relative_to(checkout.resolve()):
+            raise RuntimeError(f"imported {module_path} instead of checkout {checkout}")
+    return transforms, layouts.wbc_layout()
+
+
+def compute_mof_gt_representations(
+    transforms, layout, state: np.ndarray, action: np.ndarray, mof: dict
+) -> dict[str, np.ndarray]:
+    """GT action windows re-expressed in every enabled expert representation.
+
+    Mirrors the training-time transform exactly: frame ``idx`` is the LAST obs step
+    (window index To-1), the action chunk is the ``horizon`` window starting at
+    ``idx - (To - 1)`` (edge-replicated at episode bounds, like SequenceSampler
+    padding), and frames/refs come from raw agent_pos at ``idx`` via the checkout's
+    ``action_frames_from_agent_pos`` / ``entity_refs_in_base``. Every representation
+    is round-tripped back to world as a per-episode transform check.
+    """
+    experts = mof["enabled_experts"]
+    for name in (*experts, mof["canonical_space"]):
+        if name not in transforms.ALLOWED_EXPERTS:
+            raise ValueError(
+                f"unknown MoF expert {name!r} (allowed: {transforms.ALLOWED_EXPERTS})"
+            )
+    n = action.shape[0]
+    starts = np.arange(n) - (mof["n_obs_steps"] - 1)
+    window = np.clip(starts[:, None] + np.arange(mof["horizon"])[None, :], 0, n - 1)
+    chunks = torch.from_numpy(action[window].astype(np.float32))      # (N, H, 29)
+    agent_pos = torch.from_numpy(state.astype(np.float32))[:, None]   # (N, 1, 32)
+    frames = transforms.action_frames_from_agent_pos(agent_pos, layout)
+    refs = transforms.entity_refs_in_base(agent_pos, layout)
+
+    representations: dict[str, np.ndarray] = {}
+    worst = 0.0
+    for name in experts:
+        rep = transforms.world_to_expert_pose(chunks, name, frames, refs, layout)
+        back = transforms.expert_pose_to_world(rep, name, frames, refs, layout)
+        worst = max(worst, float((back - chunks).abs().max()))
+        representations[name] = rep.numpy()
+    if worst > 1e-3:
+        raise ValueError(
+            f"MoF expert round trip diverges by {worst:.2e} on this episode "
+            "(checkout transforms disagree with the stored world actions)"
+        )
+    print(
+        f"  mof representations: {', '.join(experts)} (round-trip max err {worst:.1e})"
+    )
+    return representations
+
+
+def _mof_rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
+    """(..., 6) column rot6d -> (..., 3, 3). GT rot6d is clean FK output in every
+    representation (rel_traj stores R_ref^T R), so the Gram-Schmidt here is exact --
+    this is display-only and never touches noisy interpolants."""
+    c1, c2 = rot6d[..., 0:3], rot6d[..., 3:6]
+    c1 = c1 / np.linalg.norm(c1, axis=-1, keepdims=True)
+    c2 = c2 - np.sum(c1 * c2, axis=-1, keepdims=True) * c1
+    c2 = c2 / np.linalg.norm(c2, axis=-1, keepdims=True)
+    return np.stack([c1, c2, np.cross(c1, c2)], axis=-1)
+
+
+def _log_mof_horizon(root: str, chunk: np.ndarray, layout, current_step: int) -> None:
+    """One expert view: per-entity horizon trace + triad at the current (To-1) step."""
+    for entity in layout.entities:
+        pos = chunk[:, entity.pos]
+        rotations = _mof_rot6d_to_matrix(chunk[:, entity.rot])
+        rr.log(
+            f"{root}/{entity.name}/horizon",
+            rr.LineStrips3D([pos], colors=[_COLOR_ACTION], radii=0.003),
+        )
+        rr.log(
+            f"{root}/{entity.name}/horizon_points",
+            rr.Points3D(pos, colors=[_COLOR_ACTION], radii=0.006),
+        )
+        rr.log(
+            f"{root}/{entity.name}/horizon_z_axes",
+            rr.Arrows3D(
+                origins=pos,
+                vectors=rotations[..., :, 2] * 0.04,
+                colors=[_COLOR_ACTION],
+                radii=0.001,
+            ),
+        )
+        rr.log(
+            f"{root}/{entity.name}/current",
+            rr.Transform3D(
+                translation=pos[current_step], mat3x3=rotations[current_step]
+            ),
+            rr.TransformAxes3D(axis_length=0.07),
+        )
 
 
 def require_policy_device(device_name: str) -> torch.device:
@@ -907,7 +1044,8 @@ def main() -> None:
         type=str,
         default=None,
         help="Training run containing .hydra/config.yaml. Zarr mode reads the active "
-             "sampler/mask/grounding switches and training-zarr path only from here.",
+             "sampler/mask/grounding/action-frame switches and training-zarr path "
+             "only from here.",
     )
     parser.add_argument("--episode_index", type=int, default=0)
     parser.add_argument(
@@ -955,11 +1093,15 @@ def main() -> None:
 
     policy = None
     policy_selection = None
+    mof_transforms = None
+    mof_action_layout = None
     if args.zarr is not None:
         zarr_path = Path(args.zarr).expanduser()
         run_dir = Path(args.maniflow_run_dir).expanduser().resolve()
         policy = load_maniflow_run(run_dir)
         sampler, checkout = import_run_sampler(run_dir)
+        if policy["mof"] is not None:
+            mof_transforms, mof_action_layout = import_run_frame_transforms(checkout)
         policy_device = require_policy_device(policy["device"])
         source = load_maniflow_zarr_episode(zarr_path, args.episode_index, policy)
         train_meta = load_zarr_meta(policy["train_zarr"])
@@ -982,6 +1124,13 @@ def main() -> None:
         print(f"  mask_channels: {policy['mask_channels']}")
         print(f"  needs_point_mask: {policy['needs_point_mask']}")
         print(f"  position_condition_mode: {policy['position_condition_mode']}")
+        print(f"  action_frame_mode: {policy['action_frame_mode']}")
+        if policy["mof"] is not None:
+            print(
+                f"  mof experts: {', '.join(policy['mof']['enabled_experts'])} "
+                f"(canonical {policy['mof']['canonical_space']}, "
+                f"router {policy['mof']['router_mode']})"
+            )
         print(f"  visual_cond_len: {policy['visual_cond_len']}")
         print(f"  use_pc_color: {policy['use_pc_color']} (viewer uses unaugmented RGB)")
         print(f"  device: {policy_device}")
@@ -1110,6 +1259,17 @@ def main() -> None:
             f"({', '.join(position_condition_labels)})"
         )
 
+    # ── MoF: GT action window in every enabled expert representation (zarr mode,
+    #    action_frame_mode=mof runs only; transforms from the run checkout). ──
+    mof_reps: dict[str, np.ndarray] | None = None
+    mof_current_step = 0
+    if mof_transforms is not None:
+        mof_current_step = policy["mof"]["n_obs_steps"] - 1
+        mof_reps = compute_mof_gt_representations(
+            mof_transforms, mof_action_layout, state, action, policy["mof"]
+        )
+    mof_experts = tuple(mof_reps) if mof_reps is not None else ()
+
     # ── Matplotlib figures (EEF xyz per arm + base top-down). ────────────────
     t_s = np.arange(N, dtype=np.float64) * dt_s
     figs: list[plt.Figure] = []
@@ -1215,7 +1375,29 @@ def main() -> None:
             views_2d,
             bottom_row,
             row_shares=[2.2, 1.2, 1.0],
+            name="Scene",
         )
+        if mof_experts:
+            # Same tab structure as vis_wbc_mof_prediction.py: base/left/right/world
+            # are metric frames, rel_trans/rel_traj are representation spaces.
+            layout = rrb.Tabs(
+                layout,
+                rrb.Grid(
+                    *[
+                        rrb.Spatial3DView(
+                            origin=f"mof_frames/{name}",
+                            name=(
+                                name
+                                if name in ("world", "base", "left", "right")
+                                else f"{name} (representation space)"
+                            ),
+                        )
+                        for name in mof_experts
+                    ],
+                    grid_columns=3,
+                    name="MoF frames (GT action)",
+                ),
+            )
     else:
         world_view = rrb.Spatial3DView(
             origin="world", name="World (pcd + EEF + base odom)",
@@ -1269,6 +1451,14 @@ def main() -> None:
            static=True)
     rr.log("world/base_path/pts", rr.Points3D(base_path_xyz, colors=[_COLOR_BASE], radii=0.006),
            static=True)
+    for name in mof_experts:
+        rr.log(f"mof_frames/{name}", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+        rr.log(
+            f"mof_frames/{name}/reference_axes",
+            rr.Transform3D(translation=[0.0, 0.0, 0.0], mat3x3=np.eye(3)),
+            rr.TransformAxes3D(axis_length=0.12),
+            static=True,
+        )
     if is_zarr and policy["needs_point_mask"]:
         rr.log(
             "world/camera",
@@ -1294,6 +1484,9 @@ def main() -> None:
                 rr.log("world/policy_rgb", rr.Clear(recursive=True))
                 if policy["needs_point_mask"]:
                     rr.log("world/policy_masks", rr.Clear(recursive=True))
+            # /gt only: the static reference_axes sibling must survive the clear.
+            for name in mof_experts:
+                rr.log(f"mof_frames/{name}/gt", rr.Clear(recursive=True))
             if has_camera:
                 rr.log("world/camera/eef_state_2d", rr.Clear(recursive=False))
                 rr.log("world/camera/eef_action_2d", rr.Clear(recursive=False))
@@ -1474,6 +1667,13 @@ def main() -> None:
                 )
             else:
                 rr.log("world/position_condition/links", rr.Clear(recursive=False))
+
+        if mof_reps is not None:
+            for name, reps in mof_reps.items():
+                _log_mof_horizon(
+                    f"mof_frames/{name}/gt", reps[idx], mof_action_layout,
+                    mof_current_step,
+                )
 
         # Gripper scalars per arm: [action (binary), observation.state (raw)].
         for side in _ARM_SIDES:

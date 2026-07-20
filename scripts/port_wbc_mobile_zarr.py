@@ -77,14 +77,13 @@ Usage:
     --raw-dir ~/Dexmate/data/raw_data \
     --out-root ~/Dexmate/data/processed_wbc/maniflow \
     --name dexmate_wbc --num-points 1024 \
-    --include-recovery-data ~/Dexmate/data/raw_data/recovery --overwrite \
+    --include-recovery-data ~/Dexmate/data/raw_data/recovery \
     --positions-dir ~/Dexmate/data/scene_diff/positions
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import logging
@@ -95,6 +94,13 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+from omniteleop.wbc_artifacts import (
+    DINO_INPUT_SCALE,
+    MASK_LEGEND,
+    ValidatedMaskArtifact,
+    load_dino_artifact,
+    validate_mask_artifact,
+)
 from omniteleop.wbc_pointcloud import (
     CROP_MAX,
     CROP_MIN,
@@ -139,126 +145,49 @@ DEFAULT_POOL_SIZE = 16384
 DEFAULT_CHUNK_FRAMES = 32
 DEFAULT_STATE_FRAME = "world"
 
-# data/point_mask labels, fixed by the scene_diff mask builder (build_wbc_masks.py).
-MASK_LEGEND = "0=background 1=box(src) 2=cloth(dst)"
-
-
-def load_episode_masks(masks_dir: Path, source: str, raw_index: int,
-                       frame_count: int, image_hw: tuple[int, int]) -> np.ndarray:
-    """``<masks-dir>/<source>/episode_<N>.npz`` -> ``(T_raw, H, W)`` uint8, validated.
-
-    The masks MUST cover the FULL raw episode (the builder tracks from raw frame 0; the
-    porter applies its own window), match the recorder's image size, and carry the
-    exact label legend this porter writes into ``data/point_mask``.
-    """
-    path = Path(masks_dir) / source / f"episode_{raw_index}.npz"
-    if not path.exists():
-        raise FileNotFoundError(
-            f"masks file for {source}/episode_{raw_index} not found: {path} "
-            "(run scene_diff/scripts/build_wbc_masks.py first, or drop --masks-dir; "
-            "note the builder auto-REJECTS episodes that fail its QC gate)")
-    with np.load(path, allow_pickle=False) as z:
-        for key in ("masks", "legend", "n_frames"):
-            if key not in z.files:
-                raise ValueError(f"{path}: missing '{key}' (regenerate with build_wbc_masks.py)")
-        legend = str(z["legend"])
-        if legend != MASK_LEGEND:
-            raise ValueError(f"{path}: legend {legend!r} != {MASK_LEGEND!r}")
-        n_frames = int(z["n_frames"])
-        masks = np.asarray(z["masks"])
-    if masks.dtype != np.uint8 or masks.shape != (frame_count, *image_hw):
-        raise ValueError(
-            f"{path}: masks {masks.shape} {masks.dtype} != ({frame_count}, "
-            f"{image_hw[0]}, {image_hw[1]}) uint8 -- built from a different take?")
-    if n_frames != frame_count:
-        raise ValueError(f"{path}: n_frames {n_frames} != raw frame count {frame_count}")
-    if masks.max() > 2:
-        raise ValueError(f"{path}: label {masks.max()} outside the legend")
-    return masks
-
-
-def validate_all_episode_masks(masks_dir: Path, work: list[dict],
-                               positions_dir: Path | None) -> None:
-    """Fail fast (before any zarr is written) on missing/contract-less masks NPZs, and
-    tie each one to the CURRENT positions NPZ: the seed's task-slot ordering came from
-    that file, so a positions re-run must invalidate stale masks or point_mask labels
-    could silently disagree with env_state. Full length/size validation happens per
-    episode at load."""
+def validate_all_episode_masks(
+    masks_dir: Path,
+    work: list[dict],
+    positions_dir: Path,
+) -> dict[tuple[str, int], ValidatedMaskArtifact]:
+    """Validate every mask/source/QC/slot contract before creating a zarr."""
+    artifacts: dict[tuple[str, int], ValidatedMaskArtifact] = {}
+    failures: list[str] = []
     for item in work:
-        path = Path(masks_dir) / item["source"] / f"episode_{item['raw_index']}.npz"
-        if not path.exists():
-            raise FileNotFoundError(
-                f"masks file missing for {item['source']}/episode_{item['raw_index']}: "
-                f"{path} (REJECTED by the builder's QC gate, or the batch is incomplete)")
-        with np.load(path, allow_pickle=False) as z:
-            missing = [k for k in ("masks", "legend", "n_frames") if k not in z.files]
-            stored_sha = str(z["positions_sha256"]) if "positions_sha256" in z.files else None
-        if missing:
-            raise ValueError(f"{path}: missing fields {missing}")
-        if positions_dir is not None:
-            if stored_sha is None:
-                raise ValueError(
-                    f"{path}: no positions_sha256 -- rebuild the masks (or patch the "
-                    "field) so they are provably tied to the current positions NPZ")
-            base = Path(positions_dir) / item["source"] / f"episode_{item['raw_index']}.npz"
-            if stored_sha != hashlib.sha256(base.read_bytes()).hexdigest():
-                raise ValueError(
-                    f"{path}: positions_sha256 does not match {base.name} -- the "
-                    "positions NPZ changed after tracking; re-run build_wbc_masks.py")
-    logging.info("Masks ON: %d episode NPZ(s) present under %s%s", len(work), masks_dir,
-                 "" if positions_dir is None else " (positions provenance verified)")
+        source, raw_index = item["source"], item["raw_index"]
+        key = (source, raw_index)
+        mask_path = Path(masks_dir) / source / f"episode_{raw_index}.npz"
+        positions_path = Path(positions_dir) / source / f"episode_{raw_index}.npz"
+        try:
+            artifacts[key] = validate_mask_artifact(
+                mask_path,
+                source=source,
+                episode_number=raw_index,
+                raw_hdf5=item["path"],
+                positions_npz=positions_path,
+            )
+        except Exception as exc:
+            failures.append(f"- {source}/episode_{raw_index}: {exc}")
+    if failures:
+        raise RuntimeError(
+            "Tracked-mask artifact validation failed; no dataset was written:\n"
+            + "\n".join(failures)
+        )
+    logging.info(
+        "Masks ON: %d episode artifact(s) under %s (source, QC, and positions "
+        "provenance verified)",
+        len(artifacts),
+        masks_dir,
+    )
+    return artifacts
 
 
 def load_episode_dino(positions_dir: Path, source: str, raw_index: int,
                       object_nums: int) -> np.ndarray:
-    """DINO sidecar -> task-slot-arranged ``(object_nums * D,)`` float32.
-
-    Cross-checks the sidecar against its base positions npz: ``base_sha256`` (a stage-3
-    re-run invalidates stale sidecars), ``scene_diff_obj_ids`` and ``order`` equality,
-    and ``dino_valid`` all-ones. Additionally requires the ``[0,1]`` marker in
-    ``dino_source``: sidecars from before the 2026-07-18 input-scale fix share their
-    base npz with corrected ones, so only this marker tells them apart. Features are
-    stored size-slot ordered; arranged here by ``order`` exactly like the positions
-    themselves.
-    """
+    """Load one DINO sidecar through the shared strict artifact contract."""
     base_path = Path(positions_dir) / source / f"episode_{raw_index}.npz"
     path = base_path.with_name(base_path.stem + "_dino.npz")
-    if not path.exists():
-        raise FileNotFoundError(
-            f"DINO sidecar for {source}/episode_{raw_index} not found: {path} "
-            "(run scene_diff/scripts/extract_object_dino_feats.py first, or drop --dino)")
-    with np.load(base_path, allow_pickle=False) as base:
-        base_order = np.asarray(base["order"])
-        base_ids = np.asarray(base["scene_diff_obj_ids"])
-    with np.load(path, allow_pickle=False) as z:
-        for key in ("dino_region_feats", "dino_valid", "base_sha256",
-                    "scene_diff_obj_ids", "order"):
-            if key not in z.files:
-                raise ValueError(f"{path}: missing '{key}' (regenerate the sidecar)")
-        feats = np.asarray(z["dino_region_feats"], dtype=np.float32)
-        # base_sha256 can't catch this one: sidecars computed on uint8 [0,255] input
-        # (2026-07-18 scale bug) share the base with corrected [0,1] ones. The source
-        # string is the only marker distinguishing them.
-        source_tag = str(z["dino_source"]) if "dino_source" in z.files else "<missing>"
-        if "[0,1]" not in source_tag:
-            raise ValueError(
-                f"{path}: dino_source '{source_tag}' predates the [0,1] input-scale "
-                "fix; re-run extract_object_dino_feats.py")
-        if str(z["base_sha256"]) != hashlib.sha256(base_path.read_bytes()).hexdigest():
-            raise ValueError(
-                f"{path}: base_sha256 does not match {base_path.name} -- the positions "
-                "npz changed after the sidecar was computed; re-run "
-                "extract_object_dino_feats.py")
-        if not np.array_equal(np.asarray(z["order"]), base_order) or \
-                not np.array_equal(np.asarray(z["scene_diff_obj_ids"]), base_ids):
-            raise ValueError(f"{path}: order/scene_diff_obj_ids disagree with the base npz")
-        if not np.all(np.asarray(z["dino_valid"]) == 1.0):
-            raise ValueError(f"{path}: dino_valid {z['dino_valid']} has invalid slots")
-    if feats.ndim != 2 or feats.shape[0] != object_nums:
-        raise ValueError(f"{path}: dino_region_feats {feats.shape} != ({object_nums}, D)")
-    if not np.all(np.isfinite(feats)) or not feats.any():
-        raise ValueError(f"{path}: dino_region_feats non-finite or all-zero")
-    return feats[base_order].reshape(-1)
+    return load_dino_artifact(base_path, path, object_nums=object_nums)
 
 
 def validate_all_episode_dino(positions_dir: Path, work: list[dict],
@@ -281,8 +210,7 @@ def episode_arrays(hdf5_path: Path, fk: WBCPolicyFK, fps: int, *,
                    state_frame: str, crop_min: tuple[float, float, float],
                    crop_max: tuple[float, float, float], min_depth: float,
                    max_depth: float, rng: np.random.Generator,
-                   masks_dir: Path | None = None, source: str | None = None,
-                   raw_index: int | None = None,
+                   mask_artifact: ValidatedMaskArtifact | None = None,
                    ) -> tuple[
                        np.ndarray, np.ndarray, np.ndarray, int, int, int,
                        np.ndarray | None,
@@ -296,7 +224,7 @@ def episode_arrays(hdf5_path: Path, fk: WBCPolicyFK, fps: int, *,
     absolute inclusive ``trim`` segment for a recovery episode -- identical windowing to
     the LeRobot porter, via its own helpers.
 
-    With ``masks_dir`` set, each stored point's tracked-object label rides the exact
+    With ``mask_artifact`` set, each stored point's tracked-object label rides the exact
     valid->crop->pool->FPS row lineage of its XYZRGB (index propagation, never
     re-projection). The cloud values and the rng draw sequence are identical with and
     without masks.
@@ -308,9 +236,18 @@ def episode_arrays(hdf5_path: Path, fk: WBCPolicyFK, fps: int, *,
     rgb, depth = ep["rgb"], ep["depth"]
 
     mask_frames = None
-    if masks_dir is not None:
-        mask_frames = load_episode_masks(
-            masks_dir, source, raw_index, ep["frame_count"], depth.shape[1:3])
+    if mask_artifact is not None:
+        if mask_artifact.frame_count != ep["frame_count"]:
+            raise RuntimeError(
+                f"{hdf5_path}: validated mask has {mask_artifact.frame_count} frames, "
+                f"raw take has {ep['frame_count']}"
+            )
+        if mask_artifact.image_hw != tuple(depth.shape[1:3]):
+            raise RuntimeError(
+                f"{hdf5_path}: validated mask image size {mask_artifact.image_hw} != "
+                f"depth image size {tuple(depth.shape[1:3])}"
+            )
+        mask_frames = mask_artifact.load_masks()
 
     states = np.empty((kept, len(STATE_AXES)), dtype=np.float32)
     actions = np.empty((kept, len(ACTION_AXES)), dtype=np.float32)
@@ -375,8 +312,8 @@ def _zarr_writable_root(zarr_path: Path):
 
     major = int(zarr.__version__.split(".", 1)[0])
     if major >= 3:
-        return zarr.group(store=str(zarr_path), overwrite=True, zarr_format=2), major
-    return zarr.group(store=zarr.DirectoryStore(str(zarr_path)), overwrite=True), major
+        return zarr.group(store=str(zarr_path), overwrite=False, zarr_format=2), major
+    return zarr.group(store=zarr.DirectoryStore(str(zarr_path)), overwrite=False), major
 
 
 def _zarr_create_array(group, name: str, *, major: int, data=None, **kwargs):
@@ -396,6 +333,9 @@ def write_split_zarr(zarr_path: Path, items: list[dict], fk: WBCPolicyFK, args,
                      rng: np.random.Generator,
                      env_state_by_key: dict[tuple[str, int], np.ndarray] | None,
                      env_dino_by_key: dict[tuple[str, int], np.ndarray] | None,
+                     mask_artifacts: dict[
+                         tuple[str, int], ValidatedMaskArtifact
+                     ] | None,
                      ) -> tuple[int, int, list[dict]]:
     """Write one split incrementally; return episode/frame counts and raw provenance."""
     compressor = _zarr_blosc()
@@ -428,8 +368,9 @@ def write_split_zarr(zarr_path: Path, items: list[dict], fk: WBCPolicyFK, args,
             data, "env_dino", major=major,
             shape=(0, dino_dim), chunks=(100, dino_dim),
             dtype="float32", compressor=compressor)
+        dino_ds.attrs["dino_input_scale"] = DINO_INPUT_SCALE
     mask_ds = None
-    if args.masks_dir is not None:
+    if mask_artifacts is not None:
         mask_ds = _zarr_create_array(
             data, "point_mask", major=major,
             shape=(0, args.num_points), chunks=(chunk, args.num_points),
@@ -439,13 +380,14 @@ def write_split_zarr(zarr_path: Path, items: list[dict], fk: WBCPolicyFK, args,
     episode_manifest: list[dict] = []
     total = 0
     for zarr_episode_index, item in enumerate(items):
+        key = (item["source"], item["raw_index"])
+        mask_artifact = None if mask_artifacts is None else mask_artifacts[key]
         point_cloud, states, actions, _, raw_start, raw_end, point_mask = episode_arrays(
             item["path"], fk, args.fps, trim=item["trim"], num_points=args.num_points,
             pool_size=args.pool_size, state_frame=args.state_frame,
             crop_min=tuple(args.crop_min), crop_max=tuple(args.crop_max),
             min_depth=args.min_depth, max_depth=args.max_depth, rng=rng,
-            masks_dir=args.masks_dir, source=item["source"],
-            raw_index=item["raw_index"])
+            mask_artifact=mask_artifact)
         if raw_end - raw_start != len(states):
             raise RuntimeError(
                 f"{item['path']}: manifest raw window [{raw_start},{raw_end}) has "
@@ -456,21 +398,16 @@ def write_split_zarr(zarr_path: Path, items: list[dict], fk: WBCPolicyFK, args,
         state_ds.append(states)
         action_ds.append(actions)
         if env_ds is not None:
-            env_vec = env_state_by_key[(item["source"], item["raw_index"])]
+            env_vec = env_state_by_key[key]
             env_ds.append(np.tile(env_vec, (len(states), 1)))
         if dino_ds is not None:
-            dino_vec = env_dino_by_key[(item["source"], item["raw_index"])]
+            dino_vec = env_dino_by_key[key]
             dino_ds.append(np.tile(dino_vec, (len(states), 1)))
         if mask_ds is not None:
             mask_ds.append(point_mask)
         total += len(states)
         episode_ends.append(total)
-        mask_path = None
-        if args.masks_dir is not None:
-            mask_path = (
-                Path(args.masks_dir) / item["source"] /
-                f"episode_{item['raw_index']}.npz"
-            ).resolve()
+        mask_path = None if mask_artifact is None else mask_artifact.path
         episode_manifest.append({
             "zarr_episode_index": zarr_episode_index,
             "source": item["source"],
@@ -490,7 +427,13 @@ def write_split_zarr(zarr_path: Path, items: list[dict], fk: WBCPolicyFK, args,
     return len(items), total, episode_manifest
 
 
-def verify_split_zarr(zarr_path: Path, first_item: dict, fk: WBCPolicyFK, args) -> None:
+def verify_split_zarr(
+    zarr_path: Path,
+    first_item: dict,
+    fk: WBCPolicyFK,
+    args,
+    mask_artifact: ValidatedMaskArtifact | None,
+) -> None:
     """Reopen a written zarr and cross-check it against a fresh recomputation."""
     import zarr  # noqa: PLC0415
 
@@ -564,7 +507,7 @@ def verify_split_zarr(zarr_path: Path, first_item: dict, fk: WBCPolicyFK, args) 
         raise RuntimeError(f"{zarr_path}: point_cloud[0] has duplicate points "
                            "(FPS should return distinct picks)")
 
-    if args.masks_dir is not None:
+    if mask_artifact is not None:
         point_mask = root["data/point_mask"]
         if point_mask.shape != (frames, args.num_points) or point_mask.dtype != np.int8:
             raise RuntimeError(f"{zarr_path}: point_mask {point_mask.shape} "
@@ -572,9 +515,7 @@ def verify_split_zarr(zarr_path: Path, first_item: dict, fk: WBCPolicyFK, args) 
         values = np.asarray(point_mask[0])
         if values.min() < 0 or values.max() > 2:
             raise RuntimeError(f"{zarr_path}: point_mask[0] outside the label legend")
-        mask_frames = load_episode_masks(
-            args.masks_dir, first_item["source"], first_item["raw_index"],
-            ep["frame_count"], ep["depth"].shape[1:3])
+        mask_frames = mask_artifact.load_masks()
         exp_labels = mask_frames[start].ravel()[exp_pix][exp_chosen[0]].astype(np.int8)
         if not np.array_equal(values, exp_labels):
             raise RuntimeError(f"{zarr_path}: point_mask[0] != recompute through the "
@@ -587,6 +528,11 @@ def verify_split_zarr(zarr_path: Path, first_item: dict, fk: WBCPolicyFK, args) 
         if env_dino.shape != (frames, exp_dino.shape[0]) or env_dino.dtype != np.float32:
             raise RuntimeError(f"{zarr_path}: env_dino {env_dino.shape} {env_dino.dtype} "
                                f"!= ({frames}, {exp_dino.shape[0]}) float32")
+        if env_dino.attrs.get("dino_input_scale") != DINO_INPUT_SCALE:
+            raise RuntimeError(
+                f"{zarr_path}: env_dino dino_input_scale attr "
+                f"{env_dino.attrs.get('dino_input_scale')!r} != {DINO_INPUT_SCALE!r}"
+            )
         first_ep_dino = np.asarray(env_dino[:int(episode_ends[0])])
         if not np.array_equal(first_ep_dino,
                               np.tile(exp_dino, (len(first_ep_dino), 1))):
@@ -667,7 +613,7 @@ def write_meta_sidecar(zarr_path: Path, split: str, args, episodes: int, frames:
             "layout": "task-slot order [src, dst], D per slot; frame-0 DINOv3 "
                       "region features (see extract_object_dino_feats.py)",
             "constant_per_episode": True,
-            "dino_input_scale": "[0,1]",
+            "dino_input_scale": DINO_INPUT_SCALE,
         }
     if args.masks_dir is not None:
         meta["point_mask"] = {
@@ -677,10 +623,26 @@ def write_meta_sidecar(zarr_path: Path, split: str, args, episodes: int, frames:
             "selection": "index propagation through valid->crop->pool->FPS "
                          "(point_cloud bit-identical to a maskless build)",
         }
-    zarr_path.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2))
+    with zarr_path.with_suffix(".meta.json").open("x") as stream:
+        stream.write(json.dumps(meta, indent=2))
 
 
 def convert(args) -> None:
+    out_root = Path(args.out_root)
+    if out_root.exists() or out_root.is_symlink():
+        raise RuntimeError(
+            f"--out-root already exists: {out_root}. Delete it manually after "
+            "confirming its contents are no longer needed, then rerun. This porter "
+            "never reuses or overwrites an output root."
+        )
+    if args.dino and args.positions_dir is None:
+        raise ValueError("--dino needs --positions-dir")
+    if args.masks_dir is not None and args.positions_dir is None:
+        raise ValueError(
+            "--masks-dir needs --positions-dir so mask labels are verified against "
+            "the current SceneDiff slot mapping"
+        )
+
     work = porter.build_work_list(args.raw_dir, args.include_recovery_data)
 
     explicit_split = args.split_csv is not None
@@ -701,8 +663,7 @@ def convert(args) -> None:
                  n_recovery, ", ".join(f"{s}:{len(v)}" for s, v in splits.items()),
                  args.state_frame, args.num_points)
 
-    # Position conditioning: load + validate EVERY episode's env-state before any zarr is
-    # created/overwritten, exactly like the LeRobot porter (same helpers, same keying).
+    # Load and validate every external artifact before creating the output root.
     env_state_by_key = None
     if args.positions_dir is not None:
         env_state_by_key = porter.validate_all_episode_positions(
@@ -717,30 +678,48 @@ def convert(args) -> None:
         logging.info("DINO conditioning ON: %d env-dino vector(s) (%d-D) from the "
                      "positions sidecars", len(env_dino_by_key),
                      next(iter(env_dino_by_key.values())).shape[0])
+    mask_artifacts = None
     if args.masks_dir is not None:
-        validate_all_episode_masks(args.masks_dir, work, args.positions_dir)
-
-    # Fail fast on pre-existing outputs BEFORE any heavy work.
-    args.out_root.mkdir(parents=True, exist_ok=True)
-    zarr_paths = {s: args.out_root / f"{args.name}_{s}.zarr" for s in splits}
-    for split, path in zarr_paths.items():
-        if path.exists():
-            if not args.overwrite:
-                raise RuntimeError(f"{path} already exists. Use --overwrite to replace it.")
-            logging.info("Removing existing %s (--overwrite)", path)
-            shutil.rmtree(path)
+        mask_artifacts = validate_all_episode_masks(
+            args.masks_dir, work, args.positions_dir
+        )
 
     fk = WBCPolicyFK()
-    for split, items in splits.items():
-        path = zarr_paths[split]
-        logging.info("Writing %s (%d episode(s))", path, len(items))
-        rng = np.random.default_rng(args.seed)
-        episodes, frames, episode_manifest = write_split_zarr(
-            path, items, fk, args, rng, env_state_by_key, env_dino_by_key
-        )
-        write_meta_sidecar(path, split, args, episodes, frames, episode_manifest)
-        verify_split_zarr(path, items[0], fk, args)
-        logging.info("Split %s finalized: %d episode(s), %d frames", split, episodes, frames)
+    # mkdir(exist_ok=False) is the atomic ownership boundary. Because this invocation
+    # created the entire root, it is safe to remove the root wholesale on any failure.
+    out_root.mkdir(parents=True, exist_ok=False)
+    try:
+        zarr_paths = {s: out_root / f"{args.name}_{s}.zarr" for s in splits}
+        for split, items in splits.items():
+            path = zarr_paths[split]
+            logging.info("Writing %s (%d episode(s))", path, len(items))
+            rng = np.random.default_rng(args.seed)
+            episodes, frames, episode_manifest = write_split_zarr(
+                path,
+                items,
+                fk,
+                args,
+                rng,
+                env_state_by_key,
+                env_dino_by_key,
+                mask_artifacts,
+            )
+            write_meta_sidecar(
+                path, split, args, episodes, frames, episode_manifest
+            )
+            first_key = (items[0]["source"], items[0]["raw_index"])
+            first_mask = None if mask_artifacts is None else mask_artifacts[first_key]
+            verify_split_zarr(path, items[0], fk, args, first_mask)
+            logging.info(
+                "Split %s finalized: %d episode(s), %d frames",
+                split,
+                episodes,
+                frames,
+            )
+    except BaseException:
+        # Includes Ctrl-C: an interrupted run must not look like a complete dataset.
+        shutil.rmtree(out_root)
+        raise
 
 
 def main() -> None:
@@ -800,7 +779,6 @@ def main() -> None:
     parser.add_argument("--dino", action="store_true",
                         help="also write data/env_dino from the positions DINO sidecars "
                              "(episode_<N>_dino.npz; needs --positions-dir)")
-    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -811,6 +789,9 @@ def main() -> None:
     if args.dino and args.positions_dir is None:
         raise SystemExit("--dino needs --positions-dir (the sidecars live next to the "
                          "positions NPZs)")
+    if args.masks_dir is not None and args.positions_dir is None:
+        raise SystemExit("--masks-dir needs --positions-dir so mask labels are verified "
+                         "against the current SceneDiff slot mapping")
 
     try:
         convert(args)
