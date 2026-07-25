@@ -17,6 +17,7 @@ import omnigibson as og
 
 from wbc_client import WBCClient
 import base_ctrl
+import zed_sim
 
 TORSO = ["torso_j1", "torso_j2", "torso_j3"]
 ARM_L = [f"L_arm_j{i}" for i in range(1, 8)]
@@ -41,7 +42,7 @@ def _jc(kp):
 
 class VegaOGEnv:
     def __init__(self, task=None, action_hz=100, physics_hz=200, render_hz=100, pos_kp=1500,
-                 lock_base=True, wbc_port=5610, obs_hw=(240, 320), wbc_overrides=None,
+                 lock_base=True, wbc_port=5610, obs_hw=None, wbc_overrides=None,
                  scene_model="Rs_int", robot_pos=(-0.5, 0.4, 0.03), robot_yaw=0.0,
                  grasping_mode="physical", grasping_direction="upper", mobile=False):
         # Base is LOCKED in the sim, so the teleop-safety terms that keep the upper body centered
@@ -94,6 +95,11 @@ class VegaOGEnv:
         # the task-level convention stable: command -1 => CLOSE, +1 => OPEN.
         self.grip_close = -1.0
         self.grip_open = 1.0
+        # A VisionSensor's render product is sized at LOAD time -- headless, its image_width
+        # setter is a no-op -- so the head render size has to be fixed here. Callers using the
+        # ZED-parity path pass `zed_sim.head_render_hw(opts)` (the raw SVGA canvas, which
+        # obs_pipeline then crops/resizes like the real publisher).
+        obs_hw = zed_sim.DEFAULT_RENDER_HW if obs_hw is None else tuple(obs_hw)
         robot_cfg = {
             # depth_linear == Isaac distance_to_image_plane (z-depth), which is what the pinhole
             # unprojection in wbc_pointcloud wants; OmniGibson's "depth" is distance_to_camera

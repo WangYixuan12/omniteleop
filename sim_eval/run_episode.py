@@ -12,14 +12,9 @@ from tasks import TASKS
 P = lambda *a: print(*a, flush=True)
 
 
-def head_rgb(env):
-    obs, _ = env.robot.get_obs()
-    for key, val in obs.items():
-        if isinstance(val, dict) and "rgb" in val:
-            a = val["rgb"]
-            a = a.detach().cpu().numpy() if hasattr(a, "detach") else np.asarray(a)
-            return a[..., :3].astype(np.uint8)
-    return None
+def head_rgb(rec):
+    """The PUBLISHED head view (post crop/resize) -- exactly the frame that gets recorded."""
+    return rec._head_images()[0]
 
 
 def main():
@@ -34,7 +29,10 @@ def main():
                     help="log measured vs WBC-reference base pose + head pose every N ticks")
     ap.add_argument("--head-cost", type=float, default=None,
                     help="override head_world_position_cost on all 3 axes (default: env's own)")
+    import zed_sim
+    zed_sim.ZedSimOptions.add_cli(ap)
     args = ap.parse_args()
+    zed_opts = zed_sim.ZedSimOptions.from_args(args)
     out = args.out or f"/tmp/claude-1000/-home-yixuan-BEHAVIOR-1K/9901aed5-d602-4345-b36f-c4b1542046a9/scratchpad/{args.task}_seed{args.seed}.mp4"
 
     task = TASKS[args.task](rng=np.random.default_rng(args.seed))
@@ -44,15 +42,16 @@ def main():
         ovr = {"head_world_position_cost": [args.head_cost] * 3,
                "enable_torso_top_x_anchor": False}
     env = VegaOGEnv(task=task, lock_base=not mobile, mobile=mobile, wbc_port=args.port, pos_kp=4000,
-                    obs_hw=(480, 640), grasping_mode=task.GRASPING_MODE, wbc_overrides=ovr,
-                    robot_pos=task.ROBOT_POS, robot_yaw=task.ROBOT_YAW)
+                    obs_hw=zed_sim.head_render_hw(zed_opts), grasping_mode=task.GRASPING_MODE,
+                    wbc_overrides=ovr, robot_pos=task.ROBOT_POS, robot_yaw=task.ROBOT_YAW)
     if mobile:
         env.base_x_max = getattr(task, "BASE_X_MAX", None)   # forward-park clamp near the table
     env.reset(seed=args.seed)
     # Park the head camera at zed_depth_frame + add the wrist camera, exactly as the data
     # collector does, so the head video the user reviews IS the policy's recorded view.
     from obs_pipeline import SimObsRecorder
-    SimObsRecorder(env).setup()
+    rec = SimObsRecorder(env, seed=args.seed, zed=zed_opts)
+    rec.setup()
     src, dst = task.objects_of_interest(env)                    # [source, target] world XYZ (generic)
     P(f"[run] task={args.task} seed={args.seed} grasp={task.GRASPING_MODE}; "
       f"src@{np.round(src,3)} dst@{np.round(dst,3)}")
@@ -105,7 +104,7 @@ def main():
               f"grasped={ag.name if ag is not None else None}{extra}")
             last_phase = cmd.phase
         if i % args.frame_every == 0:
-            f = head_rgb(env)                                   # head-cam view (the policy's view)
+            f = head_rgb(rec)                                   # head-cam view (the policy's view)
             if f is not None:
                 frames.append(f)
             try:

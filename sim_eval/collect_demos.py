@@ -29,6 +29,7 @@ import os
 os.environ.setdefault("OMNIGIBSON_HEADLESS", "1")
 import argparse
 import csv
+import dataclasses
 import json
 import numpy as np
 
@@ -36,6 +37,7 @@ import omnigibson as og
 
 from vega_og_env import VegaOGEnv
 from obs_pipeline import SimObsRecorder
+import zed_sim
 from tasks import TASKS
 
 P = lambda *a: print(*a, flush=True)
@@ -129,9 +131,14 @@ def main():
     ap.add_argument("--max-ticks", type=int, default=800)
     ap.add_argument("--n-test", type=int, default=2, help="last N episodes -> test split")
     ap.add_argument("--port", type=int, default=5640)
-    ap.add_argument("--obs-hw", type=int, nargs=2, default=(240, 320))
+    ap.add_argument("--obs-hw", type=int, nargs=2, default=None,
+                    help="raw head render size (default: whatever the zed realism switches "
+                         "imply -- zed_sim.head_render_hw)")
     ap.add_argument("--keep-failures", action="store_true")
+    zed_sim.ZedSimOptions.add_cli(ap)
     args = ap.parse_args()
+    zed_opts = zed_sim.ZedSimOptions.from_args(args)
+    obs_hw = tuple(args.obs_hw) if args.obs_hw else zed_sim.head_render_hw(zed_opts)
 
     root = args.out or os.path.expanduser(f"~/Dexmate/data/sim_{args.task}")
     raw_dir = os.path.join(root, "raw_data")
@@ -143,17 +150,18 @@ def main():
     mobile = getattr(task, "MOBILE", False)
     action_hz = 100
     env = VegaOGEnv(task=task, lock_base=not mobile, mobile=mobile, wbc_port=args.port,
-                    pos_kp=4000, action_hz=action_hz, obs_hw=tuple(args.obs_hw),
+                    pos_kp=4000, action_hz=action_hz, obs_hw=obs_hw,
                     grasping_mode=task.GRASPING_MODE,
                     robot_pos=task.ROBOT_POS, robot_yaw=task.ROBOT_YAW)
     if mobile:
         env.base_x_max = getattr(task, "BASE_X_MAX", None)
-    recorder = SimObsRecorder(env)
+    recorder = SimObsRecorder(env, seed=args.seed0, zed=zed_opts)
 
     kept, xyz_lo, xyz_hi = [], None, None
     for k in range(args.episodes):
         seed = args.seed0 + k
         task.rng = np.random.default_rng(seed)
+        recorder._rng = np.random.default_rng(seed)   # depth dropouts reproducible per episode
         frames, success, src, dst = run_episode(env, task, recorder, seed, args.fps,
                                                  args.max_ticks, action_hz)
         if not success and not args.keep_failures:
@@ -181,7 +189,8 @@ def main():
             w.writerow([i, "test" if i >= len(kept) - args.n_test else "train"])
 
     meta = {"task": args.task, "episodes": len(kept), "fps": args.fps,
-            "obs_hw": list(args.obs_hw), "seed0": args.seed0,
+            "obs_hw": list(obs_hw), "seed0": args.seed0,
+            "zed_realism": dataclasses.asdict(zed_opts),
             "object_world_min": None if xyz_lo is None else xyz_lo.round(3).tolist(),
             "object_world_max": None if xyz_hi is None else xyz_hi.round(3).tolist()}
     with open(os.path.join(root, "sim_meta.json"), "w") as f:
@@ -189,6 +198,12 @@ def main():
     P(f"[collect] kept {len(kept)}/{args.episodes} episodes -> {raw_dir}")
     P(f"[collect] objects (engage-origin world) span {meta['object_world_min']} .. "
       f"{meta['object_world_max']}  (set the zarr --crop-min/--crop-max around this)")
+    if zed_opts.match_zed_fov:
+        # The real ZED's wider field puts fewer pixels on the workspace, so a crop fitted to the
+        # objects alone starves the cloud below the 1024-point FPS budget; it then has to span the
+        # EEF targets too (the grasped object is carried back toward the robot).
+        P("[collect] NOTE --match-zed-fov: widen the crop to cover the EEF targets, e.g. "
+          "--crop-min 0.35 -0.52 0.55 --crop-max 1.65 0.46 1.04 for mobilepickplace")
     env.close()
 
 

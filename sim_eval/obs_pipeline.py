@@ -29,6 +29,10 @@ z-depth the pinhole model wants) -- NOT `depth`, which OmniGibson maps to `dista
 millimetres (`wbc_pointcloud.DEPTH_SCALE_M = 1e-3`); non-finite/out-of-range pixels become 0,
 which falls below `MIN_DEPTH_M` and is dropped by the unprojection.
 
+`zed_sim.ZedSimOptions` optionally makes the cameras behave like the real ZEDs -- real field of
+view + the publisher's crop/resize, and the measured depth-dropout process. Every switch defaults
+OFF, so unless one is passed the frames are plain OmniGibson renders as before.
+
 vega_robotiq has no wrist camera prim, so `setup()` creates one under the eef link, pulled back
 and raised above the measured eef->fingertip direction (`finger_grasp_point`), then aimed at the
 grasp point so the fingers and grasped object fill the frame.
@@ -43,11 +47,13 @@ from scipy.spatial.transform import Rotation as R
 
 import omnigibson as og
 
+import zed_sim
+
 # optical (x right, y down, z forward)  ->  USD camera (x right, y up, z backward)
 _OPTICAL_TO_USD = np.diag([1.0, -1.0, -1.0, 1.0])
 DEPTH_SCALE_M = 1e-3      # wbc_pointcloud.DEPTH_SCALE_M -- uint16 millimetres
 MAX_DEPTH_MM = 65535
-_MIN_DEPTH_M = 0.1        # matches test_head_zedx_depth.depth_min / dexsensor head_camera
+_NEAR_CLIP_M = zed_sim.NEAR_CLIP_M   # culls the robot's own chest (see zed_sim.NEAR_CLIP_M)
 
 
 def _np(x):
@@ -68,7 +74,7 @@ class SimObsRecorder:
     then `frame(cmd)` on every recorded tick.
     """
 
-    def __init__(self, env, arm="left", wrist_back=0.12, wrist_up=0.08):
+    def __init__(self, env, arm="left", wrist_back=0.12, wrist_up=0.08, seed=0, zed=None):
         self.env = env
         self.arm = arm
         self.eef_link = {"left": "L_ee", "right": "R_ee"}[arm]
@@ -77,17 +83,32 @@ class SimObsRecorder:
         self.head_cam = None
         self.wrist_cam = None
         self._head_key = None
+        self._render_k = None                 # K of the raw render (pre crop/resize)
+        self.zed = zed or zed_sim.ZedSimOptions()   # all realism switches default OFF
+        self._rng = np.random.default_rng(seed)   # depth-dropout draws; per-episode reproducible
 
     # ---- cameras ----
     def setup(self):
         robot = self.env.robot
         self.head_cam = next(iter(robot.sensors.values()))
         self._retarget_head_camera()
+        self._render_k = zed_sim.configure_head_camera(self.head_cam, self.zed)
         if self.wrist_cam is None:            # created once; re-aimed on every episode reset
             self.wrist_cam = self._make_wrist_camera()
+            zed_sim.configure_wrist_camera(self.wrist_cam, self.zed)
         self._place_wrist_camera()
         for _ in range(4):
             og.sim.render()
+        k = self.intrinsic()
+        err = float(np.abs(k - zed_sim.ZED_K).max())
+        print(f"[obs] zed realism: {self.zed.summary()}; head K fx={k[0,0]:.2f} fy={k[1,1]:.2f} "
+              f"cx={k[0,2]:.2f} cy={k[1,2]:.2f} (dev from real ZED_K {err:.3f} px)", flush=True)
+        if self.zed.match_zed_fov and err > 1.0:
+            raise RuntimeError(
+                f"--match-zed-fov is on but the sim head intrinsic is {err:.2f} px off the real "
+                f"ZED_K, so the policy would see a different camera than the robot. "
+                f"Got\n{k}\nwant\n{zed_sim.ZED_K}"
+            )
 
     def _retarget_head_camera(self):
         """Park the head VisionSensor at `zed_depth_frame` with the optical convention.
@@ -105,9 +126,10 @@ class SimObsRecorder:
             frame="parent",
         )
         # `eyes` sits 1.1 cm FORWARD of zed_depth_frame, i.e. just outside the head shell, so at
-        # the exact zed pose the shell fills the frame (measured: every pixel black at 5 mm). Clip
-        # near plane at the same 0.1 m the real ZED publisher uses (test_head_zedx_depth.depth_min).
-        self.head_cam.clipping_range = (_MIN_DEPTH_M, 1.0e7)
+        # the exact zed pose the shell fills the frame (measured: every pixel black at 5 mm), and
+        # the chest yoke at ~0.106 m straddles a 0.10 m near plane and paints a black rectangle
+        # into the lower-left corner. `zed_sim.NEAR_CLIP_M` clears both -- see the constant.
+        self.head_cam.clipping_range = (_NEAR_CLIP_M, 1.0e7)
 
     def _make_wrist_camera(self):
         """Create a VisionSensor prim on the eef link (vega_robotiq ships no wrist camera)."""
@@ -115,7 +137,7 @@ class SimObsRecorder:
         from omnigibson.utils.usd_utils import absolute_prim_path_to_scene_relative
 
         env, robot = self.env, self.env.robot
-        h, w = self.head_cam.image_height, self.head_cam.image_width
+        h, w = zed_sim.wrist_render_hw(self.zed)
         path = f"{robot.prim_path}/{self.eef_link}/WristCam"
         sensor = create_sensor(
             sensor_type="Camera",
@@ -156,20 +178,18 @@ class SimObsRecorder:
         )
 
     def intrinsic(self):
-        return np.asarray(self.head_cam.intrinsic_matrix, dtype=np.float32).reshape(3, 3)
+        """K of the PUBLISHED head view (the render's K put through any crop/resize)."""
+        return zed_sim.head_intrinsic(self._render_k, self.zed)
 
     # ---- per-frame data ----
     def _head_images(self):
         obs, _ = self.head_cam.get_obs()
-        rgb = _np(obs["rgb"])[..., :3].astype(np.uint8)
-        depth_m = _np(obs["depth_linear"]).astype(np.float64)
-        depth_mm = np.where(np.isfinite(depth_m), depth_m / DEPTH_SCALE_M, 0.0)
-        depth_mm = np.clip(depth_mm, 0.0, MAX_DEPTH_MM).astype(np.uint16)
-        return rgb, depth_mm
+        return zed_sim.head_frame(_np(obs["rgb"]), _np(obs["depth_linear"]),
+                                  self._rng, self._render_k, self.zed)
 
     def _wrist_rgb(self):
         obs, _ = self.wrist_cam.get_obs()
-        return _np(obs["rgb"])[..., :3].astype(np.uint8)
+        return zed_sim.wrist_frame(_np(obs["rgb"]), self.zed)
 
     def frame(self, cmd, timestamp_ns, wbc_resp=None):
         """One raw-schema frame dict (see module docstring). `cmd` is the ExpertCommand."""
