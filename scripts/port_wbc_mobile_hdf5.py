@@ -23,7 +23,14 @@ recorder; the porter never substitutes ``episode_*_debug.hdf5`` data):
 ``action/eef/{left,right}`` (T,4,4), ``action/head`` (T,4,4),
 ``obs/base/pose`` (T,3), plus the usual ``obs/joint``, ``obs/gripper``,
 ``action/gripper``, and ``obs/images/{head_left_rgb,head_depth,left_wrist_rgb,
-intrinsic}`` (intrinsic is STATIC (3,3) in this recorder).
+right_wrist_rgb,intrinsic}`` (intrinsic is STATIC (3,3) in this recorder).
+
+Wrist cameras: ``left``/``right`` name the ARM. Both are ported by default as
+``observation.images.{left,right}_wrist_rgb``. ``right_wrist_rgb`` is OPTIONAL so
+single-wrist takes still port -- but all takes in one run must agree, since a LeRobot
+feature schema is fixed at dataset creation (see ``detect_right_wrist_presence``).
+In pre-two-wrist takes the key ``left_wrist_rgb`` physically holds the RIGHT arm's
+camera; nothing in the file records which, so it ports as left.
 
 Gripper policy: ``obs/gripper`` is NaN until the first FC03 reply, so leading
 frames with a NaN gripper are DROPPED; a NaN after the first finite value is
@@ -39,9 +46,10 @@ Sidecars per episode (not in the parquet):
 ``debug/timing/episode_XXXXXX.npz`` key ``timestamp_ns`` (T',) always; plus, for
     takes recorded with the timing-aware recorder, the per-frame capture stamps
     ``head_frame_ns``/``left_wrist_frame_ns``/``grab_wall_ns`` (T'), optional
-    ``head_depth_frame_ns`` (T') when present, and the 0-d
+    ``head_depth_frame_ns``/``right_wrist_frame_ns`` (T') when present, and the 0-d
     ``ntp_offset_ns``/``ntp_rtt_ns``/``ntp_queried_at_ns`` SoC clock calibration,
-    plus optional 0-d ``camera_ntp_{head,wrist}_*`` camera-publisher-host clock
+    plus optional 0-d ``camera_ntp_{head,left_wrist,right_wrist}_*`` (legacy
+    ``camera_ntp_wrist_*``) camera-publisher-host clock
     calibration -- everything scripts/audit_episode_latency.py needs, preserved
     through the port so latency analysis / camera-latency-correction ablations
     never require the raw takes.
@@ -239,7 +247,7 @@ def load_trim_spec(recovery_dir: Path) -> dict[int, tuple[int, int]]:
     return spec
 
 
-def _resolve_window(
+def resolve_episode_window(
     frame_count: int, t0: int, trim: tuple[int, int] | None, source: str | Path
 ) -> tuple[int, int]:
     """The half-open ``[start, end)`` frame window an episode contributes.
@@ -295,9 +303,13 @@ def read_required_array(
 
 
 _TIMING_KEYS = ("head_frame_ns", "left_wrist_frame_ns", "grab_wall_ns")
-_OPTIONAL_TIMING_KEYS = ("head_depth_frame_ns",)
+# right_wrist_frame_ns rides with the second wrist camera; optional so single-wrist
+# takes recorded before it existed still port.
+_OPTIONAL_TIMING_KEYS = ("head_depth_frame_ns", "right_wrist_frame_ns")
 _NTP_KEYS = ("offset_ns", "rtt_ns", "queried_at_ns")
-_CAMERA_NTP_LABELS = ("head", "wrist")
+# "wrist" is the legacy single-camera label (wbc_vr_robot before the two-wrist split);
+# absent labels are skipped, so old and new episodes both load whatever they carry.
+_CAMERA_NTP_LABELS = ("head", "left_wrist", "right_wrist", "wrist")
 _CAMERA_NTP_INT_KEYS = ("offset_ns", "rtt_ns", "queried_at_ns")
 _CAMERA_NTP_STR_KEYS = ("sensor_id", "source")
 
@@ -317,8 +329,10 @@ def load_episode_timing(f: h5py.File, source: str | Path, frame_count: int) -> d
     arrays, matching the ``debug/timing`` sidecar layout. Optional
     ``obs/images/head_depth_frame_ns`` is optional for compatibility with takes recorded
     before depth carried its own stamp; when present it is validated and preserved.
-    ``meta/camera_ntp/{head,wrist}`` groups are flattened to
-    ``camera_ntp_<label>_<key>`` scalar sidecar entries.
+    ``obs/images/right_wrist_frame_ns`` is optional the same way (absent on
+    single-wrist takes). ``meta/camera_ntp/{head,left_wrist,right_wrist}`` groups --
+    plus the legacy single-camera ``wrist`` label -- are flattened to
+    ``camera_ntp_<label>_<key>`` scalar sidecar entries; absent labels are skipped.
     """
     present = [key for key in _TIMING_KEYS if f"obs/images/{key}" in f]
     optional_present = [key for key in _OPTIONAL_TIMING_KEYS if f"obs/images/{key}" in f]
@@ -360,7 +374,18 @@ def load_episode_timing(f: h5py.File, source: str | Path, frame_count: int) -> d
             )
         if np.any(arr <= 0):
             raise RuntimeError(f"{source}: obs/images/{key} has non-positive stamps")
-        if arr.shape[0] > 1 and np.any(np.diff(arr) < 0):
+        # right_wrist_frame_ns is optional only because older takes predate the second
+        # camera -- when present it is a CAMERA stream behind the recorder's freshness
+        # gate, so it must be STRICTLY increasing exactly like the required stamps.
+        # head_depth_frame_ns is merely monotonic: depth may repeat a stamp when it lags
+        # RGB by a frame.
+        if key == "right_wrist_frame_ns":
+            if arr.shape[0] > 1 and np.any(np.diff(arr) <= 0):
+                raise RuntimeError(
+                    f"{source}: obs/images/{key} is not strictly increasing -- the "
+                    "recorder freshness gate forbids duplicate frames; corrupt take"
+                )
+        elif arr.shape[0] > 1 and np.any(np.diff(arr) < 0):
             raise RuntimeError(f"{source}: obs/images/{key} is not monotonic -- corrupt take")
         timing[key] = arr
     ntp_present = [key for key in _NTP_KEYS if f"meta/ntp/{key}" in f]
@@ -555,6 +580,14 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
     with h5py.File(hdf5_path, "r") as f:
         rgb = read_required_array(f, "obs/images/head_left_rgb", hdf5_path)
         wrist_rgb = read_required_array(f, "obs/images/left_wrist_rgb", hdf5_path)
+        # Right wrist is OPTIONAL: takes recorded before the second camera only carry
+        # left_wrist_rgb. NOTE in those legacy files that key is physically the RIGHT
+        # arm's camera -- nothing in the file distinguishes them, so it ports as left.
+        right_wrist_rgb = (
+            read_required_array(f, "obs/images/right_wrist_rgb", hdf5_path)
+            if "obs/images/right_wrist_rgb" in f
+            else None
+        )
         depth = read_required_array(f, "obs/images/head_depth", hdf5_path)
         intrinsic = read_required_array(f, "obs/images/intrinsic", hdf5_path)
         joints_obs = {
@@ -580,11 +613,15 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
         raise RuntimeError(
             f"{hdf5_path}: expected (T,H,W,3) uint8 head RGB, got " f"{rgb.shape} {rgb.dtype}"
         )
-    if wrist_rgb.ndim != 4 or wrist_rgb.shape[-1] != 3 or wrist_rgb.dtype != np.uint8:
-        raise RuntimeError(
-            f"{hdf5_path}: expected (T,H,W,3) uint8 wrist RGB, got "
-            f"{wrist_rgb.shape} {wrist_rgb.dtype}"
-        )
+    for _name, _arr in (
+        ("left_wrist_rgb", wrist_rgb),
+        *((("right_wrist_rgb", right_wrist_rgb),) if right_wrist_rgb is not None else ()),
+    ):
+        if _arr.ndim != 4 or _arr.shape[-1] != 3 or _arr.dtype != np.uint8:
+            raise RuntimeError(
+                f"{hdf5_path}: expected (T,H,W,3) uint8 {_name}, got "
+                f"{_arr.shape} {_arr.dtype}"
+            )
     if depth.ndim != 3 or depth.dtype != np.uint16:
         raise RuntimeError(
             f"{hdf5_path}: expected (T,H,W) uint16 depth, got " f"{depth.shape} {depth.dtype}"
@@ -603,6 +640,11 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
     frame_count = rgb.shape[0]
     checks: list[tuple[str, np.ndarray]] = [
         ("obs/images/left_wrist_rgb", wrist_rgb),
+        *(
+            (("obs/images/right_wrist_rgb", right_wrist_rgb),)
+            if right_wrist_rgb is not None
+            else ()
+        ),
         ("obs/images/head_depth", depth),
         ("obs/base/pose", base_pose),
         ("timestamp_ns", timestamp_ns),
@@ -662,7 +704,8 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
 
     return {
         "rgb": rgb,
-        "wrist_rgb": wrist_rgb,
+        "wrist_rgb": wrist_rgb,          # LEFT arm
+        "right_wrist_rgb": right_wrist_rgb,  # RIGHT arm, None on single-wrist takes
         "depth": depth,
         "intrinsic": intrinsic,
         "base_pose": base_pose,
@@ -787,14 +830,27 @@ def validate_all_episode_positions(
     return env_state_by_key
 
 
-def build_features(resize_h: int, resize_w: int, object_nums: int | None = None) -> dict:
+def build_features(
+    resize_h: int,
+    resize_w: int,
+    object_nums: int | None = None,
+    *,
+    has_right_wrist: bool = True,
+) -> dict:
+    """LeRobot feature schema.
+
+    Wrist cameras are keyed by ARM (``left``/``right``), matching the raw
+    ``obs/images/*`` schema. ``has_right_wrist=False`` drops the right camera for
+    single-wrist source takes -- declaring a feature the frames never fill would
+    make LeRobot reject every add_frame.
+    """
     features = {
         "observation.images.head_rgb": {
             "dtype": "video",
             "shape": (resize_h, resize_w, 3),
             "names": ["height", "width", "channels"],
         },
-        "observation.images.wrist_rgb": {
+        "observation.images.left_wrist_rgb": {
             "dtype": "video",
             "shape": (resize_h, resize_w, 3),
             "names": ["height", "width", "channels"],
@@ -810,6 +866,12 @@ def build_features(resize_h: int, resize_w: int, object_nums: int | None = None)
             "names": {"axes": list(ACTION_AXES)},
         },
     }
+    if has_right_wrist:
+        features["observation.images.right_wrist_rgb"] = {
+            "dtype": "video",
+            "shape": (resize_h, resize_w, 3),
+            "names": ["height", "width", "channels"],
+        }
     # Optional constant global conditioning: SceneDiff object positions (ENV state). This
     # is float32 (NOT an image/video dtype), so no policy auto-loads it as a VISUAL input;
     # the train command wires it into input_features as type ENV (diffusion consumes
@@ -822,6 +884,30 @@ def build_features(resize_h: int, resize_w: int, object_nums: int | None = None)
             "names": {"axes": axes},
         }
     return features
+
+
+def detect_right_wrist_presence(work: list[dict]) -> bool:
+    """Whether the source takes carry the right wrist camera; all must agree.
+
+    A LeRobot dataset's feature schema is fixed at creation, so a mixed batch would
+    either declare ``observation.images.right_wrist_rgb`` that some frames cannot fill
+    (``add_frame`` rejects the frame) or silently drop the second camera from the takes
+    that do have it. Refuse instead and make the caller port the two sets separately.
+    """
+    with_right: list[str] = []
+    without_right: list[str] = []
+    for item in work:
+        with h5py.File(item["path"], "r") as f:
+            bucket = with_right if "obs/images/right_wrist_rgb" in f else without_right
+            bucket.append(str(item["path"]))
+    if with_right and without_right:
+        raise RuntimeError(
+            "source episodes disagree on the right wrist camera, so one LeRobot feature "
+            "schema cannot describe them; port the two sets separately.\n"
+            f"  {len(with_right)} with right_wrist_rgb, e.g. {with_right[0]}\n"
+            f"  {len(without_right)} without, e.g. {without_right[0]}"
+        )
+    return bool(with_right)
 
 
 def _sidecar_path(variant_root: Path, kind: str, episode_idx: int) -> Path:
@@ -880,8 +966,9 @@ def add_episode(
         raise ValueError("task must be a non-empty string")
     ep = load_and_validate_episode(hdf5_path, fps)
     rgb, wrist_rgb, depth = ep["rgb"], ep["wrist_rgb"], ep["depth"]
+    right_wrist_rgb = ep["right_wrist_rgb"]
     frame_count = ep["frame_count"]
-    start, end = _resolve_window(frame_count, ep["t0"], trim, hdf5_path)
+    start, end = resolve_episode_window(frame_count, ep["t0"], trim, hdf5_path)
     kept = end - start
 
     depth_resized = np.empty((kept, resize_h, resize_w), dtype=np.uint16)
@@ -913,6 +1000,13 @@ def add_episode(
             wrist_resized = cv2.resize(
                 wrist_rgb[t], (resize_w, resize_h), interpolation=cv2.INTER_AREA
             )
+            right_wrist_resized = (
+                None
+                if right_wrist_rgb is None
+                else cv2.resize(
+                    right_wrist_rgb[t], (resize_w, resize_h), interpolation=cv2.INTER_AREA
+                )
+            )
             # INTER_NEAREST keeps uint16 millimeter depth exact across edges.
             depth_resized[i] = cv2.resize(
                 depth[t], (resize_w, resize_h), interpolation=cv2.INTER_NEAREST
@@ -920,11 +1014,13 @@ def add_episode(
 
             frame = {
                 "observation.images.head_rgb": rgb_resized,
-                "observation.images.wrist_rgb": wrist_resized,
+                "observation.images.left_wrist_rgb": wrist_resized,
                 "observation.state": state,
                 "action": action,
                 "task": task,
             }
+            if right_wrist_resized is not None:
+                frame["observation.images.right_wrist_rgb"] = right_wrist_resized
             if env_state_vec is not None:
                 frame[OBS_ENV_STATE_KEY] = env_state_vec
             dataset.add_frame(frame)
@@ -1216,10 +1312,17 @@ def verify(
             )
 
     item = dataset[0]
-    head_rgb, wrist_rgb = item["observation.images.head_rgb"], item["observation.images.wrist_rgb"]
+    head_rgb = item["observation.images.head_rgb"]
+    wrist_rgb = item["observation.images.left_wrist_rgb"]
     state = item["observation.state"].cpu().numpy()
     action = item["action"].cpu().numpy()
-    for cam_key, cam in (("head_rgb", head_rgb), ("wrist_rgb", wrist_rgb)):
+    cams = [("head_rgb", head_rgb), ("left_wrist_rgb", wrist_rgb)]
+    # Right wrist is present iff the schema declared it (single-wrist sources omit it).
+    if "observation.images.right_wrist_rgb" in meta.features:
+        cams.append(
+            ("right_wrist_rgb", item["observation.images.right_wrist_rgb"])
+        )
+    for cam_key, cam in cams:
         if tuple(cam.shape) != (3, resize_h, resize_w):
             raise RuntimeError(
                 f"verify[{split}]: {cam_key} shape {tuple(cam.shape)} != "
@@ -1253,7 +1356,7 @@ def verify(
     # Recompute the first stored frame independently (same FK) and pull the raw verbatim
     # targets to confirm the action is a straight copy (no base composition).
     ep = load_and_validate_episode(first_item["path"], fps)
-    start, end = _resolve_window(
+    start, end = resolve_episode_window(
         ep["frame_count"], ep["t0"], first_item["trim"], first_item["path"]
     )
     with h5py.File(first_item["path"], "r") as raw:
@@ -1338,11 +1441,14 @@ def verify(
         )
 
     logging.info(
-        "verify[%s] OK: head_rgb=%s wrist_rgb=%s state=%s action=%s depth=%s "
+        "verify[%s] OK: head_rgb=%s wrist_rgb=%s (%s) state=%s action=%s depth=%s "
         "calib=extrinsic%s+base%s+intrinsic%s timing=%s",
         split,
         tuple(head_rgb.shape),
         tuple(wrist_rgb.shape),
+        "left+right"
+        if "observation.images.right_wrist_rgb" in meta.features
+        else "left only",
         tuple(state.shape),
         tuple(action.shape),
         tuple(depth_stack.shape),
@@ -1396,6 +1502,21 @@ def convert_dataset(
         state_frame,
     )
 
+    # Fixed per dataset, so decide once across ALL takes before any split is created.
+    has_right_wrist = detect_right_wrist_presence(work)
+    if has_right_wrist:
+        logging.info("Wrist cameras: left + right (both arms)")
+    else:
+        # Loud on purpose: pre-two-wrist takes stored the RIGHT arm's camera under
+        # left_wrist_rgb, and nothing in the file distinguishes them, so this port
+        # necessarily labels that footage as the left arm.
+        logging.warning(
+            "Wrist cameras: left only -- these are single-wrist takes, so no "
+            "observation.images.right_wrist_rgb is written. If they predate the "
+            "second camera, their left_wrist_rgb is PHYSICALLY THE RIGHT ARM and is "
+            "being labelled left; do not mix this dataset with two-wrist takes."
+        )
+
     # ENV-state conditioning: validate EVERY episode's positions npz UP FRONT, before the
     # pre-existing-dir check below removes anything -- a missing/bad npz must abort with no
     # data written or deleted. Keyed by (source, raw_index) via the positions subdir.
@@ -1430,7 +1551,10 @@ def convert_dataset(
                 repo_id=repo_id,
                 fps=fps,
                 features=build_features(
-                    resize_h, resize_w, object_nums if positions_dir is not None else None
+                    resize_h,
+                    resize_w,
+                    object_nums if positions_dir is not None else None,
+                    has_right_wrist=has_right_wrist,
                 ),
                 root=variant_root,
                 robot_type=ROBOT_TYPE,

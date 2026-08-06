@@ -28,7 +28,7 @@ data collection. Every rollout records:
                                       action/head = the POLICY world targets)
   <save-dir>/policy_io/episode_N.hdf5 live rollout: ONE record per predicted
                                       chunk (state, full (n, 29) chunk, schedule
-                                      offsets, timing, and position-condition
+                                      offsets, timing, and live-condition
                                       instrumentation); replay: one record per
                                       released command (state/action vectors)
 
@@ -82,27 +82,20 @@ autonomously glides its arms to the reference EEF poses (the leader's
 poses hold within the leader's alignment tolerances, then blocks on Enter
 before the take actually starts. Recording begins only after that gate.
 
-Position conditioning (``--position-condition``): a checkpoint trained with a SceneDiff
-``observation.environment_state`` (README step 3) is REQUIRED to pass ``--position-condition``.
-After engage and after ``--align-reference`` has brought the arms to the shared start pose
-(before recording / inference), the rollout captures one head frame, stamps it with the FK
-``world_T_zed`` extrinsic (engage-origin world, the same frame as ``action`` /
-``observation.state[29:32]``), and shells out to ``scene_diff/run_live_pos_condition.sh`` (in
-its own ``.venv-merged`` interpreter) to diff it against ``--reference-hdf5`` and reduce the
-change to the object world positions. The operator resolves the ``[box, cloth]`` order from the
-size-slot overlay (``--pos-cond-matching prompt --prompt-after-capture``), and the flat
-``positions[order]`` is pinned as a constant env-state for the whole episode (single stage --
-no per-frame stage mask). A missing npz means the detection gate failed; the rollout raises
-before policy motion starts.
+Live object conditioning is activated only by checkpoint-declared scene requirements.
+After engage and reference alignment, the rollout captures a head RGB-D frame with its
+engage-origin ``world_T_zed``, runs the short-lived SceneDiff bootstrap, and requires the
+operator to map the fresh size-slot overlay to ``[src box, dst cloth]``. Positions, optional
+DINO descriptors, and seed labels are reordered together, checked against a separately
+captured validation frame, then installed atomically before recording or policy motion.
 
 Usage:
   python scripts/wbc_policy_rollout.py --policy-path /path/to/checkpoint \
       --align-reference ~/Dexmate/data/raw_data/reference.hdf5 \
       [--auto-start] [--max-seconds 120] [--save-dir ~/Dexmate/data/raw_data_rollout]
-  # position-conditioned checkpoint (live SceneDiff after reference alignment):
+  # A conditioned checkpoint activates SceneDiff automatically:
   python scripts/wbc_policy_rollout.py --policy-path /path/to/conditioned_checkpoint \
-      --align-reference ~/Dexmate/data/raw_data/reference.hdf5 \
-      --position-condition --prompt-after-capture
+      --align-reference ~/Dexmate/data/raw_data/reference.hdf5
   python scripts/wbc_policy_rollout.py \
       --replay-episode ~/Dexmate/data/raw_data/episode_0.hdf5 \
       --align-reference ~/Dexmate/data/raw_data/reference.hdf5
@@ -111,9 +104,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib.util
 import itertools
+import shutil
 import signal
+import tempfile
 import threading
 import time
 import traceback
@@ -124,15 +120,24 @@ from pathlib import Path
 
 import numpy as np
 
-from omniteleop.follower.scenediff_live import (  # dependency-light shared live plumbing
+from omniteleop.follower.live_object_condition import (
+    LiveObjectCondition,
+    LiveValidationFrame,
+    SceneRequirements,
+)
+from omniteleop.follower.scenediff_live import (
     invoke_scenediff as _invoke_scenediff,
 )
 from omniteleop.follower.scenediff_live import (
+    load_live_object_artifacts,
+    load_live_tracker_api,
     prompt_for_slot_order,
 )
 from omniteleop.follower.scenediff_live import (
     write_live_capture_hdf5 as _write_live_capture_hdf5,
 )
+from omniteleop.wbc_artifacts import validate_live_condition_with_tracker
+from omniteleop.wbc_pointcloud import MAX_DEPTH_M, MIN_DEPTH_M
 from omniteleop.wbc_policy_format import (
     ACTION_AXES,
     GRIPPER_BINARY_THRESHOLD,
@@ -159,7 +164,7 @@ REPLAY_GAP_WARN_S = 0.5
 REPLAY_START_POS_TOL_M = 0.15
 REPLAY_START_ROT_TOL_DEG = 30.0
 
-# --- Live SceneDiff position conditioning (--position-condition) --------------------
+# --- Checkpoint-driven live SceneDiff object bootstrap -------------------------------
 # Mobile analog of live_scenediff_rollout.py: after reference alignment we capture ONE
 # head frame, stamp it with the FK world_T_zed extrinsic (engage-origin world), diff it
 # against the fixed reference scene, and feed the arranged object positions to the policy
@@ -172,7 +177,7 @@ DEFAULT_SCENE_DIFF_PYTHON = "/home/yixuan/scene_diff/.venv-merged/bin/python"
 # SAME scene training diffed against (run_wbc_pos_condition.sh REFERENCE_LAST). Positions
 # land in the live engage-origin WORLD frame because make_deploy_before_hdf5.py uses the
 # live capture's OWN embedded extrinsic (world_T_zed), not the reference's calibration.
-DEFAULT_POS_COND_REFERENCE = "/home/yixuan/Dexmate/data/scene_diff/_before/reference_last.hdf5"
+DEFAULT_SCENE_REFERENCE = "/home/yixuan/Dexmate/data/scene_diff/_before/reference_last.hdf5"
 # The live-capture HDF5 writer, the SceneDiff subprocess invoker and the operator-order
 # prompt are shared with the tabletop path in omniteleop.follower.scenediff_live (imported
 # above): the single-frame HDF5 layout and the run_live_pos_condition.sh env interface are
@@ -323,10 +328,8 @@ class ActionScheduleBuffer:
     final scheduled action verbatim FOREVER once the trajectory is exhausted,
     which keeps ``last_cmd_wall`` fresh and defeats the stale-source watchdog.
     Here the terminal knot is returned exactly once (so the final waypoint is
-    actually commanded); afterwards ``sample()`` returns ``None``, the caller
-    stops advancing ``last_cmd_wall``, and the untouched ``compute_hold_reason``
-    watchdog holds the robot after ``--source-timeout`` -- covering a dead or
-    stalled inference thread. Behaviorally identical otherwise: the
+    actually commanded); the next sample is a terminal underflow that aborts the
+    episode immediately and rejects late chunks. Behaviorally identical otherwise: the
     ``TargetInterpolator`` holds its segment end with or without a verbatim
     re-push.
     """
@@ -335,6 +338,8 @@ class ActionScheduleBuffer:
         self._lock = threading.Lock()
         self._buffer: deque[ScheduledPolicyAction] = deque()
         self._last_executed: ScheduledPolicyAction | None = None
+        self._armed = False
+        self._terminal_underflow = False
 
     def __len__(self) -> int:
         with self._lock:
@@ -353,18 +358,22 @@ class ActionScheduleBuffer:
                 "scheduled actions must carry finite, strictly increasing timestamps"
             )
         with self._lock:
+            if self._terminal_underflow:
+                raise RuntimeError(
+                    "action buffer already underflowed; late chunks cannot resume motion"
+                )
             while self._buffer and self._buffer[-1].timestamp >= actions[0].timestamp:
                 self._buffer.pop()
             while self._buffer and self._buffer[0].timestamp < now:
                 self._buffer.popleft()
             self._buffer.extend(actions)
+            self._armed = True
 
     def sample(self, query_time: float) -> ScheduledPolicyAction | None:
         """Scheduled-trajectory value at ``query_time``; ``None`` when idle.
 
-        ``None`` before the first chunk arrives and once the trajectory is
-        exhausted (after the terminal knot has been returned once) -- the caller
-        must then NOT advance ``last_cmd_wall``, arming the source watchdog.
+        ``None`` before the first chunk arrives. Once armed, exhaustion after the
+        terminal knot raises and permanently poisons the buffer.
         The returned action carries ``timestamp=query_time`` and is remembered
         as the last-executed anchor for the next call.
         """
@@ -386,6 +395,11 @@ class ActionScheduleBuffer:
                 prev if prev is not None else future
             )
             if out is None or gripper_source is None:
+                if self._armed:
+                    self._terminal_underflow = True
+                    raise RuntimeError(
+                        "terminal action-buffer underflow after the first chunk was armed"
+                    )
                 return None
             executed = replace(
                 out,
@@ -505,18 +519,22 @@ class RecordedEpisodeSource:
 
     @property
     def n_frames(self) -> int:
+        """Number of recorded commands in the replay."""
         return self._n
 
     @property
     def duration_s(self) -> float:
+        """Recorded wall-clock span in seconds."""
         return float(self._rel_s[-1])
 
     @property
     def released(self) -> int:
+        """Number of replay commands released so far."""
         return self._next
 
     @property
     def done(self) -> bool:
+        """Whether every recorded command has been released."""
         return self._next >= self._n
 
     def start(self, now: float) -> None:
@@ -746,13 +764,16 @@ class PolicyObservation:
 
     state: np.ndarray               # (32,) float32, frame per the checkpoint
     head_rgb: np.ndarray            # (H, W, 3) uint8
-    wrist_rgb: np.ndarray | None    # (H, W, 3) uint8; None if the policy has no wrist
+    # arm ("left"/"right") -> (H, W, 3) uint8. Empty when the policy has no wrist
+    # input; carries exactly the arms the checkpoint declares.
+    wrist_rgb: dict[str, np.ndarray]
 
 
 class _PolicyBundle:
     """Checkpoint + pre/post processors + chunk-level inference for the WBC schema."""
 
-    def __init__(self, policy_path: str, device: str | None = None) -> None:
+    def __init__(self, policy_path: str, device: str | None = None,
+                 scene_diff_repo: str = DEFAULT_SCENE_DIFF_REPO) -> None:
         import torch  # noqa: PLC0415 -- heavy, hardware/GPU path only
         from lerobot.configs import PreTrainedConfig  # noqa: PLC0415
         from lerobot.policies import (  # noqa: PLC0415
@@ -773,7 +794,14 @@ class _PolicyBundle:
         # Relative checkpoints are supported: state must be WORLD-frame (see
         # _build_state / --relative-actions). state_frame follows this flag.
         self.use_relative_actions = bool(getattr(pcfg, "use_relative_actions", False))
-        self.state_frame = "world" if self.use_relative_actions else "base"
+        self.action_frame_mode = str(getattr(pcfg, "action_frame_mode", "world"))
+        if self.action_frame_mode == "mof":
+            # MoF derives every reference frame itself and lifts base -> world in-graph, so
+            # the checkpoint states which frame it wants rather than inferring it from the
+            # relative-action flag (which MoF rejects outright).
+            self.state_frame = str(getattr(pcfg, "mof_state_frame", "base"))
+        else:
+            self.state_frame = "world" if self.use_relative_actions else "base"
         self.policy = (
             get_policy_class(pcfg.type).from_pretrained(policy_path, config=pcfg)
             .to(self.device).eval()
@@ -792,22 +820,29 @@ class _PolicyBundle:
                 f"the WBC schema ({len(STATE_AXES)}/{len(ACTION_AXES)}); wrong checkpoint?"
             )
         img_keys = [k for k in in_feats if k.startswith("observation.images.")]
-        known = {"observation.images.head_rgb", "observation.images.wrist_rgb"}
+        # left/right name the ARM the wrist camera is mounted on, matching the porter's
+        # observation.images.{left,right}_wrist_rgb.
+        known = {
+            "observation.images.head_rgb",
+            "observation.images.left_wrist_rgb",
+            "observation.images.right_wrist_rgb",
+        }
         if not img_keys or set(img_keys) - known:
             raise ValueError(f"unsupported image inputs {img_keys}; expected subset of {known}")
         self.use_head = "observation.images.head_rgb" in in_feats
-        self.use_wrist = "observation.images.wrist_rgb" in in_feats
+        self.wrist_arms: list[str] = [
+            arm
+            for arm in ("left", "right")
+            if f"observation.images.{arm}_wrist_rgb" in in_feats
+        ]
         if not self.use_head:
             raise ValueError("policy must consume observation.images.head_rgb")
         chw = in_feats["observation.images.head_rgb"].shape  # (C, H, W)
         self.image_hw = (int(chw[1]), int(chw[2]))
 
-        # Optional SceneDiff position conditioning: the policy declares
-        # observation.environment_state (a constant object_nums*3 world-frame vector). The
-        # live wrapper computes it once at the rollout start pose and calls set_env_state()
-        # BEFORE inference; _sample_dict then rides it on every observation (finding 2:
-        # inject before the obs queues fill, else a conditioned checkpoint KeyErrors on the
-        # OBS_ENV_STATE queue).
+        # Optional SceneDiff env-state: the checkpoint declares a constant object_nums*3
+        # world-frame vector. It is installed only as part of one ordered live condition,
+        # before the observation queues can fill.
         self.use_env_state = OBS_ENV_STATE in in_feats
         self.env_state_dim = int(in_feats[OBS_ENV_STATE].shape[0]) if self.use_env_state else 0
         if self.use_env_state and (self.env_state_dim < 3 or self.env_state_dim % 3 != 0):
@@ -816,6 +851,13 @@ class _PolicyBundle:
                 "multiple of 3 (object_nums*3); wrong checkpoint?"
             )
         self._env_state: np.ndarray | None = None
+        self.scene_requirements = SceneRequirements(
+            object_nums=self.env_state_dim // 3 if self.use_env_state else 0,
+            needs_env_state=self.use_env_state,
+        )
+        self.scene_diff_repo = Path(scene_diff_repo).expanduser().resolve()
+        self._condition: LiveObjectCondition | None = None
+        self._validation_report: dict | None = None
 
         self.n_obs_steps = int(getattr(pcfg, "n_obs_steps", 1))
         n_action_steps = getattr(pcfg, "n_action_steps", None)
@@ -864,6 +906,9 @@ class _PolicyBundle:
         self._chunk_tail.clear()
         self._last_inference_trace = None
         self._model_environment_trace = None
+        self._env_state = None
+        self._condition = None
+        self._validation_report = None
 
     def inference_metadata(self) -> dict[str, np.ndarray]:
         """Constant checkpoint metadata written once in the policy-IO episode."""
@@ -872,6 +917,7 @@ class _PolicyBundle:
             "position_condition_mode": np.asarray(
                 self.position_condition_mode.encode("utf-8")
             ),
+            "action_frame_mode": np.asarray(self.action_frame_mode.encode("utf-8")),
         }
 
     def last_inference_trace(self) -> dict | None:
@@ -881,27 +927,121 @@ class _PolicyBundle:
     def describe(self) -> str:
         """One-line banner for _run_rollout. Other policy families override this."""
         return (f"LeRobot policy on {self.device}; head+"
-                f"{'wrist' if self.use_wrist else 'no-wrist'} @ {self.image_hw}; "
+                f"{'+'.join(f'{a}_wrist' for a in self.wrist_arms) or 'no-wrist'} "
+                f"@ {self.image_hw}; "
                 f"relative={self.use_relative_actions} state_frame={self.state_frame}; "
+                f"action_frame={self.action_frame_mode}; "
                 f"n_obs_steps={self.n_obs_steps} n_action_steps={self.n_action_steps}")
 
-    def set_env_state(self, vec: np.ndarray) -> None:
-        """Pin the constant SceneDiff position condition fed to every observation.
-
-        ``vec`` is the arranged ``positions[order]`` world-frame vector (length
-        ``env_state_dim`` = object_nums*3). Held for the whole episode -- identical to
-        training, where the env-state is a per-episode constant. Must be called before the
-        inference worker starts.
-        """
-        if not self.use_env_state:
-            raise RuntimeError(
-                "checkpoint has no observation.environment_state input; cannot set env-state")
-        v = np.asarray(vec, dtype=np.float32).reshape(-1)
-        if v.shape != (self.env_state_dim,) or not np.all(np.isfinite(v)):
+    def install_live_object_condition(self, condition: LiveObjectCondition) -> None:
+        """Install the ordered condition through the same family-neutral seam."""
+        if not self.scene_requirements.needs_bootstrap:
+            raise RuntimeError("unconditioned checkpoint cannot install a live condition")
+        if len(condition.positions) != self.scene_requirements.object_nums:
+            raise ValueError("live condition object count does not match checkpoint")
+        env_state = np.asarray(condition.env_state, dtype=np.float32).reshape(-1)
+        if env_state.shape != (self.env_state_dim,) or not np.all(np.isfinite(env_state)):
             raise ValueError(
-                f"env-state must be a finite ({self.env_state_dim},) vector, got {v.shape}")
-        self._env_state = v
+                f"env-state must be a finite ({self.env_state_dim},) vector, "
+                f"got {env_state.shape}"
+            )
+        self._env_state = env_state.copy()
         self._model_environment_trace = None
+        self._condition = condition
+
+    def validate_live_object_condition(
+        self,
+        condition: LiveObjectCondition,
+        *,
+        capture_validation_frame,
+        stage_dir: Path,
+    ) -> dict:
+        """Validate position-only LeRobot conditions with a disposable eager tracker."""
+        api = load_live_tracker_api(self.scene_diff_repo)
+        owner = api.Sam31VosTracker(do_compile=False)
+        validation_error: BaseException | None = None
+        try:
+            fresh = capture_validation_frame()
+            report = validate_live_condition_with_tracker(
+                owner,
+                condition,
+                fresh,
+                min_depth_m=MIN_DEPTH_M,
+                max_depth_m=MAX_DEPTH_M,
+                stage_dir=stage_dir,
+                tracker_compile=False,
+            )
+            self._validation_report = report
+            return report
+        except BaseException as exc:
+            validation_error = exc
+            raise
+        finally:
+            cleanup_errors: list[BaseException] = []
+            try:
+                owner.close()
+            except BaseException as close_error:
+                cleanup_errors.append(close_error)
+            del owner
+            gc.collect()
+            if self._torch.cuda.is_available():
+                try:
+                    self._torch.cuda.synchronize()
+                    self._torch.cuda.empty_cache()
+                    self._torch.cuda.synchronize()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                if validation_error is not None:
+                    for cleanup_error in cleanup_errors:
+                        validation_error.add_note(
+                            "tracker cleanup also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                else:
+                    primary = cleanup_errors[0]
+                    for cleanup_error in cleanup_errors[1:]:
+                        primary.add_note(
+                            "additional tracker cleanup failure: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    raise primary
+
+    def start_episode_runtime(self, **_kwargs) -> None:
+        """LeRobot env-state conditioning has no steady-state tracker."""
+
+    def finish_episode_runtime(self) -> None:
+        """LeRobot env-state conditioning owns no episode-scoped runtime."""
+
+    @property
+    def initial_head_timestamp_ns(self) -> int:
+        """Freshness floor that keeps the validation frame out of policy history."""
+        if self._validation_report is not None:
+            return int(self._validation_report["head_timestamp_ns"])
+        if self._condition is not None:
+            return int(self._condition.camera_timestamp_ns)
+        return -1
+
+    def live_condition_metadata(self) -> dict[str, np.ndarray] | None:
+        if self._condition is None:
+            return None
+        condition = self._condition
+        result: dict = {
+            "order": condition.order,
+            "positions": condition.positions,
+            "scene_diff_obj_ids": condition.scene_diff_obj_ids,
+            "camera_timestamp_ns": np.asarray(condition.camera_timestamp_ns, np.int64),
+            "world_frame_epoch": np.asarray(condition.world_frame_epoch, np.int64),
+            "source_artifact": np.asarray(str(condition.source_artifact).encode()),
+            "provenance_hashes": np.asarray(
+                [value.encode() for value in condition.provenance_hashes]
+            ),
+        }
+        if self._validation_report is not None:
+            result["validation"] = {
+                key: np.asarray(value) for key, value in self._validation_report.items()
+            }
+        return result
 
     def _chw(self, img_hwc: np.ndarray):
         import cv2  # noqa: PLC0415
@@ -921,15 +1061,19 @@ class _PolicyBundle:
             "observation.state": self._torch.from_numpy(state),
             "observation.images.head_rgb": self._chw(obs.head_rgb),
         }
-        if self.use_wrist:
-            if obs.wrist_rgb is None:
-                raise ValueError("policy consumes wrist_rgb but no wrist frame is available")
-            sample["observation.images.wrist_rgb"] = self._chw(obs.wrist_rgb)
+        for arm in self.wrist_arms:
+            frame = obs.wrist_rgb.get(arm)
+            if frame is None:
+                raise ValueError(
+                    f"policy consumes {arm}_wrist_rgb but no {arm} wrist frame is available"
+                )
+            sample[f"observation.images.{arm}_wrist_rgb"] = self._chw(frame)
         if self.use_env_state:
             if self._env_state is None:
                 raise RuntimeError(
-                    "policy consumes observation.environment_state but set_env_state() was "
-                    "never called -- run with --position-condition")
+                    "policy consumes observation.environment_state but the "
+                    "checkpoint-derived live condition was not installed"
+                )
             sample["observation.environment_state"] = self._torch.from_numpy(self._env_state)
         return sample
 
@@ -1018,9 +1162,9 @@ class _PolicyBundle:
         self._last_inference_trace = None
         if self.use_env_state:
             if self._env_state is None:
-                raise RuntimeError("position-conditioned inference has no raw env-state")
+                raise RuntimeError("env-state-conditioned inference has no raw env-state")
             if self._model_environment_trace is None:
-                raise RuntimeError("position-conditioned inference has no normalized env trace")
+                raise RuntimeError("env-state-conditioned inference has no normalized env trace")
             self._last_inference_trace = {
                 "position_condition": {
                     "raw_source_destination_xyz": self._env_state.copy(),
@@ -1036,7 +1180,7 @@ class _PolicyBundle:
         return out
 
     def select_action(self, state: np.ndarray, head_rgb: np.ndarray,
-                      wrist_rgb: np.ndarray | None) -> np.ndarray:
+                      wrist_rgb: dict[str, np.ndarray]) -> np.ndarray:
         """One action per call at the dataset cadence (offline-eval compat shim).
 
         Used by ``vis_wbc_policy_prediction.py``, NOT by the live rollout (its
@@ -1080,6 +1224,20 @@ def _build_state(driver, fk: WBCPolicyFK, state_frame: str = "base") -> np.ndarr
     return build_state_vector(poses, base_pose, grip_l, grip_r, state_frame=state_frame)
 
 
+def _grab_policy_head_rgb(driver) -> tuple[np.ndarray, int] | None:
+    """Read head RGB without repeatedly converting depth when the driver supports it.
+
+    Custom/test drivers that only implement the historical RGB-D helper keep
+    working through the fallback.  Both paths return the same publisher capture
+    timestamp used by the freshness gate.
+    """
+    rgb_only = getattr(driver, "_grab_head_rgb", None)
+    if callable(rgb_only):
+        return rgb_only()
+    rgbd = driver._grab_head_images()  # noqa: SLF001 -- backward-compatible audited read
+    return None if rgbd is None else (rgbd[0], int(rgbd[2]))
+
+
 class _InferenceWorker:
     """Async chunk inference: observation gathering + GPU forward OFF the 100 Hz thread.
 
@@ -1099,9 +1257,10 @@ class _InferenceWorker:
     THREADING AUDIT (plan.md Task 4 Step 3) -- every cross-thread call is a
     read-only, thread-safe cache read:
 
-    * ``driver._grab_head_images`` / ``_grab_wrist_image``: dexcontrol camera
-      ``get_obs`` on zenoh subscriber caches (documented "Thread Safety: This
-      method is thread-safe", dexcontrol zed_camera.py).
+    * ``driver._grab_head_rgb`` / ``_grab_wrist_image``: dexcontrol camera
+      ``get_obs`` on Zenoh subscriber caches (documented "Thread Safety: This
+      method is thread-safe", dexcontrol zed_camera.py). A custom driver's
+      historical ``_grab_head_images`` remains a compatibility fallback.
     * ``driver._read_measured_joints`` (via ``_build_state``): dexcontrol
       ``get_joint_pos`` subscriber-cache reads.
     * ``driver._odom.pose``: OdometryThread property, lock-protected copy.
@@ -1137,8 +1296,11 @@ class _InferenceWorker:
         self._stop = stop_event
         self.failed = threading.Event()
         self.fail_reason = ""
-        self._last_head_ns = -1
-        self._last_wrist_ns = -1  # stays -1 when the policy has no wrist input
+        self._last_head_ns = int(getattr(policy, "initial_head_timestamp_ns", -1))
+        # Per-arm last-used capture stamp; empty when the policy has no wrist input.
+        self._last_wrist_ns: dict[str, int] = {
+            arm: -1 for arm in getattr(policy, "wrist_arms", ())
+        }
         # Per-grab budget for a strictly-fresh frame: the cameras run ~15 fps, so a
         # new frame normally lands well inside 2 dataset periods; beyond that the
         # cycle is skipped and retried (record_tick's stale-grace abort backstops
@@ -1166,25 +1328,29 @@ class _InferenceWorker:
         """
         deadline = time.perf_counter() + self._grab_timeout
         while not self._stop.is_set():
-            head = self._driver._grab_head_images()  # noqa: SLF001 -- audited read
-            wrist = (
-                self._driver._grab_wrist_image()  # noqa: SLF001 -- audited read
-                if self._policy.use_wrist else None
-            )
-            head_ns = None if head is None else int(head[2])
-            wrist_ns = None if wrist is None else int(wrist[1])
-            fresh = head_ns is not None and head_ns > self._last_head_ns and (
-                not self._policy.use_wrist
-                or (wrist_ns is not None and wrist_ns > self._last_wrist_ns)
+            head = _grab_policy_head_rgb(self._driver)
+            wrists = {
+                arm: self._driver._grab_wrist_image(arm)  # noqa: SLF001 -- audited read
+                for arm in self._policy.wrist_arms
+            }
+            head_ns = None if head is None else int(head[1])
+            wrist_ns = {
+                arm: (None if w is None else int(w[1])) for arm, w in wrists.items()
+            }
+            # Every declared stream must advance past what this worker last used, so the
+            # policy never sees any camera frame twice.
+            fresh = head_ns is not None and head_ns > self._last_head_ns and all(
+                ns is not None and ns > self._last_wrist_ns[arm]
+                for arm, ns in wrist_ns.items()
             )
             if fresh:
                 state = _build_state(self._driver, self._fk, self._policy.state_frame)
                 self._last_head_ns = head_ns
-                if wrist_ns is not None:
-                    self._last_wrist_ns = wrist_ns
+                for arm, ns in wrist_ns.items():
+                    self._last_wrist_ns[arm] = ns
                 return PolicyObservation(
                     state=state, head_rgb=head[0],
-                    wrist_rgb=None if wrist is None else wrist[0],
+                    wrist_rgb={arm: w[0] for arm, w in wrists.items()},
                 )
             if time.perf_counter() >= deadline:
                 return None
@@ -1226,31 +1392,37 @@ class _InferenceWorker:
                 if self._stop.is_set():
                     break
                 obs_list, t_obs = gathered
+                obs_ready_wall_ns = time.time_ns()
                 t_pred0 = time.perf_counter()
                 chunk = self._policy.predict_chunk(obs_list)
                 if self._stop.is_set():
                     break
-                t_end = time.perf_counter()
+                policy_end = time.perf_counter()
                 n = chunk.shape[0]
                 timestamps = t_obs + self._dataset_dt * np.arange(n, dtype=np.float64)
                 actions = scheduled_actions_from_chunk(chunk, timestamps)
-                kept = drop_stale_actions(actions, t_end + self._execution_latency)
+                queue_time = time.perf_counter()
+                kept = drop_stale_actions(actions, queue_time + self._execution_latency)
+                prospective_coverage = (
+                    kept[-1].timestamp - queue_time if kept else 0.0
+                )
                 if kept:
                     if self._stop.is_set():
                         break
-                    self._buffer.queue(kept, now=t_end)
-                    if kept[-1].timestamp < t_end + self._policy_interval:
+                    self._buffer.queue(kept, now=queue_time)
+                    if kept[-1].timestamp < queue_time + self._policy_interval:
                         print(f"\n[wbc_policy_rollout] WARNING: chunk covers only "
-                              f"{kept[-1].timestamp - t_end:.2f}s past inference end "
+                              f"{prospective_coverage:.2f}s past queue time "
                               f"but the next replan is ~{self._policy_interval:g}s away "
-                              f"(inference {t_end - t_pred0:.2f}s): the buffer will run "
-                              "dry -> stale-source holds. Lower --policy-interval or "
+                              f"(inference {policy_end - t_pred0:.2f}s): the buffer may "
+                              "underflow terminally. Lower --policy-interval or "
                               "speed up inference.")
                 else:
                     print(f"\n[wbc_policy_rollout] WARNING: entire chunk stale "
-                          f"(inference {t_end - t_pred0:.2f}s + latency "
+                          f"(inference {policy_end - t_pred0:.2f}s + latency "
                           f"{self._execution_latency:g}s passed the last frame at "
                           f"t_obs+{(n - 1) * self._dataset_dt:.2f}s); nothing queued")
+                schedule_end = time.perf_counter()
                 io_frame = {
                     "t": np.float64(t_obs - self._t0),
                     "timestamp_ns": np.int64(time.time_ns()),
@@ -1260,11 +1432,24 @@ class _InferenceWorker:
                     "action": chunk,
                     "action_offsets_s": (timestamps - self._t0).astype(np.float64),
                     "base_pose": np.asarray(self._driver._odom.pose, np.float32),  # noqa: SLF001
-                    "inference_s": np.float32(t_end - t_pred0),
+                    "inference_s": np.float32(policy_end - t_pred0),
+                    "scheduler_s": np.float32(schedule_end - policy_end),
+                    # Actual completion of scheduler preparation, on the same
+                    # perf_counter epoch as action_offsets_s. This is deliberately
+                    # recorded instead of reconstructed from several rounded durations.
+                    "queue_offset_s": np.float64(schedule_end - self._t0),
+                    "prospective_coverage_s": np.float32(prospective_coverage),
                     "obs_gather_s": np.float32(t_pred0 - cycle_t0),
+                    # Local wall/perf timestamps at the exact policy-observation handoff.
+                    # Join head_frame_ns to main episode meta/camera_ntp/head for
+                    # capture->policy-ready latency; the frame timestamp_ns is post-inference.
+                    "obs_ready_wall_ns": np.int64(obs_ready_wall_ns),
+                    "obs_ready_offset_s": np.float64(t_obs - self._t0),
                     "n_dropped": np.int64(n - len(kept)),
                     "head_frame_ns": np.int64(self._last_head_ns),
-                    "wrist_frame_ns": np.int64(self._last_wrist_ns),
+                    # -1 when the policy declares no such wrist input.
+                    "left_wrist_frame_ns": np.int64(self._last_wrist_ns.get("left", -1)),
+                    "right_wrist_frame_ns": np.int64(self._last_wrist_ns.get("right", -1)),
                 }
                 trace_fn = getattr(self._policy, "last_inference_trace", None)
                 if trace_fn is not None:
@@ -1313,11 +1498,11 @@ def _live_world_T_zed(driver, fk: WBCPolicyFK) -> np.ndarray:
     return world_T_zed.astype(np.float32)
 
 
-def _pos_cond_log(msg: str) -> None:
+def _scene_log(msg: str) -> None:
     print(f"[wbc_policy_rollout] {msg}", flush=True)
 
 
-def _prompt_for_pos_cond_order(object_nums: int, overlay_path: Path) -> list[int]:
+def _prompt_for_task_order(object_nums: int, overlay_path: Path) -> list[int]:
     """Operator picks the task order from the size-slot overlay (shared prompt + task hint).
 
     Returns ``order`` (length ``object_nums``): ``order[k]`` is the size-slot index assigned
@@ -1325,106 +1510,172 @@ def _prompt_for_pos_cond_order(object_nums: int, overlay_path: Path) -> list[int
     s1_src = the BOX, s1_dst = the CLOTH.
     """
     return prompt_for_slot_order(
-        object_nums, overlay_path, log=_pos_cond_log,
+        object_nums, overlay_path, log=_scene_log,
         hint="for the box->cloth task, s1_src = the BOX, s1_dst = the CLOTH.",
     )
 
 
 def _invoke_live_scenediff(args: argparse.Namespace, live_hdf5: Path, out_dir: Path,
-                           obj_num: int) -> Path:
+                           requirements: SceneRequirements) -> Path:
     """Adapt the rollout CLI args to the shared SceneDiff invoker; return episode_0.npz."""
     return _invoke_scenediff(
         repo=args.scene_diff_repo, python=args.scene_diff_python,
         live_hdf5=live_hdf5, out_dir=out_dir, reference=args.reference_hdf5,
-        sam=args.sam, obj_num=obj_num, matching=args.pos_cond_matching,
+        sam=args.sam, obj_num=requirements.object_nums, matching="prompt",
+        dino=requirements.needs_env_dino,
         config=args.scenediff_config or None, timeout=args.scenediff_timeout,
         # live_capture.hdf5 embeds the FK world_T_zed extrinsic, so the backprojected
         # positions are engage-origin WORLD -- stamp the npz accordingly (checked below).
         frame_label="world",
-        log=_pos_cond_log,
+        log=_scene_log,
     )
 
 
-def _position_condition_output_dir(save_dir: str | Path, episode_id: int) -> Path:
+def _live_object_output_dir(save_dir: str | Path, episode_id: int) -> Path:
     if not isinstance(episode_id, (int, np.integer)) or int(episode_id) < 0:
         raise RuntimeError(
-            f"position-condition needs a pending episode_<N>.hdf5 id, got {episode_id!r}"
+            f"live object condition needs a pending episode_<N>.hdf5 id, got {episode_id!r}"
         )
     return Path(save_dir) / "scene_diff" / f"episode_{int(episode_id)}"
 
 
-def _prepare_live_position_condition(args: argparse.Namespace, driver, fk: WBCPolicyFK,
-                                     bundle: "_PolicyBundle") -> np.ndarray:
-    """Capture -> SceneDiff -> arranged env-state ``(bundle.env_state_dim,)`` in engage-origin world.
+def _capture_live_validation_frame(
+    driver,
+    fk: WBCPolicyFK,
+    *,
+    newer_than_ns: int,
+    timeout_s: float = 2.0,
+) -> LiveValidationFrame:
+    """Capture one strictly newer RGB-D frame with its current world transform."""
+    deadline = time.perf_counter() + timeout_s
+    while True:
+        head = driver._grab_head_images()  # noqa: SLF001 -- audited cache read
+        timestamp_ns = -1 if head is None else int(head[2])
+        if timestamp_ns > int(newer_than_ns):
+            epoch_before = int(driver._world_frame_epoch)  # noqa: SLF001
+            world_t_cam = _live_world_T_zed(driver, fk)
+            epoch_after = int(driver._world_frame_epoch)  # noqa: SLF001
+            if epoch_before != epoch_after:
+                raise RuntimeError("world-frame epoch changed during RGB-D capture")
+            return LiveValidationFrame(
+                rgb=head[0],
+                depth_mm=head[1],
+                world_t_cam=world_t_cam,
+                head_timestamp_ns=timestamp_ns,
+                world_frame_epoch=epoch_after,
+            )
+        if time.perf_counter() >= deadline:
+            raise RuntimeError(
+                f"head camera delivered no frame newer than {newer_than_ns} "
+                f"within {timeout_s:.1f}s"
+            )
+        time.sleep(0.005)
 
-    ``object_nums`` is DERIVED from the policy's env-state dim (``env_state_dim // 3``), never
-    hardcoded. Returns ``positions[order].reshape(-1)`` -- the FLAT vector the mobile policy
-    consumes directly (single stage; no before/after split, unlike the tabletop 2-stage
-    collapse). SceneDiff outputs land under ``<save_dir>/scene_diff/episode_N/``, where
-    ``N`` is the pending main recorder id for the paired ``episode_N.hdf5``.
-    """
+
+def _prepare_live_object_condition(args: argparse.Namespace, driver, fk: WBCPolicyFK,
+                                   bundle) -> LiveObjectCondition:
+    """Build, order, validate, install, and publish one complete episode condition."""
     from omniteleop.common.head_camera import ZED_K  # noqa: PLC0415
 
-    object_nums = bundle.env_state_dim // 3
+    requirements = bundle.scene_requirements
+    if not requirements.needs_bootstrap:
+        raise RuntimeError("checkpoint has no live scene requirements")
     episode = getattr(driver, "_episode", None)
     if episode is None:
-        raise RuntimeError("--position-condition requires rollout recording to pair SceneDiff "
-                           "outputs with episode_<N>.hdf5")
-    out_dir = _position_condition_output_dir(args.save_dir, getattr(episode, "episode_id", None))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    live_hdf5 = out_dir / "live_capture.hdf5"
+        raise RuntimeError(
+            "live object conditioning requires recording to pair its output with episode_N"
+        )
+    final_dir = _live_object_output_dir(
+        args.save_dir, getattr(episode, "episode_id", None)
+    )
+    if final_dir.exists() or final_dir.is_symlink():
+        raise FileExistsError(
+            f"live SceneDiff output exists: {final_dir}; delete it manually before rerunning"
+        )
+    final_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage_dir = Path(tempfile.mkdtemp(
+        prefix=f".{final_dir.name}.building-", dir=final_dir.parent
+    ))
 
-    if args.prompt_before_capture:
-        input("\n>>> Robot is at the rollout start pose. Stage the scene, then press ENTER "
-              "to capture the head frame and run SceneDiff (Ctrl-C to abort) <<<\n")
+    try:
+        if args.prompt_before_capture:
+            input("\n>>> Robot is at the rollout start pose. Stage the scene, then press "
+                  "ENTER to capture the head frame and run SceneDiff (Ctrl-C to abort) <<<\n")
 
-    # 1) One head frame at the rollout start viewpoint + its FK world_T_zed extrinsic.
-    head = driver._grab_head_images()  # noqa: SLF001 -- audited camera-cache read
-    if head is None:
-        raise RuntimeError("head camera delivered no frame for the position-condition capture")
-    rgb, depth_u16 = head[0], head[1]
-    extrinsic = _live_world_T_zed(driver, fk)
-    intrinsic = np.asarray(ZED_K, dtype=np.float32)
-    _write_live_capture_hdf5(live_hdf5, rgb, depth_u16, extrinsic, intrinsic)
-    print(f"[wbc_policy_rollout] live 'before' frame -> {live_hdf5}  rgb={rgb.shape} "
-          f"depth={depth_u16.shape}  cam_xyz=[{extrinsic[0,3]:.3f},{extrinsic[1,3]:.3f},"
-          f"{extrinsic[2,3]:.3f}]", flush=True)
+        intrinsic = np.asarray(getattr(bundle, "intrinsic", ZED_K), dtype=np.float32)
+        bootstrap = _capture_live_validation_frame(
+            driver, fk, newer_than_ns=-1
+        )
+        live_hdf5 = stage_dir / "live_capture.hdf5"
+        _write_live_capture_hdf5(
+            live_hdf5,
+            bootstrap.rgb,
+            bootstrap.depth_mm,
+            bootstrap.world_t_cam,
+            intrinsic,
+            camera_timestamp_ns=bootstrap.head_timestamp_ns,
+            world_frame_epoch=bootstrap.world_frame_epoch,
+        )
+        print(
+            f"[wbc_policy_rollout] live bootstrap frame -> {live_hdf5}  "
+            f"rgb={bootstrap.rgb.shape} depth={bootstrap.depth_mm.shape}",
+            flush=True,
+        )
 
-    # 2) SceneDiff (own interpreter). 3) resolve the [box,cloth] order (operator prompt live).
-    npz = _invoke_live_scenediff(args, live_hdf5, out_dir, object_nums)
-    with np.load(npz, allow_pickle=True) as data:
-        if "positions" not in data or "order" not in data:
-            raise ValueError(f"{npz}: expected positions+order, got {list(data.files)}")
-        positions = np.asarray(data["positions"], dtype=np.float32)
-        order = [int(x) for x in np.asarray(data["order"]).reshape(-1)]
-        frame = str(data["frame"]) if "frame" in data else None
-    # Fail closed on the frame: base/camera-frame coordinates would pass every shape and
-    # finiteness check and silently mis-condition the policy (the policy's env-state is
-    # engage-origin world, like its cloud and actions).
-    if frame != "world":
-        raise ValueError(
-            f"{npz}: live position frame is {frame!r}, expected 'world'. The live capture "
-            "embeds the FK world_T_zed extrinsic and invoke_scenediff stamps "
-            "FRAME_LABEL=world; a different label means an out-of-date scene_diff/"
-            "run_live_pos_condition.sh or the wrong SceneDiff pipeline ran.")
-    if positions.shape != (object_nums, 3) or not np.all(np.isfinite(positions)):
-        raise ValueError(
-            f"{npz}: positions {tuple(positions.shape)} != ({object_nums}, 3) or non-finite")
+        _invoke_live_scenediff(args, live_hdf5, stage_dir, requirements)
+        overlay_path = stage_dir / "deploy_slot_overlay.png"
+        if not overlay_path.is_file():
+            raise FileNotFoundError(
+                "SceneDiff produced no size-slot overlay; refusing to ask the operator "
+                f"to order unseen objects: {overlay_path}"
+            )
+        artifacts = load_live_object_artifacts(
+            stage_dir / "bootstrap_size_slots.npz", live_hdf5
+        )
+        if len(artifacts.positions_size) != requirements.object_nums:
+            raise ValueError("SceneDiff bootstrap object count does not match checkpoint")
+        if requirements.needs_env_dino and artifacts.dino_region_feats_size is None:
+            raise ValueError("grounding_tokens checkpoint requires live DINO features")
 
-    if args.pos_cond_matching == "prompt" and args.prompt_after_capture:
-        order = _prompt_for_pos_cond_order(object_nums, out_dir / "deploy_slot_overlay.png")
-    elif args.pos_cond_matching == "prompt":
-        raise SystemExit(
-            "[wbc_policy_rollout] pos_cond_matching=prompt requires --prompt-after-capture: "
-            "live SceneDiff has no demo trajectory to order objects, so without an operator-"
-            "confirmed order the size order would silently assign the box/cloth roles.")
-    if sorted(order) != list(range(object_nums)):
-        raise ValueError(f"{npz}: order {order} is not a permutation of range({object_nums})")
-
-    env_vec = positions[order].reshape(-1).astype(np.float32)
-    print(f"[wbc_policy_rollout] position condition ready: order={order} "
-          f"env_state={np.round(env_vec, 3).tolist()}", flush=True)
-    return env_vec
+        order = _prompt_for_task_order(
+            requirements.object_nums, overlay_path
+        )
+        condition = artifacts.arrange(order)
+        validate = getattr(bundle, "validate_live_object_condition", None)
+        if validate is None:
+            raise RuntimeError("policy bundle lacks the live-condition validation hook")
+        validate(
+            condition,
+            capture_validation_frame=lambda: _capture_live_validation_frame(
+                driver,
+                fk,
+                newer_than_ns=condition.camera_timestamp_ns,
+            ),
+            stage_dir=stage_dir,
+        )
+        published = replace(
+            condition, source_artifact=final_dir / "bootstrap_size_slots.npz"
+        )
+        bundle.install_live_object_condition(published)
+        if final_dir.exists() or final_dir.is_symlink():
+            raise FileExistsError(
+                f"live SceneDiff output appeared during bootstrap: {final_dir}; "
+                "delete it manually"
+            )
+        stage_dir.rename(final_dir)
+        print(
+            f"[wbc_policy_rollout] live object condition ready: order={order} "
+            f"positions={np.round(published.positions, 3).tolist()} -> {final_dir}",
+            flush=True,
+        )
+        return published
+    except BaseException as bootstrap_error:
+        try:
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir)
+        except BaseException as cleanup_error:
+            raise bootstrap_error from cleanup_error
+        raise
 
 
 def _run_persistent_session(
@@ -1462,11 +1713,43 @@ def _start_rollout_recorders(driver, io_log) -> None:
     if driver._episode is not None:  # noqa: SLF001 -- shared rollout recorder
         driver._episode.start()  # noqa: SLF001
         driver._last_rec_head_ns = -1  # noqa: SLF001
-        driver._last_rec_wrist_ns = -1  # noqa: SLF001
+        driver._last_rec_wrist_ns = dict.fromkeys(  # noqa: SLF001
+            driver._last_rec_wrist_ns, -1  # noqa: SLF001
+        )
         driver._next_record_t = 0.0  # noqa: SLF001
         driver._stale_since = None  # noqa: SLF001
         driver._frame_age_log.clear()  # noqa: SLF001
     io_log.start()
+
+
+def _set_policy_io_static(io_log, policy, *, args=None) -> None:
+    """Refresh episode-specific policy and live-condition metadata before recording."""
+    if policy is None:
+        io_log.set_static({})
+        return
+    static: dict = {}
+    metadata_fn = getattr(policy, "inference_metadata", None)
+    if metadata_fn is not None:
+        static["policy"] = metadata_fn()
+    condition_fn = getattr(policy, "live_condition_metadata", None)
+    if condition_fn is not None:
+        condition = condition_fn()
+        if condition is not None:
+            static["live_object_condition"] = condition
+    if args is not None:
+        static["schedule"] = {
+            "dataset_fps": np.asarray(args.dataset_fps, np.float64),
+            "policy_interval_s": np.asarray(args.policy_interval, np.float64),
+            "execution_latency_s": np.asarray(args.execution_latency, np.float64),
+            "command_fps": np.asarray(args.cmd_rate, np.float64),
+            "n_action_steps": np.asarray(
+                0 if policy is None else policy.n_action_steps, np.int64
+            ),
+            "n_obs_steps": np.asarray(
+                0 if policy is None else policy.n_obs_steps, np.int64
+            ),
+        }
+    io_log.set_static(static)
 
 
 def _synchronize_rollout_episode_id(driver, io_log) -> int:
@@ -1489,12 +1772,14 @@ def _synchronize_rollout_episode_id(driver, io_log) -> int:
 
 
 def _prepare_rollout_episode_condition(args, driver, fk, policy, io_log) -> int:
-    """Assign the paired id and refresh this episode's optional SceneDiff input."""
+    """Assign the paired id and satisfy checkpoint-declared scene requirements."""
     episode_id = _synchronize_rollout_episode_id(driver, io_log)
-    if args.position_condition and policy is not None:
+    requirements = (
+        SceneRequirements() if policy is None else policy.scene_requirements
+    )
+    if requirements.needs_bootstrap:
         driver.stop_all_motion()
-        env_vec = _prepare_live_position_condition(args, driver, fk, policy)
-        policy.set_env_state(env_vec)
+        _prepare_live_object_condition(args, driver, fk, policy)
     return episode_id
 
 
@@ -1525,7 +1810,7 @@ def _stop_policy_io_log(io_log) -> None:
         raise KeyboardInterrupt
 
 
-def _finish_rollout_episode(*, driver, io_log, stop_event, worker) -> None:
+def _finish_rollout_episode(*, driver, io_log, stop_event, worker, policy=None) -> None:
     """Stop motion and fully flush one episode without closing hardware."""
     main_log = getattr(driver, "_episode", None)
     cleanup_errors: list[BaseException] = []
@@ -1563,6 +1848,11 @@ def _finish_rollout_episode(*, driver, io_log, stop_event, worker) -> None:
                     )
                 )
             break
+
+    if worker_joined and policy is not None:
+        finish_runtime = getattr(policy, "finish_episode_runtime", None)
+        if finish_runtime is not None:
+            run_cleanup_step(finish_runtime)
 
     if main_log is None:
         recorder_errors.append(
@@ -1758,18 +2048,25 @@ def _run_rollout_episode(
             driver.stop_all_motion()
             did_align = True
 
-        # Live SceneDiff position condition: capture ONE head frame after the robot is at
-        # the rollout start pose (post --align-reference when supplied), diff it against the
-        # fixed reference, and pin the constant env-state BEFORE recording/inference starts.
+        # Checkpoint-driven live object condition: bootstrap after the robot reaches the
+        # rollout start pose, arrange all representations once, and validate before recording.
         # Held safe during the minutes-long SceneDiff subprocess (no 100 Hz ticks run while it
         # blocks). The subprocess owns the GPU; the loaded diffusion policy sits idle.
-        # set_env_state survives the earlier policy.reset().
+        # The single arranged condition is installed after the earlier policy.reset().
         _prepare_rollout_episode_condition(args, driver, fk, policy, io_log)
 
         if did_align:
             driver.stop_all_motion()
             input(f"\n[wbc_policy_rollout] at reference pose. Press Enter to actually "
                   f"start the {mode} online ... ")
+
+        if policy is not None:
+            policy.start_episode_runtime(
+                max_seconds=args.max_seconds,
+                policy_interval=args.policy_interval,
+                dataset_dt=1.0 / args.dataset_fps,
+            )
+        _set_policy_io_static(io_log, policy, args=args)
 
         _start_rollout_recorders(driver, io_log)
 
@@ -1812,7 +2109,9 @@ def _run_rollout_episode(
                     # full camera/state pipeline during replay and yields a
                     # policy_io log directly diffable against a live rollout.
                     head_imgs = driver._grab_head_images()  # noqa: SLF001
-                    driver._grab_wrist_image()  # noqa: SLF001
+                    # Drain every wrist stream the driver tracks (keys are the arms).
+                    for _arm in driver._last_rec_wrist_ns:  # noqa: SLF001
+                        driver._grab_wrist_image(_arm)  # noqa: SLF001
                     if head_imgs is None:
                         raise RuntimeError("head camera delivered no frame at the replay tick")
                     if frame.index == 0:
@@ -1912,6 +2211,7 @@ def _run_rollout_episode(
                 io_log=io_log,
                 stop_event=stop_event,
                 worker=worker,
+                policy=policy,
             )
         except BaseException as cleanup_error:
             if isinstance(body_error, KeyboardInterrupt):
@@ -1924,6 +2224,7 @@ def _run_rollout_episode(
             io_log=io_log,
             stop_event=stop_event,
             worker=worker,
+            policy=policy,
         )
 
 
@@ -1954,8 +2255,8 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
     ``scripts/wbc_maniflow_rollout.py`` swaps in a ManiFlow point-cloud pair so both
     policy families share ONE hardware loop, alignment, scheduler and watchdog -- a
     second copy of this loop is exactly the kind of divergence that gets a robot hurt.
-    A replacement bundle must expose ``describe``/``reset``/``predict_chunk``/
-    ``state_frame``/``n_obs_steps``/``n_action_steps``/``use_env_state``.
+    A replacement bundle must expose ``describe``/``reset``/``predict_chunk``, the
+    scheduling dimensions, ``scene_requirements``, and the live-condition/runtime hooks.
     """
     from omniteleop.common.recorder import EpisodeRecorder  # noqa: PLC0415
     from omniteleop.wbc_robot_util import parse_enable_mask  # noqa: PLC0415
@@ -1990,9 +2291,22 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
     else:
         mode = "rollout"
         print(f"[wbc_policy_rollout] loading policy {args.policy_path} ...")
-        policy = (policy_factory or _PolicyBundle)(args.policy_path)
+        policy = (
+            policy_factory(args.policy_path)
+            if policy_factory is not None
+            else _PolicyBundle(
+                args.policy_path, scene_diff_repo=args.scene_diff_repo
+            )
+        )
         state_frame = policy.state_frame
         print(f"[wbc_policy_rollout] {policy.describe()}")
+        if hasattr(policy, "dataset_fps") and not np.isclose(
+            float(policy.dataset_fps), float(args.dataset_fps), rtol=0.0, atol=1e-9
+        ):
+            raise SystemExit(
+                f"[wbc_policy_rollout] --dataset-fps {args.dataset_fps:g} != "
+                f"training metadata {float(policy.dataset_fps):g}; refusing to engage"
+            )
         chunk_coverage = policy.n_action_steps / args.dataset_fps
         if args.policy_interval > chunk_coverage:
             print(f"[wbc_policy_rollout] WARNING: --policy-interval "
@@ -2000,17 +2314,6 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
                   f"{chunk_coverage:g}s ({policy.n_action_steps} steps @ "
                   f"{args.dataset_fps:g} fps): the scheduled buffer will run dry "
                   "between replans -> periodic stale-source holds")
-        # A conditioned checkpoint MUST get its env-state (else _sample_dict raises); an
-        # unconditioned one must NOT be asked to (finding 2). Enforce the match up front.
-        if args.position_condition and not policy.use_env_state:
-            raise SystemExit(
-                "[wbc_policy_rollout] --position-condition given but the checkpoint declares "
-                "no observation.environment_state input")
-        if policy.use_env_state and not args.position_condition:
-            raise SystemExit(
-                "[wbc_policy_rollout] checkpoint requires observation.environment_state "
-                f"(dim {policy.env_state_dim}); pass --position-condition (+ --reference-hdf5) "
-                "so it is computed live at the rollout start pose")
 
     fk = WBCPolicyFK(ik=ik)  # FK on the live solver's own model
     driver = mod.HardwareDriver(args, ik, cfg, enable)
@@ -2019,9 +2322,11 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
     def run_initialized_session() -> None:
         io_log = EpisodeRecorder(str(Path(args.save_dir) / "policy_io"))
         if policy is not None:
+            # Fail metadata/provenance construction before any episode prompt. The
+            # episode-specific condition tree is added again immediately before start().
             metadata_fn = getattr(policy, "inference_metadata", None)
             if metadata_fn is not None:
-                io_log.set_static({"policy": metadata_fn()})
+                metadata_fn()
         nominal_poses = (
             np.asarray(ik.frame_pose(fk.left_ee_frame).homogeneous, dtype=float),
             np.asarray(ik.frame_pose(fk.right_ee_frame).homogeneous, dtype=float),
@@ -2118,29 +2423,19 @@ def build_parser() -> argparse.ArgumentParser:
     hw.add_argument("--record-stale-grace", type=float,
                     default=mod.DEFAULT_RECORD_STALE_GRACE)
 
-    pc = parser.add_argument_group("position conditioning (live SceneDiff, --policy-path only)")
-    pc.add_argument("--position-condition", action="store_true",
-                    help="compute a live SceneDiff observation.environment_state after engage "
-                         "and post-reference-alignment: capture one head frame, diff it against "
-                         "--reference-hdf5, and pin the arranged object world positions for the "
-                         "whole episode. REQUIRED for a checkpoint that declares "
-                         "observation.environment_state.")
-    pc.add_argument("--reference-hdf5", default=DEFAULT_POS_COND_REFERENCE,
+    pc = parser.add_argument_group(
+        "checkpoint-driven live object bootstrap (--policy-path only)"
+    )
+    pc.add_argument("--reference-hdf5", default=DEFAULT_SCENE_REFERENCE,
                     help="fixed 'after'/moved reference scene the live frame is diffed against "
                          "(the SAME scene training used; default the Part-A reference_last.hdf5).")
-    pc.add_argument("--pos-cond-matching", default="prompt",
-                    choices=("prompt", "size", "hungarian"),
-                    help="ordering forwarded to extract_object_positions.py. Live scenes have no "
-                         "demo trajectory, so use 'prompt' (default): the operator reads the "
-                         "size-slot overlay and types [box, cloth].")
     pc.add_argument("--prompt-before-capture", action="store_true",
                     help="pause for ENTER at the rollout start pose and before the head capture "
                          "(post-reference-alignment when --align-reference is supplied).")
-    pc.add_argument("--prompt-after-capture", action="store_true",
-                    help="in prompt mode, preview the size-slot overlay after capture (background "
-                         "viewer if a display exists, else the path is printed) and read the task "
-                         "order from the terminal. Without it, prompt mode uses the identity order.")
-    pc.add_argument("--sam", default="sam3", help="SAM version for change detection (default sam3).")
+    pc.add_argument(
+        "--sam", default="sam3",
+        help="SAM version for change detection (default sam3).",
+    )
     pc.add_argument("--scenediff-config", default=None,
                     help="override the SceneDiff config path (relative to the scene_diff repo).")
     pc.add_argument("--scenediff-timeout", type=float, default=1200.0,
@@ -2158,10 +2453,7 @@ def finalize_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
 
     if bool(args.policy_path) == bool(args.replay_episode):
         parser.error("exactly one of --policy-path / --replay-episode is required")
-    if args.position_condition and not args.policy_path:
-        parser.error("--position-condition requires --policy-path (replay has no policy to "
-                     "condition)")
-    if args.position_condition and not np.isfinite(args.scenediff_timeout):
+    if args.policy_path and not np.isfinite(args.scenediff_timeout):
         parser.error("--scenediff-timeout must be finite")
     if args.align_reference is None:
         parser.error("--align-reference is required (pass '--align-reference none' to "

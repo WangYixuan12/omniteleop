@@ -17,6 +17,8 @@ pip install omniteleop
 
 ## Latency
 
+- Dedicated robot/workstation Ethernet setup, preflight, process placement, and
+before/after measurement: [WBC_ETHERNET.md](WBC_ETHERNET.md)
 - WLAN
 
 ```bash
@@ -69,14 +71,15 @@ See [PIPELINE_WBC](./PIPELINE_WBC.md).
 **1.** Record data:
 
 ```bash
-# Terminal 1, on lambda/leader machine.
+# on lambda/leader machine
+# Terminal 1
 (dexmate) python scripts/wbc_vr_leader.py --calibrate-ee-offset
 # one-time calibration, save src/omniteleop/leader/ee_offset.yaml for future auto load
 (dexmate) python scripts/wbc_vr_leader.py
 # generate reference episode_0.hdf5 for future --align-reference
 (dexmate) python /home/yixuan/omniteleop/scripts/wbc_vr_leader.py --align-reference /home/yixuan/Dexmate/data/raw_data_reference/reference.hdf5
 
-# Terminal 2, on robot machine.
+# Terminal 2
 (dexmate) python scripts/wbc_vr_robot.py \
   --record \
   --save-dir /home/yixuan/Dexmate/data/raw_data
@@ -219,6 +222,7 @@ Frame summary vs ManiFlow (world-frame state/cloud by default): see the comparis
 # change --job_name and --output_dir
 # Position condition:
 # update --policy.input_features and --policy.normalization_mapping and --policy.position_condition_mode=concat/film
+# default config at [configuration_diffusion.py](../lerobot_original/src/lerobot/policies/diffusion/configuration_diffusion.py)
 (dexmate_lerobot) lerobot-train \
   --policy.type=diffusion --policy.device=cuda --policy.push_to_hub=false \
   --policy.horizon=16 --policy.n_action_steps=8 --policy.use_relative_actions=false \
@@ -267,7 +271,7 @@ with a two-line diff, not two pipelines.
   --dataset.repo_id=dexmate_wbc_eef_head \
   --dataset.root=/home/yixuan/Dexmate/data/processed_wbc/train/dexmate_wbc_eef_head \
   --dataset.image_transforms.enable=true \
-  --batch_size=32 --policy.optimizer_lr=2e-4 --steps=200000 --save_freq=50000 --save_best=true --log_freq=2000 \
+  --batch_size=32 --policy.optimizer_lr=2e-4 --policy.optimizer_lr_backbone=2e-5 --steps=200000 --save_freq=50000 --save_best=true --log_freq=2000 \
   --output_dir=/home/yixuan/Dexmate/model/act/dexmate_wbc_eef_head \
   --wandb.enable=true --wandb.project=dexmate_wbc_mobile --job_name=act_pos_abs \
   --dataset.val_root=/home/yixuan/Dexmate/data/processed_wbc/test/dexmate_wbc_eef_head --val_freq=5000
@@ -293,13 +297,116 @@ passes the vector through unmasked; the N-cycle caveat from the diffusion block 
 - Tabletop normalizes STATE/ACTION with `MEAN_STD`; WBC uses `MIN_MAX` (+ rotation-dim skips) to
 stay consistent with the diffusion run on this dataset. ENV stays `MIN_MAX` in both.
 - `--policy.optimizer_lr=2e-4` overrides ACT's `1e-5` default (matches the tabletop script).
+`--policy.optimizer_lr_backbone=2e-5` keeps the ResNet at 1/10 of that (ACT already exposes this
+flag; diffusion does not — DP uses one LR for the whole model).
 - **Do not set** `--policy.temporal_ensemble_coeff`: ACT then requires `n_action_steps=1`, and
 `wbc_policy_rollout.py` schedules whole chunks — a 1-step chunk covers 0.1 s and the buffer runs dry.
 
 Deploy is unchanged: `scripts/wbc_policy_rollout.py` is policy-type agnostic (it reads `n_action_steps`
 off the checkpoint and feeds ACT the batch directly instead of the diffusion obs queues). Point
-`--policy-path` at the ACT checkpoint and add `--position-condition` iff it was trained with the ENV
-feature — the rollout cross-checks the two and aborts on a mismatch.
+`--policy-path` at the ACT checkpoint. The checkpoint's declared input features are the sole authority:
+an `observation.environment_state` input triggers the live SceneDiff bootstrap automatically, while an
+unconditioned checkpoint skips it. There is no rollout-side conditioning-mode flag.
+
+**Mixture of Frames (optional).** `--policy.action_frame_mode=mof` swaps the single
+world-frame U-Net for **one full U-Net per reference frame** plus a learned router, the same
+Mixture-of-Frames recipe as [ManiFlow's](#maniflow) `action_frame_mode=mof` and the
+[legacy standalone mofpo run](#legacy-standalone-mof-reproduction). Both integrated policies
+default to the **same four** experts, dropping `base` as a reparameterization of
+`base_rel_trans` (ManiFlow ADR 0002 amendment); `base` stays selectable for the five-tower
+set. `world` is the default `action_frame_mode` and is byte-identical to before the feature.
+Implementation:
+`../lerobot_original/src/lerobot/policies/diffusion/mof/` (`action_layout.py` +
+`frame_transforms.py` are mirrored copies of the ManiFlow/mofpo modules; `stats.py` and
+`mixture.py` are LeRobot-native).
+
+**Same dataset as the world run** — no re-port. The porter stores `observation.state[:29]`
+base-frame, and MoF lifts it to world in-graph from the planar base pose at `29:32`
+(`lift_base_state_to_world`, verified equal to the independently ported world state in both
+`dexmate_wbc_eef_head_rel` and the ManiFlow zarr to `1.2e-7`). So DP-world vs DP-mof differ in
+the action-frame machinery and **nothing else**.
+
+```bash
+(dexmate_lerobot) lerobot-train \
+  --policy.type=diffusion --policy.device=cuda --policy.push_to_hub=false \
+  --policy.action_frame_mode=mof \
+  --policy.horizon=16 --policy.n_action_steps=8 \
+  '--policy.down_dims=[256,512,1024]' \
+  --policy.noise_scheduler_type=DDIM --policy.num_inference_steps=16 \
+  '--policy.input_features={"observation.images.head_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.images.wrist_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.state": {"type": "STATE", "shape": [32]}, "observation.environment_state": {"type": "ENV", "shape": [6]}}' \
+  '--policy.normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "IDENTITY", "ACTION": "IDENTITY", "ENV": "IDENTITY"}' \
+  --policy.position_condition_mode=concat --policy.mof_env_frame=family \
+  --policy.mof_stats_root=/home/yixuan/Dexmate/data/box2cloth/processed_wbc/train/dexmate_wbc_eef_head \
+  --dataset.repo_id=dexmate_wbc_eef_head \
+  --dataset.root=/home/yixuan/Dexmate/data/box2cloth/processed_wbc/train/dexmate_wbc_eef_head \
+  --dataset.image_transforms.enable=true \
+  --batch_size=32 --steps=100000 --save_freq=50000 --save_best=true \
+  --output_dir=/home/yixuan/Dexmate/model/dp/mof_concat --job_name=mof_concat \
+  --wandb.enable=true --wandb.project=dexmate_wbc_mobile \
+  --dataset.val_root=/home/yixuan/Dexmate/data/box2cloth/processed_wbc/test/dexmate_wbc_eef_head --val_freq=5000
+# measured at FIVE experts: 361M params, 6.88 GB at batch 32, 0.11 s/step on the 4090
+#   (~3 h for 100k steps). Re-measure at the four-expert default before quoting.
+# defaults: mof_enabled_experts=[base_rel_trans,left,right,rel_traj]
+#           mof_canonical_space=base_rel_trans  mof_router_mode=learned
+#           mof_expert_loss_coef=1.0            mof_state_frame=base
+#           mof_env_frame=world
+# extra logged metrics: diffusion_loss, expert_loss_native/<expert>, router_weight/<expert>,
+#                       router_entropy (ln 4 = 1.386 at init = uniform routing)
+```
+
+Six flags differ from the world command above, and five of them are **required** — the config
+raises with the fix in the message if you forget:
+
+- `--policy.mof_stats_root` must repeat `--dataset.root`. MoF's affines are fitted from the
+parquet, not from `meta/stats.json`, and they are **not** derivable from the batch. Left unset the
+buffers stay NaN and the first forward pass raises `non-finite stats` rather than training on
+garbage — which is also what makes loading a checkpoint work, since its fitted buffers overwrite
+them.
+
+- `STATE`/`ACTION` must be `IDENTITY`. MoF needs raw world poses to build frames and returns raw
+world actions, so it owns normalization itself: it fits per-expert action and per-family state
+min/max over the **exact training windows** (one parquet-only pass at construction, seconds) and
+carries them in the checkpoint. **Drop** `--policy.skip_normalization_dims` — the rotation-dim
+skip moves inside those fitted affines.
+- `ENV` must be `IDENTITY` **when** `--policy.mof_env_frame=family`, for the same reason one dim
+up: MoF transforms raw world XYZ, so it also fits `{family}__env_state` itself. Under
+`mof_env_frame=world` leave `ENV` at `MIN_MAX` — the processor-side collapse in
+`processor_diffusion.py` is correct there and stays in charge.
+- `--policy.down_dims=[256,512,1024]` (mofpo's paper recipe). Five copies of LeRobot's default
+`[512,1024,2048]` measured **1.31B params ≈ 19.5 GiB** of weights+grad+Adam and would not fit a
+24 GB card; four copies has not been re-measured, and the paper recipe is the reason to use this
+width regardless. The incumbent world baseline trains at LeRobot's default `[512,1024,2048]`, so
+**re-run it at** `[256,512,1024]` **(90M)** before reading any DP-world vs DP-mof delta — otherwise
+the two differ by 5.7x in width as well as in action-frame machinery.
+- `DDIM` + `--policy.num_inference_steps=16`: four towers per denoise step, so the DDPM-100
+default would blow the 0.4 s chunk budget. mofpo measured ~0.6 s/chunk for 16-step DDIM × 5
+experts on a shared GPU — check `--policy-interval` against the real number before hardware.
+- `use_relative_actions` and `stage_prediction_enabled` are rejected (both are answered by
+`mof_canonical_space`, resp. need the single `global_cond` MoF replaces with one per family).
+
+**Position-condition frame.** `--policy.mof_env_frame` decides what each obs family sees of the
+task. `world` (default) is the incumbent behaviour — one world-frame env-state rides every
+family's conditioning vector. `family` re-expresses it into that family's per-step frame, which
+matters because `reexpress_agent_pos` zeroes the base block of a robot-anchored family's state:
+without it, a `base`/`left`/`right` tower holds a world-frame object position it cannot relate to
+its own state. This is the transferable half of ManiFlow's `[mof.cloud_frame](#maniflow)` — the
+scene half does not cross over, since an RGB image carries no frame. There is no separate
+ablation flag; the ablation is this flag's two values. See `docs/adr/0002-dp-mof-reexpresses-the-position-condition.md`.
+
+**Object masks are not supported here.** ManiFlow's `point_sampling_mode` has no counterpart (a
+ResNet has no point-budget sampling stage), and `mask_channels=true` is designed but deferred —
+see `docs/adr/0003-dp-mask-channels-are-a-separate-image-feature.md`. A DP-vs-ManiFlow pair must
+therefore be matched with `point_sampling_mode=fps mask_channels=false` on the ManiFlow side.
+
+**Parity pre-flight** before trusting a MoF run — reduces the mixture to the incumbent model:
+`--policy.mof_enabled_experts=[world] --policy.mof_canonical_space=world --policy.mof_router_mode=fixed_uniform`.
+
+Deploy and offline validation are **unchanged commands**: `wbc_policy_rollout.py` reads
+`action_frame_mode` off the checkpoint and takes `observation.state`'s frame from
+`mof_state_frame` instead of inferring it from `use_relative_actions`; the base-frame state it
+already builds is what a default MoF checkpoint wants. `vis_wbc_policy_prediction.py` feeds the
+dataset state verbatim and needs nothing. Tests:
+`../lerobot_original/tests/policies/test_diffusion_mof.py` (42).
 
 **Relative actions (optional).** To train with `use_relative_actions=true` (each chunk action relative to the chunk's current observation, mirroring `train_dexmate_diffusion.sh`), `observation.state` EEF/head must share the world action frame — LeRobot's relative step subtracts `observation.state[:29]` from the world action, so a base-frame state would be cross-frame. Re-port with `--relative-actions` (world-frame state; default repo-id `dexmate_wbc_eef_head_rel`):
 
@@ -336,6 +443,8 @@ REL_EXCLUDE='[9,19]'
   --output_dir=/home/yixuan/Dexmate/model/dp/dexmate_wbc_eef_head_rel
 ```
 
+
+
 `scripts/wbc_policy_rollout.py` and `scripts/vis_wbc_policy_prediction.py` auto-detect `use_relative_actions` from the checkpoint and build world-frame state + chunk-anchor de-relativization accordingly — same commands as below (point `--policy-path` at the relative checkpoint).
 
 **4.**
@@ -345,7 +454,7 @@ Validate the checkpoint OFFLINE before any hardware rollout — run the rollout'
 ```bash
 (dexmate_lerobot) python scripts/vis_wbc_policy_prediction.py \
   --policy-path ~/Dexmate/model/dp/nopos_abs_minmax/checkpoints/last/pretrained_model \
-  --dataset_dir ~/Dexmate/data/box2cloth/processed_wbc/test/dexmate_wbc_eef_head \
+  --dataset_dir ~/Dexmate/data/processed_wbc/test/dexmate_wbc_eef_head \
   --episode_index 0
 ```
 
@@ -353,9 +462,9 @@ Roll out the trained policy on the real robot. Inference is asynchronous (rby1-w
 style scheduled chunks, see `plan.md`): a worker thread replans a whole action chunk
 every `--policy-interval` (default 0.4 s), stale frames older than
 `inference_end + --execution-latency` are dropped, and a 10 Hz sampler feeds the
-100 Hz WBC tick — a slow inference never freezes the control loop (the robot holds
-via the `--source-timeout` watchdog instead). `--dataset-fps` (default 10) must match
-the porter fps.
+100 Hz WBC tick. Waiting for the first chunk is allowed; after the first chunk has armed
+the scheduler, exhausting its scheduled actions is a terminal episode failure that enters
+safe hold and rejects any later result. `--dataset-fps` (default 10) must match the porter fps.
 
 ```bash
 # replay
@@ -371,24 +480,23 @@ python scripts/wbc_policy_rollout.py --replay-episode ~/Dexmate/data/raw_data/ep
 # if the console warns "buffer will run dry" (100-step DDPM is ~0.4 s/chunk),
 # lower --policy-interval (e.g. 0.3) or reduce the checkpoint's num_inference_steps
 
-# Position-conditioned checkpoint (trained with observation.environment_state, step 3):
-# add --position-condition. After engage and --align-reference, the rollout captures ONE head
-# frame with the arms already at the reference pose, stamps it with the FK world_T_zed
-# extrinsic (engage-origin world), diffs it against the SAME reference the training positions
-# used (default reference_last.hdf5), and pins the [box, cloth] world positions as a constant
-# env-state for the whole episode. SceneDiff runs in scene_diff/.venv-merged (its SAM3/DINOv3
-# VRAM is a subprocess) and takes ~minutes; a missing npz (detection gate failed) aborts before
-# recording/policy motion. Live scenes have no demo trajectory, so the operator types the order
-# from the size-slot overlay (--prompt-after-capture).
-(dexmate_lerobot) python scripts/wbc_policy_rollout.py \
+# A checkpoint trained with observation.environment_state automatically bootstraps the scene.
+# Launch conditioned LeRobot policies from dexmate_maniflow: validation uses in-process SAM3.1.
+# After engage and --align-reference, rollout captures one head frame, runs SceneDiff against
+# the same reference used for training, displays a fresh size-slot overlay, and requires an
+# explicit [source box, destination cloth] permutation before motion. Positions are then pinned
+# for the episode. An unconditioned checkpoint skips SceneDiff and the operator prompt.
+(dexmate_maniflow) python scripts/wbc_policy_rollout.py \
   --policy-path /home/yixuan/Dexmate/model/dp/concat_abs_minmax/checkpoints/last/pretrained_model \
   --save-dir ~/Dexmate/data/rollout/concat_abs_minmax \
   --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5 \
-  --position-condition --prompt-after-capture --max-seconds 100
+  --max-seconds 100
 #   --reference-hdf5 ~/Dexmate/data/scene_diff/_before/reference_last.hdf5   (default)
 #   --prompt-before-capture   pause to stage the scene after alignment, before the head grab
-#   SceneDiff outputs -> <save-dir>/scene_diff/{live_capture.hdf5,episode_0.npz,
-#                        deploy_slot_overlay.png (VERIFY: type s1_src=BOX, s1_dst=CLOTH)}
+#   SceneDiff outputs -> <save-dir>/scene_diff/episode_N/{live_capture.hdf5,episode_0.npz,
+#                        bootstrap_size_slots.npz,deploy_slot_overlay.png,validation_*.{npz,json}}
+#   If that final episode directory already exists, rollout exits before capture and asks you
+#   to delete it manually. A failed bootstrap never publishes a partial final directory.
 
 python scripts/vis_episode.py --hdf5 /home/yixuan/Dexmate/data/rollout/concat_abs_minmax/episode_0.hdf5
 ```
@@ -404,8 +512,24 @@ but defaulted to world frame (see table). Visual obs is a world-frame head point
 
 Action-frame modeling is a config choice inside this policy family: `action_frame_mode=world` is the
 incumbent world-absolute ManiFlow path and remains the default; `action_frame_mode=mof` enables the
-integrated five-expert Mixture-of-Frames path. Both modes use the same zarr, trainer, checkpoint
-format, deployment bundle, and `dexmate_maniflow` environment.
+integrated Mixture-of-Frames path, four experts by default
+(`base_rel_trans, left, right, rel_traj`; add the fifth back with
+`mof.enabled_experts=[base,base_rel_trans,left,right,rel_traj]`). Both modes use the same zarr,
+trainer, checkpoint format, deployment bundle, and `dexmate_maniflow` environment.
+
+> The LeRobot diffusion policy carries the **same switch** with the same four experts, canonical
+> space, router and native-frame aux loss — see [Mixture of Frames](#mobile-conditioned-policy-pipeline)
+> in step 3 above. The two implementations are independent (separate envs, mirrored frame-transform
+> modules), so a DP-mof vs ManiFlow-mof comparison isolates the visual representation (RGB vs point
+> cloud) with the action-frame machinery held fixed.
+>
+> Two knobs here have no DP counterpart, so a matched pair must pin them: run the ManiFlow side at
+> `point_sampling_mode=fps mask_channels=false` (DP mask channels are deferred) and at
+> `position_condition_mode=concat` (`grounding_tokens` needs `env_dino`, which the LeRobot porter
+> does not write). `mof.cloud_frame=family` **does** have a counterpart —
+> `--policy.mof_env_frame=family` — but it moves only the position condition, not the scene. The
+> matched cell must also run on the legacy `processed_wbc/maniflow` zarr: `maniflow_v3` carries no
+> `env_state`.
 
 ```
 data/point_cloud  (T, 1024, 6) float32   engage-origin WORLD XYZ + RGB[0,1]
@@ -458,6 +582,13 @@ point_feat (B*To, 256, 128)
 
 Mask sampling / `mask_channels` are orthogonal to the mode below and may be on in any of them.
 
+`point_mask` stores **one of three mutually exclusive classes** per point as int8 —
+`0` background, `1` box/src, `2` cloth/dst — because the sampler needs to tell the two objects
+apart to fill its `64/64/128` quotas. The network never sees that integer: `mask_channels=true`
+expands it to **two binary channels** `[label == 1, label == 2]`, so src is `[1,0]`, dst is `[0,1]`
+and background is `[0,0]` (no third channel). The same 0/1/2 legend is what the full-frame SAM3.1
+mask NPZs carry.
+
 #### `position_condition_mode=none`
 
 No additional task specification.
@@ -477,7 +608,7 @@ cat(point_feat, state_feat)
 
 #### `position_condition_mode=concat`
 
-Cheap position-only comparison; **only currently deployable** conditioned mode.
+Cheap position-only comparison.
 Normalized `env_state=[src_xyz,dst_xyz]` widens `agent_pos` 32→38 before the state MLP.
 
 ```diff
@@ -531,12 +662,14 @@ metre of room the crop keeps is budget stolen from the two small objects. **Task
 object layout needs new `--crop-min/--crop-max`.
 - **Normalization is ManiFlow's** `mode='limits'` (per-dim min–max) for point cloud, state and
 action, including the 6-D rotations. `env_state` deliberately reuses the point-cloud XYZ affine
-(tiled once per task slot); `env_dino` and integer mask labels use identity normalizers. DiTX applies
-LayerNorm to the DINO block in-graph.
+(tiled once per task slot; under `mof.cloud_frame=family`, the matching family's
+`{family}__point_cloud` XYZ affine); `env_dino` and integer mask labels use identity normalizers.
+DiTX applies LayerNorm to the DINO block in-graph.
 - **Online augmentation is RGB-only:** when `use_pc_color=true`, 20% of training windows receive one
 temporally consistent brightness/contrast/saturation/hue transform (`[0.3, 0.4, 0.5, 0.08]`). It is
 applied before normalization and disabled for validation. XYZ, state, action, masks, `env_state` and
 `env_dino` are not augmented; there is no online crop, rotation, translation or point jitter.
+- **Pointcloud frame**
 
 Two crop bounds are **not** free to tighten:
 
@@ -551,72 +684,90 @@ cloth's points (40 → 22) while helping the box.
 ### Environment
 
 Use `dexmate_maniflow` **for every integrated ManiFlow stage**: zarr build/inspection, world or MoF
-training, checkpoint inspection, offline inference, and supported live rollout. SceneDiff DINO extraction and SAM3.1
-mask tracking remain separate preprocessing stages in `lerobot` and `dexmate_lerobot`.
+training, checkpoint inspection, SceneDiff DINO extraction, offline SAM3.1 mask generation, offline
+inference, and live rollout. The live SceneDiff change-detection bootstrap remains a short-lived
+subprocess, but causal SAM3.1 tracking and ManiFlow inference share the `dexmate_maniflow` process.
 
 The old generic `maniflow` environment has been retired. `dexmate_mof` is retained only for the
 legacy standalone mofpo reproduction documented at the end of this README. See
 [MANIFLOW_ENVIRONMENT.md](MANIFLOW_ENVIRONMENT.md) for the full bootstrap recipe.
 
-**1.** Build the mask-grounded artifacts and zarr. Run these after the position extractor has written
-`positions/{raw,recovery}/episode_<N>.npz`. DINO is a sibling sidecar tied to the positions NPZ by
-SHA-256; masks cover the full untrimmed episode and carry the same provenance hash. A stale sidecar or
-mask is rejected before the porter writes anything.
+### Run it from scratch
+
+Everything runs in `dexmate_maniflow` except where a line says otherwise.
+
+**0.** Record raw takes — "Mobile conditioned policy pipeline" step 1:
 
 ```bash
-(lerobot) cd ~/scene_diff
-python scripts/extract_object_dino_feats.py \
-  --scenediff-root ~/Dexmate/data/box2cloth/scene_diff
-
-(dexmate_lerobot) cd ~/scene_diff
-python scripts/build_wbc_masks.py \
-  --scenediff-root ~/Dexmate/data/box2cloth/scene_diff
-# inspect masks/qc_summary.json and masks/viz/ before porting
-
-(dexmate_maniflow) cd ~/omniteleop
-python scripts/port_wbc_mobile_zarr.py \
-  --raw-dir ~/Dexmate/data/box2cloth/raw_data \
-  --out-root ~/Dexmate/data/box2cloth/processed_wbc/maniflow \
-  --name dexmate_wbc --num-points 1024 \
-  --include-recovery-data ~/Dexmate/data/box2cloth/raw_data/recovery \
-  --positions-dir ~/Dexmate/data/box2cloth/scene_diff/positions \
-  --masks-dir ~/Dexmate/data/box2cloth/scene_diff/masks \
-  --dino --overwrite
-# ~3 min, CPU only. -> dexmate_wbc_{train,test}.zarr (46 / 2 episodes; 17,951 / 604 frames)
-# The encoder downsamples stored 1024 to policy.visual_cond_len (active baseline: 256),
-# so raising --num-points only helps if you also raise visual_cond_len.
-# --positions-dir -> data/env_state (T, 6) float32, constant per episode
-# --dino          -> data/env_dino (T, 2560) float32, constant per episode
-# --masks-dir     -> data/point_mask (T, 1024) int8, exact stored-point lineage
-# each .meta.json also records the ordered raw HDF5/mask NPZ episode manifest and
-# half-open raw/zarr frame windows used for exact camera/mask visualization
+(dexmate) python scripts/wbc_vr_leader.py --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5
+(dexmate) python scripts/wbc_vr_robot.py --record --save-dir ~/Dexmate/data/raw_data
+# -> raw_data/{,recovery/}episode_<N>.hdf5
 ```
 
-The optional arrays are additive: each policy mode loads only the keys it consumes. Thus the same
-enriched zarr supports the complete experiment ladder, including the unconditioned control. The
-sibling `.meta.json` records crop/depth/frame/sampler, mask/DINO provenance (including
-`env_dino.dino_input_scale: "[0,1]"`, and an ordered per-episode raw-frame manifest; it remains the source of truth for live preprocessing and visualization.
-
-**2.** Inspect the configured policy input. Zarr mode requires both the viewed zarr and a training run;
-it reads `point_sampling_mode`, `mask_channels`, `position_condition_mode`, `visual_cond_len`, CUDA 
-device, and the training-zarr normalizer strictly from `<run>/.hydra/config.yaml`. There are no manual
-sampler overrides and no `--compare-sampling` mode:
+**1.** Build the SceneDiff artifacts. Positions first; masks and DINO both read them.
 
 ```bash
-(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh smoke-mask-mof  \
-  action_frame_mode=mof \
-  point_sampling_mode=mask_stratified \
-  mask_channels=true \
-  position_condition_mode=grounding_tokens \
-  training.num_epochs=1
+cd ~/scene_diff
+# 1a. positions: [box, cloth] world XYZ per episode.
+# run_wbc_pos_condition.sh defaults: RAW_ROOT=~/Dexmate/data/raw_data,
+# REFERENCE_SRC + OUTPUT_ROOT under ~/Dexmate/data/scene_diff.
+(lerobot) bash run_wbc_pos_condition.sh
+# -> scene_diff/positions/<source>/episode_<N>.npz
+# VERIFY scene_diff/visualization/hungarian/<source>/episode_<N>.png
+# (green dot on the box, red arrow to the yellow cloth); skipped episodes land in skip.json
+
+# 1b. SAM3.1 masks, ~30 s/episode on the 4090. Skip 1b (and --masks-dir below) for
+# fps / mask_channels=false checkpoints.
+(dexmate_maniflow) python scripts/build_wbc_masks.py \
+  --scenediff-root ~/Dexmate/data/scene_diff \
+  --masks-dir ~/Dexmate/data/scene_diff/masks
+# check masks/qc_summary.json and masks/viz/ before porting
+
+# 1c. DINOv3 sidecars, written beside each positions NPZ. 
+(lerobot) python scripts/extract_object_dino_feats.py \
+  --scenediff-root ~/Dexmate/data/scene_diff \
+  --config configs/scenediff_config.yml
+```
+
+**2.** Port to the ManiFlow zarr:
+
+```bash
+(dexmate_maniflow) cd ~/omniteleop && python scripts/port_wbc_mobile_zarr.py \
+  --raw-dir ~/Dexmate/data/raw_data \
+  --include-recovery-data ~/Dexmate/data/raw_data/recovery \
+  --out-root ~/Dexmate/data/processed_wbc/maniflow \
+  --positions-dir ~/Dexmate/data/scene_diff/positions \
+  --masks-dir ~/Dexmate/data/scene_diff/masks \
+  --dino
+# ~3 min, CPU. -> dexmate_wbc_{train,test}.zarr + .meta.json, split by raw_data/split.csv
+# --positions-dir -> data/env_state (T, 6)     --dino -> data/env_dino (T, 2560)
+# --masks-dir     -> data/point_mask (T, 1024), exact stored-point lineage
+# drop --masks-dir for an fps-only zarr; env_state/env_dino do not depend on masks
+```
+
+- `--out-root` must not already exist. The porter validates every source before creating it and
+removes the root it created if conversion fails; it never reuses or overwrites one.
+- The stored 1024 points are downsampled by the encoder to `visual_cond_len` (256), so raising
+`--num-points` only helps if you raise `visual_cond_len` too.
+- The optional arrays are additive — each policy mode loads only the keys it consumes, so one zarr  
+serves the whole ladder including the unconditioned control. The sibling `.meta.json` (crop/depth/  
+frame/RNG/sampler parameters, camera contract, mask/DINO provenance, ordered raw-frame manifest) is  
+the source of truth for live preprocessing and visualization.
+
+**3.** Inspect what the policy will actually consume. The viewer reads the sampler, `mask_channels`,
+`position_condition_mode`, `visual_cond_len`, CUDA device and training-zarr normalizer strictly from
+`<run>/.hydra/config.yaml` — no manual sampler overrides — so a one-epoch run is enough to look:
+
+```bash
+(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh smoke-mask_mof  \
+  mof.cloud_frame=family action_frame_mode=mof point_sampling_mode=mask_stratified mask_channels=true \
+  position_condition_mode=grounding_tokens training.num_epochs=1
 
 (dexmate_maniflow) python scripts/vis_episode_processed_wbc.py \
-  --zarr ~/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_test.zarr \
-  --maniflow-run-dir ~/Dexmate/model/maniflow/maniflow_smoke-mask-mof_seed0 \
+  --zarr ~/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_test.zarr \
+  --maniflow-run-dir ~/Dexmate/model/maniflow/maniflow_smoke-mask_mof_seed0 \
   --episode_index 0
 ```
-
-The automatic Rerun blueprint is:
 
 ```text
 Scene tab:
@@ -628,68 +779,36 @@ MoF frames (GT action) tab — only when action_frame_mode=mof:
   one 3D view per enabled expert (base / base_rel_trans / left / right / rel_traj / …)
 ```
 
-**Timeline:** Rerun `frame=t` is the same scrub for both tabs. **Scene** shows that single
-frame — point cloud, `state[t]`, `action[t]`, cameras/base. **MoF** anchors on the same `t`
-as the last obs step (`To−1`) and draws the training `horizon` GT action chunk (not
-`n_action_steps`): start `t−(n_obs_steps−1)`, length `horizon`, refs from `agent_pos[t]`,
-edge-replicated at episode bounds like SequenceSampler. With the usual `To=2`, `horizon=16`,
-that is `[t−1 … t+14]` re-expressed in each expert; triad marks the current step inside the
-chunk. This viewer has no checkpoint — GT representations only (see
-`vis_wbc_mof_prediction.py` for predicted/router overlays).
+- `Stored RGB 3D` is all 1024 porter points; `Policy RGB 3D` is only the run sampler's deterministic
+selection on training-normalized XYZ, drawn back at raw world XYZ/RGB; `Policy masks 3D` colors the
+selected labels source=orange, destination=cyan, background=gray and warns whenever a mask-stratified
+frame falls below the nominal `64/64/128` quota.
+- Both tabs share the `frame=t` scrub. Scene shows that one frame; MoF treats `t` as the last obs step
+and draws the training `horizon` GT chunk (`t−(To−1)` … `+horizon`, refs from `agent_pos[t]`,
+edge-replicated at episode bounds) — GT only, this viewer has no checkpoint.
+- Head RGB/depth, Wrist RGB and the full SAM3.1 mask come from the raw HDF5/mask NPZ through the
+manifest. Depth and projected EEF pixels are logged but hidden; enable them from the Rerun sidebar.
 
-`Stored RGB 3D` shows all 1024 porter points. `Policy RGB 3D` shows only the exact deterministic
-selection produced by the run's sampler on training-normalized XYZ, rendered back at raw world
-XYZ/RGB. `Policy masks 3D` colors the selected labels source=orange, destination=cyan,
-background=gray. Mask-stratified frames label the final `q_src/q_dst/q_bg/total` and show a warning
-whenever any final count falls below the nominal `64/64/128` allocation. The full-resolution SAM3.1
-mask overlays Head RGB with the same source/destination colors and transparent background; no stored
-mask or dynamic centroid is rendered.
-
-Head RGB/depth, Wrist RGB, and the full mask are loaded directly from the raw HDF5/mask NPZ through
-the manifest—zarr mode never opens the sibling LeRobot dataset. Head depth and projected action/state
-EEF pixels are recorded but hidden from automatic views, so enable them from the Rerun sidebar when
-needed. The three 3D views have identical initial camera/world context (Rerun 0.34 does not link later
-manual camera motion across separate views). The script prints the active sampler/mask/grounding mode
-at startup, rejects legacy configs missing the three explicit switches, rejects train/view preprocessing
-mismatches, and does not apply training-only color jitter. Legacy `--dataset_dir` mode remains available
-unchanged; zarr mode suppresses the post-view Matplotlib diagnostics.
-
-**3.** Train. `train_maniflow_robotwin_workspace.py` is ManiFlow's only **env-runner-free** trainer
-(`env_runner = None`, `RUN_ROLLOUT = False`, `RUN_VALIDATION = True` are hardcoded) — which is why our
-task config lives under `config/robotwin_task/`: a Hydra group name *is* the config key. Nothing about
-it is RoboTwin.
+**4.** Train. `train_maniflow_robotwin_workspace.py` is ManiFlow's only env-runner-free trainer, which
+is why the task config lives under `config/robotwin_task/` (a Hydra group name *is* the config key) —
+nothing about it is RoboTwin:
 
 ```bash
-# Incumbent world-absolute path (`action_frame_mode=world` is the default).
-(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh control_256 \
-  point_sampling_mode=fps mask_channels=false position_condition_mode=none \
-  training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
+# mof.expert_arch = full_ditx | compact_ditx
+(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh baseline \
+  mof.cloud_frame=world action_frame_mode=world point_sampling_mode=fps mask_channels=false position_condition_mode=none \
+  training.num_epochs=200 training.checkpoint_every=10 training.val_every=5
 
-
-(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh grounding_256 \
-  point_sampling_mode=mask_stratified mask_channels=true \
+(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh mof_pos \
+  mof.cloud_frame=family action_frame_mode=mof point_sampling_mode=mask_stratified mask_channels=true \
   position_condition_mode=grounding_tokens \
-  training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
-
-# Cheap position-only comparison (no mask consumer):
-(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh concat_256 \
-  point_sampling_mode=fps mask_channels=false position_condition_mode=concat \
-  training.num_epochs=300 training.checkpoint_every=10 training.val_every=5
-
-# Integrated MoF: same zarr, launcher, checkpoint format, and Conda environment.
-# The config default enables the five v1 experts; the launcher supplies MoF memory/checkpoint defaults.
-(dexmate_maniflow) bash ~/ManiFlow_Policy/scripts/train_dexmate_wbc.sh mof_v1_500 \
-  action_frame_mode=mof point_sampling_mode=fps mask_channels=false \
-  position_condition_mode=none \
-  training.num_epochs=500 training.checkpoint_every=10 training.val_every=5
+  training.num_epochs=200 training.checkpoint_every=10 training.val_every=5
 
 # args: <addition_info> [seed] [gpu_id] [hydra overrides...]
-# checkpoints → ~/Dexmate/model/maniflow/<exp>_seed<seed>/checkpoints/
-# default zarr: ~/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_train.zarr
-# override it with ZARR_PATH=/other/train.zarr
+# checkpoints -> ~/Dexmate/model/maniflow/<exp>_seed<seed>/checkpoints/ (+ .hydra/config.yaml)
+# default zarr: .../processed_wbc/maniflow/dexmate_wbc_train.zarr, override with ZARR_PATH=
+# training.resume: relaunching the same tag+seed continues from its latest.ckpt
 ```
-
-
 
 **How many epochs?** The diffusion policy that rolled out successfully did 100k steps × batch 32 =
 **3.2M samples** over 17,951 frames — 178 epochs-equivalent. ManiFlow has 16,659 train windows at
@@ -703,77 +822,142 @@ batch 64 → **261 steps/epoch**:
 | 1010 (cfg default) | 263,610    | 16.8M     | 5.26x     |
 
 
-Use **300**, not the sample-matched 192: ManiFlow splits every batch 75% flow / 25% consistency
-(`flow_batch_ratio` / `consistency_batch_ratio`), so at 300 epochs the *flow* branch alone sees 3.75M
-samples ≈ 1.17x DP's whole budget. Watch `val_loss` (every 5 epochs) and `train_action_mse_error`; the
-`topk` manager keeps the best-val checkpoint alongside `latest.ckpt`.
+Use **300**, not the sample-matched 192: every batch splits 75% flow / 25% consistency, so at 300
+epochs the flow branch alone sees 3.75M samples ≈ 1.17x DP's whole budget. Watch `val_loss` (every 5
+epochs) and `train_action_mse_error`; the `topk` manager keeps the best-val checkpoint beside
+`latest.ckpt`.
 
-> ⚠️ `num_epochs` sets the **cosine LR horizon** (`num_training_steps = steps_per_epoch * num_epochs`,
-> workspace line 150). Killing a 1010-epoch run at epoch 300 is **not** the same as training for 300 —
-> the LR would still sit at ~79% of peak, never annealed. Choose it at launch.
+> ⚠️ `num_epochs` sets the **cosine LR horizon**. Choose it at launch: stopping a longer-horizon run
+> early does not produce the same schedule as training to that epoch count. Also do not use
+> `training.debug=true` as a smoke test — the workspace rewrites it to 100 epochs × 10 steps, and
+> `position_condition_dropout` must stay `0.0` (any nonzero value fails at policy construction).
 
-The old 512-token timing is not the estimate for this ladder; every current cell runs at 256. Two
-full-size one-epoch runs (`none+fps` and full grounding) have completed training and checkpointing.
-The sampler tests cover quota/spill/shortage/over-segmentation/empty/determinism, and every ladder
-cell has run `compute_loss + backward + predict_action` on the real zarr.
+Implementation lives in `point_process.py` (mask-stratified sampler), `pointnet_extractor.py`
+(mask-aware sampling/channels), `ditx.py` (grounding tokens), `maniflow_pointcloud_policy.py` (mode
+plumbing), `dexmate_wbc_dataset.py` (schema/normalizers), `action_layout.py` + `frame_transforms.py`
+(MoF representations), `mof_mixture.py` (expert towers and router), and `train_dexmate_wbc.sh`.
 
-`training.resume: true`, so relaunching the same `<addition_info>` and seed resumes from its
-`latest.ckpt`; use a new tag for a fresh run. The epoch-end workspace now explicitly returns the
-student to train mode while keeping the EMA teacher in eval mode. `position_condition_dropout` is
-retired and must remain `0.0`; any nonzero value fails at policy construction. Do not use
-`training.debug=true` as a smoke test—the workspace rewrites it to 100 epochs × 10 steps.
-
-Active implementation files: `point_process.py` (batched mask-stratified sampler),
-`pointnet_extractor.py` (mask-aware sampling/channels), `ditx.py` (grounding tokens),
-`maniflow_pointcloud_policy.py` (mode plumbing), `dexmate_wbc_dataset.py` (schema and normalizers),
-`action_layout.py` and `frame_transforms.py` (MoF representations), `mof_mixture.py` (expert towers
-and router), the Dexmate task/policy YAMLs, the Robotwin workspace EMA-mode fix, and
-`scripts/train_dexmate_wbc.sh`.
-
-**4.** Live rollout. `scripts/wbc_maniflow_rollout.py` does **not** fork the hardware loop: it imports
-`wbc_policy_rollout.py` and swaps in a ManiFlow bundle + observation worker via
-`_run_rollout(..., policy_factory=, worker_factory=)`. Engage, `--align-reference`, the async chunk
-scheduler, stale-action drop, the 100 Hz WBC tick, the hold watchdog, recording and shutdown are all
-the same code. `--replay-episode` works identically. The bundle instantiates the checkpoint's policy
-configuration, so this same command loads either `action_frame_mode=world` or integrated
-`action_frame_mode=mof` checkpoints; do not use the legacy `wbc_mof_rollout.py` for an integrated
-ManiFlow checkpoint.
+**5.** Validate OFFLINE before any hardware run. `scripts/vis_wbc_maniflow_prediction.py` replays one
+held-out zarr episode through the checkpoint's own `policy.predict_action` — the exact call the rollout
+makes — and scores the predicted world actions against the recording:
 
 ```bash
-(dexmate_maniflow) python scripts/wbc_maniflow_rollout.py \
-  --policy-path /home/yixuan/Dexmate/model/maniflow/<exp>_seed0/checkpoints/latest.ckpt \
-  --save-dir ~/Dexmate/data/box2cloth/rollout/maniflow \
-  --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5 \
-  --num-inference-steps 2 --policy-interval 0.3 --max-seconds 85
+(dexmate_maniflow) python scripts/vis_wbc_maniflow_prediction.py \
+  --policy-path ~/Dexmate/model/maniflow/<exp>_seed0/checkpoints/<epoch>.ckpt \
+  --zarr ~/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_test.zarr \
+  --episode_index 0 --save ~/Dexmate/tmp/scratchpad/maniflow_pred_ep0.rrd
+# per-entity translation MAE / rotation error / gripper accuracy on stdout, a GT-vs-pred
+# overlay PNG, and a Rerun recording (--save for SSH, --connect for a running viewer)
+# --stride (default n_action_steps), --num-inference-steps, --no-ema, --seed, --train-zarr
 ```
 
-- `--policy-path` is a ManiFlow `.ckpt` **file** (`torch.load` + `dill`), not a LeRobot dir. EMA
-weights by default (`--no-ema` for raw).
-- `--num-inference-steps 2`: ManiFlow's consistency-flow objective makes 1–2 flow steps enough.
-Measured ~139 ms/chunk at 2 steps (vs ~0.4 s for the 100-step DDPM baseline), so `--policy-interval`
-can drop to ~0.3 s.
-- The live cloud is rebuilt by `omniteleop.wbc_pointcloud` — **the same module the converter used** —
-with the crop/depth/frame read from the training `.meta.json` (`--pointcloud-meta` if the zarr moved).
-Verified **bit-identical** to the stored training cloud on raw `episode_1` frame 0.
-- The `n_obs_steps` head frames are grabbed at the dataset period **first**, then both clouds are built
-in one batched farthest-point call (~97 ms for 2 frames). Building inline would stretch the
-observation spacing past the 0.1 s the policy was trained on.
-- `--position-condition` is currently valid for the active `concat` mode: the shared rollout runs
-SceneDiff once and pins `[box, cloth]` `env_state` for the episode. Both directions are checked before
-engage—a concat checkpoint without the flag, or the flag with an unconditioned checkpoint, exits.
+```text
+Scene tab:
+  Stored cloud (1024) | Policy cloud (visual_cond_len, run's sampler)
+                      | Policy cloud: mask labels (only when point_mask is consumed)
+  Head RGB/depth | Wrist RGB | Left gripper | Right gripper
+  every 3D view carries the GT (red) and predicted (magenta) action horizons, their
+  first-step error segment, the base odometry path and the head camera frustum
 
-> **Live limitation:** `wbc_maniflow_rollout.py` does not yet supply `point_mask` or `env_dino`, and
-> its mode gate predates `grounding_tokens`. Therefore only `none` and `concat` checkpoints are
-> deployable through this script today. Do not deploy `mask_stratified`, `mask_channels=true`, or
-> `grounding_tokens` checkpoints until the planned causal SAM3.1 tracking integration is complete.
-> The future worker must advance masks only on policy-consumed RGB frames and expose an explicit
-> `--mask-condition` contract.
+MoF frames (GT vs pred) tab — only when action_frame_mode=mof:
+  the same chunk pair in every enabled expert, round-trip-checked back to world
+MoF router tab: learned expert weights per flow step (heatmap + per-chunk means)
+```
+
+- Observations come verbatim from the zarr, so no SceneDiff tracker or live cloud builder is involved.
+It is chunk-wise open loop: nothing is fed back, since an offline replay cannot move the robot.
+- The rendered policy cloud uses the **checkpoint's own** cloud normalizer statistics
+(`point_cloud`, or `{family}__point_cloud` when `mof.cloud_frame=family`), and predicted grippers
+are binarized at `GRIPPER_BINARY_THRESHOLD` the way `split_policy_action` does before actuation —
+so both the points and the gripper accuracy are what deployment would produce.
+- The training zarr comes from the run's cfg (falling back to the same filename beside `--zarr`),
+and its preprocessing is checked against the evaluation zarr's, because the normalizer was fit there.
+
+**6.** Live rollout. `scripts/wbc_maniflow_rollout.py` does **not** fork the hardware loop: it imports
+`wbc_policy_rollout.py` and swaps in a ManiFlow bundle + observation worker, so engage,
+`--align-reference`, `--replay-episode`, the async chunk scheduler, stale-action drop, the 100 Hz WBC
+tick, the hold watchdog, recording and shutdown are the same code. The bundle instantiates the
+checkpoint's own configuration, so this one command loads `world` or `mof` checkpoints alike; do not
+use the legacy `wbc_mof_rollout.py` for an integrated ManiFlow checkpoint.
+
+> **Deployment status:** the live code path is implemented and covered by CPU-side tests, but it is
+> **not robot-ready** until every pinned-GPU gate below has passed.
+> Unit tests alone are not permission to move the robot.
+
+```bash
+# Run this only after step 5's offline gate passes.
+(dexmate_maniflow) python scripts/wbc_maniflow_rollout.py \
+  --policy-path ~/Dexmate/model/maniflow/<exp>_seed0/checkpoints/latest.ckpt \
+  --pointcloud-meta \
+    ~/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_train.meta.json \
+  --save-dir ~/Dexmate/data/rollout/maniflow \
+  --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5 \
+  --num-inference-steps 2 --policy-interval 0.4 --max-seconds 85
+```
+
+- `--policy-path` is a ManiFlow `.ckpt` **file** (`torch.load` + `dill`), not a LeRobot dir; EMA
+weights by default (`--no-ema` for raw). `--num-inference-steps 2` is enough for the consistency-flow
+objective, but the co-resident replay below — not a standalone timing estimate — decides whether the
+step count and interval are safe.
+- `--pointcloud-meta` is a relocation override only. The v3 sidecar supplies image size, intrinsic,
+dtypes, depth scale, crop, frame, RNG seed/scheme, pool size and pinned sampler signature, and any
+mismatch (including `--dataset-fps`) fails before engage. There are no live pool-size, seed, sampler
+or conditioning overrides: the checkpoint is the sole mode authority.
 
 
+| Checkpoint configuration                      | Raw observation keys supplied by rollout         |
+| --------------------------------------------- | ------------------------------------------------ |
+| `none + fps + mask_channels=false`            | `point_cloud`, `agent_pos`                       |
+| `position_condition_mode=concat`              | above + episode-constant `env_state`             |
+| `position_condition_mode=grounding_tokens`    | above + episode-constant `env_state`, `env_dino` |
+| `mask_stratified` and/or `mask_channels=true` | above as applicable + causal `point_mask`        |
+| any row with `action_frame_mode=mof`          | identical keys; no rollout-side frame transform  |
+
+
+`policy.predict_action` owns normalization, mask-stratified sampling, mask painting, grounding-token
+construction, MoF expert transforms and world-action reconstruction; deployment supplies raw
+observations only.
+
+For any nonempty scene requirement, rollout runs one ordered, fail-closed bootstrap before motion:
+SceneDiff exports size-slot positions, the native SAM3.1 seed and (when required) DINO features in a
+temporary directory; the operator inspects a fresh overlay and enters the permutation to
+`[source box, destination cloth]`, which reorders positions, DINO and seed labels together (identity is
+never assumed); a disposable tracker session validates both slots against valid depth and their stored
+world positions (≥95% valid-depth support, ≤20 mm error) and aborts before motion on failure; only then
+is the directory published as `<save-dir>/scene_diff/episode_N` (an existing path aborts before
+capture).
+
+Mask-free conditioned modes unload SAM3.1 after validation; mask-consuming modes keep the compiled
+model but seed a **fresh** rollout session, gathering and validating all `n_obs_steps` samples before
+advancing the tracker — a partial window advances neither
+tracker state nor sampling RNG — and label points through the porter's exact pixel → valid depth → crop
+→ pool → FPS lineage. Object absence is valid; stale-mask reuse and fallback samplers are not. Invalid
+mask shapes/dtypes/labels, timestamp regression, world-epoch change, tracker failure, or a slot
+covering ≥80% of the image for three consecutive consumed frames aborts through safe hold. Run
+`scripts/diagnostics/qc_wbc_live_masks.py` after each take to review the recorded masks and telemetry.
+
+Before robot use, produce and review all of the following on the exact deployment RTX 4090 / torch /
+CUDA stack and selected checkpoint:
+
+- compiled fixed-video versus append-only SAM3.1 masks must be bit-exact;
+- rollout-cadence burst/gap replay over all 48 accepted episodes must be reviewed and a numeric drift
+threshold recorded in ADR 0001;
+- a co-resident replay of at least 1,000 windows across all 48 episodes must report post-capture maximum
+`<300 ms`, p99 `<=250 ms`, and zero simulated action-buffer underflows for the default eight-step,
+10 Hz, 0.4 s schedule;
+- peak device memory must leave at least 2 GiB free; teardown must return within 256 MiB of the warmed
+policy-only baseline; and three load/warm/run/unload cycles must show no monotonic growth.
+
+The executable evidence commands and complete acceptance matrix are in the
+[live rollout implementation plan](../ManiFlow_Policy/docs/wbc_maniflow_live_rollout_plan.md), with the
+authoritative tracker and ordering decisions in
+[ADR 0001](../ManiFlow_Policy/docs/adr/0001-track-live-masks-at-policy-observation-cadence.md) and
+[ADR 0003](../ManiFlow_Policy/docs/adr/0003-install-one-ordered-live-object-condition.md).
 
 ## Legacy standalone MoF reproduction
 
-The active MoF path is now `action_frame_mode=mof` inside ManiFlow above. This section preserves the
+The active MoF paths are now `action_frame_mode=mof` inside ManiFlow above and inside the LeRobot
+diffusion policy (step 3). This section preserves the
 older standalone [MoF](https://mofpo.github.io/) WBC v1 pipeline only, for reproducing its safetensor
 dataset, mofpo checkpoint, offline visualizer, and hardware bundle. It uses the `wbc` branch of
 [Crdr2/mofpo](https://github.com/Crdr2/mofpo) at `/home/yixuan/mofpo` (fork of the paper code;
@@ -796,10 +980,10 @@ positions are ALWAYS attached — a conditioned run later is a train-config flip
 
 ```bash
 (dexmate_lerobot) python scripts/port_wbc_mobile_mof.py \
-  --raw-dir ~/Dexmate/data/box2cloth/raw_data \
-  --out-root ~/Dexmate/data/box2cloth/processed_wbc/mof \
-  --include-recovery-data ~/Dexmate/data/box2cloth/raw_data/recovery \
-  --positions-dir ~/Dexmate/data/box2cloth/scene_diff/positions
+  --raw-dir ~/Dexmate/data/raw_data \
+  --out-root ~/Dexmate/data/processed_wbc/mof \
+  --include-recovery-data ~/Dexmate/data/raw_data/recovery \
+  --positions-dir ~/Dexmate/data/scene_diff/positions
 # -> dexmate_wbc_mof/{train,test}/episode_<i>.safetensors + meta.json
 #    (46 train / 2 test episodes, 18,555 frames == the LeRobot dataset;
 #     meta.json enumerates the tensor schema and is the deploy source of truth)
@@ -823,7 +1007,7 @@ mofpo has no `__init__.py`, so the `.pth` does what `pip install -e` cannot):
 ```bash
 (dexmate_mof) python scripts/vis_wbc_mof_prediction.py \
   --policy-path ~/mofpo/data/outputs/wbc_v1_mof_moe_500ep/checkpoints/latest.ckpt \
-  --episode ~/Dexmate/data/box2cloth/processed_wbc/mof/dexmate_wbc_mof/test/episode_0.safetensors \
+  --episode ~/Dexmate/data/processed_wbc/mof/dexmate_wbc_mof/test/episode_0.safetensors \
   --output ~/Dexmate/data/visualization/mof_pred_test0.png
 # per-entity translation/rotation MAE + gripper accuracy + GT-vs-pred overlays,
 # through the deploy bundle's exact inference path (load-time gates included)
@@ -846,8 +1030,8 @@ forked):
 
 The bundle refuses to load (before engage): a non-WBC or row-convention
 checkpoint, a missing/mismatched port `meta.json`, or a normalizer without
-fitted stats. v1 checkpoints are unconditioned — do not pass
-`--position-condition`.
+fitted stats. v1 checkpoints are unconditioned, so their checkpoint-derived scene requirements are
+empty and the shared rollout performs no SceneDiff bootstrap.
 
 # Debug
 

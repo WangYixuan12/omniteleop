@@ -80,7 +80,11 @@ class MoFObservation:
 class MoFBundle:
     """mofpo WBC checkpoint in the shared rollout bundle shape."""
 
-    use_wrist = True
+    # MoF's checkpoint schema has a single ``wrist_image`` (see OBS_KEYS), which is the
+    # LEFT arm's camera. Declared per-arm so the shared inference worker's freshness
+    # gate grabs exactly that stream; widening MoF to both wrists would change OBS_KEYS
+    # and invalidate existing checkpoints.
+    wrist_arms: tuple[str, ...] = ("left",)
     use_relative_actions = False
     # No SceneDiff position conditioning in v1 checkpoints; the shared rollout
     # cross-checks this against --position-condition.
@@ -278,7 +282,8 @@ class MoFBundle:
         history = [
             o
             if isinstance(o, MoFObservation)
-            else self.obs_from_live(o.state, o.head_rgb, o.wrist_rgb)
+            # o.wrist_rgb is keyed by arm; MoF's single wrist_image is the left one.
+            else self.obs_from_live(o.state, o.head_rgb, o.wrist_rgb["left"])
             for o in obs_history
         ]
         if not 1 <= len(history) <= self.n_obs_steps:
