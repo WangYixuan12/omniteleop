@@ -341,7 +341,6 @@ gated edits only).
 - New task collections outside box2cloth
 - MoF-Ensemble / single-frame ablations (after a conditioned or hardware
 baseline)
-- Relative-action WBC MoF port
 
 ---
 

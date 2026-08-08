@@ -69,7 +69,7 @@ _ROUTER_COLORS = (
 )
 _PLAYBACK_FPS = 10.0
 DEFAULT_EPISODE = Path(
-    "~/Dexmate/data/box2cloth/processed_wbc/mof/dexmate_wbc_mof/test/episode_0.safetensors"
+    "~/Dexmate/data/processed_wbc/mof/dexmate_wbc_mof/test/episode_0.safetensors"
 ).expanduser()
 
 

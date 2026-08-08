@@ -64,11 +64,9 @@ ACTION_AXES = LEFT_EEF_AXES + RIGHT_EEF_AXES + HEAD_AXES
 STATE_AXES = ACTION_AXES + BASE_AXES
 
 # observation.state EEF/head frame. "base": achieved FK in the base frame (the
-# egocentric default, absolute-action training). "world": each EEF/head block
-# composed to the engage-origin world via the odometry base pose, so the state
-# shares the ACTION's world frame -- REQUIRED for use_relative_actions, whose
-# relative step subtracts observation.state[:29] from the world action element-wise
-# (cross-frame subtraction is meaningless otherwise). See PLAN.md / port_wbc_mobile_hdf5.
+# egocentric default). "world": each EEF/head block composed to the engage-origin
+# world via the odometry base pose, so the state shares the ACTION's world frame.
+# MoF checkpoints declare which they want via ``mof_state_frame``.
 STATE_FRAMES = ("base", "world")
 
 # Action grippers are categorical open/closed commands. Dataset conversion and
@@ -81,18 +79,10 @@ POSITION_DIMS = [i for i, a in enumerate(ACTION_AXES) if a.rsplit("_", 1)[-1] in
 ROTATION_DIMS = [i for i, a in enumerate(ACTION_AXES) if a.rsplit("_", 1)[-1].startswith("r")]
 GRIPPER_DIMS = [i for i, a in enumerate(ACTION_AXES) if a.endswith("_gripper")]
 
-# Under use_relative_actions, translations AND 6-D rotation columns are made
-# relative (LeRobot subtracts observation.state[:29] element-wise, broadcast over
-# the chunk). The column-wise rotation delta is NOT itself a rotation, but it is
-# exactly inverted by AbsoluteActionsProcessorStep -- the same chunk-anchor state
-# is added back BEFORE pos6d_to_mat's Gram-Schmidt -- so decoded rotations are
-# exact. Only the binary grippers stay absolute: the state gripper is a raw FC03
-# reading on a different scale, so subtracting it would corrupt the 0/1 command.
 # Base pose dims 29-31 live in the STATE only (never in the 29-D action).
-RELATIVE_EXCLUDE_DIMS = GRIPPER_DIMS
 
-# 6-D rotation dims ride raw via skip_normalization_dims (absolute columns are
-# already unit-bounded; relative rotation deltas concentrate near 0).
+# 6-D rotation dims ride raw via skip_normalization_dims: the columns are already
+# unit-bounded, and a per-dim min/max rescale would distort the rotation manifold.
 SKIP_NORMALIZATION_DIMS = ROTATION_DIMS
 
 
@@ -258,7 +248,7 @@ def build_state_vector(
         state_frame: ``"base"`` keeps the EEF/head blocks base-frame (absolute-action
             default); ``"world"`` composes each block to world via ``base_pose``
             (``world_T_frame = base_pose_to_mat(base_pose) @ base_T_frame``) so the
-            state shares the world ACTION frame -- required for use_relative_actions.
+            state shares the world ACTION frame.
 
     The base pose occupies dims 29-31 in BOTH frames (the world anchor).
     """

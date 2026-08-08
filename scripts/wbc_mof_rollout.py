@@ -35,7 +35,7 @@ Usage::
 
     # replay a recorded take through the identical actuation path (no policy):
     python scripts/wbc_mof_rollout.py \
-      --replay-episode ~/Dexmate/data/box2cloth/raw_data/episode_1.hdf5 \
+      --replay-episode ~/Dexmate/data/raw_data/episode_1.hdf5 \
       --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5
 """
 

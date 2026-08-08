@@ -125,7 +125,6 @@ from omniteleop.wbc_policy_format import (
     ACTION_AXES,
     GRIPPER_BINARY_THRESHOLD,
     GRIPPER_DIMS,
-    RELATIVE_EXCLUDE_DIMS,
     SKIP_NORMALIZATION_DIMS,
     STATE_AXES,
     STATE_FRAMES,
@@ -521,9 +520,9 @@ def compute_frame_state_action(
     """One frame's ``(observation.state (32,), action (29,))`` float32 vectors.
 
     State: achieved FK poses of the measured ``obs/joint`` (base zero in q), in the
-    ``state_frame`` frame (``"base"`` = egocentric, absolute-action default;
-    ``"world"`` = composed to the engage-origin world via ``obs/base/pose``, REQUIRED
-    for use_relative_actions so the state shares the world action frame), + raw obs
+    ``state_frame`` frame (``"base"`` = egocentric default; ``"world"`` = composed
+    to the engage-origin world via ``obs/base/pose``, for MoF checkpoints that
+    declare ``mof_state_frame="world"``), + raw obs
     grippers + ``obs/base/pose`` (dims 29-31, world anchor, same in both frames).
     Action: ``mat_to_pos6d`` of the given world-frame targets (verbatim from raw) +
     binarized action grippers.
@@ -1236,20 +1235,16 @@ def _write_meta(
     object_nums: int | None = None,
 ) -> None:
     """Write the ``dexmate_meta.json`` sidecar describing this split's schema."""
-    relative_ready = state_frame == "world"
     meta = {
         "schema": "wbc_eef_head_v1",
         "split": split,
         "state_axes": list(STATE_AXES),
         "action_axes": list(ACTION_AXES),
-        # "base": egocentric achieved FK (absolute-action default). "world": composed
-        # to engage-origin world so state shares the action frame -- for use_relative_actions.
+        # "base": egocentric achieved FK (the default). "world": composed to
+        # engage-origin world so state shares the action frame, for MoF checkpoints
+        # declaring mof_state_frame="world".
         "state_frame": state_frame,
         "action_frame": "world (verbatim ik.solve targets, engage-origin)",
-        # This dataset is only usable for use_relative_actions=true when state_frame="world"
-        # (LeRobot's relative step subtracts observation.state[:29] from the world action).
-        "relative_actions_ready": relative_ready,
-        "relative_exclude_dims": RELATIVE_EXCLUDE_DIMS if relative_ready else None,
         "skip_normalization_dims": SKIP_NORMALIZATION_DIMS,
         "fps": fps,
         "resize_h": resize_h,
@@ -1652,16 +1647,15 @@ def main() -> None:
         type=str,
         default=None,
         help=f"dataset repo-id (default {DEFAULT_REPO_ID}, or "
-        f"{DEFAULT_REPO_ID}_rel with --relative-actions).",
+        f"{DEFAULT_REPO_ID}_world with --world-state).",
     )
     parser.add_argument(
-        "--relative-actions",
+        "--world-state",
         action="store_true",
         help="emit observation.state EEF/head in the WORLD frame "
-        "(composed via obs/base/pose) so the dataset supports "
-        "use_relative_actions=true training (LeRobot subtracts "
-        "observation.state[:29] from the world action). Default: "
-        "base-frame state (absolute-action, egocentric).",
+        "(composed via obs/base/pose) instead of the base-frame default. "
+        "Needed by MoF checkpoints trained with mof_state_frame=\"world\"; "
+        "ordinary base-frame checkpoints (including MoF's default) do not want it.",
     )
     parser.add_argument(
         "--include-recovery-data",
@@ -1727,11 +1721,11 @@ def main() -> None:
     if args.positions_dir is not None and args.object_nums < 1:
         raise SystemExit(f"--object_nums must be >= 1, got {args.object_nums}")
 
-    state_frame = "world" if args.relative_actions else "base"
+    state_frame = "world" if args.world_state else "base"
     if state_frame not in STATE_FRAMES:  # defensive; STATE_FRAMES is the source of truth
         raise SystemExit(f"invalid state_frame {state_frame!r}")
     repo_id = args.repo_id or (
-        f"{DEFAULT_REPO_ID}_rel" if args.relative_actions else DEFAULT_REPO_ID
+        f"{DEFAULT_REPO_ID}_world" if args.world_state else DEFAULT_REPO_ID
     )
 
     # Resolve the split map. An explicit --split-csv must exist; the default

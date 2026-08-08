@@ -30,9 +30,16 @@ The 9-D world-frame pose commanded to `VegaWholeBodyIK.solve(..., head_target=..
 
 **Frame expert**:
 One denoising branch of the MoF policy that predicts the whole action chunk
-expressed in one reference frame. WBC run enables five:
-`base`, `base_rel_trans`, `left`, `right`, `rel_traj`.
+expressed in one reference frame. Four are enabled by default —
+`base_rel_trans`, `left`, `right`, `rel_traj`; `base` stays selectable but off,
+being a reparameterization of `base_rel_trans` (ManiFlow ADR 0002, amended).
 _Avoid_: head expert (entities are not experts)
+
+**Obs family**:
+The frame an OBSERVATION is expressed in, as distinct from the frame an action is
+denoised in. Experts that differ only by reparameterization share one family, so
+the four default experts span three families: `base`, `left`, `right`.
+_Avoid_: expert frame (that is the action side)
 
 **Canonical space**:
 The single frame the shared diffusion target/noise lives in and into which every
@@ -45,6 +52,22 @@ translation relative to that entity's own obs-time position.
 **rel_traj**:
 Trajectory-relative representation: each entity's action pose expressed relative
 to that entity's own obs-time pose (in the base frame).
+
+**Cloud frame** (ManiFlow `mof.cloud_frame`, LeRobot `mof_env_frame`):
+Whether each obs family reads world-frame observations (`world`) or copies
+re-expressed into its own frame (`family`). ManiFlow moves the point cloud and every
+world-frame condition with it; LeRobot has no cloud to move, so only `env_state` does.
+
+**Mask channels**:
+The one-hot `[is_src, is_dst]` object-identity channels appended to a visual
+observation — points 6→8 in ManiFlow. Always stored as a separate label array and
+concatenated in-graph, never stored pre-concatenated. Not implemented for LeRobot.
+_Avoid_: segmentation input, mask overlay (nothing is painted onto the RGB)
+
+**Object mask**:
+The per-frame SAM3.1 label image over the head RGB, `{0=background, 1=source,
+2=destination}`. Native to image space; ManiFlow's `point_mask` is this sampled at
+the points' pixel indices.
 
 ### Data
 

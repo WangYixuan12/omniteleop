@@ -54,16 +54,9 @@ clock) is used only for same-publisher freshness gating (never converted
 across clocks).
 
 Run in the dexmate_lerobot conda env ON the robot (needs lerobot + the hardware
-SDK). Absolute and relative checkpoints are both supported:
-
-- ``use_relative_actions=false``: observation.state EEF/head are BASE-frame; the
-  policy emits world-frame targets directly.
-- ``use_relative_actions=true``: observation.state EEF/head must be WORLD-frame
-  (port with ``--relative-actions``) because LeRobot's relative step subtracts
-  observation.state[:29] from the world action. Chunk-level inference makes the
-  anchoring trivial: ``predict_chunk`` runs the preprocessor on the replan
-  observation (caching its state) and the postprocessor de-relativizes the WHOLE
-  chunk against that cached anchor in one call -- no queue peeking.
+SDK). Checkpoints emit absolute actions: observation.state EEF/head are
+BASE-frame and the policy emits world-frame targets directly. MoF checkpoints
+instead declare the frame they want via ``mof_state_frame``.
 
 Two sources can drive the loop (exactly one of ``--policy-path`` /
 ``--replay-episode``): a live policy, or a recorded ``wbc_vr_robot.py --record``
@@ -780,7 +773,6 @@ class _PolicyBundle:
             get_policy_class,
             make_pre_post_processors,
         )
-        from lerobot.processor import RelativeActionsProcessorStep  # noqa: PLC0415
         from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STATE  # noqa: PLC0415
 
         self._torch = torch
@@ -791,17 +783,13 @@ class _PolicyBundle:
         self.position_condition_mode = str(
             getattr(pcfg, "position_condition_mode", "not_applicable")
         )
-        # Relative checkpoints are supported: state must be WORLD-frame (see
-        # _build_state / --relative-actions). state_frame follows this flag.
-        self.use_relative_actions = bool(getattr(pcfg, "use_relative_actions", False))
         self.action_frame_mode = str(getattr(pcfg, "action_frame_mode", "world"))
         if self.action_frame_mode == "mof":
             # MoF derives every reference frame itself and lifts base -> world in-graph, so
-            # the checkpoint states which frame it wants rather than inferring it from the
-            # relative-action flag (which MoF rejects outright).
+            # the checkpoint states which frame it wants.
             self.state_frame = str(getattr(pcfg, "mof_state_frame", "base"))
         else:
-            self.state_frame = "world" if self.use_relative_actions else "base"
+            self.state_frame = "base"
         self.policy = (
             get_policy_class(pcfg.type).from_pretrained(policy_path, config=pcfg)
             .to(self.device).eval()
@@ -879,20 +867,6 @@ class _PolicyBundle:
                 "observation queues -- chunk-level inference unsupported"
             )
 
-        # Relative checkpoints need the enabled RelativeActionsProcessorStep: the
-        # preprocessor caches the replan observation's state and the postprocessor
-        # de-relativizes the WHOLE (1, n, 29) chunk against it (broadcast add-back,
-        # empirically exact). No per-pop cache pinning / queue peeking remains.
-        relative_step = next(
-            (s for s in self.pre.steps if isinstance(s, RelativeActionsProcessorStep)),
-            None,
-        )
-        if self.use_relative_actions and (relative_step is None or not relative_step.enabled):
-            raise ValueError(
-                "relative checkpoint but no enabled RelativeActionsProcessorStep in the "
-                "preprocessor -- cannot chunk-anchor; refusing to roll out"
-            )
-
         # select_action() compat state (vis_wbc_policy_prediction.py): rolling raw
         # observation history + the unconsumed tail of the last predicted chunk.
         self._obs_history: deque[PolicyObservation] = deque(maxlen=self.n_obs_steps)
@@ -929,7 +903,7 @@ class _PolicyBundle:
         return (f"LeRobot policy on {self.device}; head+"
                 f"{'+'.join(f'{a}_wrist' for a in self.wrist_arms) or 'no-wrist'} "
                 f"@ {self.image_hw}; "
-                f"relative={self.use_relative_actions} state_frame={self.state_frame}; "
+                f"state_frame={self.state_frame}; "
                 f"action_frame={self.action_frame_mode}; "
                 f"n_obs_steps={self.n_obs_steps} n_action_steps={self.n_action_steps}")
 
@@ -1089,13 +1063,9 @@ class _PolicyBundle:
         ``start = n_obs_steps - 1``).
 
         Bypasses the policy's internal ACTION queue: each observation runs through
-        ``self.pre`` (so the RelativeActionsProcessorStep cache ends on the LAST =
-        replan observation), the observation queues are populated the way
+        ``self.pre``, the observation queues are populated the way
         ``modeling_diffusion.select_action`` does it, and ``predict_action_chunk``
-        runs once. ``self.post`` de-normalizes the whole ``(1, n, 29)`` chunk; for
-        relative checkpoints AbsoluteActionsProcessorStep broadcasts the cached
-        anchor over every frame, de-relativizing the entire chunk against the
-        replan state (empirically exact round trip).
+        runs once. ``self.post`` de-normalizes the whole ``(1, n, 29)`` chunk.
         """
         from lerobot.policies.utils import populate_queues  # noqa: PLC0415
         from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES  # noqa: PLC0415
@@ -1203,9 +1173,8 @@ class _PolicyBundle:
 def _build_state(driver, fk: WBCPolicyFK, state_frame: str = "base") -> np.ndarray:
     """32-D observation.state from measured joints (FK base zero) + odom pose.
 
-    ``state_frame`` MUST match the checkpoint: ``"base"`` for absolute policies,
-    ``"world"`` for relative ones (LeRobot subtracts observation.state[:29] from the
-    world action, so the state must be world-frame). See ``build_state_vector``.
+    ``state_frame`` MUST match the checkpoint: ``"base"`` for ordinary policies,
+    or whatever ``mof_state_frame`` declares for MoF ones. See ``build_state_vector``.
     """
     measured = driver._read_measured_joints()  # noqa: SLF001 -- deliberate reuse
     for grp in ("torso", "left_arm", "right_arm", "head"):

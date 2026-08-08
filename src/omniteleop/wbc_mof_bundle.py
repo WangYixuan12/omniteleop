@@ -85,7 +85,6 @@ class MoFBundle:
     # gate grabs exactly that stream; widening MoF to both wrists would change OBS_KEYS
     # and invalidate existing checkpoints.
     wrist_arms: tuple[str, ...] = ("left",)
-    use_relative_actions = False
     # No SceneDiff position conditioning in v1 checkpoints; the shared rollout
     # cross-checks this against --position-condition.
     position_condition_mode = "none"

@@ -229,7 +229,6 @@ def _fake_bundle(mod, torch):
     bundle.n_obs_steps = 2
     bundle.n_action_steps = 3
     bundle._uses_obs_queues = True  # noqa: SLF001
-    bundle.use_relative_actions = False
     bundle.state_frame = "base"
     # Non-conditioned bundle: _sample_dict skips the env-state branch.
     bundle.use_env_state = False

@@ -158,7 +158,6 @@ class ManiFlowBundle:
     # ManiFlow's observation is the point cloud, so it declares no wrist streams;
     # the loop keys its per-arm freshness gate off this (see _PolicyBundle.wrist_arms).
     wrist_arms: tuple[str, ...] = ()
-    use_relative_actions = False
 
     def __init__(self, policy_path: str, *, device: str | None = None,
                  num_inference_steps: int | None = None, use_ema: bool = True,

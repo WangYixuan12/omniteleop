@@ -82,26 +82,21 @@ See [PIPELINE_WBC](./PIPELINE_WBC.md).
 # Terminal 2
 (dexmate) python scripts/wbc_vr_robot.py \
   --record \
-  --save-dir /home/yixuan/Dexmate/data/raw_data
+  --save-dir /home/yixuan/Dexmate/data/box2cloth/raw_data
   # --debug-dir /home/yixuan/Dexmate/data/raw_data_debug
 
 # for teleoperator: twist hand when pick, forward when place
 
-(dexmate) python /home/yixuan/omniteleop/scripts/vis_episode.py --hdf5 /home/yixuan/Dexmate/data/raw_data/episode_0.hdf5
+(dexmate) python /home/yixuan/omniteleop/scripts/vis_episode.py --hdf5 /home/yixuan/Dexmate/data/box2cloth/raw_data/episode_0.hdf5
 
-# per-take camera-latency audit (uses the recorded SDK capture stamps +
-# meta/camera_ntp camera-host clock offsets, falling back to meta/ntp SoC NTP;
-# jitter should stay ~1 camera frame; a WiFi-degraded take shows up here
-# BEFORE it reaches training). Also accepts a directory or the porter's
-# debug/timing sidecars. The publishers must run the current code -- they
-# serve the sensors/<id>/clock service the recorder calibrates against.
-(dexmate) python scripts/audit_episode_latency.py /home/yixuan/Dexmate/data/raw_data/episode_0.hdf5
+# jitter should stay ~1 camera frame; 
+(dexmate) python scripts/audit_episode_latency.py /home/yixuan/Dexmate/data/box2cloth/raw_data/episode_0.hdf5
 ```
 
 **1.5** Generate the SceneDiff position condition (per-episode `[box, cloth]` 3D positions).
 
 Diffs FRAME 0 of every raw + recovery episode (discovered by **globbing**
-`~/Dexmate/data/raw_data/` + `.../recovery/` — **no** `log_index.csv`, which is produced later
+`~/Dexmate/data/box2cloth/raw_data/` + `.../recovery/` — **no** `log_index.csv`, which is produced later
 by the porter) against the LAST frame of the fixed reference scene, and reduces the change
 masks to the two objects' 3D positions in the **engage-origin WORLD frame** (same frame as
 `action` and `observation.state[29:32]`). Order `[box=source, cloth=target]` is the world-frame
@@ -112,15 +107,14 @@ to the centroids with a distance + ambiguity guard — a bad episode is SKIPPED 
 ```bash
 conda activate lerobot   # SAM3 runs here; make_wbc_before_hdf5 + extract auto-use dexmate_lerobot
 bash /home/yixuan/scene_diff/run_wbc_pos_condition.sh
-#   reference : last frame of ~/Dexmate/data/scene_diff/reference/episode_0.hdf5
-#   positions : ~/Dexmate/data/scene_diff/positions/<source>/episode_<N>.npz   (porter input, step 2)
-#   VERIFY    : ~/Dexmate/data/scene_diff/visualization/hungarian/<source>/episode_<N>.png
-#               (green dot on the box, red arrow to the yellow cloth)
+#   reference : last frame of ~/Dexmate/data/box2cloth/scene_diff/reference/episode_0.hdf5
+#   positions : ~/Dexmate/data/box2cloth/scene_diff/positions/<source>/episode_<N>.npz   (porter input, step 2)
+#   VERIFY    : ~/Dexmate/data/box2cloth/scene_diff/visualization/hungarian/<source>/episode_<N>.png
+
 # subset e.g.: bash /home/yixuan/scene_diff/run_wbc_pos_condition.sh 1 25
 ```
 
-> Both the box and cloth are randomized per episode so they differ from the fixed reference and
-> SceneDiff detects both. Detection knobs in `scene_diff/configs/scenediff_config.yml`:
+> Detection knobs in `scene_diff/configs/scenediff_config.yml`:
 > `models.sam.mask_assignment_order: smallest_first` (keeps the box from being absorbed by the
 > shelf/closet mask) and `detection.min_detection_pixel: 800` (drops small false-change regions —
 > a remote e-stop, box sub-fragments — that were outranking the cloth; real box/cloth masks are
@@ -128,13 +122,9 @@ bash /home/yixuan/scene_diff/run_wbc_pos_condition.sh
 > though the porter later trims their training window.
 
 > **Position conditioning (Part B, implemented):** step 2's porter attaches these as a
-> constant 6-D `observation.environment_state` via `--positions-dir ~/Dexmate/data/scene_diff/positions --object_nums 2`. Train wiring is step 3.
+> constant 6-D `observation.environment_state` via `--positions-dir ~/Dexmate/data/box2cloth/scene_diff/positions --object_nums 2`. Train wiring is step 3.
 
-Verify train / valid / test **object-mask** coverage (image-space density on a shared head
-backdrop). Masks for train+valid live under `scene_diff/{raw,recovery}/` (splits from the
-porter's `log_index.csv`: train ↔ `processed_wbc/train`, valid ↔ `processed_wbc/test`).
-Test = live rollout masks under `rollout/<run>/scene_diff/episode_*/`. WBC head frames are
-already 240×320 → use full-frame crop `0 240 0 320` (SceneDiff resize 392×518).
+240×320 → use full-frame crop `0 240 0 320` (SceneDiff resize 392×518).
 
 ```bash
 # symlink scene_diff episodes into train/ / test/ by log_index.csv, then plot
@@ -143,8 +133,8 @@ rm -rf "$LAYOUT" && mkdir -p "$LAYOUT/train" "$LAYOUT/test"
 (dexmate_lerobot) python - <<'PY'
 import pandas as pd
 from pathlib import Path
-log = pd.read_csv("/home/yixuan/Dexmate/data/raw_data/log_index.csv")
-sd, layout = Path("/home/yixuan/Dexmate/data/scene_diff"), Path("/tmp/wbc_scene_diff_vis_layout")
+log = pd.read_csv("/home/yixuan/Dexmate/data/box2cloth/raw_data/log_index.csv")
+sd, layout = Path("/home/yixuan/Dexmate/data/box2cloth/scene_diff"), Path("/tmp/wbc_scene_diff_vis_layout")
 for _, r in log.iterrows():
     src, idx = r["source"], int(r["raw_data_index"])
     (layout / r["split"] / f"episode_{idx}").symlink_to(sd / src / f"episode_{idx}")
@@ -152,8 +142,8 @@ PY
 (lerobot) python /home/yixuan/scene_diff/scripts/visualize_train_distribution.py \
   --scene-diff-root /tmp/wbc_scene_diff_vis_layout \
   --split train --valid-split test \
-  --rollout-dir /home/yixuan/Dexmate/data/rollout/concat_abs_minmax \
-  --reference-hdf5 /home/yixuan/Dexmate/data/scene_diff/_before/raw/episode_1.hdf5 \
+  --rollout-dir /home/yixuan/Dexmate/data/box2cloth/rollout/concat_abs_minmax \
+  --reference-hdf5 /home/yixuan/Dexmate/data/box2cloth/scene_diff/_before/raw/episode_1.hdf5 \
   --crop 0 240 0 320 \
   --output /home/yixuan/Dexmate/data/visualization/wbc_train_test_distribution.png
 #   -> ~/Dexmate/data/visualization/wbc_train_test_distribution.png
@@ -164,28 +154,26 @@ PY
 
 ```bash
 (dexmate_lerobot) python scripts/port_wbc_mobile_hdf5.py \
-    --raw-dir ~/Dexmate/data/raw_data \
-    --root ~/Dexmate/data/processed_wbc \
+    --raw-dir ~/Dexmate/data/box2cloth/raw_data \
+    --root ~/Dexmate/data/box2cloth/processed_wbc \
     --repo-id dexmate_wbc_eef_head \
-    --include_recovery_data ~/Dexmate/data/raw_data/recovery \
-    --log_index ~/Dexmate/data/raw_data/log_index.csv \
-    --split-csv /home/yixuan/Dexmate/data/raw_data/split.csv \
-    --positions-dir ~/Dexmate/data/scene_diff/positions --object_nums 2
+    --include_recovery_data ~/Dexmate/data/box2cloth/raw_data/recovery \
+    --log_index ~/Dexmate/data/box2cloth/raw_data/log_index.csv \
+    --split-csv /home/yixuan/Dexmate/data/box2cloth/raw_data/split.csv \
+    --positions-dir ~/Dexmate/data/box2cloth/scene_diff/positions --object_nums 2
 ```
 
-`--positions-dir` (optional; omit for an unconditioned dataset) adds a **constant** 6-D
-`observation.environment_state` = the two objects' world positions arranged `[box(src), cloth(dst)]`,
-read from `<positions-dir>/<source>/episode_<N>.npz` (step 1.5 output; `source ∈ {raw, recovery}`
-keys the file so a raw and a recovery episode sharing an index never collide). Every ported episode
-**must** have its npz — the porter validates them all up front and aborts before writing/overwriting
-anything if any is missing. Single-stage, so no per-frame `pos_condition_mask` is emitted. The
+`--positions-dir` (optional; omit for an unconditioned dataset) adds a **constant** 6-D  
+`observation.environment_state` = the two objects' world positions arranged `[box(src), cloth(dst)]`,  
+read from `<positions-dir>/<source>/episode_<N>.npz` (step 1.5 output; `source ∈ {raw, recovery}`  
+keys the file so a raw and a recovery episode sharing an index never collide). Every ported episode  
+**must** have its npz — the porter validates them all up front and aborts before writing/overwriting  
+anything if any is missing. Single-stage, so no per-frame `pos_condition_mask` is emitted. The  
 `meta/stats.json` `min`/`max` feed the `ENV: MIN_MAX` normalization at train time (step 3).
-
-Visualize the ported dataset: `observation.state` (base-frame EEF/head FK composed to world via the odometry base pose, matching the calib sidecar), world-frame `action` targets.
 
 ```bash
 (dexmate_lerobot) python scripts/vis_episode_processed_wbc.py \
-  --dataset_dir /home/yixuan/Dexmate/data/processed_wbc/train/dexmate_wbc_eef_head \
+  --dataset_dir /home/yixuan/Dexmate/data/box2cloth/processed_wbc/train/dexmate_wbc_eef_head \
   --episode_index 0
 ```
 
@@ -214,46 +202,39 @@ action (29) — WORLD-frame targets passed to VegaWholeBodyIK.solve(..., head_ta
 wbik.yaml must keep head_mode: "ik" for rollout.
 ```
 
-
-
 Frame summary vs ManiFlow (world-frame state/cloud by default): see the comparison table under [Maniflow](#maniflow).
 
+**Vanilla DP — full command.** Copy-pasteable as-is; only `--job_name` / `--output_dir` need to
+change per run. Position conditioning is toggled by the `observation.environment_state` input
+feature + the `"ENV"` mapping entry (see the notes below the block).
+
 ```bash
-# change --job_name and --output_dir
-# Position condition:
-# update --policy.input_features and --policy.normalization_mapping and --policy.position_condition_mode=concat/film
 # default config at [configuration_diffusion.py](../lerobot_original/src/lerobot/policies/diffusion/configuration_diffusion.py)
+# --policy.position_condition_mode=concat/film
 (dexmate_lerobot) lerobot-train \
   --policy.type=diffusion --policy.device=cuda --policy.push_to_hub=false \
-  --policy.horizon=16 --policy.n_action_steps=8 --policy.use_relative_actions=false \
+  --policy.horizon=16 --policy.n_action_steps=8 \
+  '--policy.down_dims=[256,512,1024]' \
+  --policy.noise_scheduler_type=DDIM --policy.num_inference_steps=16 \
   '--policy.input_features={"observation.images.head_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.images.wrist_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.state": {"type": "STATE", "shape": [32]}, "observation.environment_state": {"type": "ENV", "shape": [6]}}' \
   '--policy.normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "MIN_MAX", "ACTION": "MIN_MAX", "ENV": "MIN_MAX"}' \
   '--policy.skip_normalization_dims={"observation.state": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28], "action": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28]}' \
   --policy.position_condition_mode=concat \
   --dataset.repo_id=dexmate_wbc_eef_head \
-  --dataset.root=/home/yixuan/Dexmate/data/processed_wbc/train/dexmate_wbc_eef_head \
+  --dataset.root=/home/yixuan/Dexmate/data/box2cloth/processed_wbc/train/dexmate_wbc_eef_head \
   --dataset.image_transforms.enable=true \
   --batch_size=32 --steps=100000 --save_freq=50000 --save_best=true \
-  --output_dir=/home/yixuan/Dexmate/model/dp/dexmate_wbc_eef_head \
+  --output_dir=/home/yixuan/Dexmate/model/dp/world_concat \
   --wandb.enable=true \
   --wandb.project=dexmate_wbc_mobile \
-  --job_name=concat_abs \
-  --dataset.val_root=/home/yixuan/Dexmate/data/processed_wbc/test/dexmate_wbc_eef_head --val_freq=5000
-# --save_best=true overwrites output_dir/checkpoints/best whenever val loss improves
-# (requires val_root + val_freq). Periodic save_freq checkpoints and checkpoints/last are unchanged.
-# Prefer checkpoints/best/pretrained_model for rollout.
-# The 6-D rotation dims (state/action 3-8, 13-18, 23-28) skip normalization; grippers and base x,y,yaw (state 29-31) stay min-max normalized.
-
-# Position conditioning (needs a dataset ported with step 2 --positions-dir): the ENV input
-# feature "observation.environment_state" [6] and the "ENV": "MIN_MAX" mapping above enable it.
-# STATE/ACTION/ENV all use MIN_MAX (dataset min/max). Add --policy.position_condition_mode=film
-# to route env through a separate identity-init per-block FiLM (default "concat" appends it to the
-# shared global conditioning). Single stage -> stage_prediction_enabled stays false and NO
-# observation.pos_condition_mask. Drop both ENV bits for an unconditioned run. For N>1 grasp cycles
-# set the ENV shape to [object_nums*3] (condition_dim follows the feature shape, so the whole vector
-# conditions the model); per-stage SELECTION would additionally need observation.pos_condition_mask
-# + --policy.stage_prediction_enabled=true (out of scope here).
+  --job_name=world_concat \
+  --dataset.val_root=/home/yixuan/Dexmate/data/box2cloth/processed_wbc/test/dexmate_wbc_eef_head --val_freq=5000
+# measured (4090, batch 32, horizon 16, this dataset):
+#   down_dims=[256,512,1024]  -> 90.2M params, 36 ms/step, 2.52 GiB peak (~1.0 h / 100k)
+#   down_dims=[512,1024,2048] -> 280M params, 62 ms/step, 5.44 GiB peak (~1.7 h / 100k)  <- LeRobot default
 ```
+
+
 
 **ACT (alternative to diffusion).** Same dataset, same 32/29 schema, same skip-normalization dims —
 only the policy flags change. Position conditioning is turned on/off by adding/dropping the SAME two
@@ -269,12 +250,12 @@ with a two-line diff, not two pipelines.
   '--policy.normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "MIN_MAX", "ACTION": "MIN_MAX", "ENV": "MIN_MAX"}' \
   '--policy.skip_normalization_dims={"observation.state": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28], "action": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28]}' \
   --dataset.repo_id=dexmate_wbc_eef_head \
-  --dataset.root=/home/yixuan/Dexmate/data/processed_wbc/train/dexmate_wbc_eef_head \
+  --dataset.root=/home/yixuan/Dexmate/data/box2cloth/processed_wbc/train/dexmate_wbc_eef_head \
   --dataset.image_transforms.enable=true \
   --batch_size=32 --policy.optimizer_lr=2e-4 --policy.optimizer_lr_backbone=2e-5 --steps=200000 --save_freq=50000 --save_best=true --log_freq=2000 \
   --output_dir=/home/yixuan/Dexmate/model/act/dexmate_wbc_eef_head \
   --wandb.enable=true --wandb.project=dexmate_wbc_mobile --job_name=act_pos_abs \
-  --dataset.val_root=/home/yixuan/Dexmate/data/processed_wbc/test/dexmate_wbc_eef_head --val_freq=5000
+  --dataset.val_root=/home/yixuan/Dexmate/data/box2cloth/processed_wbc/test/dexmate_wbc_eef_head --val_freq=5000
 
 # WITHOUT position condition: delete "observation.environment_state" from --policy.input_features
 # and the "ENV" entry from --policy.normalization_mapping (change --job_name/--output_dir).
@@ -322,9 +303,12 @@ Implementation:
 
 **Same dataset as the world run** — no re-port. The porter stores `observation.state[:29]`
 base-frame, and MoF lifts it to world in-graph from the planar base pose at `29:32`
-(`lift_base_state_to_world`, verified equal to the independently ported world state in both
-`dexmate_wbc_eef_head_rel` and the ManiFlow zarr to `1.2e-7`). So DP-world vs DP-mof differ in
-the action-frame machinery and **nothing else**.
+(`lift_base_state_to_world`, verified equal to the independently ported world-state dataset and
+to the ManiFlow zarr to `1.2e-7`). So DP-world vs DP-mof differ in the action-frame machinery
+and **nothing else** — provided you width-match them (see `down_dims` below).
+
+**DP+MoF — full command.** Same dataset, same batch/steps/val wiring as the vanilla command
+above; the differing flags are itemized under the block.
 
 ```bash
 (dexmate_lerobot) lerobot-train \
@@ -344,25 +328,42 @@ the action-frame machinery and **nothing else**.
   --output_dir=/home/yixuan/Dexmate/model/dp/mof_concat --job_name=mof_concat \
   --wandb.enable=true --wandb.project=dexmate_wbc_mobile \
   --dataset.val_root=/home/yixuan/Dexmate/data/box2cloth/processed_wbc/test/dexmate_wbc_eef_head --val_freq=5000
-# measured at FIVE experts: 361M params, 6.88 GB at batch 32, 0.11 s/step on the 4090
-#   (~3 h for 100k steps). Re-measure at the four-expert default before quoting.
+# skip_normalization_dims in modeling_diffusion.py
+
+# measured at the FOUR-expert default (4090, batch 32, horizon 16, this dataset):
+#   down_dims=[256,512,1024]  -> 294M params, 85 ms/step, 5.71 GiB peak (~2.4 h / 100k)
+#   down_dims=[512,1024,2048] -> 1.05B params; weights+grad+Adam alone are 15.7 GiB, so it does NOT fit a 24 GB card once activations are added. 
+# LeRobot's DEFAULT width (280M) happens to be
+# capacity-matched to MoF-narrow (294M)
 # defaults: mof_enabled_experts=[base_rel_trans,left,right,rel_traj]
 #           mof_canonical_space=base_rel_trans  mof_router_mode=learned
 #           mof_expert_loss_coef=1.0            mof_state_frame=base
 #           mof_env_frame=world
-# extra logged metrics: diffusion_loss, expert_loss_native/<expert>, router_weight/<expert>,
-#                       router_entropy (ln 4 = 1.386 at init = uniform routing)
 ```
 
-Six flags differ from the world command above, and five of them are **required** — the config
-raises with the fix in the message if you forget:
+
+
+Exactly five flags differ from the vanilla command above (everything else — dataset, batch,
+steps, val wiring, `horizon`/`n_action_steps`, `position_condition_mode`, `down_dims`,
+`noise_scheduler_type`/`num_inference_steps` — is identical, which is the point: both commands
+now sample DDIM/16, so a rollout/latency comparison isn't confounded by sampler choice):
+
+
+|             | flag                                                                                                       |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **adds**    | `--policy.action_frame_mode=mof`, `--policy.mof_env_frame=family`, `--policy.mof_stats_root=...`          |
+| **drops**   | `--policy.skip_normalization_dims`                                                                        |
+| **changes** | `--policy.normalization_mapping` (STATE/ACTION/ENV → `IDENTITY`)                                          |
+
+
+All of these are enforced by `_validate_mof()`, which raises with the fix in the
+message. Why each one:
 
 - `--policy.mof_stats_root` must repeat `--dataset.root`. MoF's affines are fitted from the
 parquet, not from `meta/stats.json`, and they are **not** derivable from the batch. Left unset the
 buffers stay NaN and the first forward pass raises `non-finite stats` rather than training on
 garbage — which is also what makes loading a checkpoint work, since its fitted buffers overwrite
 them.
-
 - `STATE`/`ACTION` must be `IDENTITY`. MoF needs raw world poses to build frames and returns raw
 world actions, so it owns normalization itself: it fits per-expert action and per-family state
 min/max over the **exact training windows** (one parquet-only pass at construction, seconds) and
@@ -372,17 +373,35 @@ skip moves inside those fitted affines.
 up: MoF transforms raw world XYZ, so it also fits `{family}__env_state` itself. Under
 `mof_env_frame=world` leave `ENV` at `MIN_MAX` — the processor-side collapse in
 `processor_diffusion.py` is correct there and stays in charge.
-- `--policy.down_dims=[256,512,1024]` (mofpo's paper recipe). Five copies of LeRobot's default
-`[512,1024,2048]` measured **1.31B params ≈ 19.5 GiB** of weights+grad+Adam and would not fit a
-24 GB card; four copies has not been re-measured, and the paper recipe is the reason to use this
-width regardless. The incumbent world baseline trains at LeRobot's default `[512,1024,2048]`, so
-**re-run it at** `[256,512,1024]` **(90M)** before reading any DP-world vs DP-mof delta — otherwise
-the two differ by 5.7x in width as well as in action-frame machinery.
-- `DDIM` + `--policy.num_inference_steps=16`: four towers per denoise step, so the DDPM-100
-default would blow the 0.4 s chunk budget. mofpo measured ~0.6 s/chunk for 16-step DDIM × 5
-experts on a shared GPU — check `--policy-interval` against the real number before hardware.
-- `use_relative_actions` and `stage_prediction_enabled` are rejected (both are answered by
-`mof_canonical_space`, resp. need the single `global_cond` MoF replaces with one per family).
+- `DDIM` + `--policy.num_inference_steps=16` (now pinned in **both** commands, not a MoF-only
+flag): `_validate_mof()` rejects a `None` `num_inference_steps` outright, because the
+`num_train_timesteps=100` DDPM default would cost MoF 4x100 U-Net forwards per chunk — four
+towers per denoise step blows the 0.4 s chunk budget. The vanilla command pins the same
+scheduler/step-count so the two runs aren't also confounded by sampler choice; check
+`--policy-interval` against a real measurement before hardware either way.
+- `stage_prediction_enabled` must stay `false` (the stage head needs the single `global_cond` that
+MoF replaces with one per family). It is already the default, so it is not in either command.
+
+**Width and the fair-comparison caveat.** `--policy.down_dims=[256,512,1024]` (mofpo's paper
+recipe) is set in **both** commands. It is not enforced by the config, but the default width does
+not fit: four towers at LeRobot's default `[512,1024,2048]` measure **1.05B params**, whose
+weights+grad+Adam alone are **15.7 GiB**, so a 24 GB card OOMs once activations land. Measured on
+a 4090 at batch 32 / horizon 16 on this dataset:
+
+
+| run                    | `down_dims`                         | params | step  | peak                   | 100k steps         |
+| ---------------------- | ----------------------------------- | ------ | ----- | ---------------------- | ------------------ |
+| DP world               | `[256,512,1024]`                    | 90.2M  | 36 ms | 2.52 GiB               | ~1.0 h             |
+| DP world               | `[512,1024,2048]` (LeRobot default) | 280M   | 62 ms | 5.44 GiB               | ~1.7 h             |
+| DP **mof** (4 experts) | `[256,512,1024]`                    | 294M   | 85 ms | 5.71 GiB               | ~2.4 h             |
+| DP **mof** (4 experts) | `[512,1024,2048]`                   | 1.05B  | —     | 15.7 GiB weights alone | does not fit 24 GB |
+
+
+The two commands above are **width-matched** (both `[256,512,1024]`), so MoF carries 3.3x the
+parameters — that is just the four towers, and it is the honest way to isolate the action-frame
+machinery. If you would rather control for *capacity*, note that DP-world at LeRobot's default
+width (280M) is near-identical in size to MoF-narrow (294M). Either control is defensible; state
+which one you used when reporting a delta.
 
 **Position-condition frame.** `--policy.mof_env_frame` decides what each obs family sees of the
 task. `world` (default) is the incumbent behaviour — one world-frame env-state rides every
@@ -403,49 +422,10 @@ therefore be matched with `point_sampling_mode=fps mask_channels=false` on the M
 
 Deploy and offline validation are **unchanged commands**: `wbc_policy_rollout.py` reads
 `action_frame_mode` off the checkpoint and takes `observation.state`'s frame from
-`mof_state_frame` instead of inferring it from `use_relative_actions`; the base-frame state it
+`mof_state_frame`; the base-frame state it
 already builds is what a default MoF checkpoint wants. `vis_wbc_policy_prediction.py` feeds the
 dataset state verbatim and needs nothing. Tests:
 `../lerobot_original/tests/policies/test_diffusion_mof.py` (42).
-
-**Relative actions (optional).** To train with `use_relative_actions=true` (each chunk action relative to the chunk's current observation, mirroring `train_dexmate_diffusion.sh`), `observation.state` EEF/head must share the world action frame — LeRobot's relative step subtracts `observation.state[:29]` from the world action, so a base-frame state would be cross-frame. Re-port with `--relative-actions` (world-frame state; default repo-id `dexmate_wbc_eef_head_rel`):
-
-```bash
-(dexmate_lerobot) python scripts/port_wbc_mobile_hdf5.py \
-    --raw-dir ~/Dexmate/data/raw_data \
-    --root ~/Dexmate/data/processed_wbc \
-    --repo-id dexmate_wbc_eef_head_rel \
-    --relative-actions \
-    --include_recovery_data ~/Dexmate/data/raw_data/recovery \
-    --log_index ~/Dexmate/data/raw_data/log_index_rel.csv
-```
-
-Then recompute action stats over the relative distribution and train with the relative flags. Translations AND 6-D rotations are made relative; only the binary grippers stay absolute (`relative_exclude_dims` `[9, 19]` — the raw-FC03 state gripper is on a different scale than the 0/1 command). The column-wise rotation delta is not itself a rotation, but the post-processor adds the same chunk-anchor state back before the Gram-Schmidt decode, so it is exactly invertible; rotation dims still skip normalization (relative deltas concentrate near 0, where a min/max rescale would amplify noise). `chunk_size` = horizon; `reference_offset` = `n_obs_steps − 1` = 1 for diffusion. For **ACT** the anchor is the chunk start (`action_delta_indices = range(0, chunk_size)`), so use `--operation.reference_offset=0` and `--operation.chunk_size=<--policy.chunk_size>`.
-
-```bash
-REL_ROOT=/home/yixuan/Dexmate/data/processed_wbc/dexmate_wbc_eef_head_rel
-REL_EXCLUDE='[9,19]'
-(dexmate_lerobot) lerobot-edit-dataset \
-  --repo_id=dexmate_wbc_eef_head_rel --root=$REL_ROOT --new_root=$REL_ROOT \
-  --operation.type=recompute_stats --operation.overwrite=true \
-  --operation.relative_action=true --operation.chunk_size=16 --operation.reference_offset=1 \
-  --operation.relative_exclude_dims="$REL_EXCLUDE" --operation.num_workers=4
-
-(dexmate_lerobot) lerobot-train \
-  --policy.type=diffusion --policy.device=cuda --policy.push_to_hub=false \
-  --policy.horizon=16 --policy.n_action_steps=8 --policy.use_relative_actions=true \
-  '--policy.relative_exclude_dims={"action": [9, 19]}' \
-  '--policy.input_features={"observation.images.head_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.images.wrist_rgb": {"type": "VISUAL", "shape": [3, 120, 160]}, "observation.state": {"type": "STATE", "shape": [32]}, "observation.environment_state": {"type": "ENV", "shape": [6]}}' \
-  '--policy.normalization_mapping={"VISUAL": "MEAN_STD", "STATE": "MIN_MAX", "ACTION": "MIN_MAX", "ENV": "MIN_MAX"}' \
-  '--policy.skip_normalization_dims={"observation.state": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28], "action": [3,4,5,6,7,8,13,14,15,16,17,18,23,24,25,26,27,28]}' \
-  --dataset.repo_id=dexmate_wbc_eef_head_rel --dataset.root=$REL_ROOT \
-  --batch_size=32 --steps=100000 --save_freq=50000 \
-  --output_dir=/home/yixuan/Dexmate/model/dp/dexmate_wbc_eef_head_rel
-```
-
-
-
-`scripts/wbc_policy_rollout.py` and `scripts/vis_wbc_policy_prediction.py` auto-detect `use_relative_actions` from the checkpoint and build world-frame state + chunk-anchor de-relativization accordingly — same commands as below (point `--policy-path` at the relative checkpoint).
 
 **4.**
 
@@ -454,7 +434,7 @@ Validate the checkpoint OFFLINE before any hardware rollout — run the rollout'
 ```bash
 (dexmate_lerobot) python scripts/vis_wbc_policy_prediction.py \
   --policy-path ~/Dexmate/model/dp/nopos_abs_minmax/checkpoints/last/pretrained_model \
-  --dataset_dir ~/Dexmate/data/processed_wbc/test/dexmate_wbc_eef_head \
+  --dataset_dir ~/Dexmate/data/box2cloth/processed_wbc/test/dexmate_wbc_eef_head \
   --episode_index 0
 ```
 
@@ -468,12 +448,12 @@ safe hold and rejects any later result. `--dataset-fps` (default 10) must match 
 
 ```bash
 # replay
-python scripts/wbc_policy_rollout.py --replay-episode ~/Dexmate/data/raw_data/episode_1.hdf5 \
-    --align-reference ~/Dexmate/data/raw_data/reference.hdf5
+python scripts/wbc_policy_rollout.py --replay-episode ~/Dexmate/data/box2cloth/raw_data/episode_1.hdf5 \
+    --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5
 
 (dexmate_lerobot) python scripts/wbc_policy_rollout.py \
   --policy-path /home/yixuan/Dexmate/model/dp/nopos_abs_minmax/checkpoints/last/pretrained_model \
-  --save-dir ~/Dexmate/data/rollout/nopos_abs \
+  --save-dir ~/Dexmate/data/box2cloth/rollout/nopos_abs \
   --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5 \
   --max-seconds 100
 # Ctrl+C once to save
@@ -488,17 +468,17 @@ python scripts/wbc_policy_rollout.py --replay-episode ~/Dexmate/data/raw_data/ep
 # for the episode. An unconditioned checkpoint skips SceneDiff and the operator prompt.
 (dexmate_maniflow) python scripts/wbc_policy_rollout.py \
   --policy-path /home/yixuan/Dexmate/model/dp/concat_abs_minmax/checkpoints/last/pretrained_model \
-  --save-dir ~/Dexmate/data/rollout/concat_abs_minmax \
+  --save-dir ~/Dexmate/data/box2cloth/rollout/concat_abs_minmax \
   --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5 \
   --max-seconds 100
-#   --reference-hdf5 ~/Dexmate/data/scene_diff/_before/reference_last.hdf5   (default)
+#   --reference-hdf5 ~/Dexmate/data/box2cloth/scene_diff/_before/reference_last.hdf5   (default)
 #   --prompt-before-capture   pause to stage the scene after alignment, before the head grab
 #   SceneDiff outputs -> <save-dir>/scene_diff/episode_N/{live_capture.hdf5,episode_0.npz,
 #                        bootstrap_size_slots.npz,deploy_slot_overlay.png,validation_*.{npz,json}}
 #   If that final episode directory already exists, rollout exits before capture and asks you
 #   to delete it manually. A failed bootstrap never publishes a partial final directory.
 
-python scripts/vis_episode.py --hdf5 /home/yixuan/Dexmate/data/rollout/concat_abs_minmax/episode_0.hdf5
+python scripts/vis_episode.py --hdf5 /home/yixuan/Dexmate/data/box2cloth/rollout/concat_abs_minmax/episode_0.hdf5
 ```
 
 
@@ -544,14 +524,14 @@ meta/episode_ends (E,)         int64
 **Frame conventions (defaults)** — engage-origin WORLD throughout except DP's egocentric EEF/head:
 
 
-|                                                | DP / `port_wbc_mobile_hdf5.py`                                           | ManiFlow / `port_wbc_mobile_zarr.py`                    |
-| ---------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------- |
-| Obs EEF/head (`state[:29]` / `agent_pos[:29]`) | **base** (egocentric FK; do not compose `world_T_base` into `[:29]`)     | **world** (`compose(base, odom)`)                       |
-| Obs base pose (`state[29:32]`)                 | world (`obs/base/pose`)                                                  | world (same)                                            |
-| Action (29)                                    | **world** (verbatim `ik.solve` targets)                                  | **world** (bit-identical)                               |
-| Visual obs                                     | RGB `head_rgb` (+ optional `wrist_rgb`)                                  | world-frame head point cloud                            |
-| Env state (optional `--positions-dir`)         | world `[box, cloth]`                                                     | world (same)                                            |
-| Frame override                                 | `--relative-actions` → state in **world** (needed for relative training) | `--state-frame base` → egocentric state (LeRobot-style) |
+|                                                | DP / `port_wbc_mobile_hdf5.py`                                       | ManiFlow / `port_wbc_mobile_zarr.py`                    |
+| ---------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------------------- |
+| Obs EEF/head (`state[:29]` / `agent_pos[:29]`) | **base** (egocentric FK; do not compose `world_T_base` into `[:29]`) | **world** (`compose(base, odom)`)                       |
+| Obs base pose (`state[29:32]`)                 | world (`obs/base/pose`)                                              | world (same)                                            |
+| Action (29)                                    | **world** (verbatim `ik.solve` targets)                              | **world** (bit-identical)                               |
+| Visual obs                                     | RGB `head_rgb` (+ optional `wrist_rgb`)                              | world-frame head point cloud                            |
+| Env state (optional `--positions-dir`)         | world `[box, cloth]`                                                 | world (same)                                            |
+| Frame override                                 | `--world-state` → state in **world** (for `mof_state_frame=world`)   | `--state-frame base` → egocentric state (LeRobot-style) |
 
 
 
@@ -700,7 +680,7 @@ Everything runs in `dexmate_maniflow` except where a line says otherwise.
 
 ```bash
 (dexmate) python scripts/wbc_vr_leader.py --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5
-(dexmate) python scripts/wbc_vr_robot.py --record --save-dir ~/Dexmate/data/raw_data
+(dexmate) python scripts/wbc_vr_robot.py --record --save-dir ~/Dexmate/data/box2cloth/raw_data
 # -> raw_data/{,recovery/}episode_<N>.hdf5
 ```
 
@@ -709,8 +689,8 @@ Everything runs in `dexmate_maniflow` except where a line says otherwise.
 ```bash
 cd ~/scene_diff
 # 1a. positions: [box, cloth] world XYZ per episode.
-# run_wbc_pos_condition.sh defaults: RAW_ROOT=~/Dexmate/data/raw_data,
-# REFERENCE_SRC + OUTPUT_ROOT under ~/Dexmate/data/scene_diff.
+# run_wbc_pos_condition.sh defaults: RAW_ROOT=~/Dexmate/data/box2cloth/raw_data,
+# REFERENCE_SRC + OUTPUT_ROOT under ~/Dexmate/data/box2cloth/scene_diff.
 (lerobot) bash run_wbc_pos_condition.sh
 # -> scene_diff/positions/<source>/episode_<N>.npz
 # VERIFY scene_diff/visualization/hungarian/<source>/episode_<N>.png
@@ -719,13 +699,13 @@ cd ~/scene_diff
 # 1b. SAM3.1 masks, ~30 s/episode on the 4090. Skip 1b (and --masks-dir below) for
 # fps / mask_channels=false checkpoints.
 (dexmate_maniflow) python scripts/build_wbc_masks.py \
-  --scenediff-root ~/Dexmate/data/scene_diff \
-  --masks-dir ~/Dexmate/data/scene_diff/masks
+  --scenediff-root ~/Dexmate/data/box2cloth/scene_diff \
+  --masks-dir ~/Dexmate/data/box2cloth/scene_diff/masks
 # check masks/qc_summary.json and masks/viz/ before porting
 
 # 1c. DINOv3 sidecars, written beside each positions NPZ. 
 (lerobot) python scripts/extract_object_dino_feats.py \
-  --scenediff-root ~/Dexmate/data/scene_diff \
+  --scenediff-root ~/Dexmate/data/box2cloth/scene_diff \
   --config configs/scenediff_config.yml
 ```
 
@@ -733,11 +713,11 @@ cd ~/scene_diff
 
 ```bash
 (dexmate_maniflow) cd ~/omniteleop && python scripts/port_wbc_mobile_zarr.py \
-  --raw-dir ~/Dexmate/data/raw_data \
-  --include-recovery-data ~/Dexmate/data/raw_data/recovery \
-  --out-root ~/Dexmate/data/processed_wbc/maniflow \
-  --positions-dir ~/Dexmate/data/scene_diff/positions \
-  --masks-dir ~/Dexmate/data/scene_diff/masks \
+  --raw-dir ~/Dexmate/data/box2cloth/raw_data \
+  --include-recovery-data ~/Dexmate/data/box2cloth/raw_data/recovery \
+  --out-root ~/Dexmate/data/box2cloth/processed_wbc/maniflow \
+  --positions-dir ~/Dexmate/data/box2cloth/scene_diff/positions \
+  --masks-dir ~/Dexmate/data/box2cloth/scene_diff/masks \
   --dino
 # ~3 min, CPU. -> dexmate_wbc_{train,test}.zarr + .meta.json, split by raw_data/split.csv
 # --positions-dir -> data/env_state (T, 6)     --dino -> data/env_dino (T, 2560)
@@ -764,7 +744,7 @@ the source of truth for live preprocessing and visualization.
   position_condition_mode=grounding_tokens training.num_epochs=1
 
 (dexmate_maniflow) python scripts/vis_episode_processed_wbc.py \
-  --zarr ~/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_test.zarr \
+  --zarr ~/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_test.zarr \
   --maniflow-run-dir ~/Dexmate/model/maniflow/maniflow_smoke-mask_mof_seed0 \
   --episode_index 0
 ```
@@ -844,7 +824,7 @@ makes — and scores the predicted world actions against the recording:
 ```bash
 (dexmate_maniflow) python scripts/vis_wbc_maniflow_prediction.py \
   --policy-path ~/Dexmate/model/maniflow/<exp>_seed0/checkpoints/<epoch>.ckpt \
-  --zarr ~/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_test.zarr \
+  --zarr ~/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_test.zarr \
   --episode_index 0 --save ~/Dexmate/tmp/scratchpad/maniflow_pred_ep0.rrd
 # per-entity translation MAE / rotation error / gripper accuracy on stdout, a GT-vs-pred
 # overlay PNG, and a Rerun recording (--save for SSH, --connect for a running viewer)
@@ -889,8 +869,8 @@ use the legacy `wbc_mof_rollout.py` for an integrated ManiFlow checkpoint.
 (dexmate_maniflow) python scripts/wbc_maniflow_rollout.py \
   --policy-path ~/Dexmate/model/maniflow/<exp>_seed0/checkpoints/latest.ckpt \
   --pointcloud-meta \
-    ~/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_train.meta.json \
-  --save-dir ~/Dexmate/data/rollout/maniflow \
+    ~/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_train.meta.json \
+  --save-dir ~/Dexmate/data/box2cloth/rollout/maniflow \
   --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5 \
   --num-inference-steps 2 --policy-interval 0.4 --max-seconds 85
 ```
@@ -980,10 +960,10 @@ positions are ALWAYS attached — a conditioned run later is a train-config flip
 
 ```bash
 (dexmate_lerobot) python scripts/port_wbc_mobile_mof.py \
-  --raw-dir ~/Dexmate/data/raw_data \
-  --out-root ~/Dexmate/data/processed_wbc/mof \
-  --include-recovery-data ~/Dexmate/data/raw_data/recovery \
-  --positions-dir ~/Dexmate/data/scene_diff/positions
+  --raw-dir ~/Dexmate/data/box2cloth/raw_data \
+  --out-root ~/Dexmate/data/box2cloth/processed_wbc/mof \
+  --include-recovery-data ~/Dexmate/data/box2cloth/raw_data/recovery \
+  --positions-dir ~/Dexmate/data/box2cloth/scene_diff/positions
 # -> dexmate_wbc_mof/{train,test}/episode_<i>.safetensors + meta.json
 #    (46 train / 2 test episodes, 18,555 frames == the LeRobot dataset;
 #     meta.json enumerates the tensor schema and is the deploy source of truth)
@@ -1007,7 +987,7 @@ mofpo has no `__init__.py`, so the `.pth` does what `pip install -e` cannot):
 ```bash
 (dexmate_mof) python scripts/vis_wbc_mof_prediction.py \
   --policy-path ~/mofpo/data/outputs/wbc_v1_mof_moe_500ep/checkpoints/latest.ckpt \
-  --episode ~/Dexmate/data/processed_wbc/mof/dexmate_wbc_mof/test/episode_0.safetensors \
+  --episode ~/Dexmate/data/box2cloth/processed_wbc/mof/dexmate_wbc_mof/test/episode_0.safetensors \
   --output ~/Dexmate/data/visualization/mof_pred_test0.png
 # per-entity translation/rotation MAE + gripper accuracy + GT-vs-pred overlays,
 # through the deploy bundle's exact inference path (load-time gates included)
@@ -1020,7 +1000,7 @@ forked):
 ```bash
 (dexmate_mof) python scripts/wbc_mof_rollout.py \
   --policy-path ~/mofpo/data/outputs/wbc_v1_mof_moe_500ep/checkpoints/latest.ckpt \
-  --save-dir ~/Dexmate/data/rollout/mof \
+  --save-dir ~/Dexmate/data/box2cloth/rollout/mof \
   --align-reference ~/Dexmate/data/raw_data_reference/reference.hdf5 \
   --policy-interval 0.6 --max-seconds 100
 # 16-step DDIM x 5 experts measured ~0.6 s/chunk with the GPU shared by a

@@ -37,7 +37,8 @@ Everything policy-facing is shown:
   * ``[9]`` / ``[19]`` left / right gripper commands (binarized 0/1)
   * ``[20:29]`` head target (pos3 + rot6, WORLD frame)
 
-``observation.images.head_rgb`` / ``observation.images.wrist_rgb`` -- the two
+``observation.images.head_rgb`` / ``observation.images.{left,right}_wrist_rgb``
+(left/right = the ARM the wrist camera is on; right only for two-wrist datasets) -- the
 egocentric camera streams.
 
 Frame reconciliation (the crux of this viewer): ``action`` is WORLD-frame while
@@ -64,12 +65,17 @@ Panels:
     edge-replicated at episode bounds like the training sampler's padding)
     re-expressed in every enabled expert representation through the run checkout's
     own ``maniflow.model.common.frame_transforms`` (world hub), one 3D view per
-    expert, round-trip-checked back to world per episode. The sibling of
-    ``vis_wbc_mof_prediction.py``'s frames tab, minus router/predictions (this
-    viewer has no checkpoint).
+    expert, round-trip-checked back to world per episode. Each view also carries the
+    point cloud that expert's tower actually reads: the SAME policy selection shown
+    in "Policy RGB 3D", placed by the run's ``mof.cloud_frame`` (``world`` -> the
+    shared world cloud in every view; ``family`` -> re-expressed into the expert's
+    obs-family frame), coloured by the SAM3.1 point labels when the run consumes
+    them. The sibling of ``vis_wbc_mof_prediction.py``'s frames tab, minus
+    router/predictions (this viewer has no checkpoint).
   * Head RGB + full SAM3.1 mask. Depth and projected EEF pixels are logged but hidden
     from the automatic blueprint, so they can be enabled from the Rerun sidebar.
-  * Wrist RGB -- ``observation.images.wrist_rgb`` (plain 2D; no calibration/depth).
+  * Wrist RGB -- ``observation.images.{left,right}_wrist_rgb`` (one plain 2D panel
+    per arm present; no calibration/depth for the wrists).
   * Gripper time series (left, right) -- red = ``action`` (binary command),
     blue = ``observation.state`` (raw reading).
   * Base pose time series -- ``base_x`` / ``base_y`` (m) and ``base_yaw`` (rad).
@@ -93,7 +99,7 @@ Usage::
         --episode_index 0
 
     python scripts/vis_episode_processed_wbc.py \\
-        --zarr /home/yixuan/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_test.zarr \\
+        --zarr /home/yixuan/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_test.zarr \\
         --maniflow-run-dir /home/yixuan/ManiFlow_Policy/ManiFlow/data/outputs/RUN \\
         --episode_index 0
 
@@ -163,9 +169,11 @@ OBS_ENV_STATE_KEY = "observation.environment_state"
 _GRIPPER_Y_MIN = -0.2
 _GRIPPER_Y_MAX = 1.1
 _POS_COND_RADIUS_3D = 0.018
+_MOF_CLOUD_RADIUS = 0.004   # < the 0.006 horizon points, so the GT chunk stays legible
 _HEAD_DEPTH_ENTITY = "/world/camera/depth"
 _HEAD_EEF_STATE_ENTITY = "/world/camera/eef_state_2d"
 _HEAD_EEF_ACTION_ENTITY = "/world/camera/eef_action_2d"
+_MANIFEST_SCHEMAS = ("wbc_maniflow_pointcloud_v2", "wbc_maniflow_pointcloud_v3")
 _MASK_LEGEND = "0=background 1=box(src) 2=cloth(dst)"
 _NOMINAL_MASK_QUOTAS = {1: 64, 2: 64, 0: 128}
 
@@ -239,6 +247,15 @@ def _rgb_to_hwc(t) -> np.ndarray:
     if a.dtype != np.uint8:
         a = a.astype(np.uint8)
     return a
+
+
+def _mask_label_colors(labels: np.ndarray) -> np.ndarray:
+    """SAM3.1 point labels (any shape, ``{0,1,2}``) -> ``(..., 3)`` uint8 colors."""
+    colors = np.empty((*labels.shape, 3), dtype=np.uint8)
+    colors[labels == 0] = _COLOR_MASK_BG
+    colors[labels == 1] = _COLOR_MASK_SRC
+    colors[labels == 2] = _COLOR_MASK_DST
+    return colors
 
 
 def head_optional_hidden_overrides() -> dict[str, rrb.EntityBehavior]:
@@ -330,13 +347,15 @@ def load_lerobot_episode(dataset_root: Path, episode_index: int) -> dict:
             f"(omniteleop.wbc_policy_format.ACTION_AXES).\n got:      {action_axes}\n "
             f"expected: {list(ACTION_AXES)}"
         )
-    for key in ("observation.images.head_rgb", "observation.images.wrist_rgb"):
+    # left/right wrist name the ARM. Left is required; right is present only for
+    # datasets ported from two-wrist takes (see port_wbc_mobile_hdf5.build_features).
+    for key in ("observation.images.head_rgb", "observation.images.left_wrist_rgb"):
         if key not in dataset.meta.features:
             raise ValueError(f"{dataset_root.name} is missing {key}.")
 
-    # observation.state EEF/head frame (porter dexmate_meta.json). "base" (default,
-    # absolute-action dataset) must be composed to world for display; "world"
-    # (--relative-actions dataset) is already world-frame -- do NOT re-compose.
+    # observation.state EEF/head frame (porter dexmate_meta.json). "base" (the
+    # default) must be composed to world for display; "world" (--world-state
+    # dataset) is already world-frame -- do NOT re-compose.
     state_frame = "base"
     meta_json = dataset_root / "dexmate_meta.json"
     if meta_json.exists():
@@ -427,6 +446,10 @@ def load_maniflow_run(run_dir: Path) -> dict:
             "enabled_experts": experts,
             "canonical_space": str(cfg.mof.canonical_space),
             "router_mode": str(cfg.mof.router_mode),
+            # Required, exactly as the policy reads it: which frame each tower's point
+            # cloud lives in. Validated against the checkout's ALLOWED_CLOUD_FRAMES in
+            # compute_mof_family_clouds.
+            "cloud_frame": str(cfg.mof.cloud_frame),
             "horizon": int(cfg.horizon),
             "n_obs_steps": int(cfg.n_obs_steps),
         }
@@ -528,6 +551,63 @@ def compute_mof_gt_representations(
     return representations
 
 
+def compute_mof_family_clouds(
+    transforms, layout, state: np.ndarray, points_world: np.ndarray, mof: dict
+) -> dict[str, np.ndarray]:
+    """The selected policy cloud as every enabled expert's tower actually reads it.
+
+    Mirrors ``ManiFlowTransformerPointcloudPolicy._mof_build_conds``: the points are
+    selected ONCE in the world frame (FPS/mask-stratified is rigid-equivariant, so the
+    selection is frame-independent), then placed by ``mof.cloud_frame`` --
+
+    * ``world`` (v1-faithful): the pointnet runs once and EVERY tower reads the same
+      world-frame points, including the base-anchored ones whose state has its base
+      block zeroed.
+    * ``family``: re-expressed into each obs FAMILY's per-step frame
+      (``frame_from_world_per_step``), the world family excepted -- it always keeps
+      world points.
+
+    Experts sharing a family (e.g. ``base_rel_trans`` and ``rel_traj``, both ``base``)
+    therefore share one cloud, and it is the FAMILY frame, not the expert's own
+    representation space: a rel_traj chunk is ref-shifted/rotated per entity, its cloud
+    is not, exactly as the tower sees them. Returned in real metres like the GT chunks.
+    """
+    cloud_frame = mof["cloud_frame"]
+    if cloud_frame not in transforms.ALLOWED_CLOUD_FRAMES:
+        raise ValueError(
+            f"unknown mof.cloud_frame {cloud_frame!r} "
+            f"(allowed: {transforms.ALLOWED_CLOUD_FRAMES})"
+        )
+    if points_world.ndim != 3 or points_world.shape[0] != state.shape[0]:
+        raise ValueError(
+            f"policy cloud must be (N, P, 3) with N={state.shape[0]}, "
+            f"got {points_world.shape}"
+        )
+    agent_pos = torch.from_numpy(state.astype(np.float32))[:, None]         # (N, 1, 32)
+    pts_world = torch.from_numpy(points_world.astype(np.float32))[:, None]  # (N, 1, P, 3)
+    by_family: dict[str, np.ndarray] = {}
+    clouds: dict[str, np.ndarray] = {}
+    for expert in mof["enabled_experts"]:
+        family = transforms.FAMILY_OF_EXPERT[expert]
+        if family not in by_family:
+            if cloud_frame == "world" or family == "world":
+                by_family[family] = points_world
+            else:
+                frame_t_world = transforms.frame_from_world_per_step(
+                    agent_pos, family, layout
+                )                                                           # (N, 1, 4, 4)
+                by_family[family] = transforms.reexpress_points(
+                    pts_world, frame_t_world
+                )[:, 0].numpy()
+        clouds[expert] = by_family[family]
+    mapping = ", ".join(
+        f"{expert}→{transforms.FAMILY_OF_EXPERT[expert]}"
+        for expert in mof["enabled_experts"]
+    )
+    print(f"  mof cloud frames: {mapping} ({points_world.shape[1]} pts each)")
+    return clouds
+
+
 def _mof_rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
     """(..., 6) column rot6d -> (..., 3, 3). GT rot6d is clean FK output in every
     representation (rel_traj stores R_ref^T R), so the Gram-Schmidt here is exact --
@@ -591,10 +671,15 @@ def load_zarr_meta(zarr_path: Path) -> dict:
             f"{meta_path} missing; rebuild with scripts/port_wbc_mobile_zarr.py --overwrite"
         )
     meta = json.loads(meta_path.read_text())
-    if meta.get("schema") != "wbc_maniflow_pointcloud_v2":
+    # Both schemas carry the raw-frame episode manifest this viewer needs; v3 only adds
+    # the live-preprocessing contract (camera, RNG, crop frame, artifact provenance),
+    # which nothing here reads. Pinning v2 alone rejected the zarrs the current porter
+    # writes.
+    if meta.get("schema") not in _MANIFEST_SCHEMAS:
         raise ValueError(
             f"{meta_path}: schema {meta.get('schema')!r} lacks the raw-frame episode "
-            "manifest; rebuild the zarr with the current porter"
+            f"manifest (need one of {', '.join(_MANIFEST_SCHEMAS)}); rebuild the zarr "
+            "with the current porter"
         )
     return meta
 
@@ -763,12 +848,25 @@ def attach_raw_camera_streams(source: dict, *, needs_point_mask: bool) -> dict:
         head_rgb = np.asarray(raw[keys["head_rgb"]][start:end])
         depth = np.asarray(raw[keys["depth"]][start:end])
         wrist_rgb = np.asarray(raw[keys["wrist_rgb"]][start:end])
+        # Right wrist is optional: single-wrist takes only carry left_wrist_rgb.
+        right_wrist_rgb = (
+            np.asarray(raw["obs/images/right_wrist_rgb"][start:end])
+            if "obs/images/right_wrist_rgb" in raw
+            else None
+        )
         intrinsic_raw = np.asarray(raw[keys["intrinsic"]])
     n = source["N"]
     if head_rgb.shape[0] != n or depth.shape[0] != n or wrist_rgb.shape[0] != n:
         raise ValueError(f"{hdf5_path}: manifest camera slice does not have {n} frames")
     if head_rgb.dtype != np.uint8 or wrist_rgb.dtype != np.uint8 or depth.dtype != np.uint16:
         raise ValueError(f"{hdf5_path}: expected uint8 RGB and uint16 depth")
+    if right_wrist_rgb is not None and (
+        right_wrist_rgb.shape[0] != n or right_wrist_rgb.dtype != np.uint8
+    ):
+        raise ValueError(
+            f"{hdf5_path}: right_wrist_rgb slice {right_wrist_rgb.shape} "
+            f"{right_wrist_rgb.dtype} is not {n} frames of uint8"
+        )
     if intrinsic_raw.shape == (3, 3):
         intrinsic = np.repeat(intrinsic_raw[None], n, axis=0)
     elif intrinsic_raw.shape[0] >= end and intrinsic_raw.shape[1:] == (3, 3):
@@ -802,7 +900,8 @@ def attach_raw_camera_streams(source: dict, *, needs_point_mask: bool) -> dict:
     source.update({
         "head_rgb": head_rgb,
         "depth": depth,
-        "wrist_rgb": wrist_rgb,
+        "wrist_rgb": wrist_rgb,               # LEFT arm
+        "right_wrist_rgb": right_wrist_rgb,   # RIGHT arm, None on single-wrist takes
         "intrinsic": intrinsic.astype(np.float64),
         "hw": head_rgb.shape[1:3],
         "mask_image": mask_image,
@@ -1036,7 +1135,7 @@ def main() -> None:
         type=str,
         default=None,
         help="ManiFlow point-cloud zarr (scripts/port_wbc_mobile_zarr.py), e.g. "
-             "~/Dexmate/data/box2cloth/processed_wbc/maniflow/dexmate_wbc_test.zarr. "
+             "~/Dexmate/data/processed_wbc/maniflow/dexmate_wbc_test.zarr. "
              "Requires --maniflow-run-dir and v2 episode-manifest metadata.",
     )
     parser.add_argument(
@@ -1129,7 +1228,8 @@ def main() -> None:
             print(
                 f"  mof experts: {', '.join(policy['mof']['enabled_experts'])} "
                 f"(canonical {policy['mof']['canonical_space']}, "
-                f"router {policy['mof']['router_mode']})"
+                f"router {policy['mof']['router_mode']}, "
+                f"cloud_frame {policy['mof']['cloud_frame']})"
             )
         print(f"  visual_cond_len: {policy['visual_cond_len']}")
         print(f"  use_pc_color: {policy['use_pc_color']} (viewer uses unaugmented RGB)")
@@ -1144,6 +1244,18 @@ def main() -> None:
 
     is_zarr = source["kind"] == "zarr"
     has_camera = is_zarr or "dataset" in source
+    # Which wrist arms this source actually carries; drives both the blueprint panels
+    # and the per-frame logging so a missing right camera never leaves an empty view.
+    if not has_camera:
+        wrist_arms: list[str] = []
+    elif is_zarr:
+        wrist_arms = ["left"] + (["right"] if source["right_wrist_rgb"] is not None else [])
+    else:
+        wrist_arms = [
+            arm
+            for arm in ("left", "right")
+            if f"observation.images.{arm}_wrist_rgb" in source["dataset"].meta.features
+        ]
     N = source["N"]
     state = source["state"]
     action = source["action"]
@@ -1262,11 +1374,25 @@ def main() -> None:
     # ── MoF: GT action window in every enabled expert representation (zarr mode,
     #    action_frame_mode=mof runs only; transforms from the run checkout). ──
     mof_reps: dict[str, np.ndarray] | None = None
+    mof_clouds: dict[str, np.ndarray] = {}
+    mof_cloud_colors: np.ndarray | None = None
     mof_current_step = 0
     if mof_transforms is not None:
         mof_current_step = policy["mof"]["n_obs_steps"] - 1
         mof_reps = compute_mof_gt_representations(
             mof_transforms, mof_action_layout, state, action, policy["mof"]
+        )
+        # Same selection the "Policy RGB 3D" view shows -- the tower's actual input --
+        # coloured by its SAM3.1 labels when the run consumes them, RGB otherwise.
+        mof_clouds = compute_mof_family_clouds(
+            mof_transforms, mof_action_layout, state,
+            policy_selection["points"][..., :3], policy["mof"],
+        )
+        mof_cloud_colors = (
+            _mask_label_colors(policy_selection["labels"])
+            if policy_selection["labels"] is not None
+            else (np.clip(policy_selection["points"][..., 3:], 0.0, 1.0) * 255.0
+                  ).astype(np.uint8)
         )
     mof_experts = tuple(mof_reps) if mof_reps is not None else ()
 
@@ -1361,10 +1487,12 @@ def main() -> None:
                     contents=head_contents,
                     overrides=hidden_head_entities,
                 ),
-                rrb.Spatial2DView(origin="wrist", name="Wrist RGB"),
+                *[rrb.Spatial2DView(origin=f"wrist/{_a}", name=f"{_a.capitalize()} wrist RGB")
+                  for _a in wrist_arms],
             ],
-            grid_columns=3,
-            column_shares=[1.0, 1.0, 1.0],
+            # head + one panel per wrist present.
+            grid_columns=1 + len(wrist_arms),
+            column_shares=[1.0] * (1 + len(wrist_arms)),
         )
         layout = rrb.Vertical(
             rrb.Grid(
@@ -1410,8 +1538,10 @@ def main() -> None:
                     origin="world/camera", name="Head RGB / depth",
                     overrides=hidden_depth_only,
                 ),
-                rrb.Spatial2DView(origin="wrist", name="Wrist RGB"),
-                column_shares=[2.0, 1.3, 1.3],
+                *[rrb.Spatial2DView(origin=f"wrist/{_a}", name=f"{_a.capitalize()} wrist RGB")
+                  for _a in wrist_arms],
+                # world + head + one column per wrist present.
+                column_shares=[2.0, 1.3] + [1.3] * len(wrist_arms),
             )
             if has_camera else world_view
         )
@@ -1539,11 +1669,17 @@ def main() -> None:
         if has_camera:
             if is_zarr:
                 rgb = source["head_rgb"][idx]
-                wrist_rgb = source["wrist_rgb"][idx]
+                wrist_frames = {
+                    arm: source["wrist_rgb" if arm == "left" else "right_wrist_rgb"][idx]
+                    for arm in wrist_arms
+                }
             else:
                 frame = dataset[idx]
                 rgb = _rgb_to_hwc(frame["observation.images.head_rgb"])
-                wrist_rgb = _rgb_to_hwc(frame["observation.images.wrist_rgb"])
+                wrist_frames = {
+                    arm: _rgb_to_hwc(frame[f"observation.images.{arm}_wrist_rgb"])
+                    for arm in wrist_arms
+                }
             depth_mm = depth_stack[idx]
             rr.log("world/camera/rgb", rr.Image(rgb))
             rr.log("world/camera/depth", rr.DepthImage(depth_mm, meter=1000.0))
@@ -1553,8 +1689,9 @@ def main() -> None:
                     rr.SegmentationImage(source["mask_image"][idx], opacity=0.5),
                 )
 
-            # Wrist RGB: plain 2D panel (no calibration/depth for the wrist camera).
-            rr.log("wrist/rgb", rr.Image(wrist_rgb))
+            # Wrist RGB: plain 2D panel per arm (no calibration/depth for the wrists).
+            for _arm, _wrist_frame in wrist_frames.items():
+                rr.log(f"wrist/{_arm}/rgb", rr.Image(_wrist_frame))
 
             # 2D overlays: project achieved (blue) + commanded (red) EEF into the head image.
             for tag, pos_map, color in (
@@ -1587,10 +1724,7 @@ def main() -> None:
             selected_labels = policy_selection["labels"]
             if selected_labels is not None:
                 frame_labels = selected_labels[idx]
-                mask_colors = np.empty((len(frame_labels), 3), dtype=np.uint8)
-                mask_colors[frame_labels == 0] = _COLOR_MASK_BG
-                mask_colors[frame_labels == 1] = _COLOR_MASK_SRC
-                mask_colors[frame_labels == 2] = _COLOR_MASK_DST
+                mask_colors = _mask_label_colors(frame_labels)
                 rr.log("world/policy_masks/labels", rr.Points3D(
                     selected[:, :3], colors=mask_colors, radii=0.006,
                 ))
@@ -1654,10 +1788,13 @@ def main() -> None:
 
         if mof_reps is not None:
             for name, reps in mof_reps.items():
-                _log_mof_horizon(
-                    f"mof_frames/{name}/gt", reps[idx], mof_action_layout,
-                    mof_current_step,
-                )
+                root = f"mof_frames/{name}/gt"
+                _log_mof_horizon(root, reps[idx], mof_action_layout, mof_current_step)
+                rr.log(f"{root}/cloud", rr.Points3D(
+                    mof_clouds[name][idx],
+                    colors=mof_cloud_colors[idx],
+                    radii=_MOF_CLOUD_RADIUS,
+                ))
 
         # Gripper scalars per arm: [action (binary), observation.state (raw)].
         for side in _ARM_SIDES:

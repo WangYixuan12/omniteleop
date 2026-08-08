@@ -41,11 +41,11 @@ Environment: ``dexmate_lerobot`` (safetensors + cv2 + pinocchio FK).
 
 Usage:
   python scripts/port_wbc_mobile_mof.py \
-    --raw-dir ~/Dexmate/data/box2cloth/raw_data \
-    --out-root ~/Dexmate/data/box2cloth/processed_wbc/mof \
+    --raw-dir ~/Dexmate/data/raw_data \
+    --out-root ~/Dexmate/data/processed_wbc/mof \
     --name dexmate_wbc_mof \
-    --include-recovery-data ~/Dexmate/data/box2cloth/raw_data/recovery \
-    --positions-dir ~/Dexmate/data/box2cloth/scene_diff/positions
+    --include-recovery-data ~/Dexmate/data/raw_data/recovery \
+    --positions-dir ~/Dexmate/data/scene_diff/positions
 """
 
 from __future__ import annotations
@@ -83,9 +83,9 @@ def _load_hdf5_porter() -> "types.ModuleType":
 
 porter = _load_hdf5_porter()
 
-DEFAULT_RAW_DIR = Path("~/Dexmate/data/box2cloth/raw_data").expanduser()
-DEFAULT_OUT_ROOT = Path("~/Dexmate/data/box2cloth/processed_wbc/mof").expanduser()
-DEFAULT_POSITIONS_DIR = Path("~/Dexmate/data/box2cloth/scene_diff/positions").expanduser()
+DEFAULT_RAW_DIR = Path("~/Dexmate/data/raw_data").expanduser()
+DEFAULT_OUT_ROOT = Path("~/Dexmate/data/processed_wbc/mof").expanduser()
+DEFAULT_POSITIONS_DIR = Path("~/Dexmate/data/scene_diff/positions").expanduser()
 DEFAULT_NAME = "dexmate_wbc_mof"
 IMAGE_HW = (224, 224)
 
@@ -136,7 +136,9 @@ def episode_arrays(
     for a raw episode, the absolute inclusive ``trim`` segment for a recovery one.
     """
     ep = porter.load_and_validate_episode(hdf5_path, fps)
-    start, end = porter._resolve_window(ep["frame_count"], ep["t0"], trim, hdf5_path)  # noqa: SLF001
+    start, end = porter.resolve_episode_window(
+        ep["frame_count"], ep["t0"], trim, hdf5_path
+    )
     kept = end - start
 
     states = np.empty((kept, len(STATE_AXES)), dtype=np.float32)
