@@ -346,6 +346,7 @@ def shape_project_twist(
     single_axis_deadband: float,
     single_axis_hysteresis_ratio: float,
     prev_axis: Optional[int],
+    dispatch_single_axis_deadband: float,
     preferred_axis: Optional[int] = None,
 ) -> tuple[np.ndarray, np.ndarray, Optional[int]]:
     """Shared post-PD base shaping and final single-axis projection.
@@ -355,6 +356,9 @@ def shape_project_twist(
     masked/projected twist safe to dispatch. A non-``None`` ``preferred_axis`` lets a
     direct operator command retain its selected intent axis while active. The WBC path
     omits it and uses the dominant post-PD command with configured hysteresis.
+    ``dispatch_single_axis_deadband`` is the final chassis quiet floor, kept separate from
+    (and lower than) the upstream WBIK/joystick intent floor ``single_axis_deadband`` so a
+    valid command's acceleration ramp is dispatched instead of being chopped back to zero.
     """
     shaped = shape_twist(
         raw,
@@ -388,7 +392,7 @@ def shape_project_twist(
             allow_yaw_hold=allow_yaw_hold,
             xy_max_vel=xy_max_vel,
             yaw_max_vel=yaw_max_vel,
-            deadband=single_axis_deadband,
+            deadband=dispatch_single_axis_deadband,
             hysteresis_ratio=single_axis_hysteresis_ratio,
             prev_axis=prev_axis,
         )
@@ -402,7 +406,7 @@ def shape_project_twist(
         )
         cap = xy_max_vel if preferred_axis < 2 else yaw_max_vel
         command = np.zeros(3, dtype=np.float64)
-        if abs(float(selector[preferred_axis])) / cap < single_axis_deadband:
+        if abs(float(selector[preferred_axis])) / cap < dispatch_single_axis_deadband:
             axis = None
         else:
             command[preferred_axis] = float(selector[preferred_axis])
