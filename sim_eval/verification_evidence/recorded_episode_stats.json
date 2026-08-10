@@ -1,0 +1,184 @@
+{
+ "hdf5_schema": {
+  "action/base/pose": [
+   [
+    281,
+    3
+   ],
+   "float32"
+  ],
+  "action/eef/left": [
+   [
+    281,
+    4,
+    4
+   ],
+   "float32"
+  ],
+  "action/eef/right": [
+   [
+    281,
+    4,
+    4
+   ],
+   "float32"
+  ],
+  "action/gripper/left": [
+   [
+    281
+   ],
+   "float32"
+  ],
+  "action/gripper/right": [
+   [
+    281
+   ],
+   "float32"
+  ],
+  "action/head": [
+   [
+    281,
+    4,
+    4
+   ],
+   "float32"
+  ],
+  "action/joint/head": [
+   [
+    281,
+    3
+   ],
+   "float32"
+  ],
+  "action/joint/left_arm": [
+   [
+    281,
+    7
+   ],
+   "float32"
+  ],
+  "action/joint/right_arm": [
+   [
+    281,
+    7
+   ],
+   "float32"
+  ],
+  "action/joint/torso": [
+   [
+    281,
+    3
+   ],
+   "float32"
+  ],
+  "obs/base/pose": [
+   [
+    281,
+    3
+   ],
+   "float32"
+  ],
+  "obs/gripper/left": [
+   [
+    281
+   ],
+   "float32"
+  ],
+  "obs/gripper/right": [
+   [
+    281
+   ],
+   "float32"
+  ],
+  "obs/images/head_depth": [
+   [
+    281,
+    240,
+    320
+   ],
+   "uint16"
+  ],
+  "obs/images/head_left_rgb": [
+   [
+    281,
+    240,
+    320,
+    3
+   ],
+   "uint8"
+  ],
+  "obs/images/intrinsic": [
+   [
+    3,
+    3
+   ],
+   "float32"
+  ],
+  "obs/images/left_wrist_rgb": [
+   [
+    281,
+    240,
+    320,
+    3
+   ],
+   "uint8"
+  ],
+  "obs/joint/head": [
+   [
+    281,
+    3
+   ],
+   "float32"
+  ],
+  "obs/joint/left_arm": [
+   [
+    281,
+    7
+   ],
+   "float32"
+  ],
+  "obs/joint/right_arm": [
+   [
+    281,
+    7
+   ],
+   "float32"
+  ],
+  "obs/joint/torso": [
+   [
+    281,
+    3
+   ],
+   "float32"
+  ],
+  "timestamp_ns": [
+   [
+    281
+   ],
+   "int64"
+  ]
+ },
+ "head_rgb_mean": 138.21374522723903,
+ "head_rgb_all_black_frames": 0,
+ "wrist_rgb_mean": 75.98083430642052,
+ "wrist_all_black_frames": 0,
+ "depth_valid_fraction_min": 0.9587369791666667,
+ "depth_mm_range": [
+  150,
+  3651
+ ],
+ "gripper_closed_frames": 235,
+ "gripper_transitions": 2,
+ "base_path_len_m": 5.493119716644287,
+ "base_yaw_deg_range": [
+  -108.3798828125,
+  0.2678240239620209
+ ],
+ "obs/joint/left_arm_finite": true,
+ "action/eef/left_finite": true,
+ "action/head_finite": true,
+ "L_arm_j4_deg_min_max": [
+  -75.68988037109375,
+  -8.755834579467773
+ ]
+}

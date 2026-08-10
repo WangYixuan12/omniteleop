@@ -33,16 +33,15 @@ AGREE with the body posture the reach needs, so both objectives are satisfiable 
 
 The same offset also supplies the drive: at tick 0 the waypoint is at the fingertips, so the head
 target is the spawn pose (no step input); as the waypoint sweeps to the apple the head target sweeps
-~0.9 m forward with it, which is exactly the base-following drive. Head-z rides the waypoint too, so
-the command stays consistent whether ``head_world_position_cost`` z is 0 (wbik.yaml's own value, so
-the torso can extend freely) or 10000 (the mobile override, where a frozen standing height would
-otherwise block the torso from reaching down to the table).
+~0.9 m forward with it, which is exactly the base-following drive. Head-z rides the waypoint too;
+the canonical ``head_world_position_cost`` leaves world z free, so the torso retains vertical
+reach while world x/y drive the chassis.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from .pick_place_task import PickPlaceTask
+from .pick_place_task import PickPlaceTask, rot_z
 
 
 class MobilePickPlaceTask(PickPlaceTask):
@@ -58,10 +57,14 @@ class MobilePickPlaceTask(PickPlaceTask):
     def expert_reset(self, env):
         super().expert_reset(env)
         # Head geometry computed ONCE from the reset pose, exactly like the arm's _Rgrasp/_grasp_off_local.
-        self._head_off = self._head_pos0 - self._start_center   # camera stand-back from the work point
+        # Stored in the BASE frame rather than the world: the stand-back is a body-fixed quantity
+        # ("camera this far behind my own hands"), so on a task that TURNS (long_horizon) it has to
+        # rotate with the commanded heading or the head command would order the base sideways. At the
+        # spawn heading the two coincide, so the straight-in tasks are bit-for-bit unchanged.
+        self._head_off_base = rot_z(-self._head_heading) @ (self._head_pos0 - self._start_center)
         print(f"[mobile] head={self._head_link} head0={np.round(self._head_pos0,3)} "
-              f"head_off={np.round(self._head_off,3)}", flush=True)
+              f"head_off_base={np.round(self._head_off_base,3)}", flush=True)
 
-    def _head_target_pos(self, env):
+    def _head_target_pos(self, env, heading):
         """Unlike the fixed-base task the head POSITION matters: it is the base command."""
-        return self._center + self._head_off
+        return self._center + rot_z(heading) @ self._head_off_base

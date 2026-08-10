@@ -42,6 +42,12 @@ base_dofs: "xy_yaw"
 # QP-pinned, so a pull would only fight the pin.
 posture_cost_torso: 200   # keep torso quiet for local EE changes without blocking large reaches
 posture_cost_arm: 10       # let arms absorb local EE changes
+
+# HW-WORKAROUND(right-j1-dead): pin both shoulder j1 joints out of the whole-body QP (dq = 0
+# each tick) so sim matches the dead-motor hardware, which cannot actuate R_arm_j1. L_arm_j1 is
+# pinned too for a symmetric A/B comparison. Read by WBCConfig.dead_joints in
+# whole_body_ik_tmp.py; the canonical whole_body_ik.py / wbik.yaml have no such key.
+dead_joints: ["R_arm_j1", "L_arm_j1"]
 posture_cost_head: 0.0     # follows RBY1 nominal_posture_cost_head: 0 (head not an IK DOF)
 
 # --- Joint-space velocity damping ----------------------------------------------------------
@@ -111,7 +117,7 @@ head_orientation_cost: [10000.0, 10000.0, 10000.0]
 # it; ~+0.1 m reach on life_arm.hdf5), or a small z (~200) as a camera-height comfort prior
 # that still yields to genuine higwh reaches. [0, 0, 0] disables the term (use
 # head_position_cost). Verify with scripts/diagnostics/verify_head_z_reach.py.
-head_world_position_cost: [10000.0, 10000.0, 0.0]
+head_world_position_cost: [10000.0, 10000.0, 10000.0]
 # Head DOFs pinned out of the whole-body QP in head_mode "ik" (dq = 0 each tick), as a
 # list of head joint names drawn from head_j1/head_j2/head_j3. The head joints NOT listed
 # stay whole-body IK DOFs tracked by the head FrameTask. Kinematically (FK-verified on

@@ -22,6 +22,21 @@ Writes, under `--out` (default ~/Dexmate/data/sim_<task>):
 
 Episodes are recorded at `--fps` (default 10, the dataset rate) by subsampling the 100 Hz WBC
 control loop, and FAILED episodes are dropped by default (`--keep-failures` to keep them).
+
+ONE EPISODE PER PROCESS is the reliable way to collect. Running many episodes in a single process
+reuses one OmniGibson env, and something in that reused state costs roughly half the episodes:
+measured on dish2rack, 2 of 4 seeds fail in-process while the SAME seed passes standalone, the
+failures are exactly the takes that run long (314-327 recorded frames against 281-285), i.e. the
+plan clock throttling because the body fell behind, and WHICH seeds fail changes between runs of
+the same four. The env cannot be rebuilt in-process (`og.shutdown()` ends the app), so use
+`--index0` and loop outside:
+
+    for i in 0 1 2 3; do
+      python collect_demos.py --task dish2rack --episodes 1 --seed0 $i --index0 $i --out DIR
+    done
+
+Failed episodes are dropped either way, so a dataset only ever contains verified successes -- the
+in-process keep rate costs collection throughput, not data quality.
 """
 from __future__ import annotations
 
@@ -82,6 +97,9 @@ def run_episode(env, task, recorder, seed, fps, max_ticks, action_hz):
     snapshotted after reset and before any expert motion (matches hardware SceneDiff).
     """
     env.reset(seed=seed)
+    # the tick budget is only knowable after reset: a long-horizon task sizes it from the route
+    # its planner just laid out, so `max_ticks=0` means "ask the task".
+    max_ticks = max_ticks or int(getattr(task, "MAX_TICKS", 800))
     recorder.setup()
     src_dst = np.asarray(task.objects_of_interest(env), dtype=np.float64)
     if src_dst.shape != (2, 3) or not np.all(np.isfinite(src_dst)):
@@ -128,12 +146,17 @@ def main():
     ap.add_argument("--seed0", type=int, default=0)
     ap.add_argument("--out", default=None, help="dataset root (default ~/Dexmate/data/sim_<task>)")
     ap.add_argument("--fps", type=int, default=10, help="dataset rate (porter --fps must match)")
-    ap.add_argument("--max-ticks", type=int, default=800)
+    ap.add_argument("--max-ticks", type=int, default=0,
+                    help="0 = the task's own budget (long-horizon tasks size it from the route)")
     ap.add_argument("--n-test", type=int, default=2, help="last N episodes -> test split")
     ap.add_argument("--port", type=int, default=5640)
     ap.add_argument("--obs-hw", type=int, nargs=2, default=None,
                     help="raw head render size (default: whatever the zed realism switches "
                          "imply -- zed_sim.head_render_hw)")
+    ap.add_argument("--index0", type=int, default=0,
+                    help="episode index to start writing at. Lets you collect ONE episode per "
+                         "process and still build a single dataset -- see the note below on "
+                         "reusing an env across episodes")
     ap.add_argument("--keep-failures", action="store_true")
     zed_sim.ZedSimOptions.add_cli(ap)
     args = ap.parse_args()
@@ -155,6 +178,12 @@ def main():
                     robot_pos=task.ROBOT_POS, robot_yaw=task.ROBOT_YAW)
     if mobile:
         env.base_x_max = getattr(task, "BASE_X_MAX", None)
+        if getattr(task, "BASE_MAX_ANG", None) is not None:
+            env.base_max_ang = float(task.BASE_MAX_ANG)   # whole-episode cap, see the task class
+        if getattr(task, "BASE_MAX_LIN", None) is not None:
+            env.base_max_lin = float(task.BASE_MAX_LIN)   # whole-episode cap, see the task class
+        if hasattr(task, "keepouts"):
+            env.base_keepouts = task.keepouts()   # park circles at each long-horizon station
     recorder = SimObsRecorder(env, seed=args.seed0, zed=zed_opts)
 
     kept, xyz_lo, xyz_hi = [], None, None
@@ -165,9 +194,15 @@ def main():
         frames, success, src, dst = run_episode(env, task, recorder, seed, args.fps,
                                                  args.max_ticks, action_hz)
         if not success and not args.keep_failures:
-            P(f"[collect] seed {seed}: FAILED -- dropped ({len(frames)} frames)")
+            # report WHERE it ended, not just that it failed: episodes are collected in a REUSED
+            # env, so a seed that passes standalone but fails here is state carrying over rather
+            # than a hard task, and the final pose is what distinguishes the two.
+            now = np.asarray(task.objects_of_interest(env), dtype=np.float64)
+            P(f"[collect] seed {seed}: FAILED -- dropped ({len(frames)} frames) "
+              f"start_src@{np.round(src,3)} end_src@{np.round(now[0],3)} dst@{np.round(now[1],3)} "
+              f"moved={np.linalg.norm(now[0] - src):.3f} m")
             continue
-        idx = len(kept)
+        idx = args.index0 + len(kept)
         to_wbc = lambda p: (env.T_align_inv @ np.append(p, 1.0))[:3]
         src_wbc, dst_wbc = to_wbc(src), to_wbc(dst)
         save_hdf5(os.path.join(raw_dir, f"episode_{idx}.hdf5"), frames,
@@ -182,11 +217,22 @@ def main():
           f"src@{np.round(src_wbc,3)} dst@{np.round(dst_wbc,3)} "
           f"|src-dst|={np.linalg.norm(src_wbc - dst_wbc)*100:.1f}cm")
 
-    with open(os.path.join(raw_dir, "split.csv"), "w", newline="") as f:
+    # MERGE rather than overwrite: with one episode per process (see the module docstring) each
+    # invocation would otherwise leave a split.csv naming only its own episode, and the porter
+    # would silently see a one-episode dataset.
+    split_path = os.path.join(raw_dir, "split.csv")
+    rows = {}
+    if os.path.exists(split_path):
+        with open(split_path, newline="") as f:
+            for row in csv.DictReader(f):
+                rows[int(row["episode"])] = row["split"]
+    for n, i in enumerate(kept):
+        rows[i] = "test" if n >= len(kept) - args.n_test else "train"
+    with open(split_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["episode", "split"])
-        for i in kept:
-            w.writerow([i, "test" if i >= len(kept) - args.n_test else "train"])
+        for i in sorted(rows):
+            w.writerow([i, rows[i]])
 
     meta = {"task": args.task, "episodes": len(kept), "fps": args.fps,
             "obs_hw": list(obs_hw), "seed0": args.seed0,

@@ -1,0 +1,50 @@
+{
+ "action": [
+  [
+   566,
+   29
+  ],
+  "float32",
+  true
+ ],
+ "env_state": [
+  [
+   566,
+   6
+  ],
+  "float32",
+  true
+ ],
+ "point_cloud": [
+  [
+   566,
+   1024,
+   6
+  ],
+  "float32",
+  true
+ ],
+ "state": [
+  [
+   566,
+   32
+  ],
+  "float32",
+  true
+ ],
+ "episode_ends": [
+  281,
+  566
+ ],
+ "pointcloud_xyz_min": [
+  -1.781,
+  -4.594,
+  -0.2
+ ],
+ "pointcloud_xyz_max": [
+  2.235,
+  1.2,
+  1.599
+ ],
+ "distinct_points_per_frame_median": 1024
+}

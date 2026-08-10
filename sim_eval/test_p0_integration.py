@@ -32,8 +32,8 @@ def link_T(robot, link):
 cfg = {
     "scene": {"type": "Scene", "use_floor_plane": True},
     "robots": [{
-        "type": "vega_robotiq", "obs_modalities": ["proprio"], "grasping_mode": "physical",
-        "grasping_direction": "upper", "position": [0, 0, 0.03],
+        "model": "vega_robotiq", "obs_modalities": ["proprio"], "grasping_mode": "physical",
+        "grasping_direction": "upper", "fixed_base": True, "position": [0, 0, 0.03],
         "controller_config": {
             "base": {"name": "HolonomicBaseJointController", "motor_type": "velocity",
                      "vel_kp": 150, "command_input_limits": None, "use_impedances": False},

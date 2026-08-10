@@ -45,40 +45,98 @@ class VegaOGEnv:
                  lock_base=True, wbc_port=5610, obs_hw=None, wbc_overrides=None,
                  scene_model="Rs_int", robot_pos=(-0.5, 0.4, 0.03), robot_yaw=0.0,
                  grasping_mode="physical", grasping_direction="upper", mobile=False):
-        # Base is LOCKED in the sim, so the teleop-safety terms that keep the upper body centered
-        # over the (moving) chassis are moot and only shrink/contort the arm's reach:
-        #   - head-world-position objective (base-following-head): off
-        #   - torso-top-x anchor (hold arm mount over base): off
-        #   - CoM-over-base centering (tip-over safety): off -- no tip risk with a locked base
-        #   - torso posture pull: relaxed so the torso can LEAN toward table targets (extra reach)
-        # Together these open up a much larger, cleaner reachable workspace for precise grasping.
-        # Base is planar in sim (no tip risk), so relax the teleop-safety terms that otherwise
-        # fight the arm / shrink reach. SAME config for tabletop AND mobile: mobile base motion is
-        # NOT driven by a head-world-position cost -- it emerges from the whole-body IK moving the
-        # (unlocked) base to reach the arm's far EE targets, so the head cost stays zero.
-        if wbc_overrides is None:
-            # Works under EITHER value, because the mobile task derives its head target from the SAME
-            # waypoints as the arm target (see MobilePickPlaceTask): [10000] = the head command drives
-            # the base and agrees with the reach posture, [0] = the head is ignored and the arm's far
-            # EE target drives the base. Mobile defaults to 10000 (teleop-like base-follows-head).
-            # head_world_position_cost 10000 when mobile is REQUIRED, not a preference: it is the
-            # only base-position command in the stack (head world x/y == base x/y, see
-            # MobilePickPlaceTask). At 0 the head target is ignored, the base wanders laterally
-            # (measured y 0.40 -> 0.89) and, with the torso anchor also off, the upper body folds
-            # (torso_j3 -0.3 -> -49 deg, head sinking 1.49 -> 1.11 m). Turning the anchor ON fixes
-            # the fold but is NOT a rescue: it costs reach and at cost 10000 it wrecks the take
-            # (base yaw -41 deg, ee_err 0.27), so it stays off and mobile stays at 10000.
-            wbc_overrides = {"head_world_position_cost": [10000.0, 10000.0, 10000.0] if mobile else [0.0, 0.0, 0.0],
-                             "enable_torso_top_x_anchor": False,
-                            }
+        # A task may select either canonical planar-root mode from whole_body_ik.py. Merge it
+        # with caller diagnostics rather than letting e.g. --head-cost silently restore yaw.
+        overrides = {} if wbc_overrides is None else dict(wbc_overrides)
+        task_base_dofs = getattr(task, "BASE_DOFS", None)
+        if task_base_dofs is not None:
+            requested = overrides.get("base_dofs", task_base_dofs)
+            if requested != task_base_dofs:
+                raise ValueError(
+                    f"task requires base_dofs={task_base_dofs!r}, override requested {requested!r}"
+                )
+            overrides["base_dofs"] = task_base_dofs
+        self.base_dofs = overrides.get("base_dofs", base_ctrl.WBIK.base_dofs)
+        # The task attribute is the sim's `--base-yaw-hold-in-xy`: the follower exposes the same
+        # switch as a CLI flag over the shared yaml default, so default from the file and let a
+        # task override it, rather than hardcoding either end.
+        self.base_yaw_hold_in_xy = bool(
+            getattr(task, "BASE_YAW_HOLD_IN_XY", base_ctrl.VR_TELEOP.base_yaw_hold_in_xy))
+        # Mobile episodes use whole_body_ik.py's canonical wbik.yaml unchanged. In particular,
+        # head_world_position_cost=[10000,10000,0] makes the chassis follow world x/y without
+        # pinning camera height, and enable_torso_top_x_anchor=true prevents an arm reach from
+        # folding the upper body instead of moving the base. The fixed-base tabletop task has no
+        # chassis authority, so retaining its established reach-oriented relaxation is harmless
+        # and deliberately scoped to that one mode.
+        if not mobile:
+            overrides.setdefault("head_world_position_cost", [0.0, 0.0, 0.0])
+            overrides.setdefault("enable_torso_top_x_anchor", False)
+        wbc_overrides = overrides or None
         self.base_x_max = None   # mobile: forward-park clamp (set by run_episode from the task)
+        # mobile: (x, y, radius) circles the chassis must not drive INTO. The general form of
+        # base_x_max, needed once the robot approaches stations from arbitrary headings: the head
+        # command parks the base at the reset camera-to-hands distance from the work point, which
+        # for a deep counter/fridge/bookcase is INSIDE the furniture. Only the inward radial
+        # component is removed, so the base can still slide along and back away.
+        self.base_keepouts = []
         self.mobile = mobile
-        # base-twist shaping gains/limits (wbik.yaml vr_teleop block); angular limits = 2x linear
-        self.base_kp_xy, self.base_kp_yaw = 1.0, 1.5
-        self.base_max_lin, self.base_max_ang = 0.45, 0.9
-        self.base_deadband_lin, self.base_deadband_ang = 0.02, 0.04
-        self.base_max_lin_accel, self.base_max_ang_accel = 0.4, 0.8
+        # EVERY control constant below is READ from the follower config the hardware uses --
+        # `base_ctrl.VR_TELEOP` is wbik.yaml's `vr_teleop:` block and `base_ctrl.WBIK` its solver
+        # block. None of them is retyped here, because retyping them is precisely how the sim
+        # drifted: an audit against `scripts/wbc_vr_robot.py` found this env running a dispatch
+        # deadband of 0.02 where the yaml says 0.0, for no reason but a stale local copy. The
+        # angular = 2x linear convention is the follower's own (`wbc_vr_robot._drive_base`).
+        vr, wb = base_ctrl.VR_TELEOP, base_ctrl.WBIK
+        self.base_kp_xy = float(vr.base_kp_xy)
+        self.base_kp_yaw = float(vr.base_kp_yaw)
+        self.base_max_lin = float(vr.base_max_speed)
+        self.base_max_ang = 2.0 * self.base_max_lin
+        self.base_deadband_lin = float(vr.base_deadband)
+        self.base_deadband_ang = 2.0 * self.base_deadband_lin
+        self.base_max_lin_accel = float(vr.base_accel)
+        self.base_max_ang_accel = 2.0 * self.base_max_lin_accel
         self._prev_base_twist = np.zeros(3)
+        self.base_post_linear_deadband = float(vr.base_post_linear_deadband)
+        self.base_post_angular_deadband = float(vr.base_post_angular_deadband)
+        self.enable_base_single_axis = bool(wb.enable_base_single_axis)
+        self.base_single_axis_deadband = float(wb.base_single_axis_deadband)
+        self.base_dispatch_single_axis_deadband = float(wb.base_dispatch_single_axis_deadband)
+        self.base_single_axis_hysteresis_ratio = float(wb.base_single_axis_hysteresis_ratio)
+        self.base_xy_max_vel = float(wb.base_xy_max_vel)
+        self.base_yaw_max_vel = float(wb.base_yaw_max_vel)
+        # Quiet-tick chassis dispatch, and the per-tick joint-step clamp. Both are hardware
+        # bring-up knobs the yaml keeps script-local (see its `vr_teleop:` preamble), so the
+        # follower's own defaults are mirrored here: `wbc_vr_robot.DEFAULT_BASE_QUIET_HOLD_S`
+        # and `DEFAULT_MAX_JOINT_STEP` / `_JOINT_STEP_ABORT_TICKS`.
+        self.base_quiet_hold_s = -1.0
+        self.max_joint_step = 0.05
+        self.joint_step_abort_ticks = 25
+        self._base_quiet_elapsed = 0.0
+        self._prev_joint_cmd = {}
+        self._overstep_ticks = 0
+        self._base_action = "drive"
+        # Command path: the leader's rate, and the head filters that sit between it and the solver.
+        self.cmd_rate = float(vr.cmd_rate)
+        self.head_lpf_tau = float(vr.head_lpf_tau)
+        self.head_planar_pos_deadband = float(vr.head_planar_pos_deadband)
+        self.head_planar_yaw_deadband = float(vr.head_planar_yaw_deadband)
+        self._tick = 0
+        self._interp = self._interp_n = None
+        self._head_lpf = self._head_deadband = None
+        # The follower's loop rate is a shared constant, not a sim knob: `ik_rate` is what sizes
+        # the interpolation segments, the slew limiter's dt and the head low-pass alpha, so a sim
+        # running at a different rate is running a differently-tuned controller.
+        if abs(action_hz - float(vr.ik_rate)) > 1e-9:
+            raise ValueError(
+                f"action_hz={action_hz} must equal the follower's vr_teleop.ik_rate="
+                f"{vr.ik_rate}; the control loop is shared, so its rate is too")
+        if self.cmd_rate <= 0 or abs(action_hz / self.cmd_rate - round(action_hz / self.cmd_rate)) > 1e-9:
+            raise ValueError(
+                f"vr_teleop.ik_rate={action_hz} must be an integer multiple of cmd_rate="
+                f"{self.cmd_rate}")
+        self._cmd_period_ticks = int(round(action_hz / self.cmd_rate))
+        self._base_shaped = np.zeros(3)    # slew anchor: the UNPROJECTED shaped twist
+        self._base_axis = None             # active single axis, threaded across ticks
         self._base_held = False   # mobile: park + hold the base after navigation (P-hold)
         self.base_hold_target = np.zeros(3)   # (x,y,yaw) the base is held at (updated by drive_base)
         self.robot_pos = tuple(robot_pos)
@@ -87,6 +145,7 @@ class VegaOGEnv:
         assert render_hz % action_hz == 0 and physics_hz % render_hz == 0, \
             f"need render_hz({render_hz}) % action_hz({action_hz})==0 and physics_hz({physics_hz}) % render_hz==0"
         self.task = task
+        self.scene_model = scene_model      # tasks plan their base routes on this scene's trav map
         self.action_hz = action_hz
         self.dt = 1.0 / action_hz
         self.lock_base = lock_base
@@ -104,8 +163,24 @@ class VegaOGEnv:
             # depth_linear == Isaac distance_to_image_plane (z-depth), which is what the pinhole
             # unprojection in wbc_pointcloud wants; OmniGibson's "depth" is distance_to_camera
             # (euclidean range) and would bow the recorded cloud outward at the image edges.
-            "type": "vega_robotiq", "obs_modalities": ["rgb", "depth_linear", "proprio"],
+            "model": "vega_robotiq", "obs_modalities": ["rgb", "depth_linear", "proprio"],
             "grasping_mode": grasping_mode, "grasping_direction": grasping_direction,
+            # Holonomic-base robots cannot float; OmniGibson forces this on anyway and warns if
+            # left at the default False, so state it explicitly.
+            "fixed_base": True,
+            # MUST be False. Every controller group below asks for `command_input_limits: None`,
+            # i.e. "my commands are already in physical units, pass them through". OmniGibson's
+            # default action_normalize=True DISCARDS that and rewrites the input limits to (-1, 1)
+            # for every group (robots/robot.py `if self._action_normalize: cfg[...] = "default"`),
+            # which silently mangled every command we sent. Measured on the dish2rack episode:
+            #   base   -> output limits default to the joint velocity caps, so the twist was SCALED
+            #             by 1.5 (x, y) and by pi (yaw). A 0.30 m/s command drove 0.450 m/s and a
+            #             0.35 rad/s command drove 1.099 rad/s -- the base ran 3x its commanded
+            #             turn rate, which is what the yaw thrash and the chassis tipping were.
+            #   trunk  -> WBC asked for up to 2.06 rad and was CLIPPED at 1.0 rad on 100% of ticks.
+            #   arms   -> clipped on 82% (left) / 86% (right) of ticks, targets up to 1.42 rad.
+            # The grippers pass an explicit [-1, 1] input range and are unaffected either way.
+            "action_normalize": False,
             "position": list(robot_pos),
             "orientation": R.from_euler("z", robot_yaw).as_quat().tolist(),
             "sensor_config": {"VisionSensor": {"sensor_kwargs": {"image_height": obs_hw[0], "image_width": obs_hw[1]}}},
@@ -194,6 +269,25 @@ class VegaOGEnv:
             return (amin + amax) / 2
         return (ctr(a) + ctr(b)) / 2
 
+    def joint_margins(self, names):
+        """(name, q_deg, lo_deg, hi_deg, frac) for each joint, frac=0 at a limit, 1 mid-range."""
+        q = self.robot.get_joint_positions().detach().cpu().numpy()
+        lo, hi = self.robot.joint_lower_limits, self.robot.joint_upper_limits
+        lo = lo.detach().cpu().numpy() if hasattr(lo, "detach") else np.asarray(lo)
+        hi = hi.detach().cpu().numpy() if hasattr(hi, "detach") else np.asarray(hi)
+        out = []
+        for n in names:
+            i = self.name2idx[n]
+            span = max(float(hi[i] - lo[i]), 1e-9)
+            frac = min(float(q[i] - lo[i]), float(hi[i] - q[i])) / span
+            out.append((n, np.degrees(q[i]), np.degrees(lo[i]), np.degrees(hi[i]), frac))
+        return out
+
+    def at_limits(self, names, tol=0.03):
+        """Joints within `tol` of their range ends -- the ones squeezing the IK."""
+        return [(n, round(qd, 1), round(lod, 1), round(hid, 1))
+                for n, qd, lod, hid, f in self.joint_margins(names) if f < tol]
+
     def base_xyyaw(self):
         q = self.robot.get_joint_positions().detach().cpu().numpy()
         return (float(q[self.name2idx["base_footprint_x_joint"]]),
@@ -201,8 +295,20 @@ class VegaOGEnv:
                 float(q[self.name2idx["base_footprint_rz_joint"]]))
 
     def measured_pin_q(self):
+        """Measured joints in pinocchio order, clamped into the model's own limit box.
+
+        A joint resting ON a hard stop settles a hair past it -- L_arm_j4 reads 0.244109 against
+        a 0.244000 upper limit, 1.1e-4 rad -- and pink's `Configuration.check_limits` then logs
+        `Value ... is out of limits` on every tick of every episode that holds a saturated joint.
+        The excursion is position-controller slop, not a real posture: OmniGibson enforces the
+        SAME URDF box we are clamping to, so nothing physical is being hidden.
+        """
         q = self.robot.get_joint_positions().detach().cpu().numpy()
-        qby = {n: float(q[self.name2idx[n]]) for n in (TORSO + ARM_L + ARM_R + HEAD)}
+        lo, hi = self.robot.joint_lower_limits, self.robot.joint_upper_limits
+        lo = lo.detach().cpu().numpy() if hasattr(lo, "detach") else np.asarray(lo)
+        hi = hi.detach().cpu().numpy() if hasattr(hi, "detach") else np.asarray(hi)
+        qby = {n: float(np.clip(q[i], lo[i], hi[i]))
+               for n, i in ((n, self.name2idx[n]) for n in (TORSO + ARM_L + ARM_R + HEAD))}
         return WBCClient.build_pin_q(qby, self.base_xyyaw())
 
     def og_to_wbc(self, T_og):
@@ -222,15 +328,37 @@ class VegaOGEnv:
 
     def reset(self, seed=None):
         self.env.reset()
+        # AFTER env.reset(), never before: OmniGibson's `scene.reset(hard=True)` forces the live
+        # object set back to the scene's initial file, so anything removed at construction is
+        # restored on the first reset. Decluttering there looked like it worked (the removals
+        # logged cleanly) while the furniture was quietly back before the episode started -- the
+        # robot then drove into the "removed" sofa and toppled mid-transit.
+        if self.task is not None and hasattr(self.task, "declutter"):
+            self.task.declutter(self)
+        self.lock_chassis_tilt()      # after every reset: joint limits do not survive one
         self._prev_base_twist = np.zeros(3)
+        self._base_shaped = np.zeros(3)
+        self._base_axis = None
         self._base_held = False
+        # Per-episode command-path state. The follower re-engages from scratch each run: fresh
+        # interpolation segments, head filters re-anchored on the new engage pose, and a clamp
+        # anchor that re-seeds from measured position on the first tick.
+        self._tick = 0
+        self._base_quiet_elapsed = 0.0
+        self._base_action = "drive"
+        self._interp = self._interp_n = None
+        self._head_lpf = self._head_deadband = None
+        self._prev_joint_cmd = {}
+        self._overstep_ticks = 0
         if self.task is not None:
             self.task.reset(self)
             for _ in range(10):
                 self.env.step(self._hold_action())   # settle objects + robot at nominal
+                self._level_chassis()
         self.T_align = self.link_pose("base")
         self.T_align_inv = np.linalg.inv(self.T_align)
         self.base_hold_target = np.array(self.base_xyyaw())   # ~0 at spawn
+        self.base_yaw_target = float(self.base_hold_target[2])
         self._setup_third_person()
         self.wbc.reset()
         if self.task is not None:
@@ -246,16 +374,109 @@ class VegaOGEnv:
         og.sim.viewer_camera.set_position_orientation(position=eye.tolist(), orientation=quat.tolist())
 
     def _setup_third_person(self):
-        rp = np.array(self.link_pose("base")[:3, 3])
-        self._set_cam_lookat(rp + np.array([-1.4, 1.4, 1.5]), rp + np.array([1.0, -0.1, 0.5]))
+        # A reused env must not ease from the previous episode's final camera pose.
+        for name in ("_cam_scale", "_cam_eye", "_cam_aim"):
+            if hasattr(self, name):
+                delattr(self, name)
+        self.follow_third_person()
         for _ in range(2):
             og.sim.render()
+
+    def follow_third_person(self, back=0.25, side=0.0, up=2.25, ahead=0.40):
+        """Re-aim the review camera from almost overhead, directly behind the robot.
+
+        A fixed camera pointed at the work area is useless once the task spans metres: over a
+        long-horizon episode the robot spends most of its time nowhere near the midpoint of the
+        two objects, so it is simply out of frame. Called before every capture, this keeps the
+        robot and whatever it is reaching for both in view for the whole take.
+
+        Zero lateral offset is deliberate: at the zero-yaw task heading, image horizontal is
+        exactly world -y. The review video can therefore expose whether the two EEF targets have
+        the same lateral timing instead of mixing forward motion into that comparison.
+
+        The eye is then pulled back IN toward the robot until it sits over open floor. Without
+        that the shot is buried in a wall for much of the episode -- the robot works close to
+        furniture and walls by definition, so a fixed offset spends its time outside the room.
+
+        The aim point sits well ahead of and above the base so both grippers stay in frame. The
+        hands work in front of the body at roughly chest height, and forward is IMAGE-UP in this
+        near-overhead shot, so aiming at the base itself pushed them off the top edge exactly
+        during the grasp and place phases. Tilting is the only lever available: `up` cannot grow,
+        because the Rs_int ceiling slab starts at z = 2.40 and the eye already sits ~10 cm under
+        it -- raise it and every frame is the underside of the ceiling.
+        """
+        T = self.link_pose("base")
+        p = T[:3, 3]
+        measured_yaw = float(np.arctan2(T[1, 0], T[0, 0]))
+        # Use the commanded heading when the scripted task exposes it. In dish2rack that is
+        # exactly world +x even if the undriven rz joint drifts a few degrees, so image horizontal
+        # remains exactly world -y and the two EEF lateral coordinates are visually comparable.
+        yaw = float(getattr(self.task, "_head_heading", measured_yaw))
+        fwd = np.array([np.cos(yaw), np.sin(yaw), 0.0])
+        # The stand-off direction is fixed in the WORLD, not behind the robot: a body-relative
+        # offset swings the whole shot around the robot every time it turns, which on these tasks
+        # is most of the episode.
+        offset = np.array([-back, side, 0.0])
+        want = 1.0
+        for scale in (1.0, 0.8, 0.6, 0.45, 0.3, 0.0):
+            if scale == 0.0 or self._cam_clear(p + scale * offset + np.array([0.0, 0.0, up])):
+                want = scale
+                break
+        # Ease toward it instead of snapping. Re-picking a discrete pull-in scale every frame is
+        # what made the shot pump in and out; the eye and aim point are low-passed as well so the
+        # camera drifts with the robot rather than jerking after it.
+        prev = getattr(self, "_cam_scale", want)
+        self._cam_scale = prev + np.clip(want - prev, -0.02, 0.02)
+        eye = p + self._cam_scale * offset + np.array([0.0, 0.0, up])
+        aim = p + ahead * fwd + np.array([0.0, 0.0, 0.75])
+        a = 0.12
+        self._cam_eye = eye if not hasattr(self, "_cam_eye") else (1 - a) * self._cam_eye + a * eye
+        self._cam_aim = aim if not hasattr(self, "_cam_aim") else (1 - a) * self._cam_aim + a * aim
+        self._set_cam_lookat(self._cam_eye, self._cam_aim)
+
+    def _cam_clear(self, eye):
+        """True when (x, y) is open floor, i.e. the camera is inside the room, not in a wall."""
+        if not hasattr(self, "_cam_map"):
+            try:
+                from tasks.nav_map import NavMap
+                self._cam_map = NavMap(self.scene_model, robot_radius=0.12)
+            except Exception:
+                self._cam_map = None
+        return True if self._cam_map is None else self._cam_map.free(float(eye[0]), float(eye[1]))
 
     def capture_third_person(self):
         obs = og.sim.viewer_camera.get_obs()[0]
         rgb = obs["rgb"] if isinstance(obs, dict) else obs
         rgb = rgb.detach().cpu().numpy() if hasattr(rgb, "detach") else np.asarray(rgb)
         return rgb[..., :3].astype(np.uint8)
+
+    def project_third_person(self, points):
+        """World XYZ -> (u, v) pixels in the review camera, with an in-front-of-the-lens mask.
+
+        Lets the review video draw the things the controller is actually chasing -- the commanded
+        EEF and head poses -- on top of the robot that is chasing them, which is the only way to
+        see tracking error in a picture. Must be called with the camera where the captured frame
+        had it, i.e. between `follow_third_person` and `capture_third_person`.
+
+        A USD camera looks down its own -z with +y up; the pinhole model wants +z forward and +y
+        down, and the two differ by `diag(1, -1, -1)` (`obs_pipeline._OPTICAL_TO_USD`, which is its
+        own inverse).
+        """
+        cam = og.sim.viewer_camera
+        k = cam.intrinsic_matrix
+        k = k.detach().cpu().numpy() if hasattr(k, "detach") else np.asarray(k)
+        p, q = cam.get_position_orientation()
+        world_t_cam = pose_mat(p.detach().cpu().numpy(), q.detach().cpu().numpy()) \
+            @ np.diag([1.0, -1.0, -1.0, 1.0])
+        pts = np.atleast_2d(np.asarray(points, dtype=float))
+        homo = np.concatenate([pts, np.ones((len(pts), 1))], axis=1)
+        cam_pts = (np.linalg.inv(world_t_cam) @ homo.T).T[:, :3]
+        z = cam_pts[:, 2]
+        ok = z > 1e-3
+        uv = np.full((len(pts), 2), np.nan)
+        uv[ok, 0] = k[0, 0] * cam_pts[ok, 0] / z[ok] + k[0, 2]
+        uv[ok, 1] = k[1, 1] * cam_pts[ok, 1] / z[ok] + k[1, 2]
+        return uv, ok
 
     # ---- control ----
     def _shape_base_twist(self, twist):
@@ -273,26 +494,174 @@ class VegaOGEnv:
         self.base_hold_target = np.array(self.base_xyyaw())
 
     def _mobile_base_cmd(self, resp):
-        """WBC-driven base (mobile): PD-track the WBC's desired base_pose with its base_twist as
-        feed-forward, then deadband/clamp/slew -> (vx,vy,wz) chassis velocity in the base frame.
-        base_pose (WBC world) and base_xyyaw (base_footprint joints) share the spawn-origin frame,
-        since current_q is fed with base_xyyaw each tick."""
-        ref = np.asarray(resp["base_pose"], dtype=float)      # WBC desired base pose (spawn frame)
-        ff = np.asarray(resp["base_twist"], dtype=float)      # feed-forward (reference base frame)
-        meas = np.array(self.base_xyyaw())                    # current base pose (spawn frame)
-        cmd = base_ctrl.pd_twist(ref, ff, meas, self.base_kp_xy, self.base_kp_yaw,
-                                 self.base_max_lin, self.base_max_ang)
-        shaped = base_ctrl.shape_twist(cmd, self._prev_base_twist, self.dt,
-                                       self.base_deadband_lin, self.base_deadband_ang,
-                                       self.base_max_lin, self.base_max_ang,
-                                       self.base_max_lin_accel, self.base_max_ang_accel)
+        """WBC-driven base (mobile), following `wbc_vr_robot._drive_base` step for step.
+
+        Feed-forward + proportional pose feedback against the MEASURED base pose, then the shared
+        shaping/projection, then the quiet-tick dispatch decision. The sim's odometry equivalent
+        is `base_xyyaw()` (the base_footprint joints), which shares the spawn-origin frame with
+        the WBC's own `base_pose` -- that is what makes the SE(2) error well-posed.
+
+        This env previously ran the feed-forward ALONE and fed `current_q` into the QP instead, so
+        the loop was closed inside the solver rather than around it. That is a different
+        architecture from the robot's, and the measurement offered in its defence (PD term ~1 % of
+        the command) was a measurement of the sim's own plant: hardware odometry lags and drifts,
+        which is the entire reason the outer loop exists. A sim whose base tracks better than the
+        robot's for structural reasons is not the one to validate a controller on.
+        """
+        allow_yaw_hold = self.base_dofs == "xy" and self.base_yaw_hold_in_xy
+        measured = np.array(self.base_xyyaw())
+        cmd, _err = base_ctrl.pd_twist(
+            np.asarray(resp["base_pose"], dtype=float),
+            np.asarray(resp["base_twist"], dtype=float),
+            measured,
+            kp_xy=self.base_kp_xy, kp_yaw=self.base_kp_yaw,
+            max_lin_speed=self.base_max_lin, max_ang_speed=self.base_max_ang)
+        if allow_yaw_hold:
+            # WBC yaw is hard-pinned in `xy` mode, so the PD's yaw term has no reference to track;
+            # hold the episode's fixed heading instead, which is what the flag is for on hardware.
+            cmd[2] = np.clip(
+                self.base_kp_yaw * base_ctrl.wrap_pi(self.base_yaw_target - measured[2]),
+                -self.base_max_ang,
+                self.base_max_ang,
+            )
+        cmd = base_ctrl.mask_planar_twist_for_base_dofs(
+            cmd, base_dofs=self.base_dofs, allow_yaw_hold=allow_yaw_hold)
+        # Shape AND single-axis project, exactly as both real followers do via
+        # base_closed_loop.shape_project_twist. Previously this stopped at shape_twist, so the
+        # sim could drive vx, vy and wz at once -- the very thing wbik.yaml's single-axis block
+        # exists to stop ("a drive straight leans sideways, an in-place turn wanders, and a
+        # meant-to-be-still base creeps"). The slew limiter is fed the UNPROJECTED shaped
+        # signal so a zeroed axis does not have to re-accelerate from standstill on every
+        # axis change.
+        shaped, self._base_shaped, self._base_axis = base_ctrl.shape_project_twist(
+            cmd, self._base_shaped, self.dt,
+            deadband_lin=self.base_deadband_lin, deadband_ang=self.base_deadband_ang,
+            max_lin_speed=self.base_max_lin, max_ang_speed=self.base_max_ang,
+            max_lin_accel=self.base_max_lin_accel, max_ang_accel=self.base_max_ang_accel,
+            post_linear_deadband=self.base_post_linear_deadband,
+            post_angular_deadband=self.base_post_angular_deadband,
+            enable_single_axis=self.enable_base_single_axis,
+            xy_max_vel=self.base_xy_max_vel, yaw_max_vel=self.base_yaw_max_vel,
+            single_axis_deadband=self.base_single_axis_deadband,
+            dispatch_single_axis_deadband=self.base_dispatch_single_axis_deadband,
+            single_axis_hysteresis_ratio=self.base_single_axis_hysteresis_ratio,
+            prev_axis=self._base_axis,
+            base_dofs=self.base_dofs,
+            allow_yaw_hold=allow_yaw_hold)
         # Forward-park clamp: once the base reaches base_x_max, stop it driving further toward the
         # table (the WBC would otherwise keep pulling it in to shorten the arm's reach -> collision).
         # Robot faces +x (yaw~0), so base-frame vx == world +x velocity.
         if self.base_x_max is not None and self.link_pose("base")[0, 3] >= self.base_x_max and shaped[0] > 0.0:
             shaped[0] = 0.0
+        shaped = self._apply_keepouts(shaped)
+        # This is the dispatched command in both real followers: the multi-axis signal is slewed,
+        # then the final command is projected to one axis. Slewing the projected output a second
+        # time blends the old and new axes during a switch, defeating that invariant.
+        #
+        # The quiet-tick decision runs here too, through the follower's own `base_quiet_dispatch`.
+        # Its PURPOSE does not survive the port -- it exists so a swerve chassis holds its current
+        # steering through a brief command dip instead of snapping the wheels back to 0 deg, and
+        # OmniGibson's holonomic base has no steering state to hold, so "hold" and "recenter" both
+        # dispatch the same zero twist. It is wired up anyway so the branch, the quiet timer and
+        # the invariant it asserts are the shared ones, and so a future steering model inherits the
+        # right behaviour instead of re-deriving it. The real cost is not portable and is worth
+        # stating plainly: on hardware an axis switch costs a physical re-steer that the sim gets
+        # for free.
+        action, self._base_quiet_elapsed = base_ctrl.base_quiet_dispatch(
+            shaped, self._base_quiet_elapsed, self.dt, self.base_quiet_hold_s)
+        if action != "drive":
+            shaped = np.zeros(3)
+        self._base_action = action
         self._prev_base_twist = shaped
         return shaped
+
+    def lock_chassis_tilt(self):
+        """Pin the base's z / roll / pitch joints so the chassis stays level.
+
+        OmniGibson gives a holonomic base SIX virtual joints (x, y, z, rx, ry, rz) but the
+        `HolonomicBaseJointController` drives only three of them -- x, y and rz. The other three
+        are left completely free, so every reaction torque from the arm pitches and sinks the
+        whole robot: measured, the body rolled far enough to read as tipping over on the reach
+        segments of dish2rack and towel2shelf (the task since rebuilt as towel2rack), and a
+        collision mid-transit once dropped the head from 1.38 m to 0.26 m. A wheeled chassis on a flat floor does none of that, so pinning
+        these is what makes the sim match the hardware, not a liberty taken with it. (OmniGibson
+        pins the same three for its own CuRobo export -- see `import_custom_robot.lock_joints`.)
+
+        Held kinematically, per tick, because nothing else on these joints bites. Probed
+        directly: as loaded they report `driven=False, has_limit=False, limits=[-inf, inf],
+        stiffness=0, damping=0`. They carry no limit in USD at all, so `set_joint_limits` is
+        accepted and then ignored (read-back stays +/-inf), and writing drive gains changes
+        nothing either -- both were tried and dish2rack came back bit-identical, still pitching
+        7.8 deg. Pinning the pose is what is left, and it is the honest model: the real chassis
+        rolls on wheels, so its roll, pitch and ride height ARE constants of the hardware and the
+        reaction the arm feeds back is taken by the wheels and the floor, not by leaning the body.
+        Roll and pitch go to zero; ride height is held wherever the robot SETTLED at reset rather
+        than at a nominal 0, so nothing is driven into the ground.
+        """
+        axes = ["z", "rx", "ry"]
+        q = self.robot.get_joint_positions().detach().cpu().numpy()
+        held = [float(q[self.name2idx["base_footprint_z_joint"]]), 0.0, 0.0]
+        if self.base_dofs == "xy":
+            # ...and YAW, on a task whose controller never commands wz. In `xy` mode the base-DOF
+            # mask zeroes wz on every tick, and the odometry yaw regulator that would trim it is
+            # itself below the shared `base_post_angular_deadband` (a 2.7 deg error asks for
+            # 0.07 rad/s against a 0.12 floor), so nothing drives this joint all episode -- yet it
+            # is a VELOCITY-controlled virtual joint, so the arm's reaction back-drives it anyway.
+            # Measured on dish2rack: the chassis wound to -0.047 rad while its reference sat at 0,
+            # which over the 0.6 m place reach is 28 mm of lateral error, and the bowl missed its
+            # rail by 25 mm. A wheeled chassis given no yaw command does not rotate 2.7 deg because
+            # an arm moved -- the wheels and the ground take that reaction. This is the same
+            # argument, and the same fix, as the z/roll/pitch pinning above, and it is a PLANT
+            # correction: the controller is unchanged and still runs the regulator hardware runs.
+            axes.append("rz")
+            held.append(float(q[self.name2idx["base_footprint_rz_joint"]]))
+        self._level_idx = [self.name2idx[f"base_footprint_{c}_joint"] for c in axes]
+        self._level_q = th.tensor(held, dtype=th.float32)
+
+    def _level_chassis(self):
+        """Put the chassis back on its wheels. Called after every physics step (see
+        `lock_chassis_tilt`); a no-op until that has run."""
+        idx = getattr(self, "_level_idx", None)
+        if idx is None:
+            return
+        self.robot.set_joint_positions(self._level_q, indices=idx, drive=False)
+        self.robot.set_joint_velocities(th.zeros(len(idx)), indices=idx, drive=False)
+
+    def chassis_tilt(self):
+        """(z, roll, pitch) of the chassis -- 0 when level. Nonzero means it is tipping."""
+        q = self.robot.get_joint_positions().detach().cpu().numpy()
+        return tuple(float(q[self.name2idx[f"base_footprint_{c}_joint"]]) for c in ("z", "rx", "ry"))
+
+    def _apply_keepouts(self, twist):
+        """Stop any active chassis axis that would drive farther into a violated keepout.
+
+        The real controller's final command is one pure base-frame axis. Orthogonally projecting a
+        forward command onto a circular boundary creates a diagonal vx+vy command and defeats that
+        invariant. Test each base-frame axis in world coordinates instead: inward axes stop,
+        while an already-commanded tangential or outward axis survives unchanged.
+        """
+        if not self.base_keepouts:
+            return twist
+        Tb = self.link_pose("base")
+        p = Tb[:2, 3]
+        yaw = float(np.arctan2(Tb[1, 0], Tb[0, 0]))
+        c, s = np.cos(yaw), np.sin(yaw)
+        Rz = np.array([[c, -s], [s, c]])
+        out = np.asarray(twist, dtype=float).copy()
+        for kx, ky, kr in self.base_keepouts:
+            d = p - np.array([kx, ky], dtype=float)
+            r = float(np.linalg.norm(d))
+            if r >= kr:
+                continue
+            if r < 1e-9:
+                out[:2] = 0.0
+                continue
+            n = d / r                                         # outward radial unit vector
+            for axis in range(2):
+                axis_world = Rz[:, axis] * out[axis]
+                if float(axis_world @ n) < 0.0:
+                    out[axis] = 0.0
+        return out
 
     def drive_base(self, base_vel, capture=False):
         """Navigate: command base velocity (base frame) + hold arms at nominal, step.
@@ -300,28 +669,131 @@ class VegaOGEnv:
         a = self._hold_action()
         a[self.cai["base"]] = th.tensor(np.asarray(base_vel, dtype=float), dtype=th.float32)
         self.env.step(a)
+        self._level_chassis()
         self.base_hold_target = np.array(self.base_xyyaw())
         return self.capture_third_person() if capture else None
 
     def wbc_tick(self, left_og, right_og, head_og=None, grip_l=-1.0, grip_r=-1.0):
-        """One WBC control tick: world targets (OG frame) -> WBC -> apply -> env.step."""
+        """One WBC control tick, in the order `scripts/wbc_vr_robot.py` runs it.
+
+        interpolate the leader-rate command -> low-pass + deadband the head target -> solve ->
+        hold on a bad solve -> clamp the per-joint step -> shape/dispatch the base.
+        """
         left = self.og_to_wbc(left_og)
         right = self.og_to_wbc(right_og)
         head = self.og_to_wbc(head_og) if head_og is not None else None
-        resp = self.wbc.solve(left, right, head=head, current_q=self.measured_pin_q(), dt=self.dt)
-        tgt = WBCClient.result_to_joint_targets(resp)
+        left, right, head = self._interpolate_command(left, right, head)
+        if head is not None:
+            if self._head_lpf is None:
+                # Anchored on the first commanded head pose, as the follower anchors on the head
+                # pose at engage. They coincide here: the expert's tick-0 head target IS the reset
+                # pose (see MobilePickPlaceTask -- the waypoint starts at the fingertips, so the
+                # head command starts at the spawn pose with no step input).
+                self._head_lpf = base_ctrl.HeadTargetLowPassFilter(self.head_lpf_tau, head)
+                self._head_deadband = base_ctrl.HeadTargetPlanarDeadbandFilter(
+                    head,
+                    position_deadband=self.head_planar_pos_deadband,
+                    yaw_deadband=self.head_planar_yaw_deadband)
+            head = self._head_lpf.filter(head, self.dt)
+            head = self._head_deadband.filter(head)
+        # current_q=None: the follower never re-seeds the IK from measured state (the string does
+        # not appear in wbc_vr_robot.py at all) -- it integrates its own configuration and closes
+        # the base loop OUTSIDE the solver, in `_mobile_base_cmd`. Feeding measurement in here as
+        # well would be a second, tighter loop the robot does not have.
+        resp = self.wbc.solve(left, right, head=head, current_q=None, dt=self.dt)
+        # `hold` is the follower's safety gate: a failed solve or a solver-side hold freezes the
+        # joints and stops the chassis rather than actuating a target the QP could not reach.
+        hold = (not bool(resp.get("success", True))) or bool(resp.get("held", False))
         a = th.zeros(self.robot.action_dim)
-        base_cmd = (self._mobile_base_cmd(resp) if (self.mobile and not self._base_held)
-                    else self._shape_base_twist(resp["base_twist"]))
-        a[self.cai["base"]] = th.tensor(base_cmd, dtype=th.float32)
-        a[self.cai["trunk"]] = th.tensor([tgt[n] for n in TORSO])
-        a[self.cai["camera"]] = th.tensor([tgt[n] for n in HEAD])
-        a[self.cai["arm_left"]] = th.tensor([tgt[n] for n in ARM_L])
-        a[self.cai["arm_right"]] = th.tensor([tgt[n] for n in ARM_R])
+        if hold:
+            self._prev_joint_cmd = {}          # re-seed the clamp anchor from measured on resume
+            base_cmd = np.zeros(3)
+            self._base_shaped = np.zeros(3)
+            self._base_axis = None
+            self._base_quiet_elapsed = 0.0
+            joints = self._measured_joint_targets()   # "send nothing" == hold this pose
+        else:
+            base_cmd = (self._mobile_base_cmd(resp) if (self.mobile and not self._base_held)
+                        else self._shape_base_twist(resp["base_twist"]))
+            joints = self._clamp_joint_step(WBCClient.result_to_joint_targets(resp))
+        a[self.cai["base"]] = th.tensor(np.asarray(base_cmd, dtype=float), dtype=th.float32)
+        a[self.cai["trunk"]] = th.tensor([joints[n] for n in TORSO])
+        a[self.cai["camera"]] = th.tensor([joints[n] for n in HEAD])
+        a[self.cai["arm_left"]] = th.tensor([joints[n] for n in ARM_L])
+        a[self.cai["arm_right"]] = th.tensor([joints[n] for n in ARM_R])
         a[self.cai["gripper_left"]] = float(grip_l)
         a[self.cai["gripper_right"]] = float(grip_r)
         self.env.step(a)
+        self._level_chassis()
+        self._tick += 1
+        resp["hold"] = hold
         return resp
+
+    #: Joint groups the follower clamps independently -- its `cmds` dict in `Driver.actuate`.
+    _JOINT_GROUPS = {"torso": TORSO, "left_arm": ARM_L, "right_arm": ARM_R, "head": HEAD}
+
+    def _measured_joint_targets(self):
+        """Where the joints are now -- what a HOLD tick commands, since the sim must send a target
+        every step where the follower simply skips the write."""
+        q = self.robot.get_joint_positions().detach().cpu().numpy()
+        return {n: float(q[self.name2idx[n]]) for g in self._JOINT_GROUPS.values() for n in g}
+
+    def _clamp_joint_step(self, tgt):
+        """Per-tick joint-step clamp, per group, exactly as `Driver.actuate` applies it.
+
+        The anchor is the previous CLAMPED COMMAND (not the measurement), re-seeded from measured
+        position whenever it is missing -- after a reset or on resume from a hold. A sustained
+        demand above twice the clamp is a runaway target and aborts, as it does on hardware.
+        """
+        q = None
+        out, max_over = dict(tgt), 0.0
+        for group, names in self._JOINT_GROUPS.items():
+            cmd = np.array([tgt[n] for n in names], dtype=float)
+            prev = self._prev_joint_cmd.get(group)
+            if prev is None:
+                if q is None:
+                    q = self.robot.get_joint_positions().detach().cpu().numpy()
+                prev = np.array([float(q[self.name2idx[n]]) for n in names], dtype=float)
+            clamped, requested = base_ctrl.clamp_joint_step(prev, cmd, self.max_joint_step)
+            max_over = max(max_over, float(requested))
+            self._prev_joint_cmd[group] = clamped
+            out.update(dict(zip(names, clamped.tolist())))
+        if self.max_joint_step > 0 and max_over > 2.0 * self.max_joint_step:
+            self._overstep_ticks += 1
+            if self._overstep_ticks > self.joint_step_abort_ticks:
+                raise RuntimeError(
+                    f"IK joint step {max_over:.3f} rad exceeded 2x the {self.max_joint_step:g} rad "
+                    f"clamp for {self._overstep_ticks} ticks -- aborting for safety.")
+        else:
+            self._overstep_ticks = 0
+        return out
+
+    def _interpolate_command(self, left, right, head):
+        """Hold the expert's target at the LEADER rate and lerp/slerp it up to the IK rate.
+
+        On hardware the leader publishes at `cmd_rate` (10 Hz) and the follower glides each
+        command over 1/cmd_rate toward the next, at `ik_rate` (100 Hz). A scripted expert can
+        trivially emit a fresh target every IK tick, and this env used to -- which quietly makes
+        the sim a smoother plant than the robot, and skips the one piece of the command path a
+        LEARNED policy will certainly meet: `collect_demos` records at 10 Hz, so a policy's
+        actions arrive on hardware through exactly this interpolator.
+
+        The stream count is fixed at the first tick; a task that starts supplying a head target
+        halfway through would silently change the segment geometry, so it raises instead.
+        """
+        poses = [left, right] + ([head] if head is not None else [])
+        if self._interp is None:
+            self._interp_n = len(poses)
+            self._interp = base_ctrl.TargetInterpolator(1.0 / self.cmd_rate, *poses)
+        if len(poses) != self._interp_n:
+            raise ValueError(
+                f"command stream changed from {self._interp_n} to {len(poses)} poses mid-episode "
+                "(head target appeared or vanished); the interpolator cannot be resized")
+        now = self._tick * self.dt
+        if self._tick % self._cmd_period_ticks == 0:
+            self._interp.push(*poses, now=now)
+        out = self._interp.at(now)
+        return (out[0], out[1], out[2] if head is not None else None)
 
     def close(self):
         try:

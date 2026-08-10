@@ -1,0 +1,9 @@
+INFO Using split csv /tmp/claude-1000/-home-yixuan-BEHAVIOR-1K/9901aed5-d602-4345-b36f-c4b1542046a9/scratchpad/collect5/raw_data/split.csv (2 listed episode(s))
+INFO Port plan: 2 episode(s) = 2 raw + 0 recovery -> {train:2} (state_frame=world, num_points=1024)
+INFO Position conditioning ON: 2 env-state vector(s) (6-D, world frame) from /tmp/claude-1000/-home-yixuan-BEHAVIOR-1K/9901aed5-d602-4345-b36f-c4b1542046a9/scratchpad/collect5/scene_diff/positions
+INFO Writing /tmp/claude-1000/-home-yixuan-BEHAVIOR-1K/9901aed5-d602-4345-b36f-c4b1542046a9/scratchpad/zarr_out/lh_dish2rack_train.zarr (2 episode(s))
+INFO   episode_0.hdf5: 281 frames [0,281) of 281, crop kept 27443..76800 pts/frame
+INFO   episode_1.hdf5: 285 frames [0,285) of 285, crop kept 27406..76800 pts/frame
+INFO verify[lh_dish2rack_train.zarr] OK: point_cloud=(566, 1024, 6) state=(566, 32) action=(566, 29) episodes=2 frames=566 env_state=(566, 6)
+INFO Split train finalized: 2 episode(s), 566 frames
+

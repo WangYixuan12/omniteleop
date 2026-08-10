@@ -17,18 +17,109 @@ def head_rgb(rec):
     return rec._head_images()[0]
 
 
+#: (label, commanded-pose attribute on the ExpertCommand, link whose pose is the ACTUAL, BGR colour)
+TARGETS = (("L_ee", "left_target", "L_ee", (255, 220, 40)),      # cyan-ish
+           ("R_ee", "right_target", "R_ee", (255, 90, 220)),     # magenta
+           ("head", "head_target", None, (60, 230, 255)))        # yellow; link comes from the task
+
+
+def draw_targets(env, task, frame, cmd, tick):
+    """Draw every commanded EEF/head target on the review frame, next to where the robot has
+    actually got to.
+
+    A third-person video shows the robot but not what it was ASKED to do, which is exactly the
+    thing under review here -- the whole plan is feed-forward world-frame waypoints, so a pose
+    that looks wrong is either a bad target or bad tracking and the picture alone cannot say
+    which. Each target is drawn as a filled dot with a crosshair, the measured frame as a hollow
+    ring, and the two are joined by a line whose length IS the tracking error (printed in cm).
+    The faint polyline is the rest of the planned waypoint list, so the intended path is visible
+    before the robot gets there.
+    """
+    import cv2
+    frame = np.ascontiguousarray(frame)
+    h, w = frame.shape[:2]
+
+    # gather every world point first, project in ONE pass (the intrinsic query is not free)
+    segs = getattr(task, "_segs", None) or []
+    world = [np.asarray(s[1], dtype=float) for s in segs]
+    pairs = []
+    eef_y = {}
+    for label, attr, link, colour in TARGETS:
+        T = getattr(cmd, attr, None)
+        link = link or getattr(task, "_head_link", None)
+        if T is None or link is None:
+            continue
+        tgt = np.asarray(T, dtype=float)[:3, 3]
+        act = env.link_pose(link)[:3, 3]
+        pairs.append((label, colour, len(world), float(np.linalg.norm(tgt - act))))
+        if label in ("L_ee", "R_ee"):
+            eef_y[label] = (float(tgt[1]), float(act[1]))
+        world += [tgt, act]
+    uv, ok = env.project_third_person(np.stack(world)) if world else (np.zeros((0, 2)), [])
+
+    def px(i):
+        if not ok[i] or not np.all(np.isfinite(uv[i])):
+            return None
+        u, v = int(round(uv[i][0])), int(round(uv[i][1]))
+        return (u, v) if -w < u < 2 * w and -h < v < 2 * h else None
+
+    # the planned waypoints (grasp centres), faint, so the intended path is visible up front
+    chain = [px(i) for i in range(len(segs))]
+    for a, b in zip(chain, chain[1:]):
+        if a and b:
+            cv2.line(frame, a, b, (170, 170, 170), 1, cv2.LINE_AA)
+    for i, a in enumerate(chain):
+        if a:
+            cv2.circle(frame, a, 2, (170, 170, 170), -1, cv2.LINE_AA)
+            if i == getattr(task, "_seg_i", -1):
+                cv2.circle(frame, a, 7, (255, 255, 255), 1, cv2.LINE_AA)
+
+    y = 22
+    for label, colour, base, err in pairs:
+        pt, pa = px(base), px(base + 1)
+        if pt:
+            cv2.line(frame, (pt[0] - 9, pt[1]), (pt[0] + 9, pt[1]), colour, 1, cv2.LINE_AA)
+            cv2.line(frame, (pt[0], pt[1] - 9), (pt[0], pt[1] + 9), colour, 1, cv2.LINE_AA)
+            cv2.circle(frame, pt, 4, colour, -1, cv2.LINE_AA)
+        if pa:
+            cv2.circle(frame, pa, 6, colour, 2, cv2.LINE_AA)
+        if pt and pa:
+            cv2.line(frame, pt, pa, colour, 1, cv2.LINE_AA)
+        cv2.putText(frame, f"{label} target  err {err * 100:5.1f} cm", (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1, cv2.LINE_AA)
+        y += 20
+    cv2.putText(frame, f"t={tick}  {cmd.phase}", (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (255, 255, 255), 1, cv2.LINE_AA)
+    y += 20
+    if "L_ee" in eef_y and "R_ee" in eef_y:
+        lt, lm = eef_y["L_ee"]
+        rt, rm = eef_y["R_ee"]
+        cv2.putText(
+            frame,
+            f"world y  target L {lt:+.3f} R {rt:+.3f} d {lt - rt:+.3f}"
+            f"  measured L {lm:+.3f} R {rm:+.3f} d {lm - rm:+.3f}",
+            (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+    cv2.putText(frame, "+ commanded    o measured", (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                0.45, (220, 220, 220), 1, cv2.LINE_AA)
+    return frame
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--task", default="carry", choices=list(TASKS))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--max-ticks", type=int, default=800)
+    ap.add_argument("--max-ticks", type=int, default=0,
+                    help="0 = the task's own budget (long-horizon tasks size it from the route)")
     ap.add_argument("--port", type=int, default=5620)
     ap.add_argument("--frame-every", type=int, default=5)
     ap.add_argument("--debug-every", type=int, default=0,
                     help="log measured vs WBC-reference base pose + head pose every N ticks")
     ap.add_argument("--head-cost", type=float, default=None,
                     help="override head_world_position_cost on all 3 axes (default: env's own)")
+    ap.add_argument("--no-overlay", action="store_true",
+                    help="do not draw the commanded EEF/head targets on the 3rd-person video")
     import zed_sim
     zed_sim.ZedSimOptions.add_cli(ap)
     args = ap.parse_args()
@@ -39,14 +130,20 @@ def main():
     mobile = getattr(task, "MOBILE", False)
     ovr = None
     if args.head_cost is not None:
-        ovr = {"head_world_position_cost": [args.head_cost] * 3,
-               "enable_torso_top_x_anchor": False}
+        ovr = {"head_world_position_cost": [args.head_cost] * 3}
     env = VegaOGEnv(task=task, lock_base=not mobile, mobile=mobile, wbc_port=args.port, pos_kp=4000,
                     obs_hw=zed_sim.head_render_hw(zed_opts), grasping_mode=task.GRASPING_MODE,
                     wbc_overrides=ovr, robot_pos=task.ROBOT_POS, robot_yaw=task.ROBOT_YAW)
     if mobile:
         env.base_x_max = getattr(task, "BASE_X_MAX", None)   # forward-park clamp near the table
+        if getattr(task, "BASE_MAX_ANG", None) is not None:
+            env.base_max_ang = float(task.BASE_MAX_ANG)   # whole-episode cap, see the task class
+        if getattr(task, "BASE_MAX_LIN", None) is not None:
+            env.base_max_lin = float(task.BASE_MAX_LIN)   # whole-episode cap, see the task class
+        if hasattr(task, "keepouts"):
+            env.base_keepouts = task.keepouts()               # park circles at each station
     env.reset(seed=args.seed)
+    max_ticks = args.max_ticks or int(getattr(task, "MAX_TICKS", 800))
     # Park the head camera at zed_depth_frame + add the wrist camera, exactly as the data
     # collector does, so the head video the user reviews IS the policy's recorded view.
     from obs_pipeline import SimObsRecorder
@@ -56,17 +153,17 @@ def main():
     P(f"[run] task={args.task} seed={args.seed} grasp={task.GRASPING_MODE}; "
       f"src@{np.round(src,3)} dst@{np.round(dst,3)}")
 
-    # aim the 3rd-person review camera at the work area (midpoint of the objects), from front-left
-    # and above -- looks down at the table + arms rather than off at a wall (the old default did).
-    work = (src + dst) / 2.0
-    env._set_cam_lookat(work + np.array([-0.55, 1.15, 0.95]), work)
+    # the review camera CHASES the robot (see follow_third_person): a long-horizon episode covers
+    # several metres, so anything anchored to the work area loses the robot within a second or two
+    env.follow_third_person()
     for _ in range(3):
         og.sim.render()
 
     frames, thirds = [], []
     last_phase = None
     resp = {}
-    for i in range(args.max_ticks):
+    tilt, yaws = [], []           # chassis roll/pitch and heading, for the motion-quality report
+    for i in range(max_ticks):
         cmd = task.expert_step(env, {})
         if cmd.base_vel is not None:
             env.drive_base(cmd.base_vel)                        # navigate
@@ -88,7 +185,9 @@ def main():
                       f" pitch={pitch(Th):+.1f}/{pitch(cmd.head_target):+.1f}"
                       f" hj3={np.degrees(q[env.name2idx['head_j3']]):+.1f}"
                       f" torso={np.round(np.degrees([q[env.name2idx[n]] for n in ('torso_j1','torso_j2','torso_j3')]),1)}")
-            P(f"    [dbg {i:3d}] base_meas={np.round(meas,3)} wbc_ref={np.round(ref,3)}{he}")
+            lim = env.at_limits([f"L_arm_j{k}" for k in range(1, 8)] + ["torso_j1", "torso_j2", "torso_j3"])
+            P(f"    [dbg {i:3d}] base_meas={np.round(meas,3)} wbc_ref={np.round(ref,3)}{he}"
+              + (f" AT-LIMIT={lim}" if lim else ""))
         if cmd.phase != last_phase:
             src = task.objects_of_interest(env)[0]
             ag = env.is_grasping("left")
@@ -99,24 +198,47 @@ def main():
             bx, by, bwz = env.base_xyyaw()
             byaw = round(float(np.degrees(bwz)), 1)
             bpos = env.link_pose('base')[:3, 3]
+            tz, trx, tryy = env.chassis_tilt()          # 0,0,0 unless the chassis is tipping
+            tilt.append(max(abs(trx), abs(tryy)))
+            extra += f" tilt=({tz:+.3f},{np.degrees(trx):+.1f},{np.degrees(tryy):+.1f})"
             P(f"  tick {i:3d} phase={cmd.phase:9s} base=({bpos[0]:.2f},{bpos[1]:.2f}) yaw={byaw:+.1f} "
               f"src@{np.round(src,3)} ee_err={ee_err if ee_err is None else round(float(ee_err),4)} "
               f"grasped={ag.name if ag is not None else None}{extra}")
             last_phase = cmd.phase
         if i % args.frame_every == 0:
+            yaws.append(env.base_xyyaw()[2])
+            tilt.append(max(abs(v) for v in env.chassis_tilt()[1:]))
             f = head_rgb(rec)                                   # head-cam view (the policy's view)
             if f is not None:
                 frames.append(f)
             try:
-                thirds.append(env.capture_third_person())       # 3rd-person review view
-            except Exception:
-                pass
+                env.follow_third_person()                       # keep the robot in frame
+                # Viewer-camera observation is a render-product buffer. Updating the camera pose
+                # alone leaves the next capture showing the previous pose while the overlay is
+                # projected through the new one, so render twice just as camera setup does.
+                for _ in range(2):
+                    og.sim.render()
+                third = env.capture_third_person()              # 3rd-person review view
+                if not args.no_overlay:
+                    third = draw_targets(env, task, third, cmd, i)
+                thirds.append(third)
+            except Exception as exc:
+                if not getattr(main, "_third_warned", False):
+                    main._third_warned = True
+                    P(f"[run] third-person capture failed: {exc!r}")
         if cmd.done:
             break
 
     succ = task.success(env)
     src, dst = task.objects_of_interest(env)
+    # Motion quality, the thing the review video is actually judged on: total yaw variation (the
+    # real robot manages 11.7 deg over a 3.5 m path and never commands wz at all) and the worst
+    # chassis roll/pitch, which is 0 unless the body is tipping.
+    y = np.unwrap(np.asarray(yaws, dtype=float)) if yaws else np.zeros(1)
     P(f"[run] SUCCESS={succ}  final src@{np.round(src,3)} dst@{np.round(dst,3)}  frames={len(frames)}")
+    P(f"[run] motion: yaw net {np.degrees(y[-1] - y[0]):+.1f} deg, total variation "
+      f"{np.degrees(np.abs(np.diff(y)).sum()):.1f} deg; max chassis tilt "
+      f"{np.degrees(max(tilt) if tilt else 0.0):.2f} deg")
     import imageio
     for tag, buf in [("", frames), ("_3rd", thirds)]:
         if not buf:

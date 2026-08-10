@@ -1,0 +1,83 @@
+Starting kit application with the following args:  ['/home/yixuan/miniforge3/envs/behavior/lib/python3.11/site-packages/isaacsim/exts/isaacsim.simulation_app/isaacsim/simulation_app/simulation_app.py', '/home/yixuan/miniforge3/envs/behavior/lib/python3.11/site-packages/isaacsim/apps/omnigibson_5_1_0.kit', '--/app/tokens/exe-path=/home/yixuan/miniforge3/envs/behavior/lib/python3.11/site-packages/isaacsim/kit', '--/persistent/app/viewport/displayOptions=3094', '--/rtx/materialDb/syncLoads=True', '--/rtx/hydra/materialSyncLoads=True', '--/omni.kit.plugin/syncUsdLoads=True', '--/app/renderer/resolution/width=1280', '--/app/renderer/resolution/height=720', '--/app/window/width=1440', '--/app/window/height=900', '--/renderer/multiGpu/enabled=False', '--/app/fastShutdown=True', '--/app/installSignalHandlers=0', '--ext-folder', '/home/yixuan/miniforge3/envs/behavior/lib/python3.11/site-packages/isaacsim/exts', '--ext-folder', '/home/yixuan/miniforge3/envs/behavior/lib/python3.11/site-packages/isaacsim/apps', '--/physics/cudaDevice=0', '--/plugins/carb.tasking.plugin/threadCount=32', '--/plugins/omni.tbb.globalcontrol/maxThreadCount=32', '--no-window', '--/app/window/hideUi=1']
+Passing the following args to the base kit application:  ['--portable-root', '/home/yixuan/BEHAVIOR-1K/OmniGibson/appdata/local', '--/app/tokens/omni_global_cache=/home/yixuan/BEHAVIOR-1K/OmniGibson/appdata/global/cache', '--/app/tokens/omni_global_data=/home/yixuan/BEHAVIOR-1K/OmniGibson/appdata/global/data']
+[Info] [carb] Logging to file: /home/yixuan/BEHAVIOR-1K/OmniGibson/appdata/local/logs/Kit/OmniGibson/3.9/kit_20260726_043418.log
+
+|---------------------------------------------------------------------------------------------|
+| Driver Version: 570.211.01    | Graphics API: Vulkan
+|=============================================================================================|
+| GPU | Name                             | Active | LDA | GPU Memory | Vendor-ID | LUID       |
+|     |                                  |        |     |            | Device-ID | UUID       |
+|     |                                  |        |     |            | Bus-ID    |            |
+|---------------------------------------------------------------------------------------------|
+| 0   | NVIDIA GeForce RTX 4090          | Yes: 0 |     | 24564   MB | 10de      | 0          |
+|     |                                  |        |     |            | 2684      | 879a3476.. |
+|     |                                  |        |     |            | 1         |            |
+|=============================================================================================|
+| OS: 22.04.5 LTS (Jammy Jellyfish) ubuntu, Version: 22.04.5, Kernel: 6.8.0-124-generic
+| Processor: AMD Ryzen 9 7950X 16-Core Processor
+| Cores: 16 | Logical Cores: 32
+|---------------------------------------------------------------------------------------------|
+| Total Memory (MB): 63460 | Free Memory: 48222
+| Total Page/Swap (MB): 2047 | Free Page/Swap: 0
+|---------------------------------------------------------------------------------------------|
+Warp 1.8.2 initialized:
+   CUDA Toolkit 12.8, Driver 12.8
+   Devices:
+     "cpu"      : "x86_64"
+     "cuda:0"   : "NVIDIA GeForce RTX 4090" (24 GiB, sm_89, mempool enabled)
+   Kernel cache:
+     /home/yixuan/.cache/warp/1.8.2
+
+
+
+                   ____________
+                  /          / \
+                 /          / /__
+                /          / /  /\
+               /__________/ /__/  \
+               \   _____  \ \__\  /
+                \  \  / \  \ \_/ /
+                 \  \/___\  \   /
+                  \__________\_/  
+       ___                  _  ____ _ _                     
+      / _ \ _ __ ___  _ __ (_)/ ___(_) |__  ___  ___  _ __  
+     | | | | '_ ` _ \| '_ \| | |  _| | '_ \/ __|/ _ \| '_ \ 
+     | |_| | | | | | | | | | | |_| | | |_) \__ \ (_) | | | |
+      \___/|_| |_| |_|_| |_|_|\____|_|_.__/|___/\___/|_| |_|
+
+[wbc_client] spawning WBC service: /home/yixuan/miniforge3/envs/dexmate/bin/python /home/yixuan/omniteleop/sim_eval/wbc_service.py --host 127.0.0.1 --port 5911 --overrides {"head_world_position_cost": [10000.0, 10000.0, 10000.0], "enable_torso_top_x_anchor": false}
+[wbc_service] loading VegaWholeBodyIK(/home/yixuan/omniteleop/src/omniteleop/follower/wbik.yaml) overrides={'head_world_position_cost': [10000.0, 10000.0, 10000.0], 'enable_torso_top_x_anchor': False} ...
+[wbc_service] loaded: nq=24 nv=23 head_mode=ik
+[wbc_service] listening on 127.0.0.1:5911 (READY)
+[wbc_service] client connected: ('127.0.0.1', 50666)
+[wbc_client] connected to WBC service
+[towel2rack] decluttered 21 objects: ['bed', 'carpet', 'coffee_table', 'floor_lamp', 'laptop', 'loudspeaker', 'mirror', 'ottoman', 'pedestal_sink', 'picture', 'pot_plant', 'shower_stall', 'sofa', 'standing_tv', 'swivel_chair', 'toilet']
+[towel2rack] route [[0.56, 0.4], [0.6, -1.98]] -> 1 transit legs; obj@[1.207 0.731 0.777] release@[ 1.032 -2.569  0.976] headings=[0.0, 0.0, 0.0, 0.0, 0.0, -89.0, -81.8, -81.8, -81.8, -81.8, -81.8]
+[towel2rack] L_ee0=[0.154 0.754 0.91 ] finger_ctr=[0.28  0.762 0.881] head0=[-0.324  0.425  1.497] segs=11 ticks=2507
+[mobile] head=zed_depth_frame head0=[-0.324  0.425  1.497] head_off_base=[-0.605 -0.338  0.616]
+[obs] zed realism: none (OmniGibson defaults); head K fx=259.11 fy=259.11 cx=160.00 cy=120.00 (dev from real ZED_K 130.745 px)
+[run] task=towel2rack seed=0 grasp=sticky; src@[1.207 0.731 0.777] dst@[ 1.032 -2.569  0.463]
+  tick   0 phase=pregrasp  base=(-0.35,0.40) yaw=+0.0 src@[1.207 0.731 0.777] ee_err=0.0043 grasped=None fq=[0.0001, 0.0] d(gp,src)=0.938
+  tick 300 phase=approach  base=(0.58,0.34) yaw=+0.1 src@[1.207 0.731 0.777] ee_err=0.0263 grasped=None fq=[0.0, 0.0001] d(gp,src)=0.073
+  tick 340 phase=settle    base=(0.57,0.40) yaw=+0.1 src@[1.18  0.709 0.78 ] ee_err=0.0722 grasped=None fq=[-0.0, 0.003] d(gp,src)=0.068
+  tick 390 phase=close     base=(0.57,0.46) yaw=-3.1 src@[1.187 0.703 0.779] ee_err=0.0893 grasped=lh_obj fq=[0.0229, 0.018] d(gp,src)=0.078
+  tick 435 phase=lift      base=(0.51,0.46) yaw=-3.3 src@[1.138 0.699 0.778] ee_err=0.1232 grasped=lh_obj fq=[0.7853, 0.7854] d(gp,src)=0.071
+  tick 495 phase=transit0  base=(0.55,0.46) yaw=-3.5 src@[1.151 0.664 0.782] ee_err=0.2811 grasped=lh_obj fq=[0.7854, 0.7854] d(gp,src)=0.071
+  tick 1817 phase=arrive    base=(0.50,-2.20) yaw=-65.0 src@[ 1.024 -2.575  0.99 ] ee_err=0.0792 grasped=lh_obj fq=[0.7854, 0.7854] d(gp,src)=0.071
+  tick 2237 phase=carry     base=(0.59,-2.17) yaw=-65.0 src@[ 1.135 -2.62   0.964] ee_err=0.0992 grasped=lh_obj fq=[0.7854, 0.7854] d(gp,src)=0.071
+  tick 2347 phase=place     base=(0.59,-2.17) yaw=-65.0 src@[ 1.135 -2.622  0.978] ee_err=0.106 grasped=lh_obj fq=[0.7854, 0.7854] d(gp,src)=0.071
+  tick 2437 phase=release   base=(0.58,-2.17) yaw=-65.1 src@[ 1.143 -2.612  0.949] ee_err=0.102 grasped=lh_obj fq=[0.774, 0.774] d(gp,src)=0.067
+  tick 2477 phase=retreat   base=(0.58,-2.17) yaw=-65.1 src@[ 1.144 -2.612  0.939] ee_err=0.1004 grasped=None fq=[0.0, 0.0] d(gp,src)=0.078
+  tick 2507 phase=done      base=(0.58,-2.17) yaw=-65.1 src@[ 1.144 -2.612  0.939] ee_err=0.1113 grasped=None fq=[0.0, 0.0] d(gp,src)=0.12
+[run] SUCCESS=True  final src@[ 1.144 -2.612  0.939] dst@[ 1.032 -2.569  0.463]  frames=502
+[run] wrote /home/yixuan/Dexmate/tmp/scratchpad/behavior/towel2rack.mp4
+[run] wrote /home/yixuan/Dexmate/tmp/scratchpad/behavior/towel2rack_3rd.mp4
+[wbc_service] client disconnected
+[0m[00:00:04.693] [INFO] [omnigibson.simulator] ----- Starting OmniGibson. This will take 10-30 seconds... -----[0m
+DEBUG:asyncio:Using selector: EpollSelector
+[0m[00:00:11.099] [INFO] [omnigibson.simulator] ---------- Welcome to OmniGibson! ----------[0m
+[0m[00:00:39.622] [INFO] [omnigibson.simulator] Imported scene 0.[0m
+
+Expected all fingers to have same parent link, but found multiple parents at /World/scene_0/controllable__vega_robotiq__robot_nqbagg/L_robotiq_left_inner_knuckle and /World/scene_0/controllable__vega_robotiq__robot_nqbagg/L_robotiq_right_inner_knuckle[0m
+
+
