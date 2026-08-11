@@ -29,9 +29,8 @@ z-depth the pinhole model wants) -- NOT `depth`, which OmniGibson maps to `dista
 millimetres (`wbc_pointcloud.DEPTH_SCALE_M = 1e-3`); non-finite/out-of-range pixels become 0,
 which falls below `MIN_DEPTH_M` and is dropped by the unprojection.
 
-`zed_sim.ZedSimOptions` optionally makes the cameras behave like the real ZEDs -- real field of
-view + the publisher's crop/resize, and the measured depth-dropout process. Every switch defaults
-OFF, so unless one is passed the frames are plain OmniGibson renders as before.
+`zed_sim.ZedSimOptions` applies the measured depth-dropout process by default. Field-of-view and
+crop/resize changes remain opt-in, so enabling dropout does not alter camera geometry.
 
 vega_robotiq has no wrist camera prim, so `setup()` creates one under the eef link, pulled back
 and raised above the measured eef->fingertip direction (`finger_grasp_point`), then aimed at the
@@ -76,15 +75,15 @@ class SimObsRecorder:
 
     def __init__(self, env, arm="left", wrist_back=0.12, wrist_up=0.08, seed=0, zed=None):
         self.env = env
-        self.arm = arm
-        self.eef_link = {"left": "L_ee", "right": "R_ee"}[arm]
+        self.arms = ("left", "right")
+        self.eef_links = {"left": "L_ee", "right": "R_ee"}
         self.wrist_back = wrist_back
         self.wrist_up = wrist_up
         self.head_cam = None
-        self.wrist_cam = None
+        self.wrist_cams = {side: None for side in self.arms}
         self._head_key = None
         self._render_k = None                 # K of the raw render (pre crop/resize)
-        self.zed = zed or zed_sim.ZedSimOptions()   # all realism switches default OFF
+        self.zed = zed or zed_sim.ZedSimOptions()
         self._rng = np.random.default_rng(seed)   # depth-dropout draws; per-episode reproducible
 
     # ---- cameras ----
@@ -92,11 +91,25 @@ class SimObsRecorder:
         robot = self.env.robot
         self.head_cam = next(iter(robot.sensors.values()))
         self._retarget_head_camera()
-        self._render_k = zed_sim.configure_head_camera(self.head_cam, self.zed)
-        if self.wrist_cam is None:            # created once; re-aimed on every episode reset
-            self.wrist_cam = self._make_wrist_camera()
-            zed_sim.configure_wrist_camera(self.wrist_cam, self.zed)
-        self._place_wrist_camera()
+        # Retargeting the camera prim (and the task's scene decluttering immediately before
+        # setup) invalidates Fabric's camera data until a later render.  The exact number of
+        # renders is nondeterministic in headless mode, so retry only OmniGibson's documented
+        # degenerate-intrinsic sentinel.  This synchronizes Fabric; it does not alter FOV.
+        for attempt in range(8):
+            og.sim.render()
+            try:
+                self._render_k = zed_sim.configure_head_camera(self.head_cam, self.zed)
+                break
+            except AssertionError as exc:
+                if "intrinsic matrix" not in str(exc) or "degenerate" not in str(exc):
+                    raise
+                if attempt == 7:
+                    raise RuntimeError("head camera did not synchronize with Fabric after 8 renders") from exc
+        for side in self.arms:
+            if self.wrist_cams[side] is None:  # created once; re-aimed on every reset
+                self.wrist_cams[side] = self._make_wrist_camera(side)
+                zed_sim.configure_wrist_camera(self.wrist_cams[side], self.zed)
+            self._place_wrist_camera(side)
         for _ in range(4):
             og.sim.render()
         k = self.intrinsic()
@@ -131,18 +144,19 @@ class SimObsRecorder:
         # into the lower-left corner. `zed_sim.NEAR_CLIP_M` clears both -- see the constant.
         self.head_cam.clipping_range = (_NEAR_CLIP_M, 1.0e7)
 
-    def _make_wrist_camera(self):
+    def _make_wrist_camera(self, arm):
         """Create a VisionSensor prim on the eef link (vega_robotiq ships no wrist camera)."""
         from omnigibson.sensors import create_sensor
         from omnigibson.utils.usd_utils import absolute_prim_path_to_scene_relative
 
         env, robot = self.env, self.env.robot
         h, w = zed_sim.wrist_render_hw(self.zed)
-        path = f"{robot.prim_path}/{self.eef_link}/WristCam"
+        eef_link = self.eef_links[arm]
+        path = f"{robot.prim_path}/{eef_link}/WristCam"
         sensor = create_sensor(
             sensor_type="Camera",
             relative_prim_path=absolute_prim_path_to_scene_relative(env.env.scene, path),
-            name=f"{robot.name}:wrist_cam",
+            name=f"{robot.name}:{arm}_wrist_cam",
             modalities=["rgb"],
             sensor_kwargs={"image_height": h, "image_width": w},
         )
@@ -151,11 +165,11 @@ class SimObsRecorder:
             sensor.initialize()
         return sensor
 
-    def _place_wrist_camera(self):
+    def _place_wrist_camera(self, arm):
         """Mount the wrist camera above the approach axis and aim it at the grasp point."""
         env = self.env
-        Tee = env.link_pose(self.eef_link)
-        grasp_point = env.finger_grasp_point(self.arm)
+        Tee = env.link_pose(self.eef_links[arm])
+        grasp_point = env.finger_grasp_point(arm)
         approach = grasp_point - Tee[:3, 3]                           # eef -> fingertips (world)
         approach /= max(np.linalg.norm(approach), 1e-9)
         up = np.array([0.0, 0.0, 1.0])
@@ -171,7 +185,7 @@ class SimObsRecorder:
         # optical frame: x right, y down, z forward
         T_opt = _T(camera_pos, np.stack([right, -view_up, view_fwd], axis=1))
         T_local = np.linalg.inv(Tee) @ T_opt @ _OPTICAL_TO_USD
-        self.wrist_cam.set_position_orientation(
+        self.wrist_cams[arm].set_position_orientation(
             position=T_local[:3, 3].tolist(),
             orientation=R.from_matrix(T_local[:3, :3]).as_quat().tolist(),
             frame="parent",
@@ -187,8 +201,8 @@ class SimObsRecorder:
         return zed_sim.head_frame(_np(obs["rgb"]), _np(obs["depth_linear"]),
                                   self._rng, self._render_k, self.zed)
 
-    def _wrist_rgb(self):
-        obs, _ = self.wrist_cam.get_obs()
+    def _wrist_rgb(self, arm):
+        obs, _ = self.wrist_cams[arm].get_obs()
         return zed_sim.wrist_frame(_np(obs["rgb"]), self.zed)
 
     def frame(self, cmd, timestamp_ns, wbc_resp=None):
@@ -198,34 +212,55 @@ class SimObsRecorder:
         joints = {grp: np.array([q[env.name2idx[n]] for n in names], dtype=np.float32)
                   for grp, names in (("torso", _TORSO), ("left_arm", _ARM_L),
                                      ("right_arm", _ARM_R), ("head", _HEAD))}
+        base_twist = env.base_body_twist()
+        joints.update({
+            "chassis_vx": np.float32(base_twist[0]),
+            "chassis_vy": np.float32(base_twist[1]),
+            "chassis_wz": np.float32(base_twist[2]),
+        })
         rgb, depth = self._head_images()
-        head_tgt = cmd.head_target if cmd.head_target is not None else env.link_pose("zed_depth_frame")
+        if wbc_resp is None or "effective_targets" not in wbc_resp:
+            raise RuntimeError("recording requires the post-filter targets actually sent to IK")
+        effective = wbc_resp["effective_targets"]
+        if effective["head"] is None:
+            raise RuntimeError("recording requires a commanded head target")
         base = np.array(env.base_xyyaw(), dtype=np.float32)
         frame = {
             "timestamp_ns": np.int64(timestamp_ns),
             "obs": {
                 "images": {"head_left_rgb": rgb, "head_depth": depth,
-                           "left_wrist_rgb": self._wrist_rgb()},
+                           "left_wrist_rgb": self._wrist_rgb("left"),
+                           "right_wrist_rgb": self._wrist_rgb("right")},
                 "joint": joints,
                 "base": {"pose": base},
                 # achieved gripper reading (hardware: raw FC03; sim: driven knuckle angle)
-                "gripper": {side: np.float32(env.finger_qpos(side)[0]) for side in ("left", "right")},
+                "gripper": {side: np.float32(env.finger_position_normalized(side))
+                            for side in ("left", "right")},
             },
             "action": {
                 # verbatim ik.solve targets, WBC engage-origin world -- the action the policy learns
-                "eef": {"left": env.og_to_wbc(cmd.left_target).astype(np.float32),
-                        "right": env.og_to_wbc(cmd.right_target).astype(np.float32)},
-                "head": env.og_to_wbc(head_tgt).astype(np.float32),
-                "gripper": {"left": _binary_grip(env, cmd.gripper_left),
-                            "right": _binary_grip(env, cmd.gripper_right)},
+                "eef": {"left": np.asarray(effective["left"], dtype=np.float32),
+                        "right": np.asarray(effective["right"], dtype=np.float32)},
+                "head": np.asarray(effective["head"], dtype=np.float32),
+                "gripper": {"left": np.float32(cmd.gripper_action_left),
+                            "right": np.float32(cmd.gripper_action_right)},
             },
         }
-        if wbc_resp is not None:   # parity with the hardware take; not read by the porters
-            tgt = _joint_targets(wbc_resp)
-            frame["action"]["joint"] = {grp: np.array([tgt[n] for n in names], dtype=np.float32)
-                                        for grp, names in (("torso", _TORSO), ("left_arm", _ARM_L),
-                                                           ("right_arm", _ARM_R), ("head", _HEAD))}
-            frame["action"]["base"] = {"pose": np.asarray(wbc_resp["base_pose"], dtype=np.float32)}
+        sent = wbc_resp.get("sent_joints")
+        sent_base = np.asarray(wbc_resp.get("sent_base_twist"), dtype=np.float32)
+        if not isinstance(sent, dict) or sent_base.shape != (3,):
+            raise RuntimeError("recording requires post-clamp joint and shaped base commands")
+        frame["action"]["joint"] = {
+            **{grp: np.array([sent[n] for n in names], dtype=np.float32)
+               for grp, names in (("torso", _TORSO), ("left_arm", _ARM_L),
+                                  ("right_arm", _ARM_R), ("head", _HEAD))},
+            "chassis_vx": np.float32(sent_base[0]),
+            "chassis_vy": np.float32(sent_base[1]),
+            "chassis_wz": np.float32(sent_base[2]),
+        }
+        frame["action"]["base"] = {
+            "pose": np.asarray(wbc_resp["base_pose"], dtype=np.float32)
+        }
         return frame
 
 
@@ -236,8 +271,9 @@ _HEAD = ["head_j1", "head_j2", "head_j3"]
 
 
 def _binary_grip(env, cmd_value):
-    """Task convention (-1 close / +1 open) -> the dataset's categorical 1 closed / 0 open."""
-    return np.float32(1.0 if float(cmd_value) == float(env.grip_close) else 0.0)
+    """Compatibility fallback for callers without semantic actions (0=open, 1=closed)."""
+    span = float(env.grip_open) - float(env.grip_close)
+    return np.float32(np.clip((float(env.grip_open) - float(cmd_value)) / span, 0.0, 1.0))
 
 
 def _joint_targets(resp):

@@ -73,31 +73,6 @@ def rot_y(pitch):
 #: follower deadbands instead would have been the wrong repair -- it would buy smoothness in sim
 #: that the hardware cannot reproduce, in demonstrations meant to transfer to it.
 TRANSIT_SPEED = 0.17
-#: Follower speed cap for the whole episode, replacing the 0.45 m/s wbik.yaml teleop value.
-#:
-#: Raising TRANSIT_SPEED alone does not make the base move steadily, because the chassis command
-#: never carries the plan's speed in the first place. Measured over a transit leg: the base tracks
-#: its commanded pose to within 4.5 cm (max 9.8 cm), yet the QP's `base_twist` sits pinned at its
-#: own 0.900 m/s cap on 91 % of ticks -- 2 cm of lag already saturates it. The solver twist is
-#: therefore a BANG-BANG "go / stop" signal, and the follower's 0.4 m/s^2 slew limiter integrates
-#: that square wave into a triangle: with a 0.45 m/s ceiling the base accelerated to 0.36 m/s,
-#: overtook its own target, and the y demand then collapsed far enough that a leftover 4 cm x
-#: error won the solver's single-axis argmax for one tick -- which reads to
-#: `deadband_by_reference` as "y went quiet" and zeroes the y slew anchor outright. 0.2 s of
-#: standstill, then the whole ramp again, 13 times per leg.
-#: Capping the follower just above the planned speed removes that mechanism rather than damping
-#: it: the saturated twist is clamped to a speed the plan actually wants, so the base does not run
-#: away from its target and the demand does not collapse. The margin over TRANSIT_SPEED is what
-#: lets a corner's residual lag be recovered.
-#: Measured on the same leg, the two together take the dispatched command from zero on 36 % of
-#: ticks to 7.8 %, and the base speed from 0.081 +- 0.068 m/s to 0.168 +- 0.058.
-#: What is LEFT is not the same fault and is not a task parameter: driving one axis at a time
-#: means the ~4 cm of cross-axis drift a strafe accumulates can only be corrected by taking ticks
-#: away from the travel axis, and each handover costs one dead-zone crossing (~0.15 s, about once
-#: every 1.75 s here). That is the shipped controller stack doing what wbik.yaml says it does --
-#: the same "post-slew tail-cut at axis-switch" the hardware config documents -- so it is left
-#: alone, for the reason given under TRANSIT_SPEED.
-BASE_MAX_LIN = round(1.2 * TRANSIT_SPEED, 3)
 #: Retained for the non-prehensile station tasks, whose existing layouts may still require a turn.
 TURN_RATE = 0.35
 #: World x of the post-pick retreat lane. From SRC_PARK this creates the real-data order
@@ -151,30 +126,37 @@ def _manhattan(nav, route, yaw, min_leg=MIN_LEG):
 
     Each planned leg therefore becomes two: one along the body's forward axis and one along its
     lateral axis. Both orderings are tried and the one whose corner stays on traversable floor
-    wins; if neither does, the diagonal is kept rather than driven through a wall.
+    wins. If neither is valid, planning fails; emitting the original diagonal would violate the
+    controller contract this function exists to enforce.
     """
     R = rot_z(yaw)[:2, :2]
     out = [np.asarray(route[0], dtype=float)]
     for pt in np.asarray(route, dtype=float)[1:]:
         a = out[-1]
         d = R.T @ (pt - a)                       # displacement in the body frame
-        for first in (0, 1):
-            step = np.zeros(2)
-            step[first] = d[first]
-            mid = a + R @ step
-            if min(abs(d[0]), abs(d[1])) < min_leg:
-                break                            # already single-axis; nothing to split
-            if nav.visible(a, mid) and nav.visible(mid, pt):
-                out.append(mid)
-                break
-        out.append(pt)
-    keep = [out[0]]
-    for p in out[1:]:
-        if float(np.linalg.norm(p - keep[-1])) >= min_leg:
-            keep.append(p)
-    if len(keep) == 1 or float(np.linalg.norm(out[-1] - keep[-1])) > 1e-6:
-        keep.append(out[-1])
-    return np.stack(keep)
+        active = np.flatnonzero(np.abs(d) > 1e-9)
+        if len(active) == 0:
+            continue
+        if len(active) == 2:
+            corner = None
+            # Prefer putting a sub-minimum correction second, but never merge it into a diagonal.
+            order = (int(np.argmax(np.abs(d))), int(np.argmin(np.abs(d))))
+            for first in order:
+                step = np.zeros(2)
+                step[first] = d[first]
+                mid = a + R @ step
+                if nav.visible(a, mid) and nav.visible(mid, pt):
+                    corner = mid
+                    break
+            if corner is None:
+                raise ValueError(f"no axis-aligned visible split for route leg {a} -> {pt}")
+            if float(np.linalg.norm(corner - out[-1])) > 1e-9:
+                out.append(corner)
+        if float(np.linalg.norm(pt - out[-1])) > 1e-9:
+            out.append(pt)
+    # ``min_leg`` is intentionally not used to erase an orthogonal correction: deleting a short
+    # corner rejoins its neighbours into the diagonal this function forbids.
+    return np.stack(out)
 
 
 def _box2cloth_route(nav, start, goal, retreat_x=RETREAT_X):
@@ -228,13 +210,16 @@ class LHSpec:
     #: final rotation is ``Rz(reorient_yaw) @ Rx(reorient_roll)`` composed with ``obj_quat``.
     reorient_roll: float = 0.0
     reorient_yaw: float = 0.0
-    #: Translate destination waypoints by the measured object-to-finger attachment transform.
+    #: Translate destination waypoints by the full measured object-to-finger attachment transform.
     #: This is useful for top-surface drops, but an incidental off-centre pinch must not rewrite
-    #: the book's insertion path after its 90-degree wrist turn.  That path stays feed-forward and
-    #: its stocked cubby provides the physical clearance for contact-transform variation.
+    #: the book's horizontal insertion lane.
     attachment_reaim: bool = True
-    #: Body-frame downward pitch at the source. ``rotate_book`` applies the object reorientation
-    #: on top of this same alignment, so the attached object's relative rotation stays exact.
+    #: Correct only destination height from the measured attachment while retaining feed-forward
+    #: x/y. The upright book does not rotate after grasping, so this makes its centre follow the
+    #: intended cubby height without steering an incidental lateral pinch into either filler book.
+    attachment_vertical_reaim: bool = False
+    #: Body-frame downward pitch at the source. Any requested object reorientation is composed on
+    #: top of this same alignment, so the attached object's relative rotation stays exact.
     #: A full top-down 90 degrees is not reachable on Vega at the table: measured, it saturated
     #: L_arm_j3/j6, retained 93 mm planar error, and shoved the book 178 mm before closing.
     grasp_pitch: float = 0.0
@@ -251,6 +236,16 @@ class LHSpec:
     grasp_tool_roll: float = 0.0
     #: Optional independent tool-axis roll for the right wrist.
     right_grasp_tool_roll: float | None = None
+    #: Optional normalized Robotiq close target. `None` retains the suite-wide fully-closed
+    #: command. A rigid object should instead stop near its measured width: otherwise the
+    #: position drive stores contact energy against the assisted constraint and releases it as a
+    #: launch impulse when that simulation-only joint is removed.
+    grip_close_cmd: float | None = None
+    #: Extra ticks at the achieved close target before lifting. OmniGibson assisted grasping
+    #: requires 0.3 s of uninterrupted two-finger contact; a width-matched position target can
+    #: first make contact on the last close-ramp tick, so selected rigid objects need this short
+    #: force-establishment window rather than a deeper, collision-prone close command.
+    grasp_hold_ticks: int = 0
     #: Half the separation between two grasp points along ``bimanual_axis`` in the object frame.
     #: Zero is the ordinary single-left-arm plan.
     bimanual_half_span: float = 0.0
@@ -258,8 +253,8 @@ class LHSpec:
     #: side edges (local +/-y) while both wrists stay in the robot's validated forward pose.
     bimanual_axis: tuple = (1.0, 0.0, 0.0)
     #: Where on the source table this object starts, overriding the shared `SRC_OBJ_XY` mark.
-    #: That mark was placed for a 73 mm bowl and sits 115 mm in from the tabletop's near face
-    #: (solid top measured at x = 1.085), so a LONG object centred there hangs over the edge --
+    #: The shared mark sits 115 mm in from the tabletop's near face (solid top measured at
+    #: x = 1.085), so a LONG object centred there hangs over the edge --
     #: measured, a 300 mm towel overhung it by 35 mm, and a gripper closing on a towel whose end
     #: is over thin air tips it instead of holding it. Only the object moves; the park, the
     #: keepout and the whole approach are unchanged.
@@ -267,11 +262,8 @@ class LHSpec:
     #: An object that RESTS ON the station and becomes the actual receptacle -- DatasetObject
     #: kwargs, plus `liner_z_from_bottom` for where its underside sits above the station's live
     #: AABB bottom. For a slatted station this is the difference between a task and a coin flip:
-    #: the dish rack's bare rails support the bowl over ~30 mm lanes separated by a gap that
-    #: swallows it, against a control stack whose end-effector floor is ~20 mm. Laying a rimmed
-    #: tray across the rails turns that into one continuous surface -- swept, a bowl is supported
-    #: AND `OnTop` the tray at 25 of 25 points over +/-50 mm x by +/-100 mm y -- and the rim also
-    #: stops the post-release roll that moved the bowl 74 mm on the bare rails. The dataset has
+    #: the dish rack's bare rails have gaps large enough to swallow compact objects. Laying a
+    #: rimmed tray across the rails turns that into one continuous support surface. The dataset has
     #: exactly ONE dish_rack model, so a better rack is not an option; a drying tray in a dish rack
     #: is the real-world answer anyway. `self.bowl` becomes the liner, so the place target, the
     #: support height and the success predicate all follow it.
@@ -288,59 +280,55 @@ class LHSpec:
     #: `success` already applies is the honest test -- it accepts exactly the physically correct
     #: cases and still rejects a towel on the floor.
     slatted: bool = False
+    #: Maximum angular error while attached. This is latched over the whole carry, so furniture
+    #: cannot straighten a bad grasp and turn it into a training success at the final frame.
+    carry_attitude_tol_deg: float | None = None
+    #: Object-local axis that should point upward after placement, plus its tolerance.
+    place_up_axis: tuple | None = None
+    place_tilt_tol_deg: float = 20.0
+    #: Maximum horizontal error from the scripted object-centre target at success.
+    place_xy_tolerance: float | None = None
 
 
 #: The pick-and-place tasks. WHERE each receptacle stands is `tasks.layout`, not here -- the room
 #: is furnished once and identically for every task.
 #:
-#: Every carried object is sized so its SHORT horizontal axis fits the 2F-85's 85 mm opening while
-#: lying flat in its natural pose, and is grasped at its own centre. The first cut tried to keep
-#: full-size assets by taking a plate at the rim and standing a textbook on edge; both failed --
-#: the book toppled before the hand arrived (a book on its edge is not a stable rest pose, so the
-#: sim was right to drop it) and the rim pinch on a 110 mm plate closed on a chord rather than the
-#: object. Shrinking to a side plate and a notebook is the honest fix: the grasp is then an
-#: ordinary centre pinch of the kind the tabletop task already proved out.
+#: Every carried object is sized so its pinched cross-section fits the 2F-85's 85 mm opening and is
+#: grasped at its own centre. Tall, slender drinkware retains a useful visual footprint without
+#: making the fully-open pads scrape the object before the close command.
 SPECS = [
-    # a bowl, not a plate: a 9 mm disc lying on the table cannot be taken at all, because the pads
-    # would have to close through the tabletop to get either side of it.
+    # The old bowl was 82 mm across against an 85 mm maximum opening, leaving only 1.5 mm clearance
+    # per pad. In the chained rollout the open gripper displaced it 14.5 mm before close. This
+    # The red soda cup is conspicuous in RGB and stays large at 129 mm tall, while 0.78 planar
+    # scale makes its jaw cross-section 61 mm. That leaves about 12 mm clearance per open pad,
+    # against the old bowl's 1.5 mm, without using a transparent / refractive object.
     LHSpec(name="dish2rack",
-           obj={"category": "bowl", "model": "ajzltc", "scale": [0.7, 0.7, 0.7]},   # 73 x 82 x 42
-           # Static drop sweep: this model's centre gap lets the bowl fall through, and there is a
-           # supporting lane on EITHER side of it. The far one (45 mm toward world +x) was used
-           # first and is out of reach -- measured at the place pose, the left hand cannot pass
-           # world x 1.764 because `L_arm_j4` pins at its +14 deg upper limit (URDF range
-           # [-176, +14]) and beyond that the tracking error grows 1:1 with the command. The drop
-           # it implies is 1.783, so the place was asking for 19 mm more arm than exists.
-           #
-           # It nonetheless passed for a long time, which is worth understanding because the reason
-           # is an accident: `_calibrate_grasp_delta` aims the destination at the OBJECT's target
-           # minus the measured object-to-finger offset, and that offset happened to be 15-19 mm in
-           # the helpful direction, pulling the hand back to roughly where it could go. Improve the
-           # grasp and the slack disappears -- with the offset at 1-4 mm the same place left 43-48
-           # mm of EEF error and dropped the bowl through the gap. A place that only works when the
-           # grasp is a bit off is not a working place.
-           #
-           # Both of those are moot now that a tray spans the rails (see `liner`): the receptacle
-           # is the tray's own flat top, so there is no lane to hit and no gap to miss.
-           # `place_offset` is back to zero and `support_z_from_bottom` is None, which makes
-           # `_support_surface_z` the liner's AABB top -- measured 0.8132, with the bowl resting at
-           # 0.793. The near lane the bare rack needed is kept in the note above because it is the
-           # reason the tray is there at all.
-           #
-           # The tray sits at the rack's own tested rail height, 0.408 above its AABB bottom: the
-           # number that used to place the BOWL now places the tray, and the bowl rides on top.
+           obj={"category": "soda_cup", "model": "vicaqs", "scale": [0.78, 0.78, 1.0]},
+           # coqeme is 142 x 222 mm, against the old hbjdlb's 177 x 390 mm. Its support area is
+           # 54% smaller, so a learned placement must predict the cup centre accurately rather
+           # than relying on a tray that covers almost the entire rack. It remains native scale and
+           # sits at the rack's tested rail height, 0.408 m above its AABB bottom.
            station="dish_rack", on_top=True, release_dz=0.004,
-           liner={"category": "tray", "model": "hbjdlb"},      # 177 x 390 x 42 mm, fits the deck
-           liner_z_from_bottom=0.408),
+           # The actual Robotiq linkage puts the configured grasp rays 61.39 mm apart at +0.40,
+           # effectively equal to this cup's 61.9 mm nominal diameter; collision-mesh tolerance
+           # then made two-finger contact nondeterministic. +0.30 gives a measured 57.35 mm ray
+           # gap (about 2.3 mm preload per side), still far from the 0.785 rad fully-closed limit.
+           grip_close_cmd=0.30,
+           grasp_hold_ticks=65,
+           liner={"category": "tray", "model": "coqeme"},
+           liner_z_from_bottom=0.408,
+           carry_attitude_tol_deg=20.0, place_up_axis=(0.0, 0.0, 1.0),
+           place_xy_tolerance=0.045),
     # A folded towel onto the clothes airer.  Asset survey: the old bath_towel/thmepr was the only
     # bath_towel model and needed [0.2212, 0.0999, 1.7921] to become a rigid 240 x 57 x 50 mm stick.
     # dishtowel/ltydgg is naturally 157 x 218 x 26 mm; the scale below preserves that folded-towel
     # thickness and gives a compact 220 x 261 x 31 mm object.  Both wrists remain in the
     # nominal forward approach direction while rolling about that direction by 90 degrees. Their
     # jaws then close vertically around the towel's thin overhanging front edge.  The grasp centres
-    # stay 190 mm apart: close to the arms' natural 230 mm separation, but 20 mm in from each
-    # rounded side edge. At 230 mm the right ray crossed the towel but only one pad contacted the
-    # irregular folded corner; 120 mm, at the other extreme, produced 55-60 mm cross-body error.
+    # stay 160 mm apart, symmetrically about the towel centre and roughly 50 mm in from each
+    # rounded side edge. At 190-230 mm the right ray reached the irregular folded corner and
+    # intermittently closed through air; 120 mm, at the other extreme, produced 55-60 mm
+    # cross-body error. The 160 mm pair preserves edge margin without crossing the arms inward.
     #
     # It deliberately remains rigid.  OmniGibson's assisted/sticky grasp candidate search accepts
     # only RigidDynamicPrim links, so a ClothPrim cannot attach to either 2F-85 without a separate
@@ -348,35 +336,41 @@ SPECS = [
     # the missing grasp.  `support_z_from_bottom` is the airer's deck, 0.635 above its AABB bottom.
     LHSpec(name="towel2rack",
            # A folded dishtowel with a near-native aspect ratio.  At this scale its live bbox is
-           # 220 x 261 x 31 mm.  Its near edge overhangs the table collision by about 58 mm,
-           # leaving room for the rolled grippers' lower pads while roughly three quarters of the
-           # towel remains supported. At 28 mm only the upper pad touched and the lower pad's
-           # table collision made closure shove the towel. This remains rigid because OmniGibson
+           # 220 x 261 x 31 mm. Its centre is 30 mm farther out than the original placement, so
+           # the near edge overhangs the table collision by about 88 mm while the full +/-20 mm
+           # reset jitter keeps the centre of mass over the tabletop collision. The grasp is
+           # 40 mm inside the hanging edge and 48 mm outside the table edge, leaving room for the
+           # open gripper body instead of merely keeping the fingertip centre clear. This remains
+           # rigid because OmniGibson
            # assisted grasping only considers RigidDynamicPrim links (a ClothPrim needs a new
            # attachment mechanism, not a prim_type flag).
            obj={"category": "dishtowel", "model": "ltydgg",
                 "scale": [1.40, 1.20, 1.20]},
-           station="towel_rack", on_top=True, obj_xy=(1.14, 0.40), slatted=True,
-           release_dz=0.045, grasp_offset=(-0.110, 0.0, 0.006),
-           # The grasp point is 110 mm behind the object centre. Move the object that far along the
-           # rack's local -y (world +x), so the HAND and chassis retain the verified x corridor;
-           # the 220 mm towel still has over 100 mm of rack deck beyond either x edge.
+           station="towel_rack", on_top=True, obj_xy=(1.11, 0.40), slatted=True,
+           release_dz=0.045, grasp_offset=(-0.070, 0.0, 0.006),
+           # Keep the verified object target on the rack. The source pinch changes the
+           # hand-to-object transform, so the release hand naturally sits inward.
+           # The 220 mm towel still has over 100 mm of rack deck beyond either x edge.
            place_offset=(0.0, -0.110, 0.0), support_z_from_bottom=0.635,
            grasp_tool_roll=np.pi / 2,
            right_grasp_tool_roll=np.pi / 2,
-           bimanual_half_span=0.095, bimanual_axis=(0.0, 1.0, 0.0)),
-    # A closed dark hardback lying flat: 104 x 75 mm footprint, 58 mm tall. The non-uniform scale is
-    # deliberate. Standing a full-size book on its edge is not a stable rest pose, and a full-size
-    # flat book is wider than the jaws. This model replaces textbook/nloqia, which is an OPEN-book
-    # mesh: its binding surface is normal to the broad face, so making that surface face outward
-    # required a 120-degree compound wrist turn. Measured, that pinned L_arm_j7, swung the grasp
-    # point down 33 cm, and dropped the book on the floor. ajpulw has a true closed-book spine on
-    # local -y. Spawn yaw -90 degrees and the reachable -90-degree wrist roll together map its
-    # local +x spine axis to world +z and its local -y spine face to the shelf's world -x outward
-    # normal. The source wrist pitches 30 degrees downward. The cover-width scale is 0.65 rather
-    # than 0.46: it does not change the 75 mm axis the jaws span, but gives the upright book a
-    # 104 mm base in shelf depth so the 17 mm-outward release contact remains inside its support
-    # polygon. (See
+           # Do not lift when only the first assisted hand has finished OmniGibson's 0.3 s
+           # contact window: that hand otherwise pulls the towel out of the second gripper.
+           grasp_hold_ticks=65,
+           bimanual_half_span=0.080, bimanual_axis=(0.0, 1.0, 0.0),
+           carry_attitude_tol_deg=20.0, place_up_axis=(0.0, 0.0, 1.0),
+           place_xy_tolerance=0.10),
+    # A compact dark hardback already standing in its final insertion attitude: its world AABB is
+    # 104 x 46 mm on the table and 75 mm tall. That broad base is stable, while the 46 mm thickness
+    # leaves comfortable finger and filler-book clearance. This model replaces textbook/nloqia,
+    # which is
+    # an OPEN-book mesh whose binding required an unreachable compound wrist turn. ajpulw is a true
+    # closed book: Rx(-90) @ Rz(-90) maps its local +x binding axis to world +z and its local -y
+    # spine face to the shelf's world -x outward normal. The same attitude is used on the table and
+    # in the cubby, so the gripper keeps its normal horizontal alignment from grasp through
+    # insertion; there is no in-air book rotation. The 104 mm shelf-depth base keeps the released
+    # book inside
+    # its support polygon. (See
     # `layout.book_shelf`, where the geometry below was measured.) `support_z_from_bottom` is the
     # top row's
     # interior floor, 0.716 m above the case's live AABB bottom. `place_offset` is in the
@@ -392,29 +386,27 @@ SPECS = [
     # the diagonal open linkage above the cubby floor; the flanking books guide the short final
     # gravity settle after the fingers open.
     LHSpec(name="book2shelf",
-           obj={"category": "hardback", "model": "ajpulw", "scale": [0.29, 0.65, 1.25]},
+           obj={"category": "hardback", "model": "ajpulw", "scale": [0.29, 0.65, 1.00]},
            station="book_shelf", on_top=False, release_dz=0.035,
-           obj_quat=(0.0, 0.0, -0.70710678, 0.70710678),
+           obj_quat=(-0.5, -0.5, -0.5, 0.5),
            place_offset=(0.071, -0.1984, 0.0),
            support_z_from_bottom=0.716, insert_from_front=0.20,
-           reorient_roll=-np.pi / 2,
-           grasp_pitch=np.deg2rad(30.0),
            attachment_reaim=False,
-           place_outward_axis=(0.0, -1.0, 0.0)),
+           attachment_vertical_reaim=True,
+           place_outward_axis=(0.0, -1.0, 0.0), carry_attitude_tol_deg=15.0,
+           place_xy_tolerance=0.08),
 ]
 
 # Two slim, fixed books flank the insertion target in the same top-right cubby.  They are guides,
-# not just decoration: the carried hardback is 58 mm thick after it is stood up, so their inner
-# faces leave a 130 mm slot centred on the commanded release y=-1.628. A static drop sweep found
-# that 57 mm wedges the 57.5 mm book above the cubby floor. Even the earlier 75 mm slot was too
+# not just decoration: the carried hardback is 46 mm thick after it is stood up, while their inner
+# faces leave a 130 mm slot centred on the commanded release y=-1.628. The resulting 42 mm nominal
+# clearance on either side avoids pinching the book during release. A narrower slot was too
 # prescriptive: two valid assisted grasps at different source-table y positions produced measured
 # attachment vectors [30, 4, -1] and [7, 0, -30] mm. Rotating those incidental vectors into a
 # destination correction rewrote the insertion laterally by up to 30 mm, drove L_arm_j7 to its
 # stop, and left 7--9 cm of EEF error. Keeping the insertion feed-forward reduced that error to
-# 1--2 mm; the 130 mm lane then accepted the physically held book with 6 mm worst-side clearance
-# in the reproduced low-source rollout. The carried book's 104 mm shelf-depth footprint supplies
-# the tip resistance; the fillers stock the compartment and guide it without being a precision
-# funnel.
+# 1--2 mm. The carried book's 104 mm shelf-depth footprint supplies the tip resistance; the
+# fillers stock the compartment and bound gross lateral drift without being a precision funnel.
 #
 # They also have to cover the whole settle corridor.  With their old 83 mm depth and world-x
 # centre 1.603, their rear edge ended at x=1.645.  Quaternion logging showed the held book was
@@ -438,9 +430,6 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
     SPEC: LHSpec = None
     ARM = "left"
     MOBILE = True
-    # The real box2cloth takes contain no commanded wz. This is whole_body_ik.py's supported
-    # translation-only root mode: yaw is pinned as a QP equality, not hidden by teleporting rz.
-    BASE_DOFS = "xy"
     # BASE_YAW_HOLD_IN_XY is deliberately NOT set here, so it inherits the shared
     # `vr_teleop.base_yaw_hold_in_xy: true`. It used to be forced False, on the reading that a
     # task whose demonstrations contain no commanded wz should never command wz. That conflates
@@ -487,7 +476,6 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
     ROBOT_YAW = layout.ROBOT_YAW
     APPLE_XY = layout.SRC_OBJ_XY
     BASE_X_MAX = None            # superseded by keepout circles at both work surfaces
-    BASE_MAX_LIN = BASE_MAX_LIN  # see the module constant: the chassis command is bang-bang
     SRC_KEEPOUT = layout.SRC_KEEPOUT
     SCENE_STATION_KEYS = layout.RECEPTACLE_KEYS
     #: heading is degenerate when the waypoint is right on top of the base; hold the last one
@@ -743,12 +731,9 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
     def keepouts(self):
         """(x, y, r) circles the chassis must stay out of -- see `VegaOGEnv.base_keepouts`.
 
-        With PLACE_STANDOFF leading the head command INSIDE the destination circle, this radius is
-        what actually sets the working distance: the base drives in until the circle cancels its
-        inward motion and then sits there. That is stable rather than a limit cycle, because only
-        the inward radial component is removed -- nothing pushes back out. So each station's
-        `keepout` is the working distance that receptacle wants: far enough that the chassis clears
-        its footprint, near enough that the arm still reaches over it.
+        These are a safety backstop, not a trajectory primitive. Every planned source and
+        destination park is checked outside the circles; any runtime veto is counted by the env
+        and rejects the demonstration rather than silently editing its chassis action.
 
         Only the SOURCE table and the station being worked are listed. The rest of the layout is
         avoided by the route planner instead (`NavMap(block_boxes=...)`), because a circle big
@@ -775,6 +760,18 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         if not all(bool(grasped.get(arm, False)) for arm in required_arms):
             print(f"[{self.name}] missing required grasp(s): {grasped}", flush=True)
             return False
+        quality = getattr(self, "_grasp_quality", None)
+        if quality is not None and not bool(quality.get("ok", True)):
+            print(f"[{self.name}] rejecting bad attached-object attitude: max error="
+                  f"{quality.get('max_attitude_error_deg', float('nan')):.1f} deg", flush=True)
+            return False
+        if self._is_bimanual():
+            simultaneous = getattr(self, "_bimanual_grasp_quality", {}).get(
+                "simultaneous", False
+            )
+            if not simultaneous:
+                print(f"[{self.name}] both hands never held the object simultaneously", flush=True)
+                return False
         try:
             if not self.SPEC.on_top:
                 placed = bool(self.apple.states[Inside].get_value(self.bowl))
@@ -803,13 +800,35 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
                     placed = float(self.apple.aabb[0][2]) > self._support_surface_z() - 0.06
             if not placed:
                 return False
-            if self._has_reorientation(self.SPEC):
+            if self.SPEC.place_xy_tolerance is not None:
+                goal = env.obj_pos(self.bowl).copy()
+                goal[:2] += (rot_z(float(self.station.yaw)) @ np.asarray(
+                    self.SPEC.place_offset, dtype=float
+                ))[:2]
+                xy_error = float(np.linalg.norm(env.obj_pos(self.apple)[:2] - goal[:2]))
+                if xy_error > self.SPEC.place_xy_tolerance:
+                    print(f"[{self.name}] placement centre error {xy_error:.3f} m exceeds "
+                          f"{self.SPEC.place_xy_tolerance:.3f} m", flush=True)
+                    return False
+            if self.SPEC.place_up_axis is not None:
                 q = self.apple.get_position_orientation()[1]
                 q = q.detach().cpu().numpy() if hasattr(q, "detach") else np.asarray(q)
                 from scipy.spatial.transform import Rotation as R
-                # Object orientation composes the commanded wrist reorientation with the
-                # object's non-identity spawn attitude.  Looking only at the wrist rotation
-                # checks the wrong local axis for books spawned with a tabletop yaw.
+                up_axis = np.asarray(self.SPEC.place_up_axis, dtype=float)
+                up_axis /= max(float(np.linalg.norm(up_axis)), 1e-9)
+                up_dot = float((R.from_quat(q).as_matrix() @ up_axis) @ [0.0, 0.0, 1.0])
+                if up_dot < np.cos(np.deg2rad(self.SPEC.place_tilt_tol_deg)):
+                    print(f"[{self.name}] placed object tilt exceeds "
+                          f"{self.SPEC.place_tilt_tol_deg:.1f} deg (up dot={up_dot:.3f})",
+                          flush=True)
+                    return False
+            if self.SPEC.place_outward_axis is not None:
+                q = self.apple.get_position_orientation()[1]
+                q = q.detach().cpu().numpy() if hasattr(q, "detach") else np.asarray(q)
+                from scipy.spatial.transform import Rotation as R
+                # The intended object attitude composes any commanded wrist reorientation with
+                # its non-identity spawn attitude. Looking only at the wrist checks the wrong local
+                # axis for a book that is already upright on the source table.
                 intended = self._reorient_R(self.SPEC) @ self._spawn_R(self.SPEC)
                 spine_axis = int(np.argmax(np.abs(intended[2])))
                 spine_sign = float(np.sign(intended[2, spine_axis]))
@@ -829,6 +848,16 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
                         print(f"[{self.name}] book is upright but its spine faces sideways: "
                               f"outward dot={outward_dot:.3f}", flush=True)
                         return False
+            if hasattr(self.apple, "get_linear_velocity"):
+                lv = self.apple.get_linear_velocity()
+                av = self.apple.get_angular_velocity()
+                lv = lv.detach().cpu().numpy() if hasattr(lv, "detach") else np.asarray(lv)
+                av = av.detach().cpu().numpy() if hasattr(av, "detach") else np.asarray(av)
+                if float(np.linalg.norm(lv)) > 0.10 or float(np.linalg.norm(av)) > 1.0:
+                    print(f"[{self.name}] object still moving at terminal frame: "
+                          f"|v|={np.linalg.norm(lv):.3f} m/s |w|={np.linalg.norm(av):.3f} rad/s",
+                          flush=True)
+                    return False
             return True
         except Exception as exc:
             # Deliberately NOT a distance fallback. Proximity of two centres establishes neither
@@ -836,23 +865,35 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
             # been silently converted into a success. Fail loudly instead. (Codex review.)
             raise RuntimeError(f"{self.name}: could not evaluate placement") from exc
 
-    #: Rate the final 8 cm onto the object is flown at, m/s. The inherited flat APPROACH_TICKS=40
-    #: made it 0.200 m/s, against the ~0.016 m/s the `pregrasp` leg descends at while it drives in
-    #: -- an 11x jump partway down, and the visible "slow, then suddenly fast" of the review video.
-    #: Removing the step outright needs the drive and the descent to be separate legs, which is
-    #: measurably worse (see `_build_segments`), so what is left is to close the gap from the other
-    #: end. 0.074 m/s is the slower rate of the two the 2x2 grasped at, so it is a tested value
-    #: rather than a guess, and it takes the step from 11x to 4x for 0.7 s more per pick.
+    #: Rate of the final horizontal contact approach, m/s. The inherited flat
+    #: APPROACH_TICKS=40 made a 10 cm entry 0.25 m/s. 0.074 m/s is the tested slower rate at which
+    #: the gripper can enter without pushing the object before closure.
     GRASP_DESCENT_SPEED = 0.074
-    #: Ticks held at the grasp point, fingers open, before closing -- 2.0 s against the 0.5 s
-    #: inherited from the tabletop task. Derived from the measured step response of the aligned
-    #: loop, not from a time constant: holding the settle for 8 s and logging |finger grasp point -
-    #: commanded centre| gives
-    #:     ticks into settle   +0    +50   +100   +150   +200   +400   +800
-    #:     hand error (mm)    34.7   35.2  26.2   20.0   19.8   19.0   17.3
-    #: i.e. the knee is at ~160 ticks and everything after 200 is worth ~1 mm/s. 200 buys the
-    #: convergence there is to buy; 800 would buy 2 mm more for 6 s an episode.
-    SETTLE_TICKS = 200
+    #: Keep an open single gripper behind the object while it lowers to grasp height. The final
+    #: 10 cm is then a level forward approach, never a descent over the object.
+    SINGLE_ARM_APPROACH_BACKOFF = 0.10
+    #: Keep both open towel grippers this far behind their grasp points while descending. The
+    #: towel's near edge and grasp point are both at roughly world x=1.03; backing off 10 cm puts
+    #: the entire descent outside the table before the hands advance level into contact.
+    BIMANUAL_APPROACH_BACKOFF = 0.10
+    #: At a receptacle, establish release height behind the target, advance level, open in place,
+    #: then withdraw along the same line. This is the same contact grammar as the source grasp.
+    PLACE_APPROACH_BACKOFF = 0.10
+    #: A demonstration is invalid if the attached book ever departs this far from its scripted
+    #: upright, outward-facing attitude. The terminal shelf geometry can otherwise straighten a
+    #: bad carry and turn it into a misleading success.
+    BOOK_CARRY_ATTITUDE_TOL_DEG = 15.0
+    SETTLE_TICKS = 30
+    RELEASE_HOLD_TICKS = 30
+    #: Local manipulation is arm-only. Once the open hand starts descending to a source, keep the
+    #: head (and therefore the base target inferred from it) parked through the post-grasp lift.
+    #: Do the same from the release-height descent through the final return to the neutral arms.
+    HEAD_LOCK_GRASP_PHASES = frozenset({
+        "pregrasp", "approach", "settle", "close", "close_both", "grasp_hold", "lift",
+    })
+    HEAD_LOCK_RELEASE_PHASES = frozenset({
+        "carry", "place", "release", "release_hold", "retreat", "clear_book",
+    })
     # ---- where a pick STARTS from ----
     # Two quantities `_build_segments` needs that are constants for a single pick and variables for
     # a chained one, so they are named rather than inlined. `LongHorizonSequence` picks three times
@@ -893,9 +934,13 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         self._reach_limits = {}
         self._reach_object0 = None
         self._reach_servo_logged = False
-        self._second_hand_reaimed = False
+        self._assisted_release_done = set()
+        self._assisted_handling_suspended = False
         self._ever_grasped = {"left": False, "right": not self._is_bimanual()}
-        go, gc = env.grip_open, env.grip_close
+        self._bimanual_grasp_quality = {"simultaneous": not self._is_bimanual()}
+        self._grasp_quality = {"ok": True, "max_attitude_error_deg": 0.0}
+        go = env.grip_open
+        gc = env.grip_close if self.SPEC.grip_close_cmd is None else self.SPEC.grip_close_cmd
         obj0 = env.obj_pos(self.apple).copy()
         if not hasattr(self, "_right_start_center"):
             self._right_start_center = np.asarray(env.finger_grasp_point("right"), dtype=float)
@@ -917,8 +962,14 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         if self._is_bimanual():
             start_pair = (self._start_center + self._right_start_center) / 2.0
             carry_local = rot_z(-self.ROBOT_YAW) @ (start_pair - base0)
+            left_R0 = rot_z(self.ROBOT_YAW) @ self._Rgrasp_base
+            right_R0 = rot_z(self.ROBOT_YAW) @ self._Rgrasp_right_base
+            start_eef_pair = (
+                self._start_center - left_R0 @ self._grasp_off_local
+                + self._right_start_center - right_R0 @ self._right_grasp_off_local
+            ) / 2.0
             self._head_off_bimanual_base = (
-                rot_z(-self.ROBOT_YAW) @ (self._head_pos0 - start_pair)
+                rot_z(-self.ROBOT_YAW) @ (self._head_pos0 - start_eef_pair)
             )
         else:
             carry_local = rot_z(-self.ROBOT_YAW) @ (self._start_center - base0)
@@ -937,12 +988,10 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         carry_z = max(float(drop[2]) + 0.06,                  # stay above the place itself
                       float(a[2]) + 0.03)                     # lift clear of the source surface
         if not self.SPEC.insert_from_front:
-            # A top-surface place ARRIVES over the receptacle, so the carried object sweeps
-            # through the space above it and the rest height is the validated clearance. Deriving
-            # it from the receptacle's AABB crown instead was tried and is NOT equivalent: 3 cm
-            # over the dish rack's crown is 0.934, only 3 cm below the rest height, and the bowl
-            # still ended up at z 0.402 inside the frame -- an AABB top is a poor proxy for a
-            # wire rack whose crown is two thin raised side members.
+            # A top-surface place still passes through the rack's approach corridor before its
+            # backed-off staging point, so the rest height remains the validated clearance.
+            # Deriving it from the receptacle's AABB crown is not equivalent for a wire rack whose
+            # crown is only two thin raised side members.
             carry_z = max(carry_z, float(self._start_center[2]))
         # The robot works the station facing the heading the LAYOUT assigns it -- chosen (and
         # verified against the eroded traversability map) so that the base pose it implies is
@@ -956,22 +1005,33 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         # The lead-in is applied by the HEAD COMMAND after arrival instead, where the keepout
         # circle bounds it and no arm waypoint moves.
         place_heading = float(self.station.approach)
-        # Where the carried hand has to END the drive. Over a top surface that is the receptacle
-        # itself -- the hand rides above it and comes down. Into an ENCLOSED case it emphatically
-        # is not: the case is 1.06 m tall, the carry height is 0.96 m, and a route that ends over
-        # the station centre drives the held book through the front panel at transit speed. So a
-        # containment task drives only as far as its own staging point, which the insertion then
-        # starts from. Pulling the route endpoint BACK is the safe direction -- the warning above
-        # is about leading it IN.
-        front = (rot_z(float(self.station.yaw)) @ np.array([1.0, 0.0, 0.0]))[:3]
-        stage = drop + self.SPEC.insert_from_front * front
-        right_stage = (right_drop + self.SPEC.insert_from_front * front
+        # End the drive BEHIND the release point, in the commanded robot heading. Height is then
+        # established at that clear staging point before a level forward place. Using the station's
+        # local front would be wrong for the towel rack: it is rotated so its rails run along the
+        # wall, while the robot and both hands still approach along world +x.
+        approach_forward = rot_z(place_heading) @ np.array([1.0, 0.0, 0.0])
+        place_backoff = (float(self.SPEC.insert_from_front)
+                         if self.SPEC.insert_from_front else self.PLACE_APPROACH_BACKOFF)
+        if self._is_bimanual():
+            # The paired natural hand offset parks 5 mm inside the drying-rack circle at the
+            # chained towel cycle. Stage 3 cm farther back so the planned trajectory clears the
+            # safety boundary itself instead of relying on a runtime command veto.
+            place_backoff = max(place_backoff, 0.13)
+        stage = drop - place_backoff * approach_forward
+        right_stage = (right_drop - place_backoff * approach_forward
                        if right_drop is not None else None)
         if self._is_bimanual():
             goal = ((stage + right_stage) / 2.0)[:2]
         else:
-            goal = stage[:2] if self.SPEC.insert_from_front else np.asarray(self.station.xy, float)
+            goal = stage[:2]
         park = goal - (rot_z(place_heading) @ carry_local)[:2]
+        for kx, ky, radius in self.keepouts():
+            clearance = float(np.linalg.norm(park - np.array([kx, ky], dtype=float)) - radius)
+            if clearance < 0.02:
+                raise ValueError(
+                    f"{self.name}: planned destination park {np.round(park, 3)} relies on "
+                    f"keepout at {(kx, ky, radius)} (clearance {clearance:.3f} m)"
+                )
         #: Published for `LongHorizonSequence`, which has to route the NEXT pick's return drive
         #: from wherever this place left the base.
         self._dest_park = park
@@ -1009,18 +1069,16 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         lift = np.array([a[0], a[1], carry_z])
         right_lift = (np.array([right_a[0], right_a[1], carry_z])
                       if right_a is not None else None)
-        # Top-surface tasks arrive over the receptacle and descend. A containment task has already
-        # driven to its staging point outside the front (see `goal`), so `arrive` only settles
-        # there at carry height, `carry` descends to the compartment's own height, and `place`
-        # inserts horizontally through the opening -- the gripper never passes under the roof.
+        # Every task arrives at a clear backed-off staging point. `carry` establishes release height
+        # there, `place` advances horizontally, and `retreat` reverses that line only after opening.
+        arrive = np.array([stage[0], stage[1], carry_z])
+        carry = stage.copy()
+        retreat = stage.copy()
+        right_arrive = (np.array([right_stage[0], right_stage[1], carry_z])
+                        if right_stage is not None else None)
+        right_carry = right_stage.copy() if right_stage is not None else None
+        right_retreat = right_stage.copy() if right_stage is not None else None
         if self.SPEC.insert_from_front:
-            arrive = np.array([stage[0], stage[1], carry_z])
-            carry = stage
-            retreat = stage
-            right_arrive = (np.array([right_stage[0], right_stage[1], carry_z])
-                            if right_stage is not None else None)
-            right_carry = right_stage
-            right_retreat = right_stage
             # The 20 cm insertion asks the mobile base and arm to advance together.  At 260 ticks
             # (77 mm/s) the commanded book centre reached 1.617 m but the measured centre reached
             # only 1.528 m, leaving it on the compartment lip and in front of both filler books.
@@ -1031,43 +1089,47 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
                 260,
                 int(round(float(np.linalg.norm(drop - stage)) / 0.040 * env.action_hz)),
             )
-            retreat_ticks = 100
         else:
-            arrive = np.array([drop[0], drop[1], carry_z])
-            carry = drop + np.array([0.0, 0.0, 0.10])
-            retreat = drop + np.array([0.0, 0.0, 0.12])
-            right_arrive = (np.array([right_drop[0], right_drop[1], carry_z])
-                            if right_drop is not None else None)
-            right_carry = (right_drop + np.array([0.0, 0.0, 0.10])
-                           if right_drop is not None else None)
-            right_retreat = (right_drop + np.array([0.0, 0.0, 0.12])
-                             if right_drop is not None else None)
-            carry_ticks, place_ticks = 160, 240
-            # Two assisted-grasp joints clear later than one. In the chained rollout the second
-            # towel joint disappeared on the old 30-tick retreat's final tick, so recording ended
-            # before either the free towel or its settling motion was visible.
-            retreat_ticks = 100 if self._is_bimanual() else 30
-        # The approach to the source table is a 0.9 m DRIVE, so it has to be timed off the same
-        # speed as the transit legs. At the inherited flat 300 ticks it ran at 0.30 m/s, well above
-        # the follower's own cap, and the base would simply have arrived at the table late -- with
-        # the fingers already commanded onto the book.
-        #
-        # The 8 cm hover is load-bearing and stays. This leg is a 0.9 m DRIVE that also descends,
-        # which gives the approach two very different speeds -- measured 0.016 m/s for the first
-        # 55 % of the drop and 0.200 m/s for the rest, an 11x step, and exactly the "moves slowly,
-        # then descends fast" the review video shows. The clean repair is to separate them: fly
-        # level at rest height and let `approach` own the whole 18 cm in one segment at one speed.
-        # It was implemented and REJECTED on measurement. What makes the shipped leg robust is not
-        # the hover height as such but that the hand converges LATERALLY while it descends
-        # diagonally: entering the last 8 cm it is ~3 mm off the mark, where a level fly-over hands
-        # the descent ~10 mm of error because the base is still catching up at the end of a 0.9 m
-        # drive. Coming down 18 cm off-centre clips the 42 mm bowl and shoves it -- measured 41 mm,
-        # after which the fingers shut to 0.785 rad on nothing and `assisted` rightly refuses. A
-        # 2x2 over hover height x descent duration pinned it on the hover (both durations grasp
-        # from 8 cm, neither does from rest height), and adding a dwell over the object to let the
-        # error settle first only made it intermittent -- 3 of 6 trials grasped, one shoving the
-        # bowl 74 mm. The step is a cosmetic fault; losing the bowl is not.
-        # What IS safe is narrowing the step, see `GRASP_DESCENT_SPEED` on `approach` below.
+            carry_dist = float(np.linalg.norm(carry - arrive))
+            if right_carry is not None:
+                carry_dist = max(carry_dist, float(np.linalg.norm(right_carry - right_arrive)))
+            carry_ticks = max(
+                60, int(round(carry_dist / self.GRASP_DESCENT_SPEED * env.action_hz))
+            )
+            place_ticks = max(
+                self.APPROACH_TICKS,
+                int(round(place_backoff / self.GRASP_DESCENT_SPEED * env.action_hz)),
+            )
+        retreat_ticks = max(
+            100, int(round(place_backoff / self.GRASP_DESCENT_SPEED * env.action_hz))
+        )
+        left_alignment = self._grasp_alignment("left")
+        right_alignment = self._grasp_alignment("right")
+        # End every skill at the same body-relative two-hand posture used at reset.  This is a
+        # demonstration boundary, not part of placing: release first, withdraw clear of the
+        # receptacle, and only then restore both wrists.  Deriving the endpoints from the planned
+        # destination park keeps the base/head/hand commands in one feed-forward frame.
+        home_base = np.array([park[0], park[1], base0[2]], dtype=float)
+        left_rest_local = rot_z(-self.ROBOT_YAW) @ (self._start_center - base0)
+        right_rest_local = rot_z(-self.ROBOT_YAW) @ (self._right_start_center - base0)
+        left_home = home_base + rot_z(place_heading) @ left_rest_local
+        right_home = home_base + rot_z(place_heading) @ right_rest_local
+        if self.SPEC.insert_from_front:
+            # A front-insertion spec may use a different release and home wrist alignment. Raise
+            # only the home endpoint by any resulting fingertip-to-EEF projection difference;
+            # `_linear_home_center` then cannot draw a post-release Cartesian dip. For the book's
+            # normal horizontal alignment the difference is zero.
+            release_R = rot_z(place_heading) @ left_alignment @ self._Rgrasp_base
+            home_R = rot_z(place_heading) @ self._Rgrasp_base
+            release_eef_z = float(retreat[2] - (release_R @ self._grasp_off_local)[2])
+            home_eef_z = float(left_home[2] - (home_R @ self._grasp_off_local)[2])
+            left_home[2] += max(0.0, release_eef_z - home_eef_z)
+        home_distance = float(np.linalg.norm(left_home - retreat))
+        if right_retreat is not None:
+            home_distance = max(home_distance, float(np.linalg.norm(right_home - right_retreat)))
+        home_ticks = max(180, int(round(home_distance / TRANSIT_SPEED * env.action_hz)))
+        # Establish grasp height behind the object, then advance level. No open gripper descends
+        # over an object; the old cup path did exactly that and could push it before closure.
         hand0 = np.asarray(self._hand_start(), dtype=float)
         pregrasp = a + np.array([0.0, 0.0, 0.08])
         # SQUARE UP IN Y, THEN DRIVE IN X -- the same treatment `_manhattan` and
@@ -1081,12 +1143,6 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         # when the fingers were commanded shut, and the arm reached across to cover it. Two
         # explicit legs make the ordering the plan's, not the projection's.
         #
-        # Each leg is still timed off its own L1 distance, so the descent that rides along with the
-        # x leg is paid for in that leg's clock. Height is HELD through the strafe and given
-        # entirely to the x leg, which keeps the property the grasp actually depends on: the hand
-        # converges laterally while it descends diagonally, arriving at the 8 cm hover ~3 mm off
-        # the mark (see the note above on why a level fly-over is worse).
-        #
         # A leg shorter than `MIN_LEG` is dropped, exactly as `_manhattan` drops one: the single
         # tasks pick 14 mm off the spawn's y and the chained rollout's later cycles arrive with the
         # hand already over the object, so both keep the one x leg they have always had, and only a
@@ -1095,8 +1151,6 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         right_hand0 = np.asarray(self._right_hand_start(), dtype=float)
         right_pregrasp = (right_a + np.array([0.0, 0.0, 0.08])
                           if right_a is not None else None)
-        left_alignment = self._grasp_alignment("left")
-        right_alignment = self._grasp_alignment("right")
         needs_orient = right_pregrasp is not None and (
             np.linalg.norm(left_alignment - np.eye(3)) > 1e-8
             or np.linalg.norm(right_alignment - np.eye(3)) > 1e-8
@@ -1123,7 +1177,7 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
             right_oriented = (
                 self._orient_right_eef + right_final_R @ self._right_grasp_off_local
             )
-            self._orient_head_center = (hand0 + right_hand0) / 2.0
+            self._orient_head_center = (self._orient_left_eef + self._orient_right_eef) / 2.0
             legs_in.append(("orient", left_oriented, go, 180))
             right_legs_in.append(("orient", right_oriented, go, 180))
         left_approach0 = legs_in[-1][1] if legs_in else hand0
@@ -1131,7 +1185,7 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         y_travel = abs(float(pregrasp[1] - left_approach0[1]))
         if right_pregrasp is not None:
             y_travel = max(y_travel, abs(float(right_pregrasp[1] - right_approach0[1])))
-        if y_travel >= MIN_LEG:
+        if y_travel > 1e-3:
             square_up = np.array([left_approach0[0], pregrasp[1], left_approach0[2]])
             square_dist = float(np.abs(square_up - left_approach0).sum())
             if right_pregrasp is not None:
@@ -1144,6 +1198,51 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
             legs_in.append(("pregrasp_y", square_up, go, ticks))
             if right_pregrasp is not None:
                 right_legs_in.append(("pregrasp_y", right_square, go, ticks))
+        if not self._is_bimanual():
+            # Stop 10 cm behind at the incoming height, lower there, then move forward. This is
+            # shared by the cup and upright book; only the carried object's geometry differs.
+            backoff = rot_z(float(self.ROBOT_YAW)) @ np.array([
+                self.SINGLE_ARM_APPROACH_BACKOFF, 0.0, 0.0
+            ])
+            before_stage = legs_in[-1][1] if legs_in else hand0
+            stage_high = np.array([
+                a[0] - backoff[0], a[1] - backoff[1], before_stage[2]
+            ])
+            stage_dist = float(np.linalg.norm(stage_high - before_stage))
+            if stage_dist > 1e-3:
+                stage_ticks = max(40, int(round(stage_dist / TRANSIT_SPEED * env.action_hz)))
+                legs_in.append(("pregrasp_x", stage_high, go, stage_ticks))
+            pregrasp = stage_high.copy()
+            pregrasp[2] = a[2]
+        if self._is_bimanual():
+            # Robot heading is fixed in this suite, but express "behind" in that heading frame so
+            # the scripted hand, head and base commands all agree. Both high targets have the final
+            # grasp y, remain at the incoming height, and sit 10 cm before the towel along +forward.
+            backoff = rot_z(float(self.ROBOT_YAW)) @ np.array([
+                self.BIMANUAL_APPROACH_BACKOFF, 0.0, 0.0
+            ])
+            left_before_stage = legs_in[-1][1] if legs_in else hand0
+            right_before_stage = right_legs_in[-1][1] if right_legs_in else right_hand0
+            left_stage_high = np.array([
+                a[0] - backoff[0], a[1] - backoff[1], left_before_stage[2]
+            ])
+            right_stage_high = np.array([
+                right_a[0] - backoff[0], right_a[1] - backoff[1], right_before_stage[2]
+            ])
+            stage_dist = max(
+                float(np.linalg.norm(left_stage_high - left_before_stage)),
+                float(np.linalg.norm(right_stage_high - right_before_stage)),
+            )
+            if stage_dist > 1e-3:
+                stage_ticks = max(40, int(round(stage_dist / TRANSIT_SPEED * env.action_hz)))
+                legs_in.append(("pregrasp_x", left_stage_high, go, stage_ticks))
+                right_legs_in.append(("pregrasp_x", right_stage_high, go, stage_ticks))
+            # `pregrasp` is now the vertical descent endpoint. `approach` below moves forward from
+            # this point to `a` at constant z; neither segment can intersect the towel early.
+            pregrasp = left_stage_high.copy()
+            pregrasp[2] = a[2]
+            right_pregrasp = right_stage_high.copy()
+            right_pregrasp[2] = right_a[2]
         drive = pregrasp - (legs_in[-1][1] if legs_in else hand0)
         drive_dist = float(np.abs(drive).sum())
         if right_pregrasp is not None:
@@ -1153,7 +1252,20 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
             drive_dist = max(drive_dist, float(np.abs(right_drive).sum()))
         pregrasp_ticks = max(
             self.PREGRASP_TICKS,
-            int(round(drive_dist / TRANSIT_SPEED * env.action_hz)),
+            int(round(drive_dist / (
+                self.GRASP_DESCENT_SPEED
+                if (self._is_bimanual() or self.SPEC.insert_from_front)
+                else TRANSIT_SPEED
+            ) * env.action_hz)),
+        )
+        approach_dist = float(np.linalg.norm(a - pregrasp))
+        if right_pregrasp is not None:
+            approach_dist = max(
+                approach_dist, float(np.linalg.norm(right_a - right_pregrasp))
+            )
+        approach_ticks = max(
+            self.APPROACH_TICKS,
+            int(round(approach_dist / self.GRASP_DESCENT_SPEED * env.action_hz)),
         )
         rotate_segment = []
         if self._has_reorientation(self.SPEC):
@@ -1163,35 +1275,32 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         # settles. Only once the open hand is outside the cubby is it safe to reset the wrist for
         # the next task. Resetting in place before retreat made the linkage sweep through the
         # release lane; waiting in place with the old vertical-jaw grasp tipped the book 94 degrees.
-        post_release_segments = [("retreat", retreat, go, retreat_ticks)]
+        post_release_segments = [
+            ("release_hold", drop.copy(), go, self.RELEASE_HOLD_TICKS)
+        ]
+        post_release_segments.append(("retreat", retreat, go, retreat_ticks))
         if self._has_reorientation(self.SPEC):
             post_release_segments.append(("clear_book", retreat.copy(), go, 180))
-        # Assisted grasping needs 0.30 s of continuous two-pad contact before it creates a fixed
-        # joint. Closing both grippers together made the first completed joint snap the towel
-        # 22 mm and reset the other arm's contact window. Secure the right edge first, give that
-        # joint time to settle, linearly re-aim the still-open left hand at the now-constrained
-        # towel, and only then close it. Every grip transition is still interpolated by
-        # PickPlaceTask._segment_grip; ``reaim_left`` is a genuine Cartesian segment rather than
-        # a measured-pose jump (its endpoint is captured on its first tick below).
+        # Both towel grippers are one policy action: their Cartesian targets and close commands
+        # remain phase-aligned.  A slower shared close gives assisted grasping time to establish
+        # two-pad contact without the old right-first attachment / left-only measured re-aim.
         if self._is_bimanual():
             grasp_segments = [
-                ("close_right", a.copy(), go, 45),
-                ("right_hold", a.copy(), go, 60),
-                ("reaim_left", a.copy(), go, 80),
-                ("close_left", a.copy(), gc, 45),
-                ("grasp_hold", a.copy(), gc, 60),
+                ("close_both", a.copy(), gc, 90),
             ]
         else:
             grasp_segments = [("close", a.copy(), gc, 45)]
+        grasp_hold_segments = (
+            [("grasp_hold", a.copy(), gc, int(self.SPEC.grasp_hold_ticks))]
+            if self.SPEC.grasp_hold_ticks > 0 else []
+        )
         segs = [
             *legs_in,
             ("pregrasp", pregrasp, go, pregrasp_ticks),
-            ("approach", a.copy(), go,
-             max(self.APPROACH_TICKS,
-                 int(round(float(pregrasp[2] - a[2])
-                           / self.GRASP_DESCENT_SPEED * env.action_hz)))),
+            ("approach", a.copy(), go, approach_ticks),
             ("settle",   a.copy(),                       go, self.SETTLE_TICKS),
             *grasp_segments,
+            *grasp_hold_segments,
             # Timed off the transit speed like every other travelling segment: at a flat 60 ticks
             # this 0.177 m rise ran at 0.296 m/s, the fastest command in the episode -- 1.7x the
             # transit and 4x the place descent.
@@ -1202,26 +1311,14 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
             ("lift",     lift,                           gc,
              max(60, int(round(float(np.linalg.norm(lift - a)) / TRANSIT_SPEED * env.action_hz)))),
             *legs,
-            # Settle at the receptacle before descending, and no longer. 420 ticks was the time
-            # the OLD arrive needed to drag the hand 0.20 m back to the staging point at 0.048
-            # m/s; that motion is now part of the route (see `goal`), so all that was left was a
-            # 4.2 s dwell in which the commanded hand moved 8 mm -- the robot visibly freezing
-            # just before every place, and 4 s of stationary frames in every recorded episode.
-            # What the segment still owes is convergence after the transit, and that is measured:
-            # the base comes to rest 1.5 s in and the arm's joint rate is back to noise by 2.0 s.
-            ("arrive",   arrive,  gc, 100),
             *rotate_segment,
             ("carry",    carry,   gc, carry_ticks),
             ("place",    drop,    gc, place_ticks),
             ("release",  drop,    go, 60),
             *post_release_segments,
+            ("home_arms", left_home, go, home_ticks),
         ]
         if self._is_bimanual():
-            approach_ticks = max(
-                self.APPROACH_TICKS,
-                int(round(float(right_pregrasp[2] - right_a[2])
-                          / self.GRASP_DESCENT_SPEED * env.action_hz)),
-            )
             lift_ticks = max(
                 60,
                 int(round(float(np.linalg.norm(lift - a)) / TRANSIT_SPEED * env.action_hz)),
@@ -1231,18 +1328,19 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
                 ("pregrasp", right_pregrasp, go, pregrasp_ticks),
                 ("approach", right_a.copy(), go, approach_ticks),
                 ("settle", right_a.copy(), go, self.SETTLE_TICKS),
-                ("close_right", right_a.copy(), gc, 45),
-                ("right_hold", right_a.copy(), gc, 60),
-                ("reaim_left", right_a.copy(), gc, 80),
-                ("close_left", right_a.copy(), gc, 45),
-                ("grasp_hold", right_a.copy(), gc, 60),
+                ("close_both", right_a.copy(), gc, 90),
+                *(
+                    [("grasp_hold", right_a.copy(), gc, int(self.SPEC.grasp_hold_ticks))]
+                    if self.SPEC.grasp_hold_ticks > 0 else []
+                ),
                 ("lift", right_lift, gc, lift_ticks),
                 *right_legs,
-                ("arrive", right_arrive, gc, 100),
                 ("carry", right_carry, gc, carry_ticks),
                 ("place", right_drop, gc, place_ticks),
                 ("release", right_drop, go, 60),
+                ("release_hold", right_drop.copy(), go, self.RELEASE_HOLD_TICKS),
                 ("retreat", right_retreat, go, retreat_ticks),
+                ("home_arms", right_home, go, home_ticks),
             ]
             assert [(n, t) for n, _p, _g, t in self._right_segs] == [
                 (n, t) for n, _p, _g, t in segs
@@ -1252,7 +1350,8 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         # stand-off eases from the full rest distance to the shortened destination one over the
         # `arrive` segment, so the base is led in only once it is actually at the receptacle.
         destination = {
-            "arrive", "rotate_book", "carry", "place", "release", "clear_book", "retreat",
+            "rotate_book", "carry", "place", "release",
+            "release_hold", "clear_book", "retreat",
         }
         self._standoffs = [PLACE_STANDOFF if name in destination else 1.0
                            for name, _end, _grip, _ticks in segs]
@@ -1260,7 +1359,8 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         jaw_alignment = left_alignment
         reoriented = self._reorient_R(self.SPEC) @ jaw_alignment
         self._grasp_rotations = [
-            jaw_alignment if name == "clear_book"
+            np.eye(3) if name == "home_arms"
+            else jaw_alignment if name == "clear_book"
             else reoriented if (
                 name == "rotate_book"
                 or (
@@ -1271,7 +1371,8 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
             for i, (name, _end, _grip, _ticks) in enumerate(segs)
         ]
         self._right_grasp_rotations = (
-            [right_alignment.copy() for _ in segs] if self._is_bimanual() else None
+            [np.eye(3) if name == "home_arms" else right_alignment.copy()
+             for name, _end, _grip, _ticks in segs] if self._is_bimanual() else None
         )
         self._right_segment_starts = None
         assert len(self._headings) == len(segs) == len(self._standoffs) \
@@ -1283,12 +1384,7 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         return segs
 
     def _calibrate_grasp_delta(self, env):
-        """Measure each attachment and make its destination finger path place the object.
-
-        For the book, the measured object-to-finger vector rotates with the wrist.  ``arrive``
-        therefore uses the flat correction and ``rotate_book`` / insertion use its rotated value;
-        interpolating those endpoints keeps the object centre fixed while the wrist turns.
-        """
+        """Measure each attachment and make its destination finger path place the object."""
         owners = getattr(self, "_owners", None)
         cycle = getattr(self, "_cycle", None)
         arms = ("left", "right") if self._is_bimanual() else ("left",)
@@ -1298,7 +1394,8 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
                 continue
             delta = env.obj_pos(self.apple) - env.finger_grasp_point(arm)
             setattr(self, attr, delta)
-            if not self.SPEC.attachment_reaim:
+            vertical_only = bool(self.SPEC.attachment_vertical_reaim)
+            if not self.SPEC.attachment_reaim and not vertical_only:
                 print(f"[{self.name}] {self.SPEC.name} {arm} attachment delta="
                       f"{np.round(delta, 3)}; feed-forward destination retained", flush=True)
                 continue
@@ -1306,6 +1403,9 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
             final = -self._placed_attachment_delta(delta) - self._grasp_world_offset(
                 arm, placed=True
             )
+            if not self.SPEC.attachment_reaim:
+                initial[:2] = 0.0
+                final[:2] = 0.0
             seg_attr = "_segs" if arm == "left" else "_right_segs"
             source = getattr(self, seg_attr)
             shifted = []
@@ -1317,139 +1417,82 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
                 owned = owners is None or owners[j] == cycle
                 correction = (initial if name == "arrive" else final)
                 if owned and name in {"arrive", "rotate_book", "carry", "place",
-                                      "release", "clear_book", "retreat"}:
+                                      "release", "release_hold", "clear_book", "retreat"}:
                     end = np.asarray(end, dtype=float) + correction
                 shifted.append((name, end, grip, ticks))
             setattr(self, seg_attr, shifted)
             print(f"[{self.name}] {self.SPEC.name} {arm} attachment delta="
-                  f"{np.round(delta, 3)}; destination correction="
+                  f"{np.round(delta, 3)}; "
+                  f"{'vertical ' if vertical_only and not self.SPEC.attachment_reaim else ''}"
+                  f"destination correction="
                   f"{np.round(final, 3)}", flush=True)
 
     def _calibrate_reach_delta(self, env):
-        """Continuously and rate-limitedly close measured pick residual during ``settle``.
+        """Keep the precomputed pick path immutable.
 
-        The old one-shot endpoint jump was sampled 75% through settle.  In the current chain the
-        towel still arrived 81 mm off and was physically shoved about 95 mm before attaching.
-        Updating the endpoint every settle tick is the scripted analogue of the hardware operator
-        visually trimming the leader target, while the speed and total-displacement limits keep it
-        a demonstrable trajectory rather than a teleport.
+        The WBC already tracks the commanded EEF pose. Rewriting future endpoints from measured
+        error made the hand stop and re-aim immediately before grasp, and after the idle right-arm
+        target was normalized it over-corrected a roughly 1 mm EEF error by 32 mm and pushed the
+        book across the table. Attachment calibration remains active only after a real grasp, when
+        it adjusts the destination to the measured hand-object transform without changing the pick.
         """
-        if not self.SPEC.obj:
-            return                         # station tasks have their own contact waypoint logic
-        i = getattr(self, "_seg_i", None)
-        if i is None or not getattr(self, "_segs", None):
-            return
-        phase = self._segs[i][0]
-        if phase != "settle":
-            if (phase in {"close", "close_right"}
-                    and not getattr(self, "_reach_servo_logged", False)
-                    and self._reach_delta is not None):
-                fields = [f"left={np.round(self._reach_delta * 1000, 1)} mm"]
-                if self._is_bimanual() and self._right_reach_delta is not None:
-                    fields.append(f"right={np.round(self._right_reach_delta * 1000, 1)} mm")
-                drift = (0.0 if self._reach_object0 is None else float(np.linalg.norm(
-                    env.obj_pos(self.apple) - self._reach_object0
-                )))
-                print(f"[{self.name}] {self.SPEC.name} reach servo applied "
-                      + ", ".join(fields) + f"; object drift={drift * 1000:.1f} mm", flush=True)
-                self._reach_servo_logged = True
-            return
-        if float(getattr(self, "_seg_f", 0.0)) < self.REACH_SERVO_AT:
-            return
+        return
 
-        owners = getattr(self, "_owners", None)
-        cycle = getattr(self, "_cycle", None)
-        if not hasattr(self, "_reach_servo_started"):
-            self._reach_servo_started = {"left": False, "right": False}
-        if not hasattr(self, "_reach_servo_updates"):
-            self._reach_servo_updates = {"left": 0, "right": 0}
-        if not hasattr(self, "_reach_targets"):
-            self._reach_targets = {}
-        if not hasattr(self, "_reach_limits"):
-            self._reach_limits = {}
-        arms = ("left", "right") if self._is_bimanual() else ("left",)
+    def _update_grasp_quality(self, env):
+        """Latch bad attached-object attitude so terminal furniture cannot hide it."""
+        tolerance = self.SPEC.carry_attitude_tol_deg
+        if tolerance is None or env.is_grasping(self.ARM) is not self.apple:
+            return
+        q = self.apple.get_position_orientation()[1]
+        q = q.detach().cpu().numpy() if hasattr(q, "detach") else np.asarray(q, dtype=float)
+        from scipy.spatial.transform import Rotation as R
+
+        intended = self._reorient_R(self.SPEC) @ self._spawn_R(self.SPEC)
+        actual = R.from_quat(q).as_matrix()
+        error_deg = float(np.degrees(R.from_matrix(intended.T @ actual).magnitude()))
+        quality = self._grasp_quality
+        quality["max_attitude_error_deg"] = max(
+            float(quality["max_attitude_error_deg"]), error_deg
+        )
+        if error_deg > tolerance:
+            if quality["ok"]:
+                print(f"[{self.name}] attached-object attitude exceeded limit: "
+                      f"{error_deg:.1f} > {tolerance:.1f} deg",
+                      flush=True)
+            quality["ok"] = False
+
+    def _release_assisted_grasp(self, env, phase):
+        """Unload the simulated grasp joint before the smooth physical opening ramp.
+
+        OmniGibson's automatic release waits until the controller reaches fully open. The object
+        is then left asleep at its constrained pose, with too little free time to settle onto the
+        support. Releasing at the first ``release`` tick leaves the policy command and finger
+        motion unchanged, but gives gravity the full opening plus hold window. Automatic handling
+        is gated only until retreat so the still-closed fingers cannot reattach the object.
+        """
+        if phase not in {"release", "release_hold"}:
+            if self._assisted_handling_suspended:
+                env.set_assisted_grasp_handling(True)
+                self._assisted_handling_suspended = False
+            return
+        if phase == "release_hold":
+            return
+        cycle = int(getattr(self, "_cycle", 0))
+        arms = ("left", "right") if self._is_bimanual() else (self.ARM,)
+        released = False
         for arm in arms:
-            attr = "_reach_delta" if arm == "left" else "_right_reach_delta"
-            total = getattr(self, attr, None)
-            if total is None:
-                total = np.zeros(3, dtype=float)
-                setattr(self, attr, total)
-            if arm not in self._reach_targets:
-                self._reach_object0 = env.obj_pos(self.apple).copy()
-                self._reach_targets[arm] = (
-                    self._reach_object0 + self._grasp_world_offset(arm, placed=False)
-                )
-            # Hold the first settle sample fixed.  Chasing the live object creates positive
-            # feedback as soon as an open finger nudges it: the endpoint follows the displaced
-            # object, nudges it again, and runs to the correction cap.
-            target = self._reach_targets[arm]
-            residual = target - env.finger_grasp_point(arm)
-            # This correction exists for the x/y base deadband.  The open hand becomes vertically
-            # table-constrained near the grasp; integrating that untrackable z residual winds the
-            # endpoint down through the tabletop instead of improving the pinch.
-            residual[2] = 0.0
-            if arm not in self._reach_limits:
-                self._reach_limits[arm] = np.minimum(
-                    np.abs(residual) + self.REACH_SERVO_MARGIN,
-                    np.full(3, self.REACH_SERVO_MAX),
-                )
-                self._reach_limits[arm][2] = 0.0
-            if not getattr(self, "_reach_servo_started", {}).get(arm, False):
-                self._reach_servo_started[arm] = True
-                print(f"[{self.name}] {self.SPEC.name} {arm} settle residual="
-                      f"{np.round(residual * 1000, 1)} mm", flush=True)
-            norm = float(np.linalg.norm(residual))
-            if norm <= self.REACH_SERVO_TOL:
+            key = (cycle, arm)
+            if key in self._assisted_release_done:
                 continue
-            step = residual * min(1.0, self.REACH_SERVO_SPEED / env.action_hz / norm)
-            proposed = np.clip(
-                total + step, -self._reach_limits[arm], self._reach_limits[arm]
-            )
-            step = proposed - total
-            proposed_norm = float(np.linalg.norm(proposed))
-            if proposed_norm > self.REACH_SERVO_MAX:
-                proposed *= self.REACH_SERVO_MAX / proposed_norm
-                step = proposed - total
-            if float(np.linalg.norm(step)) < 1e-9:
-                continue
-            setattr(self, attr, proposed)
-            self._reach_servo_updates[arm] += 1
-            seg_attr = "_segs" if arm == "left" else "_right_segs"
-            shifted = []
-            for j, entry in enumerate(getattr(self, seg_attr)):
-                if entry is None:
-                    shifted.append(None)
-                    continue
-                name, end, grip, ticks = entry
-                if name in {"settle", "close", "close_right", "right_hold",
-                            "reaim_left", "close_left", "grasp_hold", "lift"} and (
-                        owners is None or owners[j] == cycle):
-                    end = np.asarray(end, dtype=float) + step
-                shifted.append((name, end, grip, ticks))
-            setattr(self, seg_attr, shifted)
-
-    def _reaim_second_hand(self, env, phase):
-        """Capture one smooth left-hand segment after the right assisted grasp has settled."""
-        if (not self._is_bimanual() or phase != "reaim_left"
-                or getattr(self, "_second_hand_reaimed", False)
-                or env.is_grasping("right") is not self.apple):
-            return
-        i = self._seg_i
-        old_end = np.asarray(self._segs[i][1], dtype=float)
-        new_end = env.obj_pos(self.apple) + self._grasp_world_offset("left", placed=False)
-        correction = new_end - old_end
-        owners = getattr(self, "_owners", None)
-        cycle = getattr(self, "_cycle", None)
-        shifted = []
-        for j, (name, end, grip, ticks) in enumerate(self._segs):
-            if (name in {"reaim_left", "close_left", "grasp_hold", "lift"}
-                    and (owners is None or owners[j] == cycle)):
-                end = np.asarray(end, dtype=float) + correction
-            shifted.append((name, end, grip, ticks))
-        self._segs = shifted
-        self._second_hand_reaimed = True
-        print(f"[{self.name}] {self.SPEC.name} left re-aim after right grasp="
-              f"{np.round(correction * 1000, 1)} mm", flush=True)
+            if env.is_grasping(arm) is self.apple:
+                env.robot.release_grasp_immediately(arm=arm)
+                self._assisted_release_done.add(key)
+                released = True
+                print(f"[{self.name}] {self.SPEC.name} released assisted {arm} grasp "
+                      "before gripper opening", flush=True)
+        if released:
+            env.set_assisted_grasp_handling(False)
+            self._assisted_handling_suspended = True
 
     def expert_step(self, env, obs):
         # Calibrate before advancing the next waypoint: the pick re-aim during settle, then the
@@ -1457,14 +1500,16 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         self._calibrate_reach_delta(env)
         self._calibrate_grasp_delta(env)
         cmd = super().expert_step(env, obs)
-        # This runs after the first ``reaim_left`` sample (f=0), so changing that segment's
-        # endpoint cannot discontinuously move the commanded hand. Subsequent samples traverse
-        # the measured correction at one constant rate over the remaining segment clock.
-        self._reaim_second_hand(env, cmd.phase)
         history = getattr(self, "_ever_grasped", None)
         if history is not None:
             for arm in history:
                 history[arm] |= env.is_grasping(arm) is self.apple
+        if self._is_bimanual():
+            both = (env.is_grasping("left") is self.apple
+                    and env.is_grasping("right") is self.apple)
+            self._bimanual_grasp_quality["simultaneous"] |= bool(both)
+        self._update_grasp_quality(env)
+        self._release_assisted_grasp(env, cmd.phase)
         return cmd
 
     def _release_point(self, env, arm="left"):
@@ -1523,6 +1568,13 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         boxes = layout.station_boxes(exclude=exclude, keys=self.scene_station_keys)
         hand_boxes = []
         if hand_off is not None:
+            payload_below = 0.03
+            if getattr(self, "apple", None) is not None and getattr(self.SPEC, "obj", None):
+                payload_below = max(
+                    payload_below,
+                    0.5 * float(self.apple.aabb_extent[2])
+                    + abs(float(self._grasp_world_offset("left")[2])),
+                )
             offsets = np.asarray(hand_off, dtype=float)
             offsets = offsets[None, :] if offsets.ndim == 1 else offsets
             for off in offsets:
@@ -1530,7 +1582,11 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
                     if key in exclude:
                         continue
                     stn = STATIONS[key]
-                    if hand_z is not None and stn.top_z() < hand_z - 0.03:
+                    # Skip only furniture whose top is safely below the PAYLOAD bottom. Testing
+                    # against hand-centre height alone let a tall cup clear in the map while its
+                    # lower half still swept through the station.
+                    if (hand_z is not None
+                            and stn.top_z() < hand_z - payload_below - HAND_SWEEP_PAD):
                         continue
                     x0, y0, x1, y1 = stn.footprint()
                     pad = HAND_SWEEP_PAD
@@ -1562,8 +1618,8 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
     def expert_reset(self, env):
         super().expert_reset(env)
         # Reach / attachment calibration may trim hand endpoints after planning.  Keep an immutable
-        # copy for the bimanual head reference: on hardware the headset and both hand targets are
-        # independent WBIK inputs, so a hand re-aim must not silently become a base translation.
+        # copy for the head reference: on hardware the headset and hand targets are independent
+        # WBIK inputs, so a hand re-aim must not silently become a base translation.
         self._head_plan_segs = [
             (name, np.asarray(end, dtype=float).copy(), grip, ticks)
             for name, end, grip, ticks in self._segs
@@ -1575,29 +1631,72 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
             )
             for entry in right
         ]
+        self._head_plan_headings = list(self._headings)
+        self._head_plan_standoffs = list(self._standoffs)
+        self._head_lock_mask = [False] * len(self._head_plan_segs)
+        self._lock_head_during_manipulation()
+
+    @staticmethod
+    def _previous_planned_center(plan, start, starts, i):
+        """Endpoint feeding segment ``i`` in one immutable hand plan."""
+        if i > 0 and plan[i - 1] is not None:
+            return np.asarray(plan[i - 1][1], dtype=float).copy()
+        if starts is not None and starts[i] is not None:
+            return np.asarray(starts[i], dtype=float).copy()
+        return np.asarray(start, dtype=float).copy()
+
+    def _lock_head_during_manipulation(self):
+        """Flatten only the head-reference plan over each grasp and release window.
+
+        Arm waypoints stay untouched. The first following travel segment interpolates away from
+        the flattened endpoint, avoiding a head-command jump when the lock ends.
+        """
+        active_phases = None
+        left_anchor = right_anchor = None
+        heading_anchor = standoff_anchor = None
+        right_starts = getattr(self, "_right_segment_starts", None)
+
+        for i, (phase, _end, grip, ticks) in enumerate(self._head_plan_segs):
+            if phase == "pregrasp":
+                active_phases = self.HEAD_LOCK_GRASP_PHASES
+            elif phase == "carry":
+                active_phases = self.HEAD_LOCK_RELEASE_PHASES
+            elif active_phases is not None and phase not in active_phases:
+                active_phases = None
+
+            if active_phases is None:
+                continue
+            starts_window = phase in {"pregrasp", "carry"}
+            if starts_window:
+                left_anchor = self._previous_planned_center(
+                    self._head_plan_segs, self._start_center, None, i
+                )
+                heading_anchor = self._head_plan_headings[max(i - 1, 0)]
+                standoff_anchor = self._head_plan_standoffs[max(i - 1, 0)]
+                right_anchor = None
+                if (self._right_head_plan_segs is not None
+                        and self._right_head_plan_segs[i] is not None):
+                    right_anchor = self._previous_planned_center(
+                        self._right_head_plan_segs, self._right_start_center, right_starts, i
+                    )
+
+            self._head_plan_segs[i] = (phase, left_anchor.copy(), grip, ticks)
+            if right_anchor is not None and self._right_head_plan_segs[i] is not None:
+                rphase, _rend, rgrip, rticks = self._right_head_plan_segs[i]
+                self._right_head_plan_segs[i] = (rphase, right_anchor.copy(), rgrip, rticks)
+            self._head_plan_headings[i] = heading_anchor
+            self._head_plan_standoffs[i] = standoff_anchor
+            self._head_lock_mask[i] = True
 
     # ---- arm ----
-    #: Body-frame shift of the IDLE right hand: 0.25 m back, 0.15 m down. Outside the bimanual
-    #: towel segments, the right arm has no waypoints and holds this pose in the body frame. The
-    #: places park the base right up against a wall
-    #: of furniture, and measured at those parks the nominal pose leaves the right gripper just
-    #: 3 mm from the bookcase during the towel place (and 173 mm during the book place). It is not
-    #: reaching for anything, so it should be out of the way.
-    #:
-    #: DOWN alone does not do it, and this is the part worth remembering: at the dish park the
-    #: right hand sits directly over the drying rack, clearing it only because it rides high. Drop
-    #: it 0.25 m and it stops passing over and starts entering -- measured -180 mm, i.e. inside the
-    #: rack's footprint, a worse collision than the one being fixed. So the descent stops at 0.15 m
-    #: (lowest right link 0.816 world, 60 mm over the rack's 0.756 crown) and the clearance is
-    #: bought by pulling BACK instead, which helps at every park at once. Measured worst-case gap
-    #: to the row over the three parks: 3 mm nominal -> 252 mm here, with the WBC tracking the
-    #: commanded pose to 1 mm.
-    RIGHT_TUCK = (-0.25, 0.0, -0.15)
+    def _idle_right_shift(self):
+        """Keep the idle right hand in the same nominal body pose used between tasks."""
+        return np.zeros(3, dtype=float)
 
     def _right_target(self, head_target, heading):
-        """The held right-hand pose, tucked. Still a pure command: body frame, no measured state."""
+        """Idle right-hand pose in the commanded body frame, with no measured-state feedback."""
         held = self._Ree_base.copy()
-        held[:3, 3] += np.asarray(self.RIGHT_TUCK, dtype=float)
+        held[:3, 3] += self._idle_right_shift()
         return self._commanded_base_target(head_target, heading) @ held
 
     def _grasp_rotation_now(self, env):
@@ -1616,25 +1715,52 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         extra = self._segment_rotation(getattr(self, "_grasp_rotations", None), i, f)
         return rot_z(self._head_heading_now(env)) @ extra @ self._Rgrasp_base
 
+    def _linear_home_center(self, env, segs, rotations, start, base_R, offset):
+        """Finger centre that makes ``home_arms`` a straight Cartesian EEF segment."""
+        i = getattr(self, "_seg_i", 0)
+        f = float(getattr(self, "_seg_f", 0.0))
+        previous = start if i == 0 or segs[i - 1] is None else segs[i - 1][1]
+        end = segs[i][1]
+        h0 = self._headings[max(i - 1, 0)]
+        h1 = self._headings[i]
+        R0 = rot_z(h0) @ self._segment_rotation(rotations, i, 0.0) @ base_R
+        R1 = rot_z(h1) @ self._segment_rotation(rotations, i, 1.0) @ base_R
+        Rnow = rot_z(self._head_heading_now(env)) @ self._segment_rotation(
+            rotations, i, f
+        ) @ base_R
+        eef0 = np.asarray(previous, dtype=float) - R0 @ offset
+        eef1 = np.asarray(end, dtype=float) - R1 @ offset
+        return (1.0 - f) * eef0 + f * eef1 + Rnow @ offset
+
     def _smooth_center(self, env, raw):
-        """Follow the exact fingertip arc that keeps the left EEF fixed during ``orient``."""
+        """Keep fixed-orientation phases well behaved in Cartesian EEF space."""
         if (getattr(self, "_segs", None)
                 and self._segs[getattr(self, "_seg_i", 0)][0] == "orient"
                 and self._orient_left_eef is not None):
             return self._orient_left_eef + self._grasp_rotation_now(env) @ self._grasp_off_local
+        if (getattr(self, "_segs", None)
+                and self._segs[getattr(self, "_seg_i", 0)][0] == "home_arms"):
+            return self._linear_home_center(
+                env, self._segs, self._grasp_rotations, self._start_center,
+                self._Rgrasp_base, self._grasp_off_local,
+            )
         return super()._smooth_center(env, raw)
 
     def _smooth_right_center(self, env, raw):
         """Right-hand mirror of :meth:`_smooth_center` for the bimanual wrist turn."""
-        if (getattr(self, "_right_segs", None)
-                and self._right_segs[getattr(self, "_seg_i", 0)] is not None
-                and self._right_segs[getattr(self, "_seg_i", 0)][0] == "orient"
+        right = getattr(self, "_right_segs", None)
+        i = getattr(self, "_seg_i", 0)
+        if (right and right[i] is not None and right[i][0] == "orient"
                 and self._orient_right_eef is not None):
-            i = getattr(self, "_seg_i", 0)
             f = getattr(self, "_seg_f", 0.0)
             extra = self._segment_rotation(self._right_grasp_rotations, i, f)
             rotation = rot_z(self._head_heading_now(env)) @ extra @ self._Rgrasp_right_base
             return self._orient_right_eef + rotation @ self._right_grasp_off_local
+        if right and right[i] is not None and right[i][0] == "home_arms":
+            return self._linear_home_center(
+                env, right, self._right_grasp_rotations, self._right_start_center,
+                self._Rgrasp_right_base, self._right_grasp_off_local,
+            )
         return super()._smooth_right_center(env, raw)
 
     def _bimanual_active(self):
@@ -1669,7 +1795,21 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
                 self._right_start_center,
                 getattr(self, "_right_segment_starts", None),
             )
-            return (left + right) / 2.0
+            i = getattr(self, "_seg_i", 0)
+            f = getattr(self, "_seg_f", 0.0)
+            heading = self._head_heading_now(None)
+            left_R = (rot_z(heading)
+                      @ self._segment_rotation(self._grasp_rotations, i, f)
+                      @ self._Rgrasp_base)
+            right_R = (rot_z(heading)
+                       @ self._segment_rotation(self._right_grasp_rotations, i, f)
+                       @ self._Rgrasp_right_base)
+            left_eef = left - left_R @ self._grasp_off_local
+            right_eef = right - right_R @ self._right_grasp_off_local
+            return (left_eef + right_eef) / 2.0
+        plan = getattr(self, "_head_plan_segs", None)
+        if plan is not None:
+            return self._planned_center(plan, self._start_center)
         return self._center
 
     # ---- head ----
@@ -1696,7 +1836,9 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         so it is one continuous quantity rather than a mode: 1.0 while picking and driving, easing
         to PLACE_STANDOFF as the robot closes on the receptacle.
         """
-        scales = getattr(self, "_standoffs", None)
+        scales = getattr(self, "_head_plan_standoffs", None)
+        if scales is None:
+            scales = getattr(self, "_standoffs", None)
         if not scales:
             s = STANDOFF_SCALE
         else:
@@ -1720,8 +1862,9 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         base: measured, the chassis spun 340 deg during the grasp and never closed on the mug.
         Per-waypoint headings break the loop -- nothing in the gaze command reads the base pose.
         """
-        h0 = self._headings[max(self._seg_i - 1, 0)]
-        h1 = self._headings[self._seg_i]
+        headings = getattr(self, "_head_plan_headings", self._headings)
+        h0 = headings[max(self._seg_i - 1, 0)]
+        h1 = headings[self._seg_i]
         d = (h1 - h0 + np.pi) % (2 * np.pi) - np.pi          # shortest way round
         self._head_heading = float(h0 + d * self._seg_f)
         return self._head_heading
@@ -1791,11 +1934,11 @@ class LongHorizonSequence(LongHorizonPickPlace):
     ORDER = ("book2shelf", "dish2rack", "towel2rack")
     #: Where each object waits on the source table. Measured, the tabletop is solid over
     #: x 1.10-1.85, y -0.05..+0.87, so these sit well inside it.  At the nominal marks, book /
-    #: towel / bowl occupy about y=0.10..0.18 / 0.31..0.49 / 0.74..0.82, leaving at least 0.13 m
+    #: towel / cup occupy about y=0.10..0.18 / 0.31..0.49 / 0.75..0.81, leaving at least 0.13 m
     #: nominal clearance (at least 0.09 m under the +/-20 mm reset jitter).  The bimanual towel is
-    #: centred near the body's midline; the bowl stays near the left hand's original mark.
+    #: centred near the body's midline; the cup stays near the left hand's original mark.
     SOURCE_MARKS = {"book2shelf": (1.20, 0.14), "dish2rack": (1.20, 0.78),
-                    "towel2rack": (1.14, 0.40)}
+                    "towel2rack": (1.11, 0.40)}
     #: Ticks to raise the hand from the receptacle back to its rest height before driving off.
     CLEAR_TICKS = 60
     #: Floor on a return leg's duration, matching the outbound legs' own `max(40, ...)`.
@@ -1813,10 +1956,31 @@ class LongHorizonSequence(LongHorizonPickPlace):
         histories = getattr(self, "_grasp_histories", None)
         if histories is not None and len(histories) > k:
             self._ever_grasped = histories[k]
+        qualities = getattr(self, "_grasp_qualities", None)
+        if qualities is not None and len(qualities) > k:
+            self._grasp_quality = qualities[k]
+        bimanual = getattr(self, "_bimanual_grasp_qualities", None)
+        if bimanual is not None and len(bimanual) > k:
+            self._bimanual_grasp_quality = bimanual[k]
 
-    def _mark_park(self, task_name):
-        """Base pose an object's mark implies -- see the class note on spreading marks in y."""
-        return np.asarray(self.SOURCE_MARKS[task_name], dtype=float) - self._carry_local[:2]
+    def _mark_park(self, task_name, env):
+        """Return-drive park implied by the live object and its next safe approach point."""
+        mark = np.asarray(env.obj_pos(self.apple)[:2], dtype=float)
+        spec = SPEC_BY_NAME[task_name]
+        if not self._is_bimanual(spec):
+            return mark - self._carry_local[:2]
+
+        # The bimanual grasp centre is not the object mark: towel2rack grasps its overhanging near
+        # edge.  End the return at the already-backed-off pair centre, so the last return leg does
+        # not drive 21 cm too far toward the table only for `pregrasp_x` to reverse that motion.
+        left = self._grasp_world_offset("left")
+        right = self._grasp_world_offset("right")
+        pair_grasp = mark + ((left + right) / 2.0)[:2]
+        backoff = (rot_z(float(self.ROBOT_YAW)) @ np.array([
+            self.BIMANUAL_APPROACH_BACKOFF, 0.0, 0.0
+        ]))[:2]
+        pair_hand_off = (rot_z(float(self.ROBOT_YAW)) @ self._pair_carry_local)[:2]
+        return pair_grasp - backoff - pair_hand_off
 
     # ---- scene ----
     def object_configs(self):
@@ -1895,14 +2059,13 @@ class LongHorizonSequence(LongHorizonPickPlace):
     def _right_hand_start(self):
         return self._cycle_right_hand_start
 
-    def _tucked_right_center_at(self, base_xy):
-        """Commanded right finger centre at a return route's endpoint."""
+    def _natural_right_center_at(self, base_xy):
+        """Commanded natural right finger centre at a return route's endpoint."""
         Tbase = np.eye(4)
         Tbase[:3, :3] = rot_z(float(self.ROBOT_YAW))
         Tbase[:2, 3] = np.asarray(base_xy, dtype=float)
         Tbase[2, 3] = self._base_cmd_z
         held = self._Ree_base.copy()
-        held[:3, 3] += np.asarray(self.RIGHT_TUCK, dtype=float)
         Tee = Tbase @ held
         return Tee[:3, 3] + Tee[:3, :3] @ self._right_grasp_off_local
 
@@ -1910,19 +2073,24 @@ class LongHorizonSequence(LongHorizonPickPlace):
         base0 = env.link_pose("base")[:3, 3]
         #: rest hand-offset from the base, the body constant that turns a mark into a park
         self._carry_local = rot_z(-self.ROBOT_YAW) @ (self._start_center - base0)
+        self._pair_carry_local = rot_z(-self.ROBOT_YAW) @ (
+            (self._start_center + self._right_start_center) / 2.0 - base0
+        )
         hand_off = rot_z(float(self.ROBOT_YAW)) @ self._carry_local
         rest_z = float(self._start_center[2])
         go = env.grip_open
 
         segs, headings, standoffs, owners = [], [], [], []
         grasp_rotations, right_rotations = [], []
-        right_segs, right_starts, grasp_histories = [], [], []
+        right_segs, right_starts, grasp_histories, grasp_qualities = [], [], [], []
+        bimanual_grasp_qualities = []
         self._grasp_histories = []
+        self._grasp_qualities = []
         hand = self._start_center.copy()
         prev_park = None
         for k, task_name in enumerate(self.ORDER):
             self._select(k)
-            self._cycle_src_park = self._mark_park(task_name)
+            self._cycle_src_park = self._mark_park(task_name, env)
             if prev_park is not None:
                 segs.append(("clear", np.array([hand[0], hand[1], rest_z]), go, self.CLEAR_TICKS))
                 nav = self._nav(env, hand_off=hand_off, hand_z=rest_z,
@@ -1950,12 +2118,14 @@ class LongHorizonSequence(LongHorizonPickPlace):
             self._cycle_hand_start = hand
             self._cycle_right_hand_start = (
                 self._right_start_center.copy() if k == 0
-                else self._tucked_right_center_at(self._cycle_src_park)
+                else self._natural_right_center_at(self._cycle_src_park)
             )
             cycle = super()._build_segments(env)     # the validated pick / transit / place, as-is
             cycle_right = self._right_segs
             cycle_right_rotations = self._right_grasp_rotations
             grasp_histories.append(self._ever_grasped)
+            grasp_qualities.append(self._grasp_quality)
+            bimanual_grasp_qualities.append(self._bimanual_grasp_quality)
             segs += cycle
             headings += list(self._headings)
             standoffs += list(self._standoffs)
@@ -1982,6 +2152,8 @@ class LongHorizonSequence(LongHorizonPickPlace):
         self._right_grasp_rotations = right_rotations
         self._right_segment_starts = right_starts
         self._grasp_histories = grasp_histories
+        self._grasp_qualities = grasp_qualities
+        self._bimanual_grasp_qualities = bimanual_grasp_qualities
         self._seg_i, self._seg_f = 0, 0.0
         self._select(0)
         per_cycle = [sum(n for (_, _, _, n), o in zip(segs, owners) if o == k)
@@ -1999,7 +2171,7 @@ class LongHorizonSequence(LongHorizonPickPlace):
         k = self._owners[min(getattr(self, "_seg_i", 0), len(self._owners) - 1)]
         if k != self._cycle:
             self._select(k)
-            # Both re-aims are per PICK, so both reset at the cycle boundary.
+            # Pick-side and attachment calibration are per cycle.
             self._grasp_delta = None            # see `_calibrate_grasp_delta`
             self._right_grasp_delta = None
             self._reach_delta = None            # see `_calibrate_reach_delta`
@@ -2010,7 +2182,6 @@ class LongHorizonSequence(LongHorizonPickPlace):
             self._reach_limits = {}
             self._reach_object0 = None
             self._reach_servo_logged = False
-            self._second_hand_reaimed = False
             env.base_keepouts = self.keepouts()  # the worked station's circle moves with the cycle
             print(f"[{self.name}] --- cycle {k}: {self.SPEC.name} "
                   f"-> {self.SPEC.station} ---", flush=True)

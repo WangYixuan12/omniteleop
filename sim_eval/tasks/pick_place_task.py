@@ -7,9 +7,9 @@ right arm holds at nominal and the base does not move (tabletop). SceneDiff obje
 interest are [apple, bowl]; success = apple Inside/OnTop the bowl.
 
 Grasp is OmniGibson **sticky** (`GRASPING_MODE = "sticky"`), i.e. contact-triggered
-magnetization: the object is attached once a finger touches it WHILE CLOSING, and
-`vega_og_env` sets `GRASP_WINDOW = 0` so that happens on the first contact. It is not
-friction holding the object. What makes it legitimate rather than a teleport is that the
+magnetization: the object is attached once a finger touches it while closing, subject to
+OmniGibson's normal grasp window. It is not friction holding the object. What makes it legitimate
+rather than a teleport is that the
 expert drives the open finger gap onto the object and closes there, so the attachment only
 ever fires with the pads already in contact -- nothing is grabbed across a gap and nothing
 is moved into the hand. The non-prehensile tasks use "physical" instead, because a closed
@@ -155,7 +155,7 @@ class PickPlaceTask(SimTask):
         self._head_pos_base = (
             np.linalg.inv(Tbase0) @ env.link_pose(self._head_link)
         )[:3, 3].copy()
-        pair0 = (self._start_center + self._right_start_center) / 2.0
+        pair0 = (self._L0[:3, 3] + Ree[:3, 3]) / 2.0
         self._head_off_bimanual_base = rot_z(-self._head_heading) @ (self._head_pos0 - pair0)
         self._base_cmd_z = float(Tbase0[2, 3])
         # built LAST, so a subclass may lay its waypoints out using the head geometry above
@@ -299,6 +299,23 @@ class PickPlaceTask(SimTask):
         return (1.0 - f) * previous + f * current
 
     @staticmethod
+    def _segment_grip_action(segs, i, f, grip_open):
+        """Interpolate policy close intent (0=open, 1=closed) on the waypoint clock.
+
+        Actuator values are not categorical labels: dish2rack stops its rigid-cup pinch at a
+        calibrated intermediate command.  Every non-open endpoint is therefore a close endpoint,
+        and the semantic action follows the same ramp as the physical command.
+        """
+        def closed(entry):
+            if entry is None:
+                return 0.0
+            return 0.0 if np.isclose(float(entry[2]), float(grip_open)) else 1.0
+
+        current = closed(segs[i])
+        previous = 0.0 if i == 0 else closed(segs[i - 1])
+        return (1.0 - f) * previous + f * current
+
+    @staticmethod
     def _interp_rotation(R0, R1, f):
         """Shortest-path SO(3) interpolation without linearly blending matrix entries."""
         from scipy.spatial.transform import Rotation as R
@@ -343,7 +360,7 @@ class PickPlaceTask(SimTask):
                 H = self._head_target(env)
                 L = self._grasp_target(center, self._grasp_rotation_now(env))
                 if not right_active:
-                    Rt = self._right_target(H, self._head_heading)
+                    Rt = self._right_target(H, self._head_heading_now(env))
                     right_grip = env.grip_open
                 else:
                     right_grip = self._segment_grip(right_segs, i, f, env.grip_open)
@@ -358,6 +375,14 @@ class PickPlaceTask(SimTask):
                                      gripper_left=self._segment_grip(
                                          self._segs, i, f, env.grip_open
                                      ), gripper_right=right_grip,
+                                     gripper_action_left=self._segment_grip_action(
+                                         self._segs, i, f, env.grip_open
+                                     ),
+                                     gripper_action_right=(
+                                         self._segment_grip_action(
+                                             right_segs, i, f, env.grip_open
+                                         ) if right_active else 0.0
+                                     ),
                                      done=False, phase=name)
             acc += n
             prev = end_c
@@ -369,7 +394,7 @@ class PickPlaceTask(SimTask):
         H = self._head_target(env)
         L = self._grasp_target(self._center, self._grasp_rotation_now(env))
         if right_segs is None or right_segs[-1] is None:
-            Rt = self._right_target(H, self._head_heading)
+            Rt = self._right_target(H, self._head_heading_now(env))
             right_grip = env.grip_open
         else:
             extra = (np.eye(3) if getattr(self, "_right_grasp_rotations", None) is None
@@ -379,4 +404,11 @@ class PickPlaceTask(SimTask):
             right_grip = right_segs[-1][2]
         return ExpertCommand(left_target=L, right_target=Rt, head_target=H,
                              gripper_left=self._segs[-1][2], gripper_right=right_grip,
+                             gripper_action_left=(
+                                 0.0 if np.isclose(self._segs[-1][2], env.grip_open) else 1.0
+                             ),
+                             gripper_action_right=(
+                                 0.0 if right_segs is None or right_segs[-1] is None
+                                 or np.isclose(right_segs[-1][2], env.grip_open) else 1.0
+                             ),
                              done=True, phase="done")

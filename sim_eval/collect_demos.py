@@ -116,7 +116,45 @@ def run_episode(env, task, recorder, seed, fps, max_ticks, action_hz):
             t_ns += dt_ns
         if cmd.done:
             break
-    return frames, bool(task.success(env)), src_dst[0].copy(), src_dst[1].copy()
+    reasons = episode_quality_failures(env, frames)
+    terminal = bool(task.success(env))
+    if reasons:
+        P(f"[collect] seed {seed}: trajectory-quality rejection: " + "; ".join(reasons))
+    return frames, bool(terminal and not reasons), src_dst[0].copy(), src_dst[1].copy()
+
+
+def episode_quality_failures(env, frames):
+    """Reject simulator artifacts even when the task's terminal geometry happens to pass."""
+    q = getattr(env, "_quality", {})
+    reasons = []
+    if q.get("hold_ticks", 0):
+        reasons.append(f"WBC held for {q['hold_ticks']} ticks")
+    if q.get("keepout_interventions", 0):
+        reasons.append(f"keepout veto changed {q['keepout_interventions']} commands")
+    if q.get("max_chassis_tilt_deg", 0.0) > 2.0:
+        reasons.append(f"chassis tilt reached {q['max_chassis_tilt_deg']:.2f} deg")
+    # The shared hardware head deadband intentionally releases at 4 cm (wbik.yaml); reject arm
+    # discontinuities, while retaining the all-stream maximum in telemetry for inspection.
+    if q.get("max_arm_target_jump_m", 0.0) > 0.03:
+        reasons.append(f"one-tick arm target jump was {q['max_arm_target_jump_m']:.3f} m")
+    if q.get("max_target_jump_deg", 0.0) > 10.0:
+        reasons.append(f"one-tick target rotation was {q['max_target_jump_deg']:.1f} deg")
+    if len(frames) > 1:
+        def policy_action(frame):
+            action = frame["action"]
+            return np.concatenate([
+                np.asarray(action["eef"]["left"]).ravel(),
+                np.asarray(action["eef"]["right"]).ravel(),
+                np.asarray(action["head"]).ravel(),
+                [action["gripper"]["left"], action["gripper"]["right"]],
+            ])
+
+        actions = np.stack([policy_action(frame) for frame in frames])
+        repeated = np.all(np.isclose(np.diff(actions, axis=0), 0.0, atol=1e-8), axis=1)
+        fraction = float(np.mean(repeated))
+        if fraction > 0.08:
+            reasons.append(f"fully stationary policy action on {100.0 * fraction:.1f}% of frames")
+    return reasons
 
 
 def write_positions(path, src_wbc, dst_wbc):
@@ -178,12 +216,6 @@ def main():
                     robot_pos=task.ROBOT_POS, robot_yaw=task.ROBOT_YAW)
     if mobile:
         env.base_x_max = getattr(task, "BASE_X_MAX", None)
-        if getattr(task, "BASE_MAX_ANG", None) is not None:
-            env.base_max_ang = float(task.BASE_MAX_ANG)   # whole-episode cap, see the task class
-        if getattr(task, "BASE_MAX_LIN", None) is not None:
-            env.base_max_lin = float(task.BASE_MAX_LIN)   # whole-episode cap, see the task class
-        if hasattr(task, "keepouts"):
-            env.base_keepouts = task.keepouts()   # park circles at each long-horizon station
     recorder = SimObsRecorder(env, seed=args.seed0, zed=zed_opts)
 
     kept, xyz_lo, xyz_hi = [], None, None

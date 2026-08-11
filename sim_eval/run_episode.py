@@ -136,12 +136,6 @@ def main():
                     wbc_overrides=ovr, robot_pos=task.ROBOT_POS, robot_yaw=task.ROBOT_YAW)
     if mobile:
         env.base_x_max = getattr(task, "BASE_X_MAX", None)   # forward-park clamp near the table
-        if getattr(task, "BASE_MAX_ANG", None) is not None:
-            env.base_max_ang = float(task.BASE_MAX_ANG)   # whole-episode cap, see the task class
-        if getattr(task, "BASE_MAX_LIN", None) is not None:
-            env.base_max_lin = float(task.BASE_MAX_LIN)   # whole-episode cap, see the task class
-        if hasattr(task, "keepouts"):
-            env.base_keepouts = task.keepouts()               # park circles at each station
     env.reset(seed=args.seed)
     max_ticks = args.max_ticks or int(getattr(task, "MAX_TICKS", 800))
     # Park the head camera at zed_depth_frame + add the wrist camera, exactly as the data
@@ -195,6 +189,13 @@ def main():
             if hasattr(env, "finger_qpos"):
                 gp = env.finger_grasp_point("left")
                 extra = f" fq={env.finger_qpos('left')} d(gp,src)={round(float(np.linalg.norm(gp - src)),3)}"
+            carried = getattr(task, "apple", None)
+            if carried is not None and hasattr(carried, "get_linear_velocity"):
+                lv = carried.get_linear_velocity()
+                av = carried.get_angular_velocity()
+                lv = lv.detach().cpu().numpy() if hasattr(lv, "detach") else np.asarray(lv)
+                av = av.detach().cpu().numpy() if hasattr(av, "detach") else np.asarray(av)
+                extra += f" obj_v={np.linalg.norm(lv):.3f} obj_w={np.linalg.norm(av):.3f}"
             bx, by, bwz = env.base_xyyaw()
             byaw = round(float(np.degrees(bwz)), 1)
             bpos = env.link_pose('base')[:3, 3]
@@ -230,6 +231,19 @@ def main():
             break
 
     succ = task.success(env)
+    quality = getattr(env, "_quality", {})
+    quality_reasons = []
+    if quality.get("hold_ticks", 0):
+        quality_reasons.append(f"WBC holds={quality['hold_ticks']}")
+    if quality.get("keepout_interventions", 0):
+        quality_reasons.append(f"keepout edits={quality['keepout_interventions']}")
+    if quality.get("max_chassis_tilt_deg", 0.0) > 2.0:
+        quality_reasons.append(f"tilt={quality['max_chassis_tilt_deg']:.2f}deg")
+    if quality.get("max_arm_target_jump_m", 0.0) > 0.03:
+        quality_reasons.append(f"arm target jump={quality['max_arm_target_jump_m']:.3f}m")
+    if quality.get("max_target_jump_deg", 0.0) > 10.0:
+        quality_reasons.append(f"target turn={quality['max_target_jump_deg']:.1f}deg")
+    succ = bool(succ and not quality_reasons)
     src, dst = task.objects_of_interest(env)
     # Motion quality, the thing the review video is actually judged on: total yaw variation (the
     # real robot manages 11.7 deg over a 3.5 m path and never commands wz at all) and the worst
@@ -239,6 +253,8 @@ def main():
     P(f"[run] motion: yaw net {np.degrees(y[-1] - y[0]):+.1f} deg, total variation "
       f"{np.degrees(np.abs(np.diff(y)).sum()):.1f} deg; max chassis tilt "
       f"{np.degrees(max(tilt) if tilt else 0.0):.2f} deg")
+    P(f"[run] trajectory quality: {quality if quality else 'not instrumented'}"
+      + (f" REJECT={quality_reasons}" if quality_reasons else ""))
     import imageio
     for tag, buf in [("", frames), ("_3rd", thirds)]:
         if not buf:

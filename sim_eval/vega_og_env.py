@@ -45,32 +45,16 @@ class VegaOGEnv:
                  lock_base=True, wbc_port=5610, obs_hw=None, wbc_overrides=None,
                  scene_model="Rs_int", robot_pos=(-0.5, 0.4, 0.03), robot_yaw=0.0,
                  grasping_mode="physical", grasping_direction="upper", mobile=False):
-        # A task may select either canonical planar-root mode from whole_body_ik.py. Merge it
-        # with caller diagnostics rather than letting e.g. --head-cost silently restore yaw.
         overrides = {} if wbc_overrides is None else dict(wbc_overrides)
-        task_base_dofs = getattr(task, "BASE_DOFS", None)
-        if task_base_dofs is not None:
-            requested = overrides.get("base_dofs", task_base_dofs)
-            if requested != task_base_dofs:
-                raise ValueError(
-                    f"task requires base_dofs={task_base_dofs!r}, override requested {requested!r}"
-                )
-            overrides["base_dofs"] = task_base_dofs
-        self.base_dofs = overrides.get("base_dofs", base_ctrl.WBIK.base_dofs)
-        # The task attribute is the sim's `--base-yaw-hold-in-xy`: the follower exposes the same
-        # switch as a CLI flag over the shared yaml default, so default from the file and let a
-        # task override it, rather than hardcoding either end.
-        self.base_yaw_hold_in_xy = bool(
-            getattr(task, "BASE_YAW_HOLD_IN_XY", base_ctrl.VR_TELEOP.base_yaw_hold_in_xy))
-        # Mobile episodes use whole_body_ik.py's canonical wbik.yaml unchanged. In particular,
-        # head_world_position_cost=[10000,10000,0] makes the chassis follow world x/y without
-        # pinning camera height, and enable_torso_top_x_anchor=true prevents an arm reach from
-        # folding the upper body instead of moving the base. The fixed-base tabletop task has no
-        # chassis authority, so retaining its established reach-oriented relaxation is harmless
-        # and deliberately scoped to that one mode.
-        if not mobile:
-            overrides.setdefault("head_world_position_cost", [0.0, 0.0, 0.0])
-            overrides.setdefault("enable_torso_top_x_anchor", False)
+        # The simulator and the real follower share one controller configuration.  Tasks may plan
+        # different paths, but they may not silently replace solver DOFs or controller gains.
+        if "base_dofs" in overrides and overrides["base_dofs"] != base_ctrl.WBIK.base_dofs:
+            raise ValueError(
+                "sim base_dofs must match follower/wbik.yaml: "
+                f"{base_ctrl.WBIK.base_dofs!r}, got {overrides['base_dofs']!r}"
+            )
+        self.base_dofs = base_ctrl.WBIK.base_dofs
+        self.base_yaw_hold_in_xy = bool(base_ctrl.VR_TELEOP.base_yaw_hold_in_xy)
         wbc_overrides = overrides or None
         self.base_x_max = None   # mobile: forward-park clamp (set by run_episode from the task)
         # mobile: (x, y, radius) circles the chassis must not drive INTO. The general form of
@@ -205,12 +189,6 @@ class VegaOGEnv:
         }
         self.env = og.Environment(configs=cfg)
         self.robot = self.env.robots[0]
-        if grasping_mode in ("sticky", "assisted"):
-            # instant scripted grasp: magnetize as soon as a finger contacts while closing
-            # (default 0.3s window is fragile under a subsampled scripted trajectory).
-            from omnigibson.macros import macros
-            with macros.unlocked():
-                macros.robots.robot.GRASP_WINDOW = 0.0
         self.names = self.robot.dof_names_ordered
         self.name2idx = {n: i for i, n in enumerate(self.names)}
         self.cai = self.robot.controller_action_idx
@@ -232,11 +210,41 @@ class VegaOGEnv:
         """Object magnetized to @arm under assisted/sticky grasping, else None."""
         return self.robot._ag_obj_in_hand.get(arm)
 
+    def set_assisted_grasp_handling(self, enabled):
+        """Gate automatic reattachment while a deliberately released gripper opens."""
+        if self.grasping_mode != "physical":
+            self.robot._disable_grasp_handling = not bool(enabled)
+
     def finger_qpos(self, arm="left"):
         """The two driven gripper-joint positions for @arm."""
         q = self.robot.get_joint_positions().detach().cpu().numpy()
         return [round(float(q[self.name2idx[name]]), 4)
                 for name in self.robot.finger_joint_names[arm]]
+
+    def finger_position_normalized(self, arm="left"):
+        """Mean achieved Robotiq position in hardware FC03 semantics (0=open, 1=closed)."""
+        q = self.robot.get_joint_positions().detach().cpu().numpy()
+        lo = self.robot.joint_lower_limits.detach().cpu().numpy()
+        hi = self.robot.joint_upper_limits.detach().cpu().numpy()
+        values = []
+        for name in self.robot.finger_joint_names[arm]:
+            i = self.name2idx[name]
+            values.append((float(q[i]) - float(lo[i])) / max(float(hi[i] - lo[i]), 1e-9))
+        return float(np.clip(np.mean(values), 0.0, 1.0))
+
+    def base_body_twist(self):
+        """Measured base velocity in the body frame, matching hardware wheel odometry."""
+        qd = self.robot.get_joint_velocities().detach().cpu().numpy()
+        world = np.array([
+            qd[self.name2idx["base_footprint_x_joint"]],
+            qd[self.name2idx["base_footprint_y_joint"]],
+        ], dtype=float)
+        yaw = self.base_xyyaw()[2]
+        c, s = np.cos(yaw), np.sin(yaw)
+        body = np.array([[c, s], [-s, c]]) @ world
+        return np.array([
+            body[0], body[1], qd[self.name2idx["base_footprint_rz_joint"]]
+        ], dtype=float)
 
     def finger_center_world(self, arm="left"):
         """World midpoint between @arm's two fingertip links (where the grasp closes)."""
@@ -328,6 +336,7 @@ class VegaOGEnv:
 
     def reset(self, seed=None):
         self.env.reset()
+        self.set_assisted_grasp_handling(True)
         # AFTER env.reset(), never before: OmniGibson's `scene.reset(hard=True)` forces the live
         # object set back to the scene's initial file, so anything removed at construction is
         # restored on the first reset. Decluttering there looked like it worked (the removals
@@ -335,7 +344,7 @@ class VegaOGEnv:
         # robot then drove into the "removed" sofa and toppled mid-transit.
         if self.task is not None and hasattr(self.task, "declutter"):
             self.task.declutter(self)
-        self.lock_chassis_tilt()      # after every reset: joint limits do not survive one
+        self.lock_chassis_tilt()
         self._prev_base_twist = np.zeros(3)
         self._base_shaped = np.zeros(3)
         self._base_axis = None
@@ -350,11 +359,21 @@ class VegaOGEnv:
         self._head_lpf = self._head_deadband = None
         self._prev_joint_cmd = {}
         self._overstep_ticks = 0
+        self._quality = {
+            "hold_ticks": 0,
+            "keepout_interventions": 0,
+            "max_target_jump_m": 0.0,
+            "max_target_jump_detail": None,
+            "max_arm_target_jump_m": 0.0,
+            "max_target_jump_deg": 0.0,
+            "max_chassis_tilt_deg": 0.0,
+        }
+        self._previous_effective_targets = None
         if self.task is not None:
             self.task.reset(self)
+            self.base_keepouts = list(self.task.keepouts()) if hasattr(self.task, "keepouts") else []
             for _ in range(10):
                 self.env.step(self._hold_action())   # settle objects + robot at nominal
-                self._level_chassis()
         self.T_align = self.link_pose("base")
         self.T_align_inv = np.linalg.inv(self.T_align)
         self.base_hold_target = np.array(self.base_xyyaw())   # ~0 at spawn
@@ -422,16 +441,15 @@ class VegaOGEnv:
             if scale == 0.0 or self._cam_clear(p + scale * offset + np.array([0.0, 0.0, up])):
                 want = scale
                 break
-        # Ease toward it instead of snapping. Re-picking a discrete pull-in scale every frame is
-        # what made the shot pump in and out; the eye and aim point are low-passed as well so the
-        # camera drifts with the robot rather than jerking after it.
+        # Ease only the discrete wall-clearance scale. The eye and aim must follow the base
+        # exactly: low-passing their world poses made the whole robot drift sideways by ~65 pixels
+        # at episode start, then appear to teleport back when the first strafe ended.
         prev = getattr(self, "_cam_scale", want)
         self._cam_scale = prev + np.clip(want - prev, -0.02, 0.02)
         eye = p + self._cam_scale * offset + np.array([0.0, 0.0, up])
         aim = p + ahead * fwd + np.array([0.0, 0.0, 0.75])
-        a = 0.12
-        self._cam_eye = eye if not hasattr(self, "_cam_eye") else (1 - a) * self._cam_eye + a * eye
-        self._cam_aim = aim if not hasattr(self, "_cam_aim") else (1 - a) * self._cam_aim + a * aim
+        self._cam_eye = eye
+        self._cam_aim = aim
         self._set_cam_lookat(self._cam_eye, self._cam_aim)
 
     def _cam_clear(self, eye):
@@ -576,56 +594,31 @@ class VegaOGEnv:
         return shaped
 
     def lock_chassis_tilt(self):
-        """Pin the base's z / roll / pitch joints so the chassis stays level.
+        """Dynamically servo the non-planar virtual joints instead of teleporting them per tick.
 
-        OmniGibson gives a holonomic base SIX virtual joints (x, y, z, rx, ry, rz) but the
-        `HolonomicBaseJointController` drives only three of them -- x, y and rz. The other three
-        are left completely free, so every reaction torque from the arm pitches and sinks the
-        whole robot: measured, the body rolled far enough to read as tipping over on the reach
-        segments of dish2rack and towel2shelf (the task since rebuilt as towel2rack), and a
-        collision mid-transit once dropped the head from 1.38 m to 0.26 m. A wheeled chassis on a flat floor does none of that, so pinning
-        these is what makes the sim match the hardware, not a liberty taken with it. (OmniGibson
-        pins the same three for its own CuRobo export -- see `import_custom_robot.lock_joints`.)
-
-        Held kinematically, per tick, because nothing else on these joints bites. Probed
-        directly: as loaded they report `driven=False, has_limit=False, limits=[-inf, inf],
-        stiffness=0, damping=0`. They carry no limit in USD at all, so `set_joint_limits` is
-        accepted and then ignored (read-back stays +/-inf), and writing drive gains changes
-        nothing either -- both were tried and dish2rack came back bit-identical, still pitching
-        7.8 deg. Pinning the pose is what is left, and it is the honest model: the real chassis
-        rolls on wheels, so its roll, pitch and ride height ARE constants of the hardware and the
-        reaction the arm feeds back is taken by the wheels and the floor, not by leaning the body.
-        Roll and pitch go to zero; ride height is held wherever the robot SETTLED at reset rather
-        than at a nominal 0, so nothing is driven into the ground.
+        The real Vega root is structurally planar. OmniGibson's imported holonomic root exposes
+        free z/roll/pitch joints, so give those three joints ordinary PhysX position drives and a
+        persistent target.  This lets reaction forces flow through the simulated chassis while
+        avoiding the energy/state discontinuity caused by writing positions and velocities after
+        every physics step. Yaw remains controlled by the normal base controller, as required by
+        wbik.yaml's ``base_dofs: xy_yaw``.
         """
-        axes = ["z", "rx", "ry"]
-        q = self.robot.get_joint_positions().detach().cpu().numpy()
-        held = [float(q[self.name2idx["base_footprint_z_joint"]]), 0.0, 0.0]
-        if self.base_dofs == "xy":
-            # ...and YAW, on a task whose controller never commands wz. In `xy` mode the base-DOF
-            # mask zeroes wz on every tick, and the odometry yaw regulator that would trim it is
-            # itself below the shared `base_post_angular_deadband` (a 2.7 deg error asks for
-            # 0.07 rad/s against a 0.12 floor), so nothing drives this joint all episode -- yet it
-            # is a VELOCITY-controlled virtual joint, so the arm's reaction back-drives it anyway.
-            # Measured on dish2rack: the chassis wound to -0.047 rad while its reference sat at 0,
-            # which over the 0.6 m place reach is 28 mm of lateral error, and the bowl missed its
-            # rail by 25 mm. A wheeled chassis given no yaw command does not rotate 2.7 deg because
-            # an arm moved -- the wheels and the ground take that reaction. This is the same
-            # argument, and the same fix, as the z/roll/pitch pinning above, and it is a PLANT
-            # correction: the controller is unchanged and still runs the regulator hardware runs.
-            axes.append("rz")
-            held.append(float(q[self.name2idx["base_footprint_rz_joint"]]))
-        self._level_idx = [self.name2idx[f"base_footprint_{c}_joint"] for c in axes]
-        self._level_q = th.tensor(held, dtype=th.float32)
+        from omnigibson.controllers.controller_base import ControlType
+        import omnigibson.lazy as lazy
 
-    def _level_chassis(self):
-        """Put the chassis back on its wheels. Called after every physics step (see
-        `lock_chassis_tilt`); a no-op until that has run."""
-        idx = getattr(self, "_level_idx", None)
-        if idx is None:
-            return
-        self.robot.set_joint_positions(self._level_q, indices=idx, drive=False)
-        self.robot.set_joint_velocities(th.zeros(len(idx)), indices=idx, drive=False)
+        names = [f"base_footprint_{axis}_joint" for axis in ("z", "rx", "ry")]
+        q = self.robot.get_joint_positions().detach().cpu().numpy()
+        targets = th.tensor([
+            float(q[self.name2idx[names[0]]]), 0.0, 0.0
+        ], dtype=th.float32)
+        indices = [self.name2idx[name] for name in names]
+        for name, drive_type in zip(names, ("linear", "angular", "angular")):
+            joint = self.robot.joints[name]
+            with og.sim.editing_usd():
+                lazy.pxr.UsdPhysics.DriveAPI.Apply(joint.prim, drive_type)
+            joint._driven = True
+            joint.set_control_type(ControlType.POSITION, kp=50000.0, kd=5000.0)
+        self.robot.set_joint_positions(targets, indices=indices, drive=True)
 
     def chassis_tilt(self):
         """(z, roll, pitch) of the chassis -- 0 when level. Nonzero means it is tipping."""
@@ -661,6 +654,10 @@ class VegaOGEnv:
                 axis_world = Rz[:, axis] * out[axis]
                 if float(axis_world @ n) < 0.0:
                     out[axis] = 0.0
+        if not np.allclose(out, twist, atol=1e-12):
+            quality = getattr(self, "_quality", None)
+            if quality is not None:
+                quality["keepout_interventions"] += 1
         return out
 
     def drive_base(self, base_vel, capture=False):
@@ -669,7 +666,6 @@ class VegaOGEnv:
         a = self._hold_action()
         a[self.cai["base"]] = th.tensor(np.asarray(base_vel, dtype=float), dtype=th.float32)
         self.env.step(a)
-        self._level_chassis()
         self.base_hold_target = np.array(self.base_xyyaw())
         return self.capture_third_person() if capture else None
 
@@ -696,6 +692,8 @@ class VegaOGEnv:
                     yaw_deadband=self.head_planar_yaw_deadband)
             head = self._head_lpf.filter(head, self.dt)
             head = self._head_deadband.filter(head)
+        effective = {"left": left.copy(), "right": right.copy(),
+                     "head": None if head is None else head.copy()}
         # current_q=None: the follower never re-seeds the IK from measured state (the string does
         # not appear in wbc_vr_robot.py at all) -- it integrates its own configuration and closes
         # the base loop OUTSIDE the solver, in `_mobile_base_cmd`. Feeding measurement in here as
@@ -724,9 +722,46 @@ class VegaOGEnv:
         a[self.cai["gripper_left"]] = float(grip_l)
         a[self.cai["gripper_right"]] = float(grip_r)
         self.env.step(a)
-        self._level_chassis()
         self._tick += 1
         resp["hold"] = hold
+        resp["effective_targets"] = effective
+        resp["sent_joints"] = dict(joints)
+        resp["sent_base_twist"] = np.asarray(base_cmd, dtype=float).copy()
+        quality = getattr(self, "_quality", None)
+        if quality is not None:
+            quality["hold_ticks"] += int(hold)
+            tilt = self.chassis_tilt()[1:]
+            quality["max_chassis_tilt_deg"] = max(
+                quality["max_chassis_tilt_deg"],
+                float(np.degrees(max(abs(v) for v in tilt))),
+            )
+            previous = self._previous_effective_targets
+            if previous is not None:
+                from scipy.spatial.transform import Rotation as SciRot
+                for side in ("left", "right", "head"):
+                    if effective[side] is None or previous[side] is None:
+                        continue
+                    dp = float(np.linalg.norm(effective[side][:3, 3] - previous[side][:3, 3]))
+                    dr = float(np.degrees(SciRot.from_matrix(
+                        previous[side][:3, :3].T @ effective[side][:3, :3]
+                    ).magnitude()))
+                    if dp > quality["max_target_jump_m"]:
+                        phase = None
+                        if self.task is not None and getattr(self.task, "_segs", None):
+                            index = min(getattr(self.task, "_seg_i", 0), len(self.task._segs) - 1)
+                            phase = self.task._segs[index][0]
+                        quality["max_target_jump_m"] = dp
+                        quality["max_target_jump_detail"] = {
+                            "tick": self._tick,
+                            "side": side,
+                            "phase": phase,
+                        }
+                    if side in {"left", "right"}:
+                        quality["max_arm_target_jump_m"] = max(
+                            quality["max_arm_target_jump_m"], dp
+                        )
+                    quality["max_target_jump_deg"] = max(quality["max_target_jump_deg"], dr)
+            self._previous_effective_targets = effective
         return resp
 
     #: Joint groups the follower clamps independently -- its `cmds` dict in `Driver.actuate`.

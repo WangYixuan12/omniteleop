@@ -26,8 +26,13 @@ class ExpertCommand:
     right_target: Optional[np.ndarray] = None   # (4,4) desired R_ee world pose (manipulate)
     head_target: Optional[np.ndarray] = None    # (4,4) desired zed_depth_frame world pose, or None to hold
     base_vel: Optional[np.ndarray] = None        # (vx,vy,wz) base-frame twist for the navigate phase
-    gripper_left: float = -1.0       # gripper command in [-1(open), 1(close)]
+    gripper_left: float = -1.0       # task actuator convention: +1 open, -1 close
     gripper_right: float = -1.0
+    # Policy semantics, independent of actuator calibration: 0=open, 1=closed.  A task may
+    # deliberately stop a rigid-object pinch at an intermediate Robotiq command, so equality with
+    # ``env.grip_close`` cannot recover this label after the fact.
+    gripper_action_left: float = 1.0
+    gripper_action_right: float = 1.0
     done: bool = False               # expert signals episode end (reached terminal state)
     phase: str = ""                  # human-readable phase label (for logging/video overlay)
 

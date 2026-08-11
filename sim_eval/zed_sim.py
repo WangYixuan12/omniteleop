@@ -129,7 +129,7 @@ class ZedSimOptions:
     recorded intrinsic is ZED_K (102.5 x 75.8 deg, pixel aspect 1.2) instead of OmniGibson's
     63.4 x 49.7 deg. Needs a WIDER ManiFlow workspace crop -- see the module docstring."""
 
-    depth_dropout: bool = False
+    depth_dropout: bool = True
     """Invalidate depth at occlusion boundaries and on grazing surfaces, matching the real
     sensor's 1.06% invalid rate (sim is otherwise 0.08%)."""
 
@@ -143,11 +143,11 @@ class ZedSimOptions:
     @staticmethod
     def add_cli(parser: argparse.ArgumentParser) -> None:
         g = parser.add_argument_group(
-            "ZED camera realism (all default OFF; see zed_sim.py for the measurements)")
+            "ZED camera realism (depth dropout on by default; geometry unchanged)")
         g.add_argument("--match-zed-fov", action=argparse.BooleanOptionalAction, default=False,
                        help="render the real ZED field of view + crop/resize chain (recorded "
                             "intrinsic becomes ZED_K). Needs a wider zarr crop.")
-        g.add_argument("--depth-dropout", action=argparse.BooleanOptionalAction, default=False,
+        g.add_argument("--depth-dropout", action=argparse.BooleanOptionalAction, default=True,
                        help="model the real sensor's ~1.1%% invalid-depth pixels (edges + "
                             "grazing incidence)")
         g.add_argument("--wrist-zedm-fov", action=argparse.BooleanOptionalAction, default=False,
@@ -159,7 +159,7 @@ class ZedSimOptions:
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "ZedSimOptions":
         return cls(match_zed_fov=bool(getattr(args, "match_zed_fov", False)),
-                   depth_dropout=bool(getattr(args, "depth_dropout", False)),
+                   depth_dropout=bool(getattr(args, "depth_dropout", True)),
                    wrist_zedm_fov=bool(getattr(args, "wrist_zedm_fov", False)),
                    axial_noise_mm_per_m2=float(getattr(args, "axial_noise", 0.0)))
 

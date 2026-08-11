@@ -144,8 +144,12 @@ class CarryTask(SimTask):
         L = self._arm_target("left", first, prev, end_c, f)
         R = self._arm_target("right", first, prev, end_c, f)
         done = (name == "done" and f > 0.9)
+        grip_action = 0.0 if np.isclose(grip, env.grip_open) else 1.0
         return ExpertCommand(left_target=L, right_target=R,
-                             gripper_left=grip, gripper_right=grip, done=done, phase=name)
+                             gripper_left=grip, gripper_right=grip,
+                             gripper_action_left=grip_action,
+                             gripper_action_right=grip_action,
+                             done=done, phase=name)
 
     def _arm_target(self, arm, first, prev_center, end_center, f):
         if first:

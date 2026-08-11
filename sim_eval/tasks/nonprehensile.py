@@ -126,13 +126,6 @@ class CloseFridgeTask(_StationTask):
     PUSH_TICKS = 520                # slow enough that the door swings with the hand
     APPROACH_TICKS = 260            # settle the base in front of the panel before contact
     CONTACT_OFFSET = 0.06           # door panel is thin; just clear its face
-    #: Base angular rate cap for the WHOLE episode (not a mid-episode mode -- the control law
-    #: stays uniform). Pressing a fist into an object feeds reaction torque back through the
-    #: chassis and the base rings about its commanded heading; measured, damping this cut yaw
-    #: total variation from 211 to 180 deg and still closed the door. It has to stay ABOVE
-    #: `TURN_RATE`, though, or the one deliberate in-place turn cannot be executed at the rate
-    #: the plan plots it at and the clock spends the whole turn throttled waiting for the base.
-    BASE_MAX_ANG = 0.40
     BODY_MASS = 400.0               # see `_anchor_body`
     MAX_BODY_DRIFT = 0.10           # appliance must stay put; see `success`
     SPEC = LHSpec(name="closefridge", obj={}, station="fridge")
@@ -145,7 +138,6 @@ class CloseFridgeTask(_StationTask):
         self._set_door(env, self.OPEN_ANGLE)
         for _ in range(5):
             env.env.step(env._hold_action())
-            env._level_chassis()
 
     def bind(self, env):
         super().bind(env)
@@ -215,6 +207,9 @@ class CloseFridgeTask(_StationTask):
         q = self.fridge.get_joint_positions()
         q[idx] = angle
         self.fridge.set_joint_positions(th.as_tensor(q))
+        qd = self.fridge.get_joint_velocities()
+        qd[idx] = 0.0
+        self.fridge.set_joint_velocities(th.as_tensor(qd))
 
     def _door_angle(self, env):
         idx = list(self.fridge.joints).index(self._door_joint)
@@ -229,11 +224,9 @@ class CloseFridgeTask(_StationTask):
         for ang in np.linspace(self.OPEN_ANGLE, 0.0, self.ARC_STEPS):
             self._set_door(env, float(ang))
             env.env.step(env._hold_action())
-            env._level_chassis()
             pts.append(_link_center(self.fridge, self._door_link))
         self._set_door(env, here)                     # leave the door as the episode found it
         env.env.step(env._hold_action())
-        env._level_chassis()
         path = np.stack(pts)
         path[:, 2] = np.clip(path[:, 2], 0.85, 1.15)  # push at a comfortable working height
         return path
@@ -244,6 +237,7 @@ class CloseFridgeTask(_StationTask):
         gc = env.grip_close
         path = self._push_path(env)
         self._obj0, self._goal0 = path[0].copy(), path[-1].copy()
+        self._door_progress_during_push = 0.0
         base0 = env.link_pose("base")[:3, 3]
         carry_local = rot_z(-self.ROBOT_YAW) @ (self._start_center - base0)
 
@@ -306,7 +300,20 @@ class CloseFridgeTask(_StationTask):
             print(f"[{self.name}] fridge slid {drift:.3f} m (limit {self.MAX_BODY_DRIFT}) -- "
                   f"pushed the appliance, not the door", flush=True)
             return False
-        return bool(started_open and closed)
+        demonstrated = self._door_progress_during_push >= 0.5 * self.OPEN_ANGLE
+        if not demonstrated:
+            print(f"[{self.name}] door closed without enough recorded push progress: "
+                  f"{self._door_progress_during_push:.3f} rad", flush=True)
+        return bool(started_open and closed and demonstrated)
+
+    def expert_step(self, env, obs):
+        cmd = super().expert_step(env, obs)
+        if cmd.phase.startswith("push") or cmd.phase == "engage":
+            self._door_progress_during_push = max(
+                self._door_progress_during_push,
+                float(self._door_start - self._door_angle(env)),
+            )
+        return cmd
 
 
 class PushChairTask(_StationTask):
@@ -332,7 +339,7 @@ class PushChairTask(_StationTask):
     """
 
     name = "pushchair"
-    GRASPING_MODE = "sticky"        # must actually hold the chair, not lean on it
+    GRASPING_MODE = "assisted"      # requires two-pad contact and a ray hit on each handle
     #: How far above the rail the hand starts its descent. The grasp itself is a straight vertical
     #: drop onto the rail from here -- "from above" is the whole approach, not a wrist orientation:
     #: a top-down wrist blows up the IK (see `PickPlaceTask.expert_reset`), so the hand keeps its
@@ -373,7 +380,7 @@ class PushChairTask(_StationTask):
     #: old 150 ticks (0.08 m/s) the pads arrived as an impulse and knocked the chair 4 cm sideways
     #: and 6 deg over in the last centimetres, which is what cost the right hand its rail.
     DESCENT_SPEED = 0.03
-    SETTLE_ON_RAIL = 150
+    SETTLE_ON_RAIL = 30
     #: Commanded speed of the push. The push is a BASE move, not an arm move -- the hand target
     #: travels the whole tuck and the head command drags the chassis after it -- and the follower
     #: has a 0.06 m/s single-axis dead-band (see `long_horizon.TRANSIT_SPEED` for the measurement).
@@ -410,10 +417,8 @@ class PushChairTask(_StationTask):
         q_robot = env.robot.get_joint_positions().clone()
         for _ in range(60):
             env.env.step(env._hold_action())
-            env._level_chassis()
         env.robot.set_joint_positions(q_robot)
         env.env.step(env._hold_action())
-        env._level_chassis()
         self._chair0 = env.obj_pos(self.chair).copy()
         self._table0 = env.obj_pos(self.table).copy()
         self._upright0 = self._upright(env)
@@ -518,8 +523,6 @@ class PushChairTask(_StationTask):
 
         segs = [
             *drive,
-            # arrive holding the hand directly OVER the rail, then come straight down onto it
-            ("above",    above,          go, 220),
             ("descend",  grasp.copy(),   go, descend_ticks),
             ("settle",   grasp.copy(),   go, self.SETTLE_ON_RAIL),
             ("close",    grasp.copy(),   gc, 120),
@@ -529,7 +532,6 @@ class PushChairTask(_StationTask):
         ]
         self._right_segs = [
             *right_drive,
-            ("above",    right_above,        go, 220),
             ("descend",  right_grasp.copy(), go, descend_ticks),
             ("settle",   right_grasp.copy(), go, self.SETTLE_ON_RAIL),
             ("close",    right_grasp.copy(), gc, 120),
@@ -538,6 +540,7 @@ class PushChairTask(_StationTask):
             ("retreat",  right_drag_end + np.array([0.0, 0.0, self.PREGRASP_LIFT]), go, 60),
         ]
         self._ever_grasped = {"left": False, "right": False}
+        self._simultaneously_grasped = False
         # The chair is now directly ahead, so these are all the reset heading. For any future
         # turned layout, `_drive_segments` still rotates the head target with the turn.
         self._headings = drive_headings + [heading] * (len(segs) - len(drive))
@@ -563,6 +566,9 @@ class PushChairTask(_StationTask):
         if ever_grasped is not None:
             for arm in ("left", "right"):
                 ever_grasped[arm] |= env.is_grasping(arm) is self.chair
+        self._simultaneously_grasped |= (
+            env.is_grasping("left") is self.chair and env.is_grasping("right") is self.chair
+        )
         return cmd
 
     def _release_point(self, env):
@@ -595,6 +601,9 @@ class PushChairTask(_StationTask):
             return False
         if not all(self._ever_grasped.values()):
             print(f"[{self.name}] missing handle grasp(s): {self._ever_grasped}", flush=True)
+            return False
+        if not self._simultaneously_grasped:
+            print(f"[{self.name}] handles were never held simultaneously", flush=True)
             return False
         p = env.obj_pos(self.chair)
         moved = p[:2] - self._chair0[:2]
