@@ -10,6 +10,7 @@ Hold the right index trigger for 1 s to advance each calibration stage:
 
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -35,7 +36,7 @@ LEFT_ARM_JOINTS  = [f"L_arm_j{i}" for i in range(1, 8)]
 RIGHT_ARM_JOINTS = [f"R_arm_j{i}" for i in range(1, 8)]
 TORSO_JOINTS     = ["torso_j1", "torso_j2", "torso_j3"]
 
-URDF_PATH = "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"
+URDF_PATH = os.path.expanduser("~/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf")
 
 console = Console()
 

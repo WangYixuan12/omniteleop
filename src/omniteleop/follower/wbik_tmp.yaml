@@ -43,11 +43,33 @@ base_dofs: "xy_yaw"
 posture_cost_torso: 200   # keep torso quiet for local EE changes without blocking large reaches
 posture_cost_arm: 10       # let arms absorb local EE changes
 
-# HW-WORKAROUND(right-j1-dead): pin both shoulder j1 joints out of the whole-body QP (dq = 0
-# each tick) so sim matches the dead-motor hardware, which cannot actuate R_arm_j1. L_arm_j1 is
-# pinned too for a symmetric A/B comparison. Read by WBCConfig.dead_joints in
-# whole_body_ik_tmp.py; the canonical whole_body_ik.py / wbik.yaml have no such key.
-dead_joints: ["R_arm_j1", "L_arm_j1"]
+# HW-WORKAROUND(right-arm-frozen): keep every right-arm joint at nominal while leaving all
+# seven left-arm joints live. ``dead_joints`` is the temporary fork's legacy config name;
+# whole_body_ik_tmp.py resets every listed joint to nominal before pinning dq = 0.
+#
+# CAMERA-STABILITY(torso-pinned): torso_j1/j2/j3 remain frozen at nominal for a different
+# reason -- keeping the head camera rigid to the base.
+#
+# With the right arm AND the torso pinned, EVERY joint between the planar root and R_ee is
+# fixed, so the right gripper is rigid to the chassis and the R_ee FrameTask can no longer
+# pose it at all -- it can only drag the base. whole_body_ik_tmp.py therefore drops that
+# task from the QP (``_frame_rigid_to_base``); left in, it anchored the base against the
+# equal-weight head world-position term and the QP split the difference, handing the
+# operator exactly HALF of every forward step (books_08_24/episode_0: head fore/aft error
+# +7.24 cm vs R_ee -7.24 cm, sum 0.00 +- 0.26 cm over all 476 frames). Restoring ANY joint
+# on the right chain -- a torso entry included -- puts the task back automatically. Do not
+# remove a right-arm entry while this hardware workaround is active.
+dead_joints:
+  - R_arm_j1
+  - R_arm_j2
+  - R_arm_j3
+  - R_arm_j4
+  - R_arm_j5
+  - R_arm_j6
+  - R_arm_j7
+  - torso_j1
+  - torso_j2
+  - torso_j3
 posture_cost_head: 0.0     # follows RBY1 nominal_posture_cost_head: 0 (head not an IK DOF)
 
 # --- Joint-space velocity damping ----------------------------------------------------------
@@ -101,8 +123,18 @@ head_mode: "ik"
 # head_pos_cost / head_ori_cost (10000). Roll about the camera forward axis is
 # unactuatable (planar-yaw base + pitch torso + pan/tilt head); the QP just leaves it
 # as residual (RBY1 keeps roll weighted too) -- zero the roll axis only if it biases.
+# Weights are per CAMERA-LOCAL axis (pink FrameTask error is a body twist): FK-verified on
+# vega_with_robotiq.urdf at the nominal posture, local x = TILT/PITCH (head_j1, head_j3 AND
+# torso_j1/j2/j3 all rotate about it), local y = PAN, local z = optical roll. Base yaw shows
+# up on y/z only (world z = (0, -0.925, -0.381) in camera axes), so pan/turn-follow is
+# carried by the y weight.
+# HW-WORKAROUND(head-frozen): with head_j3 also pinned (head_ik_pinned_joints below) NO head
+# DOF can serve a pitch error, so a weighted x axis would force the TORSO to nod along with
+# the operator's head. x = 0 drops pitch tracking entirely: the camera keeps the fixed
+# nominal down-look (head_j1) and the torso stays quiet. Restore 10000.0 when head_j3 goes
+# back to being a free IK DOF.
 head_position_cost: 0.0
-head_orientation_cost: [10000.0, 10000.0, 10000.0]
+head_orientation_cost: [0.0, 10000.0, 10000.0]
 # WORLD-frame head-position objective (head_mode "ik" only), the gravity-aligned
 # alternative to head_position_cost. A pink FrameTask weights position in the head's
 # own LOCAL axes, but zed_depth_frame is pitched ~45 deg down, so a per-axis mask there
@@ -130,7 +162,10 @@ head_world_position_cost: [10000.0, 10000.0, 10000.0]
 # this list via WBCConfig/VegaWholeBodyIK, so sim and hardware pin the SAME head DOFs and a
 # sim-verified take replays identically. Ignored in head_mode "track" (which pins ALL head
 # DOFs). [] pins nothing (every head joint becomes an IK DOF).
-head_ik_pinned_joints: ["head_j1", "head_j2"]
+# HW-WORKAROUND(head-frozen): head_j3 pinned too, so ALL head DOFs hold their engage
+# (homed nominal) angles and the head never moves during teleop; head orientation
+# tracking resolves entirely through the base/torso.
+head_ik_pinned_joints: ["head_j1", "head_j2", "head_j3"]
 
 # --- Torso-top x anchor (hard QP equality) ----------------------------------------------------
 # RBY1's hard torso equality rows (torso_3 == -(torso_1 + torso_2) keeps its arm/head mount from pitching
@@ -140,7 +175,13 @@ head_ik_pinned_joints: ["head_j1", "head_j2"]
 # the nominal_posture below. EE load can then never lean the upper body fore-aft over
 # the base: the base drives instead. ONLY that x is anchored: the mount's height, the
 # lower torso joints (torso_j3 included), and torso_l3's pitch all stay free.
-enable_torso_top_x_anchor: true
+# CAMERA-STABILITY(torso-pinned): OFF because the pin above subsumes it. The anchor row is
+# "supported on the three torso joints only" (_torso_top_x_offset zeroes the planar-base
+# columns), so with all three pinned to dq = 0 the row degenerates to an all-zero equality
+# 0 . dq = delta. The delta clip keeps that feasible (cap = 0.5 * |row| @ velocityLimit * dt
+# -> 0), but it leaves a zero row in the QP equality matrix for nothing. Restore this to true
+# together with the torso entries in dead_joints.
+enable_torso_top_x_anchor: false
 # Correction rate (1/s) of the equality's right-hand side: each tick servos
 # min(1, gain*dt) of the residual offset from the anchor (the head_ik_gain
 # convention), so off-anchor states (measured current_q, custom reset poses) recover
@@ -186,7 +227,7 @@ damping: 1.0e-6
 # a proactive SelfCollisionBarrier CBF in the QP (safe_dist) plus the reactive
 # SafetyGate hold as the hard backstop (floor).
 enable_collision_avoidance: true
-collision_spheres_urdf: "~/miniforge3/envs/dexmate/lib/python3.12/site-packages/dexmate_urdf/robots/humanoid/vega_1/vega_1_collision_spheres.collision.urdf"
+collision_spheres_urdf: "${dexmate_urdf}/robots/humanoid/vega_1/vega_1_collision_spheres.collision.urdf"
 # CBF separation target (m): the barrier asymptotically forbids cross-group sphere
 # pairs closer than this. QP SelfCollisionBarrier's d_min
 self_collision_safe_dist: 0.02 # will give ~0.04m in real robot, should be enough
@@ -258,7 +299,7 @@ nominal_posture:
   # less down-pitch = less projected-yaw cone amplification: ~1.38x at 0, ~1.12x at -0.3).
   # Leave head_j2 (pan) and head_j3 (tilt, the live IK DOF) at 0: biasing head_j3 would
   # consume operator tilt authority instead.
-  head_j1: -0.40
+  head_j1: -0.20
   L_arm_j1: 0.844    # L_shape 0.064 + torso pitch 0.78
   L_arm_j2: 0.3      # L_shape
   L_arm_j4: -1.556   # L_shape
@@ -328,7 +369,7 @@ vr_teleop:
   # the linear band no longer needs the large 0.18 that chopped slow single-axis drives (it
   # zeroed legit forward/strafe commands on 35-150 ticks/take); back to the nominal quiet band.
   base_post_linear_deadband: 0.01
-  base_post_angular_deadband: 0.12
+  base_post_angular_deadband: 0.04
 
 # Joystick-pipeline-only axis switching policy.
 joystick_teleop:

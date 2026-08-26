@@ -4,6 +4,11 @@
 # Adapted from the reference /home/yixuan/hommi/deps/rby1-wbc/config/wbik.yaml. 
 # RBY1 keys intentionally NOT ported: (torso_0/4/5 pinned, torso_3 coupled)
 
+# Kinematics / visual model: vega_with_robotiq.urdf (fixed L_robotiq/R_robotiq 2F-85
+# meshes on L_ee/R_ee). There is no matching Dexmate collision-spheres URDF for this
+# robot -- vega_1_gripper_collision_spheres.collision.urdf is the Dexmate two-finger
+# gripper, not Robotiq. Self-collision uses vega_1_collision_spheres.collision.urdf
+# (body, stops at L_ee/R_ee) plus ROBOTIQ_PROXY_SPHERES in whole_body_ik.py.
 urdf_path: "~/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_with_robotiq.urdf" #"~/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"
 
 # every other cost matters as a ratio to these.
@@ -180,7 +185,13 @@ damping: 1.0e-6
 # a proactive SelfCollisionBarrier CBF in the QP (safe_dist) plus the reactive
 # SafetyGate hold as the hard backstop (floor).
 enable_collision_avoidance: true
-collision_spheres_urdf: "~/miniforge3/envs/dexmate/lib/python3.12/site-packages/dexmate_urdf/robots/humanoid/vega_1/vega_1_collision_spheres.collision.urdf"
+# Body-only sphere model (no gripper links). Do NOT swap in
+# vega_1_gripper_collision_spheres.collision.urdf -- that file is Dexmate's
+# L/R_gripper_* two-finger geometry, not the Robotiq 2F-85 on vega_with_robotiq.
+# Distal gripper volume is the three fixed proxy spheres per L_robotiq/R_robotiq
+# in whole_body_ik.ROBOTIQ_PROXY_SPHERES. Mesh collision (robotiq_2f85.obj) lives
+# on the robot URDF but is not used by the sphere-sphere QP barrier.
+collision_spheres_urdf: "${dexmate_urdf}/robots/humanoid/vega_1/vega_1_collision_spheres.collision.urdf"
 # CBF separation target (m): the barrier asymptotically forbids cross-group sphere
 # pairs closer than this. QP SelfCollisionBarrier's d_min
 self_collision_safe_dist: 0.02 # will give ~0.04m in real robot, should be enough
@@ -322,7 +333,7 @@ vr_teleop:
   # the linear band no longer needs the large 0.18 that chopped slow single-axis drives (it
   # zeroed legit forward/strafe commands on 35-150 ticks/take); back to the nominal quiet band.
   base_post_linear_deadband: 0.01
-  base_post_angular_deadband: 0.12
+  base_post_angular_deadband: 0.04
 
 # Joystick-pipeline-only axis switching policy.
 joystick_teleop:

@@ -24,9 +24,9 @@ import numpy as np
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
-DEFAULT_URDF = Path(
-    "/home/yixuan/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/"
-    "vega_with_robotiq.urdf"
+DEFAULT_URDF = (
+    Path("~/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/"
+         "vega_with_robotiq.urdf").expanduser()
 )
 
 

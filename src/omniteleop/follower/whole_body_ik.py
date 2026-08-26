@@ -76,6 +76,19 @@ def _load_config_yaml(path: Union[str, Path]) -> Dict:
         raise ValueError(
             f"{path}: expected a top-level mapping, got {type(data).__name__}"
         )
+    # Filesystem-path fields may use "~" -- expand it here (YAML does not), before the
+    # raw strings reach loader.load()/ET.parse(), which don't understand "~".
+    # "${dexmate_urdf}" resolves to the installed dexmate_urdf package, so the config
+    # is not tied to one conda env's site-packages layout.
+    for _key in ("urdf_path", "collision_spheres_urdf"):
+        if isinstance(data.get(_key), str):
+            value = data[_key]
+            if value.startswith("${dexmate_urdf}"):
+                import dexmate_urdf
+
+                pkg_root = Path(dexmate_urdf.__file__).parent
+                value = str(pkg_root) + value[len("${dexmate_urdf}"):]
+            data[_key] = str(Path(value).expanduser())
     return data
 
 
@@ -285,6 +298,11 @@ class WBCConfig:
     # base meant to move at all" gate, distinct from the follower-loop vr_teleop deadbands
     # that shape the already-chosen command.
     base_single_axis_deadband: float = _DEFAULTS["base_single_axis_deadband"]
+    # Follower-side quiet floor applied after measured-base PD and slew limiting. Keeping
+    # it below the solver intent gate lets an accepted command ramp without being zeroed.
+    base_dispatch_single_axis_deadband: float = _DEFAULTS[
+        "base_dispatch_single_axis_deadband"
+    ]
     # Relative hysteresis on the axis choice: the previously active axis is retained unless a
     # different axis's normalized magnitude beats it by this fraction, so two near-equal axes
     # do not chatter the chassis between (say) forward and turn at 100 Hz. 0 => per-tick argmax.
@@ -875,13 +893,20 @@ class VegaWholeBodyIK:
                 f"(vx, vy, wz); got {cfg.base_velocity_smoothing_cost!r}"
             )
         self._prev_base_velocity = np.zeros(3)
-        # Single-axis base projection (see _project_base_twist_single_axis): the index
-        # (0=vx,1=vy,2=wz) of the currently active base axis, or None when the base is
-        # quiet; carried across solves for the axis-choice hysteresis (cleared at reset).
+        # Single-axis base projection state (see _project_base_twist_single_axis): retain
+        # the active axis across quiet solves. Cleared at reset.
         if not np.isfinite(cfg.base_single_axis_deadband) or cfg.base_single_axis_deadband < 0.0:
             raise ValueError(
                 "base_single_axis_deadband must be finite and >= 0, got "
                 f"{cfg.base_single_axis_deadband!r}"
+            )
+        if (
+            not np.isfinite(cfg.base_dispatch_single_axis_deadband)
+            or cfg.base_dispatch_single_axis_deadband < 0.0
+        ):
+            raise ValueError(
+                "base_dispatch_single_axis_deadband must be finite and >= 0, got "
+                f"{cfg.base_dispatch_single_axis_deadband!r}"
             )
         if (
             not np.isfinite(cfg.base_single_axis_hysteresis_ratio)
@@ -1562,13 +1587,9 @@ class VegaWholeBodyIK:
         emitted ``base_twist``, and the next tick's base-velocity-smoothing reference all stay
         consistent with what is actually commanded.
 
-        The active-axis selection (normalize by the base velocity caps, argmax, the quiet
-        ``base_single_axis_deadband`` floor, and the ``base_single_axis_hysteresis_ratio``
-        anti-chatter latch) is the shared
-        :func:`~omniteleop.follower.base_closed_loop.project_planar_twist_single_axis`, the
-        SAME routine the followers apply to the post-PD wheel command -- so the solver and the
-        chassis pick the active axis identically. ``_base_single_axis_idx`` carries that axis
-        across solves (cleared on reset / when quiet).
+        Active-axis selection uses the same primitive as the follower's post-PD projection.
+        WBIK retains the selected axis across quiet solves; the next effective command may
+        still switch immediately under the existing hysteresis rule. Reset clears the memory.
 
         Scope: this constrains the WBC solve output (the ``base_twist`` IK feed-forward); the
         followers additionally re-project the post-PD command, so the open- AND closed-loop
@@ -1586,6 +1607,7 @@ class VegaWholeBodyIK:
             deadband=self.config.base_single_axis_deadband,
             hysteresis_ratio=self.config.base_single_axis_hysteresis_ratio,
             prev_axis=prev_axis,
+            retain_axis_on_quiet=True,
         )
         out[:3] = self._mask_base_twist(out[:3])
         return out
