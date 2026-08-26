@@ -93,6 +93,9 @@ def main() -> None:
     t0 = time.time()
     while time.time() - t0 < args.duration:
         msg = sub.get_latest()
+        # dexcomm 0.6 get_latest() returns a Message wrapper; the decoded payload
+        # dict lives in .data.
+        msg = getattr(msg, "data", msg)
         if isinstance(msg, dict) and msg.get("data") is not None:
             sequence = int(msg.get("sequence", 0) or 0)
             timestamp_ns = int(msg.get("timestamp_ns", msg.get("timestamp", 0)) or 0)

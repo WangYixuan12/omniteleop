@@ -175,7 +175,7 @@ class BaseVelocityController:
         self._prev = target
         robot.chassis.set_velocity(
             vx=float(target[0]), vy=float(target[1]), wz=float(target[2]),
-            wait_time=0.0, sequential_steering=False,
+            wait_time=0.0,
         )
         return target.copy()
 
@@ -645,14 +645,14 @@ class _DexChassis:
     ) -> None:
         """Forward a coordinated base velocity command to the official dexcontrol API.
 
-        ``sequential_steering=False`` so a single call doesn't stall ~1 s adjusting
-        steering; ``wait_time=0`` so it issues immediately in the high-rate loop. These
-        are the kwargs :class:`BaseVelocityController` passes (the official non-sequential
-        send-now path).
+        ``wait_time=0`` so it issues immediately in the high-rate loop.
+        ``sequential_steering`` is accepted for façade compatibility but no longer
+        forwarded: dexcontrol 0.5 removed the kwarg and sequences steering itself
+        only when the steering error exceeds its built-in tolerance, so high-rate
+        small-delta commands still go out immediately.
         """
-        self._chassis.set_velocity(
-            vx, vy, wz, wait_time=wait_time, sequential_steering=sequential_steering
-        )
+        del sequential_steering
+        self._chassis.set_velocity(vx, vy, wz, wait_time=wait_time)
 
     def stop(self) -> None:
         """Stop the base."""

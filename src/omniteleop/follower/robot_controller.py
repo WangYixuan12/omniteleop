@@ -323,7 +323,9 @@ class RobotController():
                 arm_head_pose[component] = self.home_positions[component]
 
         if arm_head_pose:
-            self.robot.set_joint_pos(arm_head_pose, wait_time=9.0, exit_on_reach=True)
+            handle = self.robot.move_to_joint_pos(arm_head_pose)
+            if handle is not None:
+                handle.wait(timeout=9.0)
             logger.info("Robot moved to home position")
 
         # Open hands
@@ -352,7 +354,18 @@ class RobotController():
                 pose_dict[comp] = self.home_positions[comp]
 
         if pose_dict:
-            self.robot.set_joint_pos(pose_dict, wait_time=5.0, exit_on_reach=True)
+            # dexcontrol 0.5 move_to_joint_pos manages only Arm/Head/Torso; hands go
+            # through their component-level set_joint_pos.
+            hand_pose = {
+                k: v for k, v in pose_dict.items() if k in ("left_hand", "right_hand")
+            }
+            managed_pose = {k: v for k, v in pose_dict.items() if k not in hand_pose}
+            if managed_pose:
+                handle = self.robot.move_to_joint_pos(managed_pose)
+                if handle is not None:
+                    handle.wait(timeout=5.0)
+            for comp, pos in hand_pose.items():
+                getattr(self.robot, comp).set_joint_pos(pos, wait_time=5.0)
             logger.info(f"Returned to home position: {list(pose_dict.keys())}")
 
     def _on_safe_command(self, data: Dict) -> None:
@@ -598,7 +611,9 @@ class RobotController():
         if "right_arm" in components:
             arm_commands["right_arm"] = components["right_arm"]["pos"]
         if arm_commands:
-            self.robot.set_joint_pos(arm_commands, wait_time=5.0, exit_on_reach=True)
+            handle = self.robot.move_to_joint_pos(arm_commands)
+            if handle is not None:
+                handle.wait(timeout=5.0)
 
     def _send_base_command(self, base_data: Dict):
         """Send command to mobile base.
@@ -606,11 +621,12 @@ class RobotController():
         Args:
             base_data: Dictionary with vx, vy, wz velocities.
         """
+        # dexcontrol 0.5 sequences steering automatically when the steering error
+        # exceeds its built-in tolerance, replacing the old sequential_steering flag.
         self.robot.chassis.set_velocity(
             vx=base_data["vx"],
             vy=base_data["vy"],
             wz=base_data["wz"],
-            sequential_steering=abs(base_data["vy"]) > 0.02,
         )
 
     def _send_torso_command(self, torso_data: Dict):

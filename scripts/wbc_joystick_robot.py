@@ -110,8 +110,7 @@ class JoystickHardwareDriver(HardwareDriver):
             # Park the joystick reference on the measured base so there is no lunge on
             # resume, and zero the wheels (the parent's hold behavior).
             self._shaper.hold(snap["pose"])
-            chassis.set_velocity(vx=0.0, vy=0.0, wz=0.0, wait_time=0.0,
-                                 sequential_steering=True)
+            chassis.set_velocity(vx=0.0, vy=0.0, wz=0.0, wait_time=0.0)
             self._prev_base_cmd = np.zeros(3)
             self._base_quiet_elapsed = 0.0
             self._dbg["base_pd_raw"] = None
@@ -142,12 +141,11 @@ class JoystickHardwareDriver(HardwareDriver):
                 assert float(np.max(np.abs(cmd))) <= 1e-6  # base_quiet_dispatch invariant
                 chassis.set_wheel_velocity(0.0)
             else:
-                chassis.set_velocity(vx=0.0, vy=0.0, wz=0.0, wait_time=0.0,
-                                     sequential_steering=True)
+                chassis.set_velocity(vx=0.0, vy=0.0, wz=0.0, wait_time=0.0)
                 action = "recenter"
         else:
             chassis.set_velocity(vx=float(cmd[0]), vy=float(cmd[1]), wz=float(cmd[2]),
-                                 wait_time=0.0, sequential_steering=True)
+                                 wait_time=0.0)
         self._dbg["base_pd_raw"] = pd_raw
         self._dbg["base_pd_err"] = pd_err
         self._dbg["base_cmd"] = np.asarray(cmd, dtype=float)
