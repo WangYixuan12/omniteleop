@@ -341,6 +341,14 @@ class WBCConfig:
     # DOF (the existing head-follow / EE-reach behavior); no wbik.yaml key required.
     lock_base_in_ik: bool = False
 
+    # Exclude the torso from the whole-body IK chain while keeping it in the model for
+    # FK, collision, and stability calculations. When True, all three torso tangent
+    # DOFs are hard-pinned to zero in every QP step, so the torso stays at the posture
+    # supplied by reset/current_q while the base, arms, and available head joints solve
+    # the targets. Loaded from wbik.yaml so every caller shares the same default; callers
+    # may still override it through WBCConfig(lock_torso_in_ik=...).
+    lock_torso_in_ik: bool = _DEFAULTS["lock_torso_in_ik"]
+
     # Single-axis base motion (one pure chassis motion per tick). The QP resolves
     # leader/EE-target noise into small simultaneous vx/vy/wz, so a "drive straight" leans
     # sideways, an in-place turn wanders, and a meant-to-be-still base creeps. When enabled,
@@ -782,6 +790,18 @@ class VegaWholeBodyIK:
                 f"nominal_posture keys {unknown_nominal} are not joints of the reduced "
                 f"model (valid: {sorted(self._idx_q)})"
             )
+
+        # Optional torso exclusion: retain the joints in the model so their fixed pose
+        # still feeds arm/head FK and the safety geometry, but remove them as QP levers
+        # with one hard dq = 0 row per joint. The explicit velocity mask below makes the
+        # fixed-joint invariant exact even at the QP solver's numerical tolerance.
+        self._torso_idx_v = [
+            self.model.idx_vs[self.model.getJointId(name)] for name in TORSO_JOINTS
+        ]
+        n_torso_pins = len(self._torso_idx_v) if cfg.lock_torso_in_ik else 0
+        self._torso_dof_pin_A = np.zeros((n_torso_pins, self.model.nv))
+        for row, idx_v in enumerate(self._torso_idx_v[:n_torso_pins]):
+            self._torso_dof_pin_A[row, idx_v] = 1.0
 
         # The head is teleoperated by its own damped IK (solve_head -> head_pos
         # command fed back via solve(head_joints=...)) and is never a *whole-body* IK
@@ -1422,6 +1442,7 @@ class VegaWholeBodyIK:
                 problem.A = self._head_pin_A
                 problem.b = np.zeros(len(self._head_idx_v))
             self._add_base_dof_equalities(problem)
+            self._add_torso_dof_equalities(problem)
             self._add_torso_top_x_equality(problem, dt)
             self._add_com_over_base_terms(problem)
             self._add_head_world_position_objective(problem)
@@ -1434,7 +1455,7 @@ class VegaWholeBodyIK:
             velocity = np.zeros(self.model.nv)
             success = False
 
-        velocity = self._apply_base_dof_mask(velocity)
+        velocity = self._apply_locked_dof_masks(velocity)
 
         # Constrain the chassis to ONE pure motion (forward XOR strafe XOR turn), zeroing
         # the non-dominant base axes BEFORE integration so the solver's own base pose and
@@ -1464,7 +1485,7 @@ class VegaWholeBodyIK:
                 velocity = velocity.copy()
                 velocity[3:] = 0.0                           # zero joint vel, keep base twist
             self_dist = self._min_self_distance()
-        velocity = self._apply_base_dof_mask(velocity)
+        velocity = self._apply_locked_dof_masks(velocity)
 
         # Remember the base twist actually committed this tick (post-hold, so a frozen or
         # base-only-hold tick anchors smoothing on what the chassis really did) for the
@@ -1568,7 +1589,11 @@ class VegaWholeBodyIK:
         velocity-limit headroom so the equality alone can never make the QP
         infeasible.
         """
-        if self._torso_top_fid is None or self._torso_top_x_target is None:
+        if (
+            self.config.lock_torso_in_ik
+            or self._torso_top_fid is None
+            or self._torso_top_x_target is None
+        ):
             return
         x_off, row = self._torso_top_x_offset(self.configuration.q)
         err = x_off - self._torso_top_x_target
@@ -1584,6 +1609,20 @@ class VegaWholeBodyIK:
             return
         problem.A = np.vstack([problem.A, self._base_dof_pin_A])
         problem.b = np.hstack([problem.b, np.zeros(self._base_dof_pin_A.shape[0])])
+
+    def _add_torso_dof_equalities(self, problem: qpsolvers.Problem) -> None:
+        """Stack ``dq_torso = 0`` rows when the torso is excluded from IK."""
+        if self._torso_dof_pin_A.shape[0] == 0:
+            return
+        problem.A = np.vstack([problem.A, self._torso_dof_pin_A])
+        problem.b = np.hstack([problem.b, np.zeros(self._torso_dof_pin_A.shape[0])])
+
+    def _apply_locked_dof_masks(self, velocity: np.ndarray) -> np.ndarray:
+        """Make configured base and torso locks exact in a full ``nv`` vector."""
+        out = self._apply_base_dof_mask(velocity)
+        if self.config.lock_torso_in_ik:
+            out[self._torso_idx_v] = 0.0
+        return out
 
     def _apply_base_dof_mask(self, velocity: np.ndarray) -> np.ndarray:
         """Zero disabled planar-root velocity components in a full ``nv`` vector."""

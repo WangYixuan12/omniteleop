@@ -142,6 +142,13 @@ head_world_position_cost: [10000.0, 10000.0, 0.0]
 # DOFs). [] pins nothing (every head joint becomes an IK DOF).
 head_ik_pinned_joints: ["head_j1", "head_j2"]
 
+# --- Torso whole-body IK policy ------------------------------------------------------------
+# true: keep torso_j1/j2/j3 in FK, collision, and stability calculations, but hard-pin
+# their velocity to zero in the QP. The torso then stays at the posture supplied by
+# reset/current_q while the base, arms, and available head joints solve the targets.
+# false: leave all three torso joints available to whole-body IK (original behavior).
+lock_torso_in_ik: true
+
 # --- Torso-top x anchor (hard QP equality) ----------------------------------------------------
 # RBY1's hard torso equality rows (torso_3 == -(torso_1 + torso_2) keeps its arm/head mount from pitching
 # fore-aft). Vega analog: a QP equality row holds "arm_center" -- the fixed mount at the
@@ -149,7 +156,8 @@ head_ik_pinned_joints: ["head_j1", "head_j2"]
 # it) that carries both arms and the head chain -- at the SAME base-frame x it has at
 # the nominal_posture below. EE load can then never lean the upper body fore-aft over
 # the base: the base drives instead. ONLY that x is anchored: the mount's height, the
-# lower torso joints (torso_j3 included), and torso_l3's pitch all stay free.
+# lower torso joints (torso_j3 included), and torso_l3's pitch all stay free. Ignored when
+# lock_torso_in_ik is true because the three hard joint pins already fix the torso.
 enable_torso_top_x_anchor: true
 # Correction rate (1/s) of the equality's right-hand side: each tick servos
 # min(1, gain*dt) of the residual offset from the anchor (the head_ik_gain
@@ -278,7 +286,7 @@ nominal_posture:
   # less down-pitch = less projected-yaw cone amplification: ~1.38x at 0, ~1.12x at -0.3).
   # Leave head_j2 (pan) and head_j3 (tilt, the live IK DOF) at 0: biasing head_j3 would
   # consume operator tilt authority instead.
-  head_j1: -0.40
+  head_j1: -0.25
   L_arm_j1: 0.844    # L_shape 0.064 + torso pitch 0.78
   L_arm_j2: 0.3      # L_shape
   L_arm_j4: -1.556   # L_shape
