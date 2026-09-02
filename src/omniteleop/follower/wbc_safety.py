@@ -50,7 +50,7 @@ if not isinstance(_WBIK, dict):
 
 # Dexmate collision-sphere URDF (link names match vega_no_effector.urdf; primitives
 # only, so it needs no mesh package dirs). Absolute path => readable from any env.
-DEFAULT_COLLISION_SPHERES_URDF = str(_WBIK["collision_spheres_urdf"])
+DEFAULT_COLLISION_SPHERES_URDF = str(Path(_WBIK["collision_spheres_urdf"]).expanduser())
 # Proactive separation (m) the in-solve constraint tries to maintain between
 # cross-group spheres, and the reactive floor (m) below which a *worsening* step is
 # vetoed (robot holds).
@@ -80,11 +80,13 @@ def collision_group(name: str) -> Optional[str]:
 
     Works for both Pinocchio geometry-object names and MuJoCo body/link names, which
     both start with the link name (e.g. ``"L_arm_l3_0"`` -> ``"left"``, ``"torso_l2"``
-    -> ``"body"``). Wheels and the ``arm_center``/camera frames have no spheres.
+    -> ``"body"``). Wheels, ``arm_center`` and the HEAD camera frames have no spheres;
+    the WRIST cameras do (``whole_body_ik.WRIST_CAM_PROXY_SPHERES``) and ride with the
+    arm that carries them, so ``L_wrist``/``R_wrist`` map to that arm's group.
     """
-    if name.startswith(("L_arm", "L_ee", "L_robotiq")):
+    if name.startswith(("L_arm", "L_ee", "L_robotiq", "L_wrist")):
         return "left"
-    if name.startswith(("R_arm", "R_ee", "R_robotiq")):
+    if name.startswith(("R_arm", "R_ee", "R_robotiq", "R_wrist")):
         return "right"
     if name.startswith(("base", "torso", "head")):
         return "body"

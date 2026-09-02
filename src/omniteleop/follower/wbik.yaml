@@ -4,12 +4,23 @@
 # Adapted from the reference /home/yixuan/hommi/deps/rby1-wbc/config/wbik.yaml. 
 # RBY1 keys intentionally NOT ported: (torso_0/4/5 pinned, torso_3 coupled)
 
-# Kinematics / visual model: vega_with_robotiq.urdf (fixed L_robotiq/R_robotiq 2F-85
-# meshes on L_ee/R_ee). There is no matching Dexmate collision-spheres URDF for this
-# robot -- vega_1_gripper_collision_spheres.collision.urdf is the Dexmate two-finger
-# gripper, not Robotiq. Self-collision uses vega_1_collision_spheres.collision.urdf
-# (body, stops at L_ee/R_ee) plus ROBOTIQ_PROXY_SPHERES in whole_body_ik.py.
-urdf_path: "~/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_with_robotiq.urdf" #"~/yixuan_utilities/src/yixuan_utilities/assets/robot/vega-urdf/vega_no_effector.urdf"
+# Kinematics / visual model: vega_with_robotiq_wrist_cam.urdf -- vega_with_robotiq
+# plus the dexmate connector, the 2F-85 ZED Mini brackets and the wrist camera
+# frames (L/R_wrist_camera, L/R_wrist_zed_mini). Same 26 actuated joints with the
+# same limits, and base/arm_center/zed_depth_frame/L_ee/R_ee are placed identically,
+# so the IK targets (L_ee/R_ee) are unchanged; L/R_robotiq sit 5.811 mm closer to
+# the wrist and the gripper meshes are seated on the connector rather than floating
+# at L_ee. There is no matching Dexmate collision-spheres URDF for this robot --
+# vega_1_gripper_collision_spheres.collision.urdf is the Dexmate two-finger gripper,
+# not Robotiq. Self-collision uses vega_1_collision_spheres.collision.urdf (body,
+# stops at L_ee/R_ee) plus ROBOTIQ_PROXY_SPHERES and WRIST_CAM_PROXY_SPHERES in
+# whole_body_ik.py -- the sphere URDF is Dexmate's stock-robot file, so it models
+# neither the Robotiq nor the wrist cameras this URDF adds.
+# "${yixuan_utilities}" resolves to the installed package, a YIXUAN_UTILITIES_ROOT
+# override, or a ~/yixuan_utilities checkout -- see _resolve_package_root().
+urdf_path: "${yixuan_utilities}/assets/robot/vega-urdf/vega_with_robotiq_wrist_cam.urdf"
+# alternatives: "${yixuan_utilities}/assets/robot/vega-urdf/vega_with_robotiq.urdf"
+#               "${yixuan_utilities}/assets/robot/vega-urdf/vega_no_effector.urdf"
 
 # every other cost matters as a ratio to these.
 ee_position_cost: 10000.0
@@ -189,8 +200,12 @@ enable_collision_avoidance: true
 # vega_1_gripper_collision_spheres.collision.urdf -- that file is Dexmate's
 # L/R_gripper_* two-finger geometry, not the Robotiq 2F-85 on vega_with_robotiq.
 # Distal gripper volume is the three fixed proxy spheres per L_robotiq/R_robotiq
-# in whole_body_ik.ROBOTIQ_PROXY_SPHERES. Mesh collision (robotiq_2f85.obj) lives
-# on the robot URDF but is not used by the sphere-sphere QP barrier.
+# in whole_body_ik.ROBOTIQ_PROXY_SPHERES, and the wrist cameras added by
+# vega_with_robotiq_wrist_cam.urdf are three more per L/R_wrist_zed_mini in
+# whole_body_ik.WRIST_CAM_PROXY_SPHERES (they also cover the mount bracket, which
+# gets none of its own). Mesh collision (robotiq_2f85.obj) lives on the robot URDF
+# but is not used by the sphere-sphere QP barrier. Inspect the assembled model with
+# scripts/diagnostics/view_collision_spheres_viser.py.
 collision_spheres_urdf: "${dexmate_urdf}/robots/humanoid/vega_1/vega_1_collision_spheres.collision.urdf"
 # CBF separation target (m): the barrier asymptotically forbids cross-group sphere
 # pairs closer than this. QP SelfCollisionBarrier's d_min

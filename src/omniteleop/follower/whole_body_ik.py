@@ -28,6 +28,9 @@ solver -- rather than calling :func:`pink.solve_ik` directly.
 
 from __future__ import annotations
 
+import importlib
+import os
+import re
 import warnings as _warnings
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -68,6 +71,44 @@ DEFAULT_CONFIG_PATH = Path(__file__).with_name("wbik.yaml")
 _NON_WBC_SECTIONS = frozenset({"vr_teleop", "joystick_teleop"})
 
 
+# Config paths may name an asset package as "${<package>}/...". Resolution order is
+# the <PACKAGE>_ROOT env var, then the importable package, then a known source
+# checkout -- yixuan_utilities ships its assets as package data but is commonly used
+# straight from a git clone rather than installed into the environment.
+_PKG_PLACEHOLDER = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_PKG_CHECKOUT_FALLBACKS: Dict[str, tuple] = {
+    "yixuan_utilities": (Path.home() / "yixuan_utilities" / "src" / "yixuan_utilities",),
+}
+
+
+def _resolve_package_root(pkg: str) -> Path:
+    """Directory that a "${pkg}" prefix stands for in a config path."""
+    override = os.environ.get(f"{pkg.upper()}_ROOT")
+    if override:
+        root = Path(override).expanduser()
+        if not root.is_dir():
+            raise FileNotFoundError(f"{pkg.upper()}_ROOT={root} is not a directory.")
+        return root
+    try:
+        module = importlib.import_module(pkg)
+    except ImportError:
+        pass
+    else:
+        if module.__file__ is not None:
+            return Path(module.__file__).parent
+    for candidate in _PKG_CHECKOUT_FALLBACKS.get(pkg, ()):
+        if candidate.is_dir():
+            return candidate
+    tried = [f"${pkg.upper()}_ROOT", f"import {pkg}"]
+    tried += [str(c) for c in _PKG_CHECKOUT_FALLBACKS.get(pkg, ())]
+    raise FileNotFoundError(
+        f"cannot resolve '${{{pkg}}}' in a WBC config path -- {pkg} is neither "
+        f"installed in this environment nor present as a checkout. Tried: "
+        f"{', '.join(tried)}. Install it, or set {pkg.upper()}_ROOT to the "
+        f"directory that '${{{pkg}}}' should stand for."
+    )
+
+
 def _load_config_yaml(path: Union[str, Path]) -> Dict:
     """Load a WBC YAML config into a plain dict (must be a top-level mapping)."""
     with open(path, "r", encoding="utf-8") as f:
@@ -77,17 +118,15 @@ def _load_config_yaml(path: Union[str, Path]) -> Dict:
             f"{path}: expected a top-level mapping, got {type(data).__name__}"
         )
     # Filesystem-path fields may use "~" -- expand it here (YAML does not), before the
-    # raw strings reach loader.load()/ET.parse(), which don't understand "~".
-    # "${dexmate_urdf}" resolves to the installed dexmate_urdf package, so the config
-    # is not tied to one conda env's site-packages layout.
+    # raw strings reach loader.load()/ET.parse(), which don't understand "~". A
+    # "${<package>}" prefix resolves to that package's root, so the config is tied
+    # neither to one conda env's site-packages layout nor to one user's home.
     for _key in ("urdf_path", "collision_spheres_urdf"):
         if isinstance(data.get(_key), str):
             value = data[_key]
-            if value.startswith("${dexmate_urdf}"):
-                import dexmate_urdf
-
-                pkg_root = Path(dexmate_urdf.__file__).parent
-                value = str(pkg_root) + value[len("${dexmate_urdf}"):]
+            match = _PKG_PLACEHOLDER.match(value)
+            if match:
+                value = str(_resolve_package_root(match.group(1))) + value[match.end():]
             data[_key] = str(Path(value).expanduser())
     return data
 
@@ -112,6 +151,8 @@ LEFT_EE_FRAME = "L_ee"
 RIGHT_EE_FRAME = "R_ee"
 LEFT_GRIPPER_FRAME = "L_robotiq"
 RIGHT_GRIPPER_FRAME = "R_robotiq"
+LEFT_WRIST_CAM_FRAME = "L_wrist_zed_mini"
+RIGHT_WRIST_CAM_FRAME = "R_wrist_zed_mini"
 HEAD_FRAME = "zed_depth_frame"
 BASE_FRAME = "base"
 BASE_DOF_MODES = ("xy_yaw", "xy")
@@ -130,6 +171,22 @@ ROBOTIQ_PROXY_SPHERES: tuple[tuple[str, tuple[float, float, float], float], ...]
     ("palm", (0.0, 0.0, -0.205), 0.055),
     ("finger_pos", (0.050, 0.0, -0.125), 0.055),
     ("finger_neg", (-0.050, 0.0, -0.125), 0.055),
+)
+
+# Fixed ZED-Mini proxy spheres, expressed in the L_wrist_zed_mini/R_wrist_zed_mini link
+# frame (identical on both sides -- the URDF mounts the same mesh at the same offset from
+# L_ee/R_ee). The wrist cameras of vega_with_robotiq_wrist_cam.urdf hang ~98 mm off the
+# BACK of the wrist, opposite the gripper axis, where neither the Dexmate spheres nor the
+# Robotiq proxies above reach: without these the camera body sits fully outside the sphere
+# model and protrudes 62 mm past its nearest sphere, so the barrier can hold the modelled
+# geometry at safe_dist while the camera is already deep inside an obstacle. Three spheres
+# strung along the 125 mm bar also cover the 2F-85 ZED-Mini BRACKET to within 9.1 mm --
+# below self_collision_floor -- so the bracket needs no proxies of its own. Radii come from
+# scripts/diagnostics/view_collision_spheres_viser.py --fit.
+WRIST_CAM_PROXY_SPHERES: tuple[tuple[str, tuple[float, float, float], float], ...] = (
+    ("lens_pos", (0.040, 0.009, 0.0), 0.026),
+    ("body", (-0.002, 0.009, 0.0), 0.032),
+    ("lens_neg", (-0.044, 0.008, 0.0), 0.032),
 )
 
 # Nominal "natural" posture, in the *URDF* joint convention. The values are loaded
@@ -584,20 +641,25 @@ class VegaWholeBodyIK:
     # -- construction -----------------------------------------------------------
 
     @staticmethod
-    def _add_gripper_collision_spheres(
+    def _add_proxy_collision_spheres(
         model: pin.Model,
         geometry_model: pin.GeometryModel,
     ) -> None:
-        """Append fixed Robotiq proxy spheres to the sphere collision model if needed."""
+        """Append the fixed Robotiq / wrist-camera proxy spheres, per frame present."""
         existing = {obj.name for obj in geometry_model.geometryObjects}
-        for frame_name in (LEFT_GRIPPER_FRAME, RIGHT_GRIPPER_FRAME):
+        for frame_name, spheres in (
+            (LEFT_GRIPPER_FRAME, ROBOTIQ_PROXY_SPHERES),
+            (RIGHT_GRIPPER_FRAME, ROBOTIQ_PROXY_SPHERES),
+            (LEFT_WRIST_CAM_FRAME, WRIST_CAM_PROXY_SPHERES),
+            (RIGHT_WRIST_CAM_FRAME, WRIST_CAM_PROXY_SPHERES),
+        ):
             if not model.existFrame(frame_name):
                 continue
             if any(name.startswith(frame_name) for name in existing):
                 continue
             frame_id = model.getFrameId(frame_name)
             frame = model.frames[frame_id]
-            for label, xyz, radius in ROBOTIQ_PROXY_SPHERES:
+            for label, xyz, radius in spheres:
                 name = f"{frame_name}_{label}"
                 local_center = pin.SE3(np.eye(3), np.asarray(xyz, dtype=float))
                 geom = pin.GeometryObject(
@@ -660,7 +722,7 @@ class VegaWholeBodyIK:
         self.visual_model, self.collision_model = reduced_geoms[0], reduced_geoms[1]
         self.collision_sphere_model = reduced_geoms[2] if sphere_full is not None else None
         if self.collision_sphere_model is not None:
-            self._add_gripper_collision_spheres(self.model, self.collision_sphere_model)
+            self._add_proxy_collision_spheres(self.model, self.collision_sphere_model)
 
         # Cap mobile-base velocity (planar nv layout: 0=vx, 1=vy, 2=yaw-rate). Validate the
         # caps (and the headroom scale) here, before they enter both the QP VelocityLimit and

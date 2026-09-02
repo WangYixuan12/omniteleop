@@ -10,9 +10,16 @@ Needs mujoco, so run with pytest in the dexmate env::
 
 from __future__ import annotations
 
-import numpy as np
+from pathlib import Path
 
-from omniteleop.follower.wbc_safety import SafetyGate, parse_collision_spheres
+import numpy as np
+import pytest
+
+from omniteleop.follower.wbc_safety import (
+    SafetyGate,
+    collision_group,
+    parse_collision_spheres,
+)
 from omniteleop.follower.whole_body_ik import (
     HEAD_JOINTS,
     LEFT_ARM_JOINTS,
@@ -21,6 +28,7 @@ from omniteleop.follower.whole_body_ik import (
     RIGHT_EE_FRAME,
     ROBOTIQ_PROXY_SPHERES,
     TORSO_JOINTS,
+    WRIST_CAM_PROXY_SPHERES,
     VegaWholeBodyIK,
     WBCConfig,
 )
@@ -155,6 +163,50 @@ def test_robotiq_proxy_spheres_follow_robotiq_frames():
             expected = frame_pose.act(np.asarray(xyz, dtype=float))
             actual = ik.collision_sphere_data.oMg[idx].translation
             np.testing.assert_allclose(actual, expected, atol=1e-9)
+
+
+def test_wrist_cam_proxy_spheres_follow_wrist_frames():
+    ik, _, _ = _make()
+    names = [obj.name for obj in ik.collision_sphere_model.geometryObjects]
+
+    for frame_name, group in (("L_wrist_zed_mini", "left"), ("R_wrist_zed_mini", "right")):
+        frame_pose = ik.configuration.get_transform_frame_to_world(frame_name)
+        for label, xyz, _ in WRIST_CAM_PROXY_SPHERES:
+            name = f"{frame_name}_{label}"
+            idx = names.index(name)
+            expected = frame_pose.act(np.asarray(xyz, dtype=float))
+            actual = ik.collision_sphere_data.oMg[idx].translation
+            np.testing.assert_allclose(actual, expected, atol=1e-9)
+            # A sphere with no group is silently dropped from every cross-group pair,
+            # so it would sit in the model looking correct while guarding nothing.
+            assert collision_group(name) == group
+
+
+def test_wrist_cam_proxy_spheres_cover_the_camera_body():
+    """The proxies must actually wrap the ZED-Mini mesh they stand in for.
+
+    The Dexmate sphere URDF stops at L_ee/R_ee, so before these proxies the camera
+    body sat entirely outside the sphere model and protruded 62 mm past its nearest
+    sphere -- the barrier would hold the modelled geometry at safe_dist while the real
+    camera was already deep inside an obstacle.
+    """
+    trimesh = pytest.importorskip("trimesh")
+    ik, _, _ = _make()
+    urdf = Path(ik.config.urdf_path)
+    mesh = trimesh.load(urdf.parent / "meshes/visual/ZEDM.stl", force="mesh")
+    verts = np.asarray(mesh.vertices, dtype=float) * 0.001  # URDF mesh scale
+
+    sm, sd = ik.collision_sphere_model, ik.collision_sphere_data
+    centers = np.array([sd.oMg[i].translation for i in range(sm.ngeoms)])
+    radii = np.array([g.geometry.radius for g in sm.geometryObjects])
+
+    pose = ik.configuration.get_transform_frame_to_world("L_wrist_zed_mini")
+    world = (pose.rotation @ verts.T).T + pose.translation
+    # Per-vertex signed distance outside the union of every sphere.
+    outside = np.min(
+        np.linalg.norm(world[:, None, :] - centers[None], axis=2) - radii[None], axis=1
+    )
+    assert outside.max() <= 0.0
 
 
 def test_normal_reach_not_held_pink():
