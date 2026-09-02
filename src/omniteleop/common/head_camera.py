@@ -25,19 +25,42 @@ import numpy as np
 #   * scripts/drive_box_record.py — records ZED_K alongside the head frames.
 # Change them HERE and every consumer follows.
 #
-# Currently set to the FULL SVGA frame (no ROI crop) then downscaled to 320x240 (WxH).
+# Currently set to the FULL SVGA frame (no ROI crop and no resize): 960x600 (WxH).
 # To re-enable the manipulation-ROI crop, restore:
 #     HEAD_CROP_TBLR = (300, 600, 375, 775)   # 300x400 ROI
 #     HEAD_RESIZE_HW = (240, 320)
 # rerun the test_head_zedx_depth.py publisher after changing these constants.
 HEAD_CROP_TBLR: tuple[int, int, int, int] = (0, 600, 0, 960)  # (300, 600, 375, 775)
-HEAD_RESIZE_HW: tuple[int, int] = (240, 320)  # (H, W); does not affect pose tracking on the raw SVGA (600, 960)
+HEAD_RESIZE_HW: tuple[int, int] = (600, 960)  # (240, 320)
+# (H, W); does not affect pose tracking on the raw SVGA (600, 960).
 
-# Intrinsics of the raw SVGA head frame (960x600), pre-crop.
+# Intrinsics of the raw SVGA head frame (960x600), pre-crop: the ZED SDK's RECTIFIED
+# left-cam calibration for this unit at SVGA, i.e. exactly what
+# ``tests/test_head_zedx_depth.py`` reports as ``stereo.left_K`` before its crop/resize
+# (SDK ``camera_configuration.calibration_parameters.left_cam``; rectified, so fx == fy).
+# Taking the SDK value verbatim keeps ZED_K and the publisher's left_K algebraically
+# identical for ANY --crop/--resize, since both apply crop_resize_intrinsics() to this
+# same base -- which is what wbc_vr_robot_tmp's meta/head_stereo check compares.
+#
+# These are the repeatable RECTIFIED factory-derived values reported by the publisher with
+# ``init.camera_disable_self_calib = True``. The raw/unrectified values in
+# /usr/local/zed/settings/SN50571637.conf intentionally differ because VIEW.LEFT is
+# rectified by the SDK. With self-calibration enabled, three opens instead measured fx
+# 384.9714, 385.0734, and 385.2446 px; an earlier edit mistakenly promoted the middle
+# self-calibrated draw to the factory constant. Restarting the publisher with self-calib
+# disabled exposed the stable value below (fx 377.13342).
+#
+# CONSEQUENCE: obs/images/intrinsic changes by ~2% for NEW takes. port_wbc_mobile_zarr.py
+# requires ONE exact intrinsic across all source takes, so takes recorded before and after
+# this change cannot be ported together, and checkpoints trained on the old value expect it
+# at rollout. Stereo recordings now stamp the live publisher left_K directly; this constant
+# remains the compatibility fallback for legacy left+SDK-depth paths and other consumers.
+# These numbers are per-unit and resolution-specific (SVGA): re-read them from the
+# publisher's info service if the camera or --resolution changes.
 HEAD_BASE_K = np.array(
     [
-        [770.1868 / 2.0, 0.0, 990.2711 / 2.0],
-        [0.0, 770.1868 / 2.0, 637.7721 / 2.0],
+        [377.13342, 0.0, 489.7027],
+        [0.0, 377.13342, 319.49548],
         [0.0, 0.0, 1.0],
     ],
     dtype=np.float64,

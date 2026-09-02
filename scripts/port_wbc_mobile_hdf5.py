@@ -10,20 +10,24 @@ policy schema of ``omniteleop.wbc_policy_format`` (see PLAN.md Conventions):
       zed_depth_frame head pos3+rot6, from WBC FK on the MEASURED ``obs/joint``
       with the base at zero -- computed on the SAME model the follower solves
       with (``WBCPolicyFK``; never a different URDF / KinHelper) -- then the
-      measured odometry base pose ``obs/base/pose`` (x, y, yaw, engage-origin
-      world): the policy's only absolute world anchor.
-  action (29,) float32
-      the WORLD-frame targets given VERBATIM to ``ik.solve()`` at the record
-      tick, read straight from ``action/eef/{left,right}`` / ``action/head``
-      (+ binarized commanded gripper). NO FK, NO base composition: offline
-      action values are bit-identical to the online solver inputs.
+      canonical measured base pose ``obs/base/pose`` (x, y, yaw, engage-origin
+      world): the policy's only absolute world anchor. Its source is declared by
+      ``meta/obs_base_pose_source`` (wheel odometry for legacy takes, or ARKit).
+  action (29,) or (32,) float32
+      WBC takes retain the 29-D WORLD-frame pose/gripper contract. Joystick takes
+      use current-base pose/head targets and append body-frame ``[vx,vy,wz]`` from
+      ``action/chassis/intent_body``: the follower-effective intent after DOF masking
+      and single-axis projection, before integration/PD/slew/dispatch. In both modes
+      the recorded values are copied verbatim; no FK or base composition is applied.
 
 Required raw datasets (RuntimeError if absent -- re-record with the updated
 recorder; the porter never substitutes ``episode_*_debug.hdf5`` data):
 ``action/eef/{left,right}`` (T,4,4), ``action/head`` (T,4,4),
 ``obs/base/pose`` (T,3), plus the usual ``obs/joint``, ``obs/gripper``,
-``action/gripper``, and ``obs/images/{head_left_rgb,head_depth,left_wrist_rgb,
+``action/gripper``, and ``obs/images/{head_left_rgb,left_wrist_rgb,
 right_wrist_rgb,intrinsic}`` (intrinsic is STATIC (3,3) in this recorder).
+``obs/images/head_depth`` is OPTIONAL: image policies never consume it, and current
+stereo takes intentionally use ``--no-head-depth`` so FoundationStereo can run offline.
 
 Wrist cameras: ``left``/``right`` name the ARM. Both are ported by default as
 ``observation.images.{left,right}_wrist_rgb``. ``right_wrist_rgb`` is OPTIONAL so
@@ -38,7 +42,8 @@ data corruption and raises. Action grippers are binarized at 0.5 like the
 tabletop porter.
 
 Sidecars per episode (not in the parquet):
-``debug/depth/episode_XXXXXX.npz``  key ``depth``   (T', resize_h, resize_w) uint16
+``debug/depth/episode_XXXXXX.npz``  key ``depth``   (T', resize_h, resize_w) uint16,
+    written only when the raw take contains SDK ``head_depth``
 ``debug/calib/episode_XXXXXX.npz``  keys ``extrinsic`` (world_T_zed, from
     world_T_base(obs/base/pose) @ base_T_zed), ``base_extrinsic`` (base_T_zed
     from the state FK), ``intrinsic`` (static intrinsic rescaled to the output
@@ -46,7 +51,8 @@ Sidecars per episode (not in the parquet):
 ``debug/timing/episode_XXXXXX.npz`` key ``timestamp_ns`` (T',) always; plus, for
     takes recorded with the timing-aware recorder, the per-frame capture stamps
     ``head_frame_ns``/``left_wrist_frame_ns``/``grab_wall_ns`` (T'), optional
-    ``head_depth_frame_ns``/``right_wrist_frame_ns`` (T') when present, and the 0-d
+    ``head_depth_frame_ns``/``right_wrist_frame_ns`` plus the three stereo right-eye
+    stamps (T') when present, and the 0-d
     ``ntp_offset_ns``/``ntp_rtt_ns``/``ntp_queried_at_ns`` SoC clock calibration,
     plus optional 0-d ``camera_ntp_{head,left_wrist,right_wrist}_*`` (legacy
     ``camera_ntp_wrist_*``) camera-publisher-host clock
@@ -56,10 +62,13 @@ Sidecars per episode (not in the parquet):
 
 Episode ordering & splits: raw ``episode_<N>.hdf5`` are ported in NUMERIC index
 order (the recorder writes non-zero-padded names, so a lexicographic sort is
-wrong). ``--split-csv`` (default ``<raw-dir>/split.csv``) assigns episodes to
-train/val/test; each split is written to its OWN ``<root>/<split>/<repo_id>/``
-dataset. Rows are ``episode, split`` where ``episode`` is ``<N>`` (raw) or
-``recovery/<N>``; every episode NOT listed defaults to ``train``. If the DEFAULT
+wrong). ``--split-csv`` (default ``<raw-dir>/split.csv``) assigns episodes to a
+declared benchmark split; each split is written to its OWN
+``<root>/<split>/<repo_id>/`` dataset. Rows are ``episode, split`` where
+``episode`` is ``<N>`` (raw) or ``recovery/<N>``; every episode NOT listed
+defaults to ``--default-split`` (``train`` by default). This lets one collection
+directory such as ``raw_data/offline_val`` be ported directly without copying or
+renaming episodes. If the DEFAULT
 split.csv is absent every episode goes to ``train``; an explicitly-passed missing
 ``--split-csv`` errors. Each split dataset is re-opened and cross-checked by
 ``verify()`` right after it is written.
@@ -90,6 +99,26 @@ npz -- validated UP FRONT, before any dataset is written or overwritten. This is
 single-stage task, so NO per-frame ``observation.pos_condition_mask`` is emitted (the
 one constant vector holds throughout, forward-compatible with N grasp cycles).
 
+Structured simulator conditioning (``--structured-env-state-from-raw``): read
+the authoritative ``task/env_state`` ``(3,2,3)``, categorical
+``task/task_sequence`` ``(3,)``, target-only ``progress_index`` and checked
+``active_task_id`` from each raw HDF5. This mode is mutually exclusive with
+SceneDiff ``--positions-dir`` and never flattens the task axes. For collection
+roots whose episodes already live under split directories, port each directory
+with its matching default split, for example::
+
+  python scripts/port_wbc_mobile_hdf5.py \
+    --raw-dir /home/yixuan/Dexmate/bigym/raw_data/train \
+    --root /home/yixuan/Dexmate/bigym/processed_data \
+    --repo-id dexmate_wbc_drawer_dish2rack_close_jar \
+    --default-split train --structured-env-state-from-raw
+
+  python scripts/port_wbc_mobile_hdf5.py \
+    --raw-dir /home/yixuan/Dexmate/bigym/raw_data/offline_val \
+    --root /home/yixuan/Dexmate/bigym/processed_data \
+    --repo-id dexmate_wbc_drawer_dish2rack_close_jar \
+    --default-split offline_val --structured-env-state-from-raw
+
 Environments: the unit tests need only the dexmate env (pinocchio/pink); the
 actual conversion + ``verify()`` additionally need ``lerobot`` and ``tqdm``
 (``dexmate_lerobot`` env) -- both imports are lazy.
@@ -108,6 +137,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import logging
 import os
@@ -125,10 +155,13 @@ from omniteleop.wbc_policy_format import (
     ACTION_AXES,
     GRIPPER_BINARY_THRESHOLD,
     GRIPPER_DIMS,
+    JOYSTICK_POLICY_ACTION_SCHEMA,
     SKIP_NORMALIZATION_DIMS,
     STATE_AXES,
     STATE_FRAMES,
+    WBC_POLICY_ACTION_SCHEMA,
     WBCPolicyFK,
+    action_axes_for_policy_schema,
     base_pose_to_mat,
     build_state_vector,
     mat_to_pos6d,
@@ -147,15 +180,101 @@ DEFAULT_TASK = "dexmate_wbc"
 DEFAULT_REPO_ID = "dexmate_wbc_eef_head"
 ROBOT_TYPE = "dexmate_vega_wbc"
 # Splits are written to <root>/<split>/<repo_id>/ (tabletop porter layout).
-ALL_SPLITS = ("train", "val", "test")
+ALL_SPLITS = (
+    "train",
+    "val",
+    "test",
+    "offline_val",
+    "rollout_val",
+    "iid_test",
+    "spatial_ood_test",
+)
 DEFAULT_SPLIT = "train"  # episodes not named in split.csv land here
 # Rotation-column sanity for RECORDED action targets (float32 leader poses).
 _ROT_COL_NORM_TOL = 1e-2
+# A Hand-E encoder count is 1/255 of normalized achieved position. Requiring two
+# counts avoids treating float noise as physical motion. A command state must persist
+# for half a second at 10 Hz before this gate calls it intentional.
+_GRIPPER_MIN_RESPONSE_RANGE = 2.0 / 255.0
+_GRIPPER_MIN_COMMAND_RUN = 5
+# Raw v4 required one distinct FC03 event per row. Raw v5 preserves the 10 Hz
+# image/action grid across an isolated dropped reply by explicitly zero-order-holding a
+# status sample, but only inside this age bound. The bad first rows in episodes 5/6 were
+# 107 s / 5 s old and remain unconditionally invalid.
+_GRIPPER_STATUS_MAX_AGE_PERIODS = 2.5
+_GRIPPER_STATUS_REQUEST_TIMEOUT_V4_S = 0.5
+_GRIPPER_STATUS_REQUEST_TIMEOUT_V5_S = 0.075
 
 _REQUIRED_ACTION_TARGETS = ("action/eef/left", "action/eef/right", "action/head")
+_BASE_POSE_SOURCES = frozenset({"wheel_odometry", "arkit"})
+_RAW_SCHEMA_V3 = "omniteleop_wbc_mobile_raw/v3"
+_RAW_SCHEMA_V4 = "omniteleop_wbc_mobile_raw/v4"
+_RAW_SCHEMA_V5 = "omniteleop_wbc_mobile_raw/v5"
+_RAW_JOYSTICK_SCHEMA_V1 = "omniteleop_joystick_mobile_raw/v1"
+_RAW_SCHEMAS_WITH_EXPLICIT_BASE = frozenset({
+    _RAW_SCHEMA_V3,
+    _RAW_SCHEMA_V4,
+    _RAW_SCHEMA_V5,
+    _RAW_JOYSTICK_SCHEMA_V1,
+})
+_RAW_SCHEMAS_WITH_CAMERA_ALIGNMENT = frozenset({
+    _RAW_SCHEMA_V4, _RAW_SCHEMA_V5, _RAW_JOYSTICK_SCHEMA_V1,
+})
+_RAW_SCHEMAS_WITH_GRIPPER_PROVENANCE = frozenset({
+    _RAW_SCHEMA_V4, _RAW_SCHEMA_V5, _RAW_JOYSTICK_SCHEMA_V1,
+})
+_RAW_SCHEMAS_WITH_GRIPPER_REUSE = frozenset({
+    _RAW_SCHEMA_V5, _RAW_JOYSTICK_SCHEMA_V1,
+})
 
 # Strict ``episode_<int>.hdf5`` name; excludes any ``episode_*_debug.hdf5`` sidecar.
 _EPISODE_RE = re.compile(r"^episode_(\d+)\.hdf5$")
+
+_LATENCY_AUDITOR = None
+
+
+def _load_latency_auditor():
+    """Load the sibling audit script without requiring ``scripts`` to be a package."""
+    global _LATENCY_AUDITOR
+    if _LATENCY_AUDITOR is not None:
+        return _LATENCY_AUDITOR
+    path = Path(__file__).resolve().with_name("audit_episode_latency.py")
+    spec = importlib.util.spec_from_file_location("wbc_audit_episode_latency", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import the required latency auditor at {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _LATENCY_AUDITOR = module
+    return module
+
+
+def audit_work_list(work: list[dict]) -> dict[Path, dict]:
+    """Run and print the mandatory timing audit for every raw episode.
+
+    Dataset processors call this before creating, deleting, or overwriting outputs.
+    Malformed/non-monotonic timing aborts the whole port. Latency magnitudes remain
+    reported measurements: no pass/fail threshold is imposed without an explicit
+    experiment contract.
+    """
+    auditor = _load_latency_auditor()
+    results: dict[Path, dict] = {}
+    failures: list[str] = []
+    print(f"\nRunning required episode-latency audit ({len(work)} episode(s)) ...")
+    for item in work:
+        path = Path(item["path"])
+        try:
+            result = auditor.audit_episode(path)
+            auditor.print_report(result)
+            results[path] = result
+        except Exception as exc:
+            failures.append(f"- {path}: {type(exc).__name__}: {exc}")
+    if failures:
+        raise RuntimeError(
+            "Required episode-latency audit failed; no dataset was written:\n"
+            + "\n".join(failures)
+        )
+    logging.info("Required episode-latency audit passed for %d episode(s)", len(results))
+    return results
 
 
 def episode_index_from_path(path: Path) -> int:
@@ -301,10 +420,563 @@ def read_required_array(
     return arr
 
 
+def _read_optional_hdf5_text(
+    f: h5py.File, key: str, source: str | Path
+) -> str | None:
+    """Read one optional scalar UTF-8/ASCII HDF5 dataset."""
+    if key not in f:
+        return None
+    node = f[key]
+    if not isinstance(node, h5py.Dataset):
+        raise RuntimeError(f"{source}: {key} is not an HDF5 dataset")
+    value = np.asarray(node[()])
+    if value.shape != ():
+        raise RuntimeError(f"{source}: {key} must be scalar text, got {value.shape}")
+    scalar = value.item()
+    if isinstance(scalar, (bytes, np.bytes_)):
+        try:
+            return bytes(scalar).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"{source}: {key} is not valid UTF-8") from exc
+    if isinstance(scalar, str):
+        return scalar
+    raise RuntimeError(
+        f"{source}: {key} must be scalar text, got {type(scalar).__name__}"
+    )
+
+
+def _inspect_open_base_pose_contract(
+    f: h5py.File, source: str | Path
+) -> dict[str, str | bool | None]:
+    """Validate which sensor owns canonical ``obs/base/pose`` in one raw take.
+
+    Raw-v3 always retains wheel odometry for diagnostics while allowing ARKit to be
+    the canonical control/policy pose. Older takes predate this declaration and are
+    interpreted as wheel odometry, matching their recorder semantics.
+    """
+    canonical = read_required_array(f, "obs/base/pose", source)
+    if canonical.ndim != 2 or canonical.shape[1] != 3:
+        raise RuntimeError(
+            f"{source}: obs/base/pose must be (T,3), got {canonical.shape}"
+        )
+
+    schema = _read_optional_hdf5_text(f, "meta/schema", source)
+    provenance_schema = _read_optional_hdf5_text(
+        f, "meta/provenance/schema", source
+    )
+    if schema is not None and provenance_schema is not None and schema != provenance_schema:
+        raise RuntimeError(
+            f"{source}: meta/schema={schema!r} disagrees with "
+            f"meta/provenance/schema={provenance_schema!r}"
+        )
+    schema = schema or provenance_schema
+
+    declared_source = _read_optional_hdf5_text(
+        f, "meta/obs_base_pose_source", source
+    )
+    legacy_inferred = declared_source is None
+    base_pose_source = declared_source or "wheel_odometry"
+    if base_pose_source not in _BASE_POSE_SOURCES:
+        raise RuntimeError(
+            f"{source}: meta/obs_base_pose_source={base_pose_source!r}; expected one "
+            f"of {sorted(_BASE_POSE_SOURCES)}"
+        )
+
+    control_source = _read_optional_hdf5_text(
+        f, "meta/base_control_pose_source", source
+    )
+    if control_source is not None and control_source not in _BASE_POSE_SOURCES:
+        raise RuntimeError(
+            f"{source}: meta/base_control_pose_source={control_source!r}; expected one "
+            f"of {sorted(_BASE_POSE_SOURCES)}"
+        )
+    if control_source is not None and control_source != base_pose_source:
+        raise RuntimeError(
+            f"{source}: canonical obs/base/pose source {base_pose_source!r} disagrees "
+            f"with base control source {control_source!r}"
+        )
+
+    if schema in _RAW_SCHEMAS_WITH_EXPLICIT_BASE:
+        if legacy_inferred:
+            raise RuntimeError(
+                f"{source}: {schema} requires meta/obs_base_pose_source"
+            )
+        if control_source is None:
+            raise RuntimeError(
+                f"{source}: {schema} requires meta/base_control_pose_source"
+            )
+        if "obs/base/pose_odom" not in f:
+            raise RuntimeError(
+                f"{source}: {schema} requires diagnostic obs/base/pose_odom"
+            )
+
+    reference_key = (
+        "obs/base/pose_arkit" if base_pose_source == "arkit" else "obs/base/pose_odom"
+    )
+    if base_pose_source == "arkit" and reference_key not in f:
+        raise RuntimeError(
+            f"{source}: ARKit is the declared canonical base pose but {reference_key} "
+            "is missing"
+        )
+    if reference_key in f:
+        reference = read_required_array(f, reference_key, source)
+        if reference.shape != canonical.shape:
+            raise RuntimeError(
+                f"{source}: {reference_key} shape {reference.shape} != canonical "
+                f"obs/base/pose shape {canonical.shape}"
+            )
+        if not np.array_equal(canonical, reference):
+            mismatch = np.argwhere(canonical != reference)
+            frame = int(mismatch[0, 0]) if mismatch.size else 0
+            raise RuntimeError(
+                f"{source}: obs/base/pose does not exactly match declared "
+                f"{base_pose_source} stream {reference_key} (first mismatch frame {frame})"
+            )
+
+    return {
+        "base_pose_source": base_pose_source,
+        "base_control_pose_source": control_source,
+        "raw_schema": schema,
+        "legacy_inferred": legacy_inferred,
+    }
+
+
+def inspect_episode_base_pose_contract(hdf5_path: Path) -> dict[str, str | bool | None]:
+    """Open and validate one episode's canonical base-pose source contract."""
+    path = Path(hdf5_path)
+    with h5py.File(path, "r") as f:
+        return _inspect_open_base_pose_contract(f, path)
+
+
+def validate_work_base_pose_contract(work: list[dict]) -> str:
+    """Require every episode in one processed dataset to use one pose source."""
+    by_source: dict[str, list[Path]] = {}
+    failures: list[str] = []
+    for item in work:
+        path = Path(item["path"])
+        try:
+            contract = inspect_episode_base_pose_contract(path)
+            source = str(contract["base_pose_source"])
+            by_source.setdefault(source, []).append(path)
+        except Exception as exc:
+            failures.append(f"- {path}: {exc}")
+    if failures:
+        raise RuntimeError(
+            "Raw base-pose contract validation failed; no dataset was written:\n"
+            + "\n".join(failures)
+        )
+    if len(by_source) != 1:
+        detail = ", ".join(
+            f"{source}={len(paths)} (e.g. {paths[0]})"
+            for source, paths in sorted(by_source.items())
+        )
+        raise RuntimeError(
+            "source episodes mix canonical base-pose sources; train/port wheel "
+            f"odometry and ARKit separately: {detail}"
+        )
+    if not by_source:
+        raise RuntimeError("cannot validate base-pose source for an empty work list")
+    return next(iter(by_source))
+
+
+def _inspect_open_policy_action_contract(
+    f: h5py.File, source: str | Path
+) -> dict[str, object]:
+    """Validate the action frame/layout declared by one raw episode.
+
+    Historical WBC takes predate these metadata fields and retain their established
+    29-D engage-world contract. Joystick takes are intentionally strict: silently
+    inferring the human chassis intent from an integrated pose or an applied twist
+    would create a different learning target, so all declarations and the exact
+    post-projection intent dataset are required.
+    """
+    raw_schema = (
+        _read_optional_hdf5_text(f, "meta/schema", source)
+        or _read_optional_hdf5_text(f, "meta/provenance/schema", source)
+    )
+    control_mode = _read_optional_hdf5_text(f, "meta/control_mode", source)
+    policy_schema = _read_optional_hdf5_text(
+        f, "meta/policy_action_schema", source
+    )
+    frame_values = {
+        name: _read_optional_hdf5_text(f, f"meta/{name}", source)
+        for name in ("action_target_frame", "eef_target_frame", "head_target_frame")
+    }
+
+    joystick_markers = (
+        raw_schema == _RAW_JOYSTICK_SCHEMA_V1,
+        policy_schema == JOYSTICK_POLICY_ACTION_SCHEMA,
+        control_mode == "joystick",
+    )
+    is_joystick = any(joystick_markers)
+    if is_joystick:
+        expected = {
+            "raw schema": (raw_schema, _RAW_JOYSTICK_SCHEMA_V1),
+            "meta/control_mode": (control_mode, "joystick"),
+            "meta/policy_action_schema": (
+                policy_schema,
+                JOYSTICK_POLICY_ACTION_SCHEMA,
+            ),
+            "meta/action_target_frame": (
+                frame_values["action_target_frame"],
+                "current_base",
+            ),
+            "meta/eef_target_frame": (
+                frame_values["eef_target_frame"],
+                "current_base",
+            ),
+            "meta/head_target_frame": (
+                frame_values["head_target_frame"],
+                "current_base",
+            ),
+        }
+        bad = [
+            f"{name}={actual!r} (expected {wanted!r})"
+            for name, (actual, wanted) in expected.items()
+            if actual != wanted
+        ]
+        if bad:
+            raise RuntimeError(
+                f"{source}: incomplete/conflicting joystick policy contract: "
+                + "; ".join(bad)
+            )
+        intent = read_required_array(f, "action/chassis/intent_body", source)
+        if intent.ndim != 2 or intent.shape[1] != 3:
+            raise RuntimeError(
+                f"{source}: action/chassis/intent_body must be (T,3), got "
+                f"{intent.shape}"
+            )
+        if "action/eef/left" in f and intent.shape[0] != f["action/eef/left"].shape[0]:
+            raise RuntimeError(
+                f"{source}: action/chassis/intent_body frame count {intent.shape[0]} "
+                f"!= action/eef/left {f['action/eef/left'].shape[0]}"
+            )
+        resolved_schema = JOYSTICK_POLICY_ACTION_SCHEMA
+        action_frame = "current_base"
+    else:
+        if raw_schema == _RAW_JOYSTICK_SCHEMA_V1 or control_mode == "joystick":
+            raise RuntimeError(f"{source}: malformed joystick policy contract")
+        if policy_schema not in (None, WBC_POLICY_ACTION_SCHEMA):
+            raise RuntimeError(
+                f"{source}: unknown meta/policy_action_schema={policy_schema!r}"
+            )
+        for name, value in frame_values.items():
+            if value not in (None, "engage_origin_world", "world"):
+                raise RuntimeError(
+                    f"{source}: WBC {name}={value!r}; expected engage-origin world"
+                )
+        resolved_schema = WBC_POLICY_ACTION_SCHEMA
+        action_frame = "world"
+
+    return {
+        "policy_action_schema": resolved_schema,
+        "action_axes": action_axes_for_policy_schema(resolved_schema),
+        "action_target_frame": action_frame,
+        "control_mode": control_mode or ("joystick" if is_joystick else "wbc"),
+        "raw_schema": raw_schema,
+    }
+
+
+def inspect_episode_policy_action_contract(hdf5_path: Path) -> dict[str, object]:
+    """Open and validate one episode's policy-action schema/frame contract."""
+    path = Path(hdf5_path)
+    with h5py.File(path, "r") as f:
+        return _inspect_open_policy_action_contract(f, path)
+
+
+def validate_work_policy_action_contract(work: list[dict]) -> dict[str, object]:
+    """Require every take in one processed dataset to share one action meaning."""
+    contracts: dict[tuple[str, str], list[Path]] = {}
+    failures: list[str] = []
+    first_by_key: dict[tuple[str, str], dict[str, object]] = {}
+    for item in work:
+        path = Path(item["path"])
+        try:
+            contract = inspect_episode_policy_action_contract(path)
+            key = (
+                str(contract["policy_action_schema"]),
+                str(contract["action_target_frame"]),
+            )
+            contracts.setdefault(key, []).append(path)
+            first_by_key.setdefault(key, contract)
+        except Exception as exc:
+            failures.append(f"- {path}: {exc}")
+    if failures:
+        raise RuntimeError(
+            "Raw policy-action contract validation failed; no dataset was written:\n"
+            + "\n".join(failures)
+        )
+    if not contracts:
+        raise RuntimeError("cannot validate policy action contract for an empty work list")
+    if len(contracts) != 1:
+        detail = ", ".join(
+            f"{schema}/{frame}={len(paths)} (e.g. {paths[0]})"
+            for (schema, frame), paths in sorted(contracts.items())
+        )
+        raise RuntimeError(
+            "source episodes mix policy action contracts; keep joystick/current-base "
+            f"and WBC/world datasets separate: {detail}"
+        )
+    key = next(iter(contracts))
+    return first_by_key[key]
+
+
+_CAMERA_ALIGNMENT_MODES = frozenset({
+    "head_capture_nearest",
+    "latest_arrived_compatibility",
+})
+
+
+def _read_required_int64_scalar(
+    f: h5py.File, key: str, source: str | Path
+) -> int:
+    if key not in f or not isinstance(f[key], h5py.Dataset):
+        raise RuntimeError(f"{source}: missing required scalar dataset {key}")
+    value = np.asarray(f[key][()])
+    if value.shape != () or value.dtype != np.int64:
+        raise RuntimeError(
+            f"{source}: {key} must be 0-d int64, got {value.shape} {value.dtype}"
+        )
+    return int(value)
+
+
+def _timing_camera_offset_ns(timing: dict, label: str) -> int | None:
+    value = timing.get(f"camera_ntp_{label}_offset_ns")
+    if value is None and label == "left_wrist":
+        value = timing.get("camera_ntp_wrist_offset_ns")
+    return None if value is None else int(np.asarray(value))
+
+
+def _inspect_open_camera_alignment_contract(
+    f: h5py.File,
+    source: str | Path,
+    timing: dict | None,
+    *,
+    raw_schema: str | None = None,
+) -> dict:
+    """Validate the recorder's head-anchored multi-camera timing contract."""
+    if raw_schema is None:
+        raw_schema = (
+            _read_optional_hdf5_text(f, "meta/schema", source)
+            or _read_optional_hdf5_text(f, "meta/provenance/schema", source)
+        )
+    group = "meta/camera_alignment"
+    if group not in f:
+        if raw_schema in _RAW_SCHEMAS_WITH_CAMERA_ALIGNMENT:
+            raise RuntimeError(
+                f"{source}: {raw_schema} requires {group}; re-record with the "
+                "capture-nearest recorder"
+            )
+        return {
+            "mode": "latest_arrived_legacy_unverified",
+            "clock_domain": "raw_publisher_clock_unverified",
+            "max_abs_skew_ns": None,
+            "max_camera_age_ns": None,
+            "wrist_buffer_frames": None,
+            "verified": False,
+            "measured_max_abs_skew_ns": {},
+            "measured_max_camera_age_ns": {},
+            "raw_schema": raw_schema,
+        }
+    if not isinstance(f[group], h5py.Group):
+        raise RuntimeError(f"{source}: {group} must be an HDF5 group")
+
+    required_text = {
+        "mode": "head_capture_nearest or latest_arrived_compatibility",
+        "anchor": "head_left_rgb_capture",
+        "clock_domain": "local_via_camera_ntp",
+    }
+    text_values: dict[str, str] = {}
+    for key, expected in required_text.items():
+        value = _read_optional_hdf5_text(f, f"{group}/{key}", source)
+        if value is None:
+            raise RuntimeError(f"{source}: missing required {group}/{key} ({expected})")
+        text_values[key] = value
+    mode = text_values["mode"]
+    if mode not in _CAMERA_ALIGNMENT_MODES:
+        raise RuntimeError(
+            f"{source}: {group}/mode={mode!r}; expected one of "
+            f"{sorted(_CAMERA_ALIGNMENT_MODES)}"
+        )
+    if text_values["anchor"] != "head_left_rgb_capture":
+        raise RuntimeError(
+            f"{source}: {group}/anchor={text_values['anchor']!r}, expected "
+            "'head_left_rgb_capture'"
+        )
+    if text_values["clock_domain"] != "local_via_camera_ntp":
+        raise RuntimeError(
+            f"{source}: {group}/clock_domain={text_values['clock_domain']!r}, expected "
+            "'local_via_camera_ntp'"
+        )
+    max_skew_ns = _read_required_int64_scalar(
+        f, f"{group}/max_abs_skew_ns", source
+    )
+    max_camera_age_ns = _read_required_int64_scalar(
+        f, f"{group}/max_camera_age_ns", source
+    )
+    buffer_frames = _read_required_int64_scalar(
+        f, f"{group}/wrist_buffer_frames", source
+    )
+    if buffer_frames <= 0:
+        raise RuntimeError(
+            f"{source}: {group}/wrist_buffer_frames must be > 0, got {buffer_frames}"
+        )
+    if max_camera_age_ns <= 0:
+        raise RuntimeError(
+            f"{source}: {group}/max_camera_age_ns must be > 0, got "
+            f"{max_camera_age_ns}"
+        )
+    if mode == "head_capture_nearest" and max_skew_ns <= 0:
+        raise RuntimeError(
+            f"{source}: head_capture_nearest requires max_abs_skew_ns > 0, got "
+            f"{max_skew_ns}"
+        )
+    if mode == "latest_arrived_compatibility" and max_skew_ns != 0:
+        raise RuntimeError(
+            f"{source}: latest_arrived_compatibility requires max_abs_skew_ns == 0, "
+            f"got {max_skew_ns}"
+        )
+    if timing is None:
+        raise RuntimeError(
+            f"{source}: {group} exists without per-frame camera timing; cannot verify it"
+        )
+
+    measured: dict[str, int] = {}
+    measured_age: dict[str, int] = {}
+    head_offset = _timing_camera_offset_ns(timing, "head")
+    if head_offset is None:
+        raise RuntimeError(f"{source}: {mode} requires meta/camera_ntp/head")
+    head_local = timing["head_frame_ns"] - head_offset
+    head_age = timing["grab_wall_ns"] - head_local
+    bad_head_age = (head_age < -10_000_000) | (head_age > max_camera_age_ns)
+    if np.any(bad_head_age):
+        frame = int(np.flatnonzero(bad_head_age)[0])
+        raise RuntimeError(
+            f"{source}: corrected head camera age at frame {frame} is "
+            f"{int(head_age[frame]) / 1e6:+.3f} ms, outside the declared "
+            f"[-10, {max_camera_age_ns / 1e6:g}] ms contract"
+        )
+    measured_age["head"] = int(head_age.max())
+    wrist_streams = [("left_wrist", "left_wrist_frame_ns")]
+    if "right_wrist_frame_ns" in timing:
+        wrist_streams.append(("right_wrist", "right_wrist_frame_ns"))
+    for label, key in wrist_streams:
+        wrist_offset = _timing_camera_offset_ns(timing, label)
+        if wrist_offset is None:
+            raise RuntimeError(f"{source}: {mode} requires meta/camera_ntp/{label}")
+        wrist_local = timing[key] - wrist_offset
+        if mode == "head_capture_nearest":
+            skew_ns = head_local - wrist_local
+            abs_skew = np.abs(skew_ns)
+            measured[label] = int(abs_skew.max())
+            bad = abs_skew > max_skew_ns
+            if np.any(bad):
+                frame = int(np.flatnonzero(bad)[0])
+                raise RuntimeError(
+                    f"{source}: corrected head-minus-{label} capture skew at frame "
+                    f"{frame} is {int(skew_ns[frame]) / 1e6:+.3f} ms, exceeding the "
+                    f"declared {max_skew_ns / 1e6:g} ms contract"
+                )
+        wrist_age = timing["grab_wall_ns"] - wrist_local
+        bad_age = (wrist_age < -10_000_000) | (wrist_age > max_camera_age_ns)
+        if np.any(bad_age):
+            frame = int(np.flatnonzero(bad_age)[0])
+            raise RuntimeError(
+                f"{source}: corrected {label} camera age at frame {frame} is "
+                f"{int(wrist_age[frame]) / 1e6:+.3f} ms, outside the declared "
+                f"[-10, {max_camera_age_ns / 1e6:g}] ms contract"
+            )
+        measured_age[label] = int(wrist_age.max())
+
+    return {
+        "mode": mode,
+        "clock_domain": text_values["clock_domain"],
+        "max_abs_skew_ns": max_skew_ns,
+        "max_camera_age_ns": max_camera_age_ns,
+        "wrist_buffer_frames": buffer_frames,
+        "verified": mode == "head_capture_nearest",
+        "measured_max_abs_skew_ns": measured,
+        "measured_max_camera_age_ns": measured_age,
+        "raw_schema": raw_schema,
+    }
+
+
+def inspect_episode_camera_alignment_contract(hdf5_path: Path) -> dict:
+    path = Path(hdf5_path)
+    with h5py.File(path, "r") as f:
+        if "timestamp_ns" not in f:
+            raise RuntimeError(f"{path}: missing timestamp_ns")
+        frame_count = int(f["timestamp_ns"].shape[0])
+        timing = load_episode_timing(f, path, frame_count)
+        return _inspect_open_camera_alignment_contract(f, path, timing)
+
+
+def validate_work_camera_alignment_contract(work: list[dict]) -> dict:
+    """Require one camera-pairing semantic/limit throughout a training dataset."""
+    by_signature: dict[tuple, list[Path]] = {}
+    contracts: dict[tuple, dict] = {}
+    failures: list[str] = []
+    for item in work:
+        path = Path(item["path"])
+        try:
+            contract = inspect_episode_camera_alignment_contract(path)
+            signature = (
+                contract["mode"],
+                contract["clock_domain"],
+                contract["max_abs_skew_ns"],
+                contract["max_camera_age_ns"],
+            )
+            by_signature.setdefault(signature, []).append(path)
+            contracts[signature] = contract
+        except Exception as exc:
+            failures.append(f"- {path}: {exc}")
+    if failures:
+        raise RuntimeError(
+            "Raw camera-alignment contract validation failed; no dataset was written:\n"
+            + "\n".join(failures)
+        )
+    if not by_signature:
+        raise RuntimeError("cannot validate camera alignment for an empty work list")
+    if len(by_signature) != 1:
+        detail = ", ".join(
+            f"{signature}={len(paths)} (e.g. {paths[0]})"
+            for signature, paths in by_signature.items()
+        )
+        raise RuntimeError(
+            "source episodes mix camera-alignment semantics/limits; port them "
+            f"separately: {detail}"
+        )
+    return contracts[next(iter(by_signature))]
+
+
 _TIMING_KEYS = ("head_frame_ns", "left_wrist_frame_ns", "grab_wall_ns")
 # right_wrist_frame_ns rides with the second wrist camera; optional so single-wrist
 # takes recorded before it existed still port.
-_OPTIONAL_TIMING_KEYS = ("head_depth_frame_ns", "right_wrist_frame_ns")
+_OPTIONAL_TIMING_KEYS = (
+    "head_depth_frame_ns",
+    "right_wrist_frame_ns",
+    "head_right_frame_ns",
+    "left_wrist_right_frame_ns",
+    "right_wrist_right_frame_ns",
+    "head_receive_ns",
+    "head_depth_receive_ns",
+    "head_right_receive_ns",
+    "left_wrist_receive_ns",
+    "left_wrist_right_receive_ns",
+    "right_wrist_receive_ns",
+    "right_wrist_right_receive_ns",
+)
+# Per-frame causal timing added after capture/receive timestamps. All six fields are
+# required together: a partial bracket cannot answer whether the action, image, and
+# measured robot state belong to the same point on the timeline.
+_CAUSAL_TIMING_KEYS = (
+    "source_timestamp_ns",
+    "source_receive_wall_ns",
+    "action_dispatch_start_wall_ns",
+    "action_dispatch_end_wall_ns",
+    "state_read_start_wall_ns",
+    "state_read_end_wall_ns",
+)
 _NTP_KEYS = ("offset_ns", "rtt_ns", "queried_at_ns")
 # "wrist" is the legacy single-camera label (wbc_vr_robot before the two-wrist split);
 # absent labels are skipped, so old and new episodes both load whatever they carry.
@@ -335,10 +1007,12 @@ def load_episode_timing(f: h5py.File, source: str | Path, frame_count: int) -> d
     """
     present = [key for key in _TIMING_KEYS if f"obs/images/{key}" in f]
     optional_present = [key for key in _OPTIONAL_TIMING_KEYS if f"obs/images/{key}" in f]
+    causal_present = [key for key in _CAUSAL_TIMING_KEYS if f"timing/{key}" in f]
     if not present:
-        if optional_present:
+        if optional_present or causal_present:
             raise RuntimeError(
-                f"{source}: optional timing fields {optional_present} exist without "
+                f"{source}: optional timing fields {optional_present + causal_present} "
+                "exist without "
                 f"required {list(_TIMING_KEYS)}; corrupt timing metadata"
             )
         return None
@@ -364,6 +1038,50 @@ def load_episode_timing(f: h5py.File, source: str | Path, frame_count: int) -> d
                 "recorder freshness gate forbids duplicate frames; corrupt take"
             )
         timing[key] = arr
+    if causal_present and len(causal_present) != len(_CAUSAL_TIMING_KEYS):
+        missing = sorted(set(_CAUSAL_TIMING_KEYS) - set(causal_present))
+        raise RuntimeError(
+            f"{source}: partial timing causal bracket -- timing has "
+            f"{causal_present} but is missing {missing}"
+        )
+    for key in causal_present:
+        arr = np.asarray(f[f"timing/{key}"][()])
+        if arr.shape != (frame_count,) or arr.dtype != np.int64:
+            raise RuntimeError(
+                f"{source}: timing/{key} must be ({frame_count},) int64, got "
+                f"{arr.shape} {arr.dtype}"
+            )
+        if np.any(arr <= 0):
+            raise RuntimeError(f"{source}: timing/{key} has non-positive stamps")
+        # One source command may legitimately feed two adjacent 10 Hz record rows;
+        # all locally generated action/state stages, however, occur once per row.
+        strict = key not in {"source_timestamp_ns", "source_receive_wall_ns"}
+        delta = np.diff(arr)
+        if arr.shape[0] > 1 and np.any(delta <= 0 if strict else delta < 0):
+            order = "strictly increasing" if strict else "monotonic"
+            raise RuntimeError(f"{source}: timing/{key} is not {order}")
+        timing[key] = arr
+    if causal_present:
+        source_receive = timing["source_receive_wall_ns"]
+        dispatch_start = timing["action_dispatch_start_wall_ns"]
+        dispatch_end = timing["action_dispatch_end_wall_ns"]
+        state_start = timing["state_read_start_wall_ns"]
+        state_end = timing["state_read_end_wall_ns"]
+        commit = np.asarray(f["timestamp_ns"][()])
+        causal_checks = (
+            (source_receive <= dispatch_start, "source_receive <= action_dispatch_start"),
+            (dispatch_start <= dispatch_end, "action_dispatch_start <= action_dispatch_end"),
+            (timing["grab_wall_ns"] <= state_start, "grab_wall <= state_read_start"),
+            (dispatch_end <= state_start, "action_dispatch_end <= state_read_start"),
+            (state_start <= state_end, "state_read_start <= state_read_end"),
+            (state_end <= commit, "state_read_end <= timestamp_ns(commit)"),
+        )
+        for valid, relation in causal_checks:
+            if not np.all(valid):
+                frame = int(np.flatnonzero(~valid)[0])
+                raise RuntimeError(
+                    f"{source}: causal timing order violated at frame {frame}: {relation}"
+                )
     for key in optional_present:
         arr = np.asarray(f[f"obs/images/{key}"][()])
         if arr.shape != (frame_count,) or arr.dtype != np.int64:
@@ -373,12 +1091,10 @@ def load_episode_timing(f: h5py.File, source: str | Path, frame_count: int) -> d
             )
         if np.any(arr <= 0):
             raise RuntimeError(f"{source}: obs/images/{key} has non-positive stamps")
-        # right_wrist_frame_ns is optional only because older takes predate the second
-        # camera -- when present it is a CAMERA stream behind the recorder's freshness
-        # gate, so it must be STRICTLY increasing exactly like the required stamps.
-        # head_depth_frame_ns is merely monotonic: depth may repeat a stamp when it lags
-        # RGB by a frame.
-        if key == "right_wrist_frame_ns":
+        # Every RGB eye is a camera stream behind the recorder's freshness gate and
+        # must be strictly increasing. head_depth_frame_ns alone may repeat when SDK
+        # depth lags RGB by a frame.
+        if key != "head_depth_frame_ns":
             if arr.shape[0] > 1 and np.any(np.diff(arr) <= 0):
                 raise RuntimeError(
                     f"{source}: obs/images/{key} is not strictly increasing -- the "
@@ -475,13 +1191,274 @@ def first_valid_frame(
     return t0
 
 
-def load_action_targets_world(raw: h5py.File, t: int) -> tuple[dict[str, np.ndarray], np.ndarray]:
-    """The frame-``t`` WORLD-frame solver targets, VERBATIM from the raw file.
+def _longest_true_run(mask: np.ndarray) -> int:
+    """Length of the longest contiguous True run in a one-dimensional mask."""
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 1 or mask.size == 0:
+        return 0
+    padded = np.concatenate(([False], mask, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    lengths = edges[1::2] - edges[::2]
+    return int(lengths.max()) if lengths.size else 0
+
+
+def validate_gripper_feedback(
+    gripper_obs: Mapping[str, np.ndarray],
+    gripper_act: Mapping[str, np.ndarray],
+    t0: int,
+    source: str | Path,
+) -> None:
+    """Reject commanded gripper motion with an effectively constant encoder.
+
+    A stationary gripper is legitimate when the operator never changes its command.
+    It is not legitimate when both open and close are each commanded for a sustained
+    interval but gPO never moves by even two encoder counts. That pattern means the
+    achieved-state channel is stale/broken and would corrupt observation.state.
+    """
+    for side in ("left", "right"):
+        obs = np.asarray(gripper_obs[side][t0:], dtype=np.float64)
+        act = np.asarray(gripper_act[side][t0:], dtype=np.float64)
+        out_of_range = (obs < -1e-6) | (obs > 1.0 + 1e-6)
+        if np.any(out_of_range):
+            local_bad = int(np.flatnonzero(out_of_range)[0])
+            raise RuntimeError(
+                f"{source}: obs/gripper/{side}[{t0 + local_bad}]="
+                f"{obs[local_bad]:.6f} is outside [0,1]"
+            )
+        closed = act >= GRIPPER_BINARY_THRESHOLD
+        open_run = _longest_true_run(~closed)
+        close_run = _longest_true_run(closed)
+        response_range = float(np.ptp(obs))
+        if (
+            open_run >= _GRIPPER_MIN_COMMAND_RUN
+            and close_run >= _GRIPPER_MIN_COMMAND_RUN
+            and response_range < _GRIPPER_MIN_RESPONSE_RANGE
+        ):
+            raise RuntimeError(
+                f"{source}: obs/gripper/{side} is stale or stuck: action commands "
+                f"open for {open_run} consecutive frame(s) and close for "
+                f"{close_run}, but achieved gPO range is only "
+                f"{response_range:.6f} (< {_GRIPPER_MIN_RESPONSE_RANGE:.6f}, two "
+                "encoder counts). Do not train on this take. Re-record with the "
+                "fresh-status recorder and inspect obs/gripper_status provenance."
+            )
+
+
+def validate_gripper_status_provenance(
+    raw: h5py.File,
+    *,
+    frame_count: int,
+    fps: int,
+    timestamp_ns: np.ndarray,
+    gripper_obs: Mapping[str, np.ndarray],
+    timing: dict | None,
+    raw_schema: str,
+    source: str | Path,
+) -> dict[str, np.ndarray]:
+    """Validate timestamped FC03 provenance for raw v4/v5 takes.
+
+    V4 requires one distinct transaction per row. V5 permits an explicitly marked
+    zero-order hold while the callback remains at most 2.5 frame periods old. In both
+    schemas both arms are atomic, callback time precedes row commit/state read, and the
+    achieved scalar exactly matches ``obs/gripper``. Returned arrays are copied into
+    the processed timing sidecar for post-hoc latency audits.
+    """
+    groups = {
+        side: f"obs/gripper_status/{side}" for side in ("left", "right")
+    }
+    present = {side: group in raw for side, group in groups.items()}
+    if not any(present.values()):
+        if raw_schema in _RAW_SCHEMAS_WITH_GRIPPER_PROVENANCE:
+            raise RuntimeError(
+                f"{source}: {raw_schema} take is missing obs/gripper_status for both "
+                "arms; achieved-state provenance cannot be verified"
+            )
+        return {}
+    if not all(present.values()):
+        missing = [side for side, exists in present.items() if not exists]
+        raise RuntimeError(
+            f"{source}: partial obs/gripper_status; missing arm(s) {missing}"
+        )
+
+    max_age_ns = round(_GRIPPER_STATUS_MAX_AGE_PERIODS / float(fps) * 1e9)
+    request_timeout_s = (
+        _GRIPPER_STATUS_REQUEST_TIMEOUT_V5_S
+        if raw_schema in _RAW_SCHEMAS_WITH_GRIPPER_REUSE
+        else _GRIPPER_STATUS_REQUEST_TIMEOUT_V4_S
+    )
+    max_request_ns = round(request_timeout_s * 1e9)
+    commit = np.asarray(timestamp_ns, dtype=np.int64)
+    state_start = None
+    if timing is not None and "state_read_start_wall_ns" in timing:
+        state_start = np.asarray(timing["state_read_start_wall_ns"], dtype=np.int64)
+    sidecar: dict[str, np.ndarray] = {}
+
+    for side, group in groups.items():
+        arrays: dict[str, np.ndarray] = {}
+        for key in (
+            "status_request_id",
+            "request_send_wall_ns",
+            "read_wall_ns",
+            "actual",
+        ):
+            path = f"{group}/{key}"
+            if path not in raw:
+                raise RuntimeError(f"{source}: missing required {path}")
+            arrays[key] = np.asarray(raw[path][()])
+
+        for key in ("status_request_id", "request_send_wall_ns", "read_wall_ns"):
+            arr = arrays[key]
+            if arr.shape != (frame_count,) or arr.dtype != np.int64:
+                raise RuntimeError(
+                    f"{source}: {group}/{key} must be ({frame_count},) int64, got "
+                    f"{arr.shape} {arr.dtype}"
+                )
+            if np.any(arr < 0 if key == "status_request_id" else arr <= 0):
+                raise RuntimeError(f"{source}: {group}/{key} has invalid values")
+            if frame_count > 1:
+                delta = np.diff(arr)
+                if raw_schema in _RAW_SCHEMAS_WITH_GRIPPER_REUSE:
+                    if np.any(delta < 0):
+                        raise RuntimeError(
+                            f"{source}: {group}/{key} regresses in raw v5"
+                        )
+                elif np.any(delta <= 0):
+                    raise RuntimeError(
+                        f"{source}: {group}/{key} is not strictly increasing; cached "
+                        "FC03 feedback was reused"
+                    )
+
+        if raw_schema in _RAW_SCHEMAS_WITH_GRIPPER_REUSE:
+            reused_path = f"{group}/sample_reused"
+            if reused_path not in raw:
+                raise RuntimeError(f"{source}: raw v5 is missing required {reused_path}")
+            reused = np.asarray(raw[reused_path][()])
+            if reused.shape != (frame_count,) or reused.dtype.kind != "b":
+                raise RuntimeError(
+                    f"{source}: {reused_path} must be ({frame_count},) bool, got "
+                    f"{reused.shape} {reused.dtype}"
+                )
+            if frame_count and bool(reused[0]):
+                raise RuntimeError(
+                    f"{source}: {reused_path}[0] is true; frame zero must use a "
+                    "post-engage FC03 callback"
+                )
+            request_ids = arrays["status_request_id"]
+            repeated = np.zeros(frame_count, dtype=bool)
+            if frame_count > 1:
+                repeated[1:] = np.diff(request_ids) == 0
+            if not np.array_equal(reused, repeated):
+                frame = int(np.flatnonzero(reused != repeated)[0])
+                raise RuntimeError(
+                    f"{source}: {reused_path}[{frame}]={bool(reused[frame])} does "
+                    f"not match status_request_id reuse={bool(repeated[frame])}"
+                )
+            # A repeated id denotes the exact same sample, not merely another packet
+            # with a coincidentally duplicated identifier. Its timing and value must be
+            # bit-identical; advancing ids must advance both timestamps.
+            if frame_count > 1:
+                for key in ("request_send_wall_ns", "read_wall_ns"):
+                    delta = np.diff(arrays[key])
+                    if np.any(delta[repeated[1:]] != 0):
+                        frame = int(np.flatnonzero(
+                            repeated[1:] & (delta != 0)
+                        )[0]) + 1
+                        raise RuntimeError(
+                            f"{source}: {group}/{key} changes at reused frame {frame}"
+                        )
+                    if np.any(delta[~repeated[1:]] <= 0):
+                        frame = int(np.flatnonzero(
+                            (~repeated[1:]) & (delta <= 0)
+                        )[0]) + 1
+                        raise RuntimeError(
+                            f"{source}: {group}/{key} does not advance with the new "
+                            f"status at frame {frame}"
+                        )
+        else:
+            reused = np.zeros(frame_count, dtype=bool)
+
+        request = arrays["request_send_wall_ns"]
+        read = arrays["read_wall_ns"]
+        request_latency = read - request
+        if np.any(request_latency < 0) or np.any(request_latency > max_request_ns):
+            frame = int(np.flatnonzero(
+                (request_latency < 0) | (request_latency > max_request_ns)
+            )[0])
+            raise RuntimeError(
+                f"{source}: {side} FC03 request latency at frame {frame} is "
+                f"{request_latency[frame] / 1e6:.1f} ms (expected 0.."
+                f"{max_request_ns / 1e6:.0f} ms)"
+            )
+        status_age = commit - read
+        if np.any(status_age < 0) or np.any(status_age > max_age_ns):
+            frame = int(np.flatnonzero(
+                (status_age < 0) | (status_age > max_age_ns)
+            )[0])
+            raise RuntimeError(
+                f"{source}: obs/gripper_status/{side} at frame {frame} is "
+                f"{status_age[frame] / 1e6:.1f} ms old at commit (maximum "
+                f"{max_age_ns / 1e6:.0f} ms); stale pre-episode FC03 reply"
+            )
+        if state_start is not None and np.any(read > state_start):
+            frame = int(np.flatnonzero(read > state_start)[0])
+            raise RuntimeError(
+                f"{source}: {side} gripper status callback is later than state read "
+                f"at frame {frame}"
+            )
+
+        actual = np.asarray(arrays["actual"], dtype=np.float32)
+        if actual.shape != (frame_count,) or not np.all(np.isfinite(actual)):
+            raise RuntimeError(
+                f"{source}: {group}/actual must be finite ({frame_count},), got "
+                f"{actual.shape}"
+            )
+        if raw_schema in _RAW_SCHEMAS_WITH_GRIPPER_REUSE and frame_count > 1:
+            repeated_rows = reused[1:]
+            if np.any(actual[1:][repeated_rows] != actual[:-1][repeated_rows]):
+                local = int(np.flatnonzero(
+                    repeated_rows & (actual[1:] != actual[:-1])
+                )[0])
+                frame = local + 1
+                raise RuntimeError(
+                    f"{source}: {group}/actual changes at reused frame {frame}"
+                )
+        obs = np.asarray(gripper_obs[side], dtype=np.float32)
+        if not np.allclose(actual, obs, rtol=0.0, atol=1e-6):
+            frame = int(np.flatnonzero(np.abs(actual - obs) > 1e-6)[0])
+            raise RuntimeError(
+                f"{source}: {group}/actual[{frame}]={actual[frame]:.6f} does not "
+                f"match obs/gripper/{side}={obs[frame]:.6f}"
+            )
+
+        prefix = f"gripper_{side}_"
+        sidecar[prefix + "status_request_id"] = arrays["status_request_id"]
+        sidecar[prefix + "request_send_wall_ns"] = request
+        sidecar[prefix + "read_wall_ns"] = read
+        sidecar[prefix + "sample_reused"] = reused
+        sidecar[prefix + "request_latency_ns"] = request_latency
+        sidecar[prefix + "status_age_ns"] = status_age
+
+    return sidecar
+
+
+def load_action_targets(
+    raw: h5py.File,
+    t: int,
+    *,
+    pose_action_offset: int = 0,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Recorded solver targets from ``t + pose_action_offset`` in their declared frame.
 
     Returns ``({"left": (4,4), "right": (4,4)}, head (4,4))``. RuntimeError on a
     missing dataset (named), a bad frame index, a wrong shape, or a non-finite /
-    non-rotation transform.
+    non-rotation transform.  A positive offset terminally repeats the final pose.
+    The caller must use the same resolved action frame for the gripper commands;
+    :func:`compute_frame_state_action` exposes ``action_t`` for that purpose.
     """
+    if not isinstance(pose_action_offset, int) or pose_action_offset < 0:
+        raise ValueError(
+            f"pose_action_offset must be a non-negative integer, got {pose_action_offset!r}"
+        )
     source = raw.filename
     for key in _REQUIRED_ACTION_TARGETS:
         if key not in raw:
@@ -502,10 +1479,21 @@ def load_action_targets_world(raw: h5py.File, t: int) -> tuple[dict[str, np.ndar
             raise RuntimeError(
                 f"{source}: frame index {t} out of range for {key} " f"(T={ds.shape[0]})"
             )
-        mat = np.asarray(ds[t], dtype=np.float64)
+        action_t = min(t + pose_action_offset, ds.shape[0] - 1)
+        mat = np.asarray(ds[action_t], dtype=np.float64)
         _validate_target_batch(key, mat[None], source)
         out[name] = mat
     return {"left": out["left"], "right": out["right"]}, out["head"]
+
+
+def load_action_targets_world(
+    raw: h5py.File,
+    t: int,
+    *,
+    pose_action_offset: int = 0,
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Backward-compatible name for legacy callers of :func:`load_action_targets`."""
+    return load_action_targets(raw, t, pose_action_offset=pose_action_offset)
 
 
 def compute_frame_state_action(
@@ -516,16 +1504,21 @@ def compute_frame_state_action(
     action_head: np.ndarray,
     *,
     state_frame: str = "base",
+    action_t: int | None = None,
+    policy_action_schema: str = WBC_POLICY_ACTION_SCHEMA,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """One frame's ``(observation.state (32,), action (29,))`` float32 vectors.
+    """One frame's state and schema-selected 29-D or 32-D action vectors.
 
     State: achieved FK poses of the measured ``obs/joint`` (base zero in q), in the
     ``state_frame`` frame (``"base"`` = egocentric default; ``"world"`` = composed
     to the engage-origin world via ``obs/base/pose``, for MoF checkpoints that
     declare ``mof_state_frame="world"``), + raw obs
     grippers + ``obs/base/pose`` (dims 29-31, world anchor, same in both frames).
-    Action: ``mat_to_pos6d`` of the given world-frame targets (verbatim from raw) +
-    binarized action grippers.
+    Action: ``mat_to_pos6d`` of the given targets in the episode's declared action
+    frame (engage-world for WBC, current-base for joystick), verbatim from raw, plus
+    binarized action grippers from the same raw action frame. ``action_t`` defaults
+    to ``t``; a porter applying a future action offset must pass the resolved future
+    index here so one 29-D label never mixes two command times.
     """
     source = raw.filename
 
@@ -534,6 +1527,25 @@ def compute_frame_state_action(
         if arr is None:
             raise RuntimeError(f"{source}: missing required HDF5 dataset {key}")
         _validate_finite(f"{key}[{t}]", arr, source)
+        return arr
+
+    if action_t is None:
+        action_t = t
+    if isinstance(action_t, bool) or not isinstance(action_t, (int, np.integer)):
+        raise ValueError(f"action_t must be an integer frame index, got {action_t!r}")
+    action_t = int(action_t)
+
+    def action_at(key: str) -> np.ndarray:
+        if key not in raw:
+            raise RuntimeError(f"{source}: missing required HDF5 dataset {key}")
+        ds = raw[key]
+        if not 0 <= action_t < ds.shape[0]:
+            raise RuntimeError(
+                f"{source}: action frame index {action_t} out of range for {key} "
+                f"(T={ds.shape[0]})"
+            )
+        arr = np.asarray(ds[action_t], dtype=np.float64)
+        _validate_finite(f"{key}[{action_t}]", arr, source)
         return arr
 
     poses = fk.base_frame_poses(
@@ -546,22 +1558,38 @@ def compute_frame_state_action(
     if base_pose.shape != (3,):
         raise RuntimeError(f"{source}: obs/base/pose[{t}] must be (3,), got {base_pose.shape}")
     grip_obs_l, grip_obs_r = float(at("obs/gripper/left")), float(at("obs/gripper/right"))
-    grip_act_l = float(float(at("action/gripper/left")) >= GRIPPER_BINARY_THRESHOLD)
-    grip_act_r = float(float(at("action/gripper/right")) >= GRIPPER_BINARY_THRESHOLD)
+    grip_act_l = float(
+        float(action_at("action/gripper/left")) >= GRIPPER_BINARY_THRESHOLD
+    )
+    grip_act_r = float(
+        float(action_at("action/gripper/right")) >= GRIPPER_BINARY_THRESHOLD
+    )
 
     state = build_state_vector(poses, base_pose, grip_obs_l, grip_obs_r, state_frame=state_frame)
-    action = np.concatenate(
-        [
-            mat_to_pos6d(action_eef["left"]),
-            [grip_act_l],
-            mat_to_pos6d(action_eef["right"]),
-            [grip_act_r],
-            mat_to_pos6d(action_head),
-        ]
-    ).astype(np.float32)
-    if action.shape != (len(ACTION_AXES),):
+    components: list[np.ndarray | list[float]] = [
+        mat_to_pos6d(action_eef["left"]),
+        [grip_act_l],
+        mat_to_pos6d(action_eef["right"]),
+        [grip_act_r],
+        mat_to_pos6d(action_head),
+    ]
+    if policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA:
+        chassis_intent = action_at("action/chassis/intent_body").reshape(-1)
+        if chassis_intent.shape != (3,):
+            raise RuntimeError(
+                f"{source}: action/chassis/intent_body[{action_t}] must be (3,), "
+                f"got {chassis_intent.shape}"
+            )
+        components.append(chassis_intent)
+    try:
+        action_axes = action_axes_for_policy_schema(policy_action_schema)
+    except ValueError as exc:
+        raise RuntimeError(f"{source}: {exc}") from exc
+    action = np.concatenate(components).astype(np.float32)
+    if action.shape != (len(action_axes),):
         raise RuntimeError(
-            f"{source}: frame {t} built action {action.shape}, " f"expected ({len(ACTION_AXES)},)"
+            f"{source}: frame {t} built action {action.shape}, "
+            f"expected ({len(action_axes)},) for {policy_action_schema}"
         )
     return state, action
 
@@ -577,6 +1605,21 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
     if not hdf5_path.exists():
         raise RuntimeError(f"episode file not found: {hdf5_path}")
     with h5py.File(hdf5_path, "r") as f:
+        if not bool(f.attrs.get("complete", False)):
+            raise RuntimeError(
+                f"{hdf5_path}: HDF5 complete flag is missing/false; this is an "
+                "interrupted or legacy-unverified take, not policy training input"
+            )
+        if "n_frames" not in f.attrs:
+            raise RuntimeError(
+                f"{hdf5_path}: complete take is missing HDF5 n_frames attribute"
+            )
+        try:
+            declared_frames = int(f.attrs["n_frames"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                f"{hdf5_path}: invalid HDF5 n_frames={f.attrs['n_frames']!r}"
+            ) from exc
         rgb = read_required_array(f, "obs/images/head_left_rgb", hdf5_path)
         wrist_rgb = read_required_array(f, "obs/images/left_wrist_rgb", hdf5_path)
         # Right wrist is OPTIONAL: takes recorded before the second camera only carry
@@ -587,13 +1630,23 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
             if "obs/images/right_wrist_rgb" in f
             else None
         )
-        depth = read_required_array(f, "obs/images/head_depth", hdf5_path)
+        # Image-policy training does not consume depth. Current six-eye recordings
+        # intentionally omit the bandwidth-heavy SDK depth and reconstruct it offline
+        # with FoundationStereo, so preserve legacy depth when present but never invent
+        # or require it here.
+        depth = (
+            read_required_array(f, "obs/images/head_depth", hdf5_path)
+            if "obs/images/head_depth" in f
+            else None
+        )
         intrinsic = read_required_array(f, "obs/images/intrinsic", hdf5_path)
         joints_obs = {
             grp: read_required_array(f, f"obs/joint/{grp}", hdf5_path)
             for grp in ("torso", "left_arm", "right_arm", "head")
         }
         base_pose = read_required_array(f, "obs/base/pose", hdf5_path)
+        base_pose_contract = _inspect_open_base_pose_contract(f, hdf5_path)
+        policy_action_contract = _inspect_open_policy_action_contract(f, hdf5_path)
         gripper_obs = {
             side: read_required_array(f, f"obs/gripper/{side}", hdf5_path, check_finite=False)
             for side in ("left", "right")
@@ -605,8 +1658,33 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
         eef_left = read_required_array(f, "action/eef/left", hdf5_path)
         eef_right = read_required_array(f, "action/eef/right", hdf5_path)
         head_target = read_required_array(f, "action/head", hdf5_path)
+        chassis_intent = (
+            read_required_array(f, "action/chassis/intent_body", hdf5_path)
+            if policy_action_contract["policy_action_schema"]
+            == JOYSTICK_POLICY_ACTION_SCHEMA
+            else None
+        )
         timestamp_ns = read_required_array(f, "timestamp_ns", hdf5_path)
         timing = load_episode_timing(f, hdf5_path, rgb.shape[0])
+        camera_alignment_contract = _inspect_open_camera_alignment_contract(
+            f,
+            hdf5_path,
+            timing,
+            raw_schema=base_pose_contract["raw_schema"],
+        )
+        gripper_status_timing = validate_gripper_status_provenance(
+            f,
+            frame_count=rgb.shape[0],
+            fps=fps,
+            timestamp_ns=timestamp_ns,
+            gripper_obs=gripper_obs,
+            timing=timing,
+            raw_schema=base_pose_contract["raw_schema"],
+            source=hdf5_path,
+        )
+        if gripper_status_timing:
+            timing = dict(timing or {})
+            timing.update(gripper_status_timing)
 
     if rgb.ndim != 4 or rgb.shape[-1] != 3 or rgb.dtype != np.uint8:
         raise RuntimeError(
@@ -621,14 +1699,17 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
                 f"{hdf5_path}: expected (T,H,W,3) uint8 {_name}, got "
                 f"{_arr.shape} {_arr.dtype}"
             )
-    if depth.ndim != 3 or depth.dtype != np.uint16:
-        raise RuntimeError(
-            f"{hdf5_path}: expected (T,H,W) uint16 depth, got " f"{depth.shape} {depth.dtype}"
-        )
-    if depth.shape[1:] != rgb.shape[1:3]:
-        raise RuntimeError(
-            f"{hdf5_path}: depth/rgb spatial mismatch: " f"{depth.shape[1:]} vs {rgb.shape[1:3]}"
-        )
+    if depth is not None:
+        if depth.ndim != 3 or depth.dtype != np.uint16:
+            raise RuntimeError(
+                f"{hdf5_path}: expected (T,H,W) uint16 depth, got "
+                f"{depth.shape} {depth.dtype}"
+            )
+        if depth.shape[1:] != rgb.shape[1:3]:
+            raise RuntimeError(
+                f"{hdf5_path}: depth/rgb spatial mismatch: "
+                f"{depth.shape[1:]} vs {rgb.shape[1:3]}"
+            )
     # This recorder stores the head intrinsic ONCE (static (3,3)), not per frame.
     if intrinsic.shape != (3, 3):
         raise RuntimeError(
@@ -637,6 +1718,16 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
         )
 
     frame_count = rgb.shape[0]
+    if declared_frames != frame_count:
+        raise RuntimeError(
+            f"{hdf5_path}: HDF5 n_frames={declared_frames} disagrees with "
+            f"head_left_rgb={frame_count}"
+        )
+    if frame_count < 2:
+        raise RuntimeError(
+            f"{hdf5_path}: policy episode has only {frame_count} frame(s); at least 2 "
+            "are required to verify cadence and form a state/action sequence"
+        )
     checks: list[tuple[str, np.ndarray]] = [
         ("obs/images/left_wrist_rgb", wrist_rgb),
         *(
@@ -644,12 +1735,21 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
             if right_wrist_rgb is not None
             else ()
         ),
-        ("obs/images/head_depth", depth),
+        *(
+            (("obs/images/head_depth", depth),)
+            if depth is not None
+            else ()
+        ),
         ("obs/base/pose", base_pose),
         ("timestamp_ns", timestamp_ns),
         ("action/eef/left", eef_left),
         ("action/eef/right", eef_right),
         ("action/head", head_target),
+        *(
+            (("action/chassis/intent_body", chassis_intent),)
+            if chassis_intent is not None
+            else ()
+        ),
     ]
     checks += [(f"obs/joint/{g}", a) for g, a in joints_obs.items()]
     checks += [(f"obs/gripper/{s}", a) for s, a in gripper_obs.items()]
@@ -674,6 +1774,13 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
         ("action/head", head_target),
     ):
         _validate_target_batch(name, arr, hdf5_path)
+    if chassis_intent is not None and (
+        chassis_intent.ndim != 2 or chassis_intent.shape[1] != 3
+    ):
+        raise RuntimeError(
+            f"{hdf5_path}: action/chassis/intent_body must be (T,3), got "
+            f"{chassis_intent.shape}"
+        )
 
     # Record cadence: the recorder throttles to --record-rate (= dataset fps), but
     # hold windows leave gaps. The median tick must match fps; gaps are warned.
@@ -700,14 +1807,22 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
     t0 = first_valid_frame(gripper_obs["left"], gripper_obs["right"], hdf5_path)
     if t0 > 0:
         logging.info("%s: dropping %d leading frame(s) with NaN obs/gripper", hdf5_path.name, t0)
+    validate_gripper_feedback(gripper_obs, gripper_act, t0, hdf5_path)
 
     return {
+        "source_path": hdf5_path,
         "rgb": rgb,
         "wrist_rgb": wrist_rgb,          # LEFT arm
         "right_wrist_rgb": right_wrist_rgb,  # RIGHT arm, None on single-wrist takes
         "depth": depth,
         "intrinsic": intrinsic,
         "base_pose": base_pose,
+        "base_pose_source": base_pose_contract["base_pose_source"],
+        "base_pose_contract": base_pose_contract,
+        "policy_action_contract": policy_action_contract,
+        "policy_action_schema": policy_action_contract["policy_action_schema"],
+        "action_axes": policy_action_contract["action_axes"],
+        "camera_alignment_contract": camera_alignment_contract,
         "frame_count": frame_count,
         "t0": t0,
         "timestamp_ns": ts,
@@ -733,6 +1848,12 @@ def load_and_validate_episode(hdf5_path: Path, fps: int) -> dict:
 # is gated UPSTREAM by Part A, which only emits an npz for passing episodes; here we
 # defensively check shape/finiteness/permutation/frame and fail fast on a missing file.
 OBS_ENV_STATE_KEY = "observation.environment_state"
+OBS_TASK_SEQUENCE_KEY = "observation.task_sequence"
+PROGRESS_INDEX_KEY = "progress_index"
+ACTIVE_TASK_ID_KEY = "active_task_id"
+STRUCTURED_ENV_STATE_SHAPE = (3, 2, 3)
+STRUCTURED_STAGE_NAMES = ("drawer", "plate", "jar")
+SUPPORTED_TASK_SEQUENCES = ((0, 1, 2), (0, 2, 1))
 DEFAULT_OBJECT_NUMS = 2
 # Stage roles in the arranged env-state: [s1_src, s1_dst, s2_src, s2_dst, ...].
 STAGE_ROLES = ("src", "dst")
@@ -829,12 +1950,101 @@ def validate_all_episode_positions(
     return env_state_by_key
 
 
+def load_structured_env_state_from_raw(
+    hdf5_path: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Read semantic conditions, task plan, and ordinal progress labels."""
+    with h5py.File(hdf5_path, "r") as raw:
+        condition = read_required_array(
+            raw, "task/env_state", hdf5_path
+        ).astype(np.float32)
+        task_sequence = read_required_array(
+            raw, "task/task_sequence", hdf5_path
+        )
+        progress_index = read_required_array(
+            raw, PROGRESS_INDEX_KEY, hdf5_path
+        )
+        active_task_id = read_required_array(
+            raw, ACTIVE_TASK_ID_KEY, hdf5_path
+        )
+        frame_count = int(raw["obs/images/head_left_rgb"].shape[0])
+    if condition.shape != STRUCTURED_ENV_STATE_SHAPE:
+        raise RuntimeError(
+            f"{hdf5_path}: task/env_state must be "
+            f"{STRUCTURED_ENV_STATE_SHAPE}, got {condition.shape}"
+        )
+    if task_sequence.shape != (3,) or task_sequence.dtype != np.int64:
+        raise RuntimeError(
+            f"{hdf5_path}: task/task_sequence must be (3,) int64, "
+            f"got {task_sequence.shape} {task_sequence.dtype}"
+        )
+    sequence = tuple(int(value) for value in task_sequence)
+    if sequence not in SUPPORTED_TASK_SEQUENCES:
+        raise RuntimeError(
+            f"{hdf5_path}: unsupported task/task_sequence {sequence}"
+        )
+    if (
+        progress_index.shape != (frame_count,)
+        or progress_index.dtype != np.int64
+    ):
+        raise RuntimeError(
+            f"{hdf5_path}: progress_index must be ({frame_count},) int64, "
+            f"got {progress_index.shape} {progress_index.dtype}"
+        )
+    if progress_index[0] != 0 or progress_index[-1] != 2:
+        raise RuntimeError(
+            f"{hdf5_path}: accepted progress_index must begin at 0 and end at 2"
+        )
+    differences = np.diff(progress_index)
+    if np.any((differences < 0) | (differences > 1)):
+        raise RuntimeError(
+            f"{hdf5_path}: progress_index must be monotonic 0->1->2"
+        )
+    if (
+        active_task_id.shape != (frame_count,)
+        or active_task_id.dtype != np.int64
+    ):
+        raise RuntimeError(
+            f"{hdf5_path}: active_task_id must be ({frame_count},) int64"
+        )
+    if not np.array_equal(active_task_id, task_sequence[progress_index]):
+        raise RuntimeError(
+            f"{hdf5_path}: active_task_id != task_sequence[progress_index]"
+        )
+    return condition, task_sequence, progress_index, active_task_id
+
+
+def validate_all_structured_env_state(
+    work: list[dict],
+) -> dict[
+    tuple[str, int],
+    tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+]:
+    """Fail before writing if any raw episode violates the structured contract."""
+    result = {}
+    failures = []
+    for item in work:
+        key = (item["source"], item["raw_index"])
+        try:
+            result[key] = load_structured_env_state_from_raw(item["path"])
+        except Exception as exc:
+            failures.append(f"- {item['path']}: {exc}")
+    if failures:
+        raise RuntimeError(
+            "Structured raw env-state validation failed; no dataset was written:\n"
+            + "\n".join(failures)
+        )
+    return result
+
+
 def build_features(
     resize_h: int,
     resize_w: int,
     object_nums: int | None = None,
     *,
     has_right_wrist: bool = True,
+    structured_env_state: bool = False,
+    action_axes: list[str] | tuple[str, ...] = ACTION_AXES,
 ) -> dict:
     """LeRobot feature schema.
 
@@ -861,8 +2071,8 @@ def build_features(
         },
         "action": {
             "dtype": "float32",
-            "shape": (len(ACTION_AXES),),
-            "names": {"axes": list(ACTION_AXES)},
+            "shape": (len(action_axes),),
+            "names": {"axes": list(action_axes)},
         },
     }
     if has_right_wrist:
@@ -875,7 +2085,28 @@ def build_features(
     # is float32 (NOT an image/video dtype), so no policy auto-loads it as a VISUAL input;
     # the train command wires it into input_features as type ENV (diffusion consumes
     # observation.environment_state natively). Single-stage -> no pos_condition_mask.
-    if object_nums is not None:
+    if structured_env_state:
+        features[OBS_ENV_STATE_KEY] = {
+            "dtype": "float32",
+            "shape": STRUCTURED_ENV_STATE_SHAPE,
+            "names": None,
+        }
+        features[OBS_TASK_SEQUENCE_KEY] = {
+            "dtype": "int64",
+            "shape": (3,),
+            "names": {"axes": ["progress0", "progress1", "progress2"]},
+        }
+        features[PROGRESS_INDEX_KEY] = {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": {"axes": ["progress"]},
+        }
+        features[ACTIVE_TASK_ID_KEY] = {
+            "dtype": "int64",
+            "shape": (1,),
+            "names": {"axes": ["task_id"]},
+        }
+    elif object_nums is not None:
         axes = env_state_axes(object_nums)
         features[OBS_ENV_STATE_KEY] = {
             "dtype": "float32",
@@ -911,6 +2142,39 @@ def detect_right_wrist_presence(work: list[dict]) -> bool:
 
 def _sidecar_path(variant_root: Path, kind: str, episode_idx: int) -> Path:
     return Path(variant_root) / "debug" / kind / f"episode_{episode_idx:06d}.npz"
+
+
+def _metadata_sidecar_path(variant_root: Path, episode_idx: int) -> Path:
+    return (
+        Path(variant_root)
+        / "debug"
+        / "provenance"
+        / f"episode_{episode_idx:06d}.hdf5"
+    )
+
+
+def write_metadata_sidecar(raw_path: Path, output_path: Path) -> None:
+    """Copy raw static ``/meta`` exactly, without duplicating per-frame payloads."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(raw_path, "r") as source, h5py.File(output_path, "w") as target:
+        target.attrs["schema"] = "omniteleop_raw_metadata_sidecar/v1"
+        target.attrs["raw_filename"] = Path(raw_path).name
+        if "meta" in source:
+            source.copy("meta", target)
+        else:
+            target.create_group("meta")
+
+
+def _hdf5_leaf_arrays(group: h5py.Group) -> dict[str, np.ndarray]:
+    """Flatten HDF5 datasets below ``group`` for exact sidecar verification."""
+    out: dict[str, np.ndarray] = {}
+
+    def visitor(name, obj):
+        if isinstance(obj, h5py.Dataset):
+            out[name] = np.asarray(obj[()])
+
+    group.visititems(visitor)
+    return out
 
 
 def timing_sidecar_arrays(ep: dict, start: int, end: int) -> dict[str, np.ndarray]:
@@ -950,35 +2214,95 @@ def add_episode(
     fps: int,
     state_frame: str = "base",
     *,
+    policy_action_schema: str = WBC_POLICY_ACTION_SCHEMA,
+    pose_action_offset: int = 0,
     trim: tuple[int, int] | None = None,
     env_state_vec: np.ndarray | None = None,
+    task_sequence: np.ndarray | None = None,
+    progress_index: np.ndarray | None = None,
+    active_task_id: np.ndarray | None = None,
 ) -> tuple[int, int]:
     """Port one raw episode; returns ``(num_frames_before, num_frames_after)``.
 
     ``num_frames_before`` is the raw take length; ``num_frames_after`` is the number
     of frames written -- after the leading-NaN-gripper drop (``trim is None``) or after
     the ABSOLUTE INCLUSIVE ``trim=(frame_start, frame_end)`` recovery segment.
-    ``env_state_vec`` (when given) is the CONSTANT (object_nums*3,) ENV-state broadcast to
-    every frame as ``observation.environment_state``.
+    ``env_state_vec`` is constant per episode and may be the legacy flat
+    SceneDiff vector or the simulator-native semantic (3,2,3) condition.
+    ``pose_action_offset`` is the legacy name for a coherent future ACTION offset:
+    EEF, head, and gripper labels all come from the same future raw frame while the
+    observation remains at the current frame.
+    ``task_sequence`` is categorical policy input; ``progress_index`` is stage-
+    head supervision; ``active_task_id`` is a redundant checked target.
     """
     if not task:
         raise ValueError("task must be a non-empty string")
     ep = load_and_validate_episode(hdf5_path, fps)
+    if ep["policy_action_schema"] != policy_action_schema:
+        raise RuntimeError(
+            f"{hdf5_path}: policy action schema changed after preflight: "
+            f"{ep['policy_action_schema']!r} != {policy_action_schema!r}"
+        )
     rgb, wrist_rgb, depth = ep["rgb"], ep["wrist_rgb"], ep["depth"]
     right_wrist_rgb = ep["right_wrist_rgb"]
     frame_count = ep["frame_count"]
     start, end = resolve_episode_window(frame_count, ep["t0"], trim, hdf5_path)
     kept = end - start
+    structured_fields = (task_sequence, progress_index, active_task_id)
+    if any(value is not None for value in structured_fields):
+        if any(value is None for value in structured_fields):
+            raise RuntimeError(
+                f"{hdf5_path}: structured condition requires task_sequence, "
+                "progress_index, and active_task_id together"
+            )
+        if env_state_vec is None or env_state_vec.shape != STRUCTURED_ENV_STATE_SHAPE:
+            raise RuntimeError(
+                f"{hdf5_path}: structured labels require env_state "
+                f"{STRUCTURED_ENV_STATE_SHAPE}"
+            )
+        task_sequence = np.asarray(task_sequence)
+        progress_index = np.asarray(progress_index)
+        active_task_id = np.asarray(active_task_id)
+        if task_sequence.shape != (3,) or task_sequence.dtype != np.int64:
+            raise RuntimeError(f"{hdf5_path}: task_sequence must be (3,) int64")
+        if (
+            progress_index.shape != (frame_count,)
+            or progress_index.dtype != np.int64
+        ):
+            raise RuntimeError(
+                f"{hdf5_path}: progress_index must be ({frame_count},) int64"
+            )
+        if (
+            active_task_id.shape != (frame_count,)
+            or active_task_id.dtype != np.int64
+        ):
+            raise RuntimeError(
+                f"{hdf5_path}: active_task_id must be ({frame_count},) int64"
+            )
 
-    depth_resized = np.empty((kept, resize_h, resize_w), dtype=np.uint16)
+    depth_resized = (
+        np.empty((kept, resize_h, resize_w), dtype=np.uint16)
+        if depth is not None
+        else None
+    )
     extrinsic = np.empty((kept, 4, 4), dtype=np.float32)
     base_extrinsic = np.empty((kept, 4, 4), dtype=np.float32)
 
     with h5py.File(hdf5_path, "r") as raw:
         for i, t in enumerate(range(start, end)):
-            action_eef, action_head = load_action_targets_world(raw, t)
+            action_t = min(t + pose_action_offset, frame_count - 1)
+            action_eef, action_head = load_action_targets(
+                raw, t, pose_action_offset=pose_action_offset
+            )
             state, action = compute_frame_state_action(
-                raw, t, fk, action_eef, action_head, state_frame=state_frame
+                raw,
+                t,
+                fk,
+                action_eef,
+                action_head,
+                state_frame=state_frame,
+                action_t=action_t,
+                policy_action_schema=policy_action_schema,
             )
 
             # Calib sidecar: recover base_T_zed and world_T_zed from the state head
@@ -1006,10 +2330,11 @@ def add_episode(
                     right_wrist_rgb[t], (resize_w, resize_h), interpolation=cv2.INTER_AREA
                 )
             )
-            # INTER_NEAREST keeps uint16 millimeter depth exact across edges.
-            depth_resized[i] = cv2.resize(
-                depth[t], (resize_w, resize_h), interpolation=cv2.INTER_NEAREST
-            )
+            if depth_resized is not None:
+                # INTER_NEAREST keeps uint16 millimeter depth exact across edges.
+                depth_resized[i] = cv2.resize(
+                    depth[t], (resize_w, resize_h), interpolation=cv2.INTER_NEAREST
+                )
 
             frame = {
                 "observation.images.head_rgb": rgb_resized,
@@ -1022,13 +2347,23 @@ def add_episode(
                 frame["observation.images.right_wrist_rgb"] = right_wrist_resized
             if env_state_vec is not None:
                 frame[OBS_ENV_STATE_KEY] = env_state_vec
+            if progress_index is not None:
+                frame[OBS_TASK_SEQUENCE_KEY] = task_sequence
+                frame[PROGRESS_INDEX_KEY] = np.asarray(
+                    [progress_index[t]], dtype=np.int64
+                )
+                frame[ACTIVE_TASK_ID_KEY] = np.asarray(
+                    [active_task_id[t]], dtype=np.int64
+                )
             dataset.add_frame(frame)
 
     dataset.save_episode()
 
-    depth_path = _sidecar_path(variant_root, "depth", episode_idx)
-    depth_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(depth_path, depth=depth_resized)
+    depth_path: Path | None = None
+    if depth_resized is not None:
+        depth_path = _sidecar_path(variant_root, "depth", episode_idx)
+        depth_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(depth_path, depth=depth_resized)
 
     intrinsic_resized = _scaled_intrinsic(ep["intrinsic"], rgb.shape[1:3], (resize_h, resize_w))
     calib_path = _sidecar_path(variant_root, "calib", episode_idx)
@@ -1044,22 +2379,27 @@ def add_episode(
     timing_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(timing_path, **timing_sidecar_arrays(ep, start, end))
 
+    metadata_path = _metadata_sidecar_path(variant_root, episode_idx)
+    write_metadata_sidecar(ep["source_path"], metadata_path)
+
     logging.info(
-        "Ported %s: %d frames [%d,%d) of %d, sidecars %s / %s / %s",
+        "Ported %s: %d frames [%d,%d) of %d, sidecars %s / %s / %s / %s",
         hdf5_path.name,
         kept,
         start,
         end,
         frame_count,
-        depth_path.name,
+        depth_path.name if depth_path is not None else "depth=absent (stereo-only raw)",
         calib_path.name,
         timing_path.name,
+        metadata_path.name,
     )
     return frame_count, kept
 
 
 def build_work_list(raw_dir: Path, include_recovery_data: Path | None) -> list[dict]:
     """Ordered port plan: raw episodes (numeric-sorted), then -- if requested -- the
+
     trimmed recovery episodes (numeric-sorted, APPENDED last).
 
     Each item is ``{"source": "raw"|"recovery", "path": Path, "raw_index": int,
@@ -1164,14 +2504,19 @@ def assign_splits(
     work: list[dict],
     split_map: Mapping[tuple[str, int], str],
     include_recovery_data: Path | None = None,
+    default_split: str = DEFAULT_SPLIT,
 ) -> dict[str, list[dict]]:
     """Partition the ordered work list into ``{split: [items...]}`` per ``split_map``.
 
-    Items not named in ``split_map`` go to :data:`DEFAULT_SPLIT` (``"train"``). Within
+    Items not named in ``split_map`` go to ``default_split``. Within
     each split the raw-then-recovery numeric order of ``work`` is preserved, and empty
     splits are dropped. Raises if ``split_map`` names an episode absent from ``work``
     (a stale split.csv -- e.g. a ``recovery/<N>`` row without ``--include_recovery_data``).
     """
+    if default_split not in ALL_SPLITS:
+        raise ValueError(
+            f"default_split must be one of {ALL_SPLITS}, got {default_split!r}"
+        )
     keys = {(w["source"], w["raw_index"]) for w in work}
     unknown = sorted(set(split_map) - keys)
     if unknown:
@@ -1184,7 +2529,7 @@ def assign_splits(
         raise RuntimeError(f"split csv references episodes not in the port plan: {refs}{hint}")
     buckets: dict[str, list[dict]] = {s: [] for s in ALL_SPLITS}
     for w in work:
-        buckets[split_map.get((w["source"], w["raw_index"]), DEFAULT_SPLIT)].append(w)
+        buckets[split_map.get((w["source"], w["raw_index"]), default_split)].append(w)
     return {s: buckets[s] for s in ALL_SPLITS if buckets[s]}
 
 
@@ -1232,19 +2577,48 @@ def _write_meta(
     resize_h: int,
     resize_w: int,
     task: str,
+    base_pose_source: str,
+    camera_alignment_contract: dict,
+    policy_action_schema: str = WBC_POLICY_ACTION_SCHEMA,
+    pose_action_offset: int = 0,
     object_nums: int | None = None,
+    structured_env_state: bool = False,
 ) -> None:
     """Write the ``dexmate_meta.json`` sidecar describing this split's schema."""
+    action_axes = action_axes_for_policy_schema(policy_action_schema)
+    joystick = policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA
     meta = {
-        "schema": "wbc_eef_head_v1",
+        "schema": policy_action_schema,
+        "policy_action_schema": policy_action_schema,
         "split": split,
         "state_axes": list(STATE_AXES),
-        "action_axes": list(ACTION_AXES),
+        "action_axes": action_axes,
         # "base": egocentric achieved FK (the default). "world": composed to
         # engage-origin world so state shares the action frame, for MoF checkpoints
         # declaring mof_state_frame="world".
         "state_frame": state_frame,
-        "action_frame": "world (verbatim ik.solve targets, engage-origin)",
+        "action_frame": (
+            "current_base (verbatim joystick IK targets; chassis intent in body frame)"
+            if joystick
+            else "world (verbatim ik.solve targets, engage-origin)"
+        ),
+        "base_pose_source": base_pose_source,
+        "base_pose_semantics": (
+            "observation.state[29:32] is raw obs/base/pose and anchors all "
+            "world-frame state/calibration composition"
+        ),
+        "camera_alignment_mode": camera_alignment_contract["mode"],
+        "camera_alignment_clock_domain": camera_alignment_contract["clock_domain"],
+        "camera_alignment_max_abs_skew_ns": camera_alignment_contract[
+            "max_abs_skew_ns"
+        ],
+        "camera_alignment_max_camera_age_ns": camera_alignment_contract[
+            "max_camera_age_ns"
+        ],
+        "camera_alignment_verified": bool(camera_alignment_contract["verified"]),
+        "action_offset_frames": pose_action_offset,
+        "pose_action_offset_frames": pose_action_offset,
+        "action_offset_semantics": "all action components shifted together",
         "skip_normalization_dims": SKIP_NORMALIZATION_DIMS,
         "fps": fps,
         "resize_h": resize_h,
@@ -1253,9 +2627,39 @@ def _write_meta(
         "robot_type": ROBOT_TYPE,
         "gripper_binary_threshold": GRIPPER_BINARY_THRESHOLD,
     }
+    if joystick:
+        meta.update({
+            "chassis_intent_dims": [29, 30, 31],
+            "chassis_intent_frame": "current_base_body",
+            "chassis_intent_units": ["m/s", "m/s", "rad/s"],
+            "chassis_intent_stage": "post_mask_projection_pre_controller",
+            "chassis_intent_temporal_semantics": "zero_order_hold",
+        })
     # Constant ENV-state conditioning (only when --positions-dir was used).
     # Env-state is world-frame and per-episode CONSTANT.
-    if object_nums is not None:
+    if structured_env_state:
+        meta.update(
+            {
+                "env_state_key": OBS_ENV_STATE_KEY,
+                "env_state_shape": list(STRUCTURED_ENV_STATE_SHAPE),
+                "env_state_task_names": list(STRUCTURED_STAGE_NAMES),
+                "env_state_role_names": ["src", "dst"],
+                "env_state_coordinate_names": ["x", "y", "z"],
+                "env_state_frame": "engage-origin world",
+                "env_state_normalization": (
+                    "shared_xyz_across_stage_and_role"
+                ),
+                "task_sequence_key": OBS_TASK_SEQUENCE_KEY,
+                "task_sequence_semantics": (
+                    "categorical_progress_to_task_input_no_normalization"
+                ),
+                "progress_index_key": PROGRESS_INDEX_KEY,
+                "progress_index_semantics": "stage_head_target_only",
+                "active_task_id_key": ACTIVE_TASK_ID_KEY,
+                "active_task_id_semantics": "derived_target_only",
+            }
+        )
+    elif object_nums is not None:
         meta["env_state_key"] = OBS_ENV_STATE_KEY
         meta["object_nums"] = object_nums
         meta["env_state_axes"] = env_state_axes(object_nums)
@@ -1274,6 +2678,11 @@ def verify(
     variant_root: Path,
     split: str,
     env_state_vec: np.ndarray | None = None,
+    task_sequence: np.ndarray | None = None,
+    progress_index: np.ndarray | None = None,
+    active_task_id: np.ndarray | None = None,
+    pose_action_offset: int = 0,
+    policy_action_schema: str = WBC_POLICY_ACTION_SCHEMA,
 ) -> None:
     """Re-open a written split dataset and cross-check frame 0 against a fresh build.
 
@@ -1325,8 +2734,11 @@ def verify(
             )
     if state.shape != (len(STATE_AXES),):
         raise RuntimeError(f"verify[{split}]: state shape {state.shape} != ({len(STATE_AXES)},)")
-    if action.shape != (len(ACTION_AXES),):
-        raise RuntimeError(f"verify[{split}]: action shape {action.shape} != ({len(ACTION_AXES)},)")
+    action_axes = action_axes_for_policy_schema(policy_action_schema)
+    if action.shape != (len(action_axes),):
+        raise RuntimeError(
+            f"verify[{split}]: action shape {action.shape} != ({len(action_axes)},)"
+        )
 
     # ENV-state conditioning: the declared feature and the first frame's stored vector must
     # match the loaded positions exactly iff positions were requested (feature must be ABSENT
@@ -1347,6 +2759,53 @@ def verify(
         raise RuntimeError(
             f"verify[{split}]: {OBS_ENV_STATE_KEY} present but positions were not requested"
         )
+    if progress_index is not None:
+        for key in (
+            OBS_TASK_SEQUENCE_KEY,
+            PROGRESS_INDEX_KEY,
+            ACTIVE_TASK_ID_KEY,
+        ):
+            if key not in meta.features:
+                raise RuntimeError(
+                    f"verify[{split}]: structured feature {key} is missing"
+                )
+        stored_sequence = np.asarray(
+            item[OBS_TASK_SEQUENCE_KEY].cpu().numpy()
+        ).reshape(-1)
+        if stored_sequence.shape != (3,) or not np.array_equal(
+            stored_sequence, task_sequence
+        ):
+            raise RuntimeError(
+                f"verify[{split}]: stored task_sequence differs from raw"
+            )
+        stored_progress = np.asarray(
+            item[PROGRESS_INDEX_KEY].cpu().numpy()
+        ).reshape(-1)
+        if stored_progress.shape != (1,) or int(stored_progress[0]) != int(
+            progress_index[0]
+        ):
+            raise RuntimeError(
+                f"verify[{split}]: stored progress_index[0] differs from raw"
+            )
+        stored_task = np.asarray(
+            item[ACTIVE_TASK_ID_KEY].cpu().numpy()
+        ).reshape(-1)
+        if stored_task.shape != (1,) or int(stored_task[0]) != int(
+            active_task_id[0]
+        ):
+            raise RuntimeError(
+                f"verify[{split}]: stored active_task_id[0] differs from raw"
+            )
+    else:
+        forbidden = (
+            OBS_TASK_SEQUENCE_KEY,
+            PROGRESS_INDEX_KEY,
+            ACTIVE_TASK_ID_KEY,
+        )
+        if any(key in meta.features for key in forbidden):
+            raise RuntimeError(
+                f"verify[{split}]: structured labels present outside raw mode"
+            )
 
     # Recompute the first stored frame independently (same FK) and pull the raw verbatim
     # targets to confirm the action is a straight copy (no base composition).
@@ -1355,14 +2814,48 @@ def verify(
         ep["frame_count"], ep["t0"], first_item["trim"], first_item["path"]
     )
     with h5py.File(first_item["path"], "r") as raw:
-        action_eef, action_head = load_action_targets_world(raw, start)
-        exp_state, exp_action = compute_frame_state_action(
-            raw, start, fk, action_eef, action_head, state_frame=state_frame
+        action_start = min(start + pose_action_offset, ep["frame_count"] - 1)
+        action_eef, action_head = load_action_targets(
+            raw, start, pose_action_offset=pose_action_offset
         )
-        raw_left = mat_to_pos6d(np.asarray(raw["action/eef/left"][start], dtype=np.float64))
-        raw_head = mat_to_pos6d(np.asarray(raw["action/head"][start], dtype=np.float64))
+        exp_state, exp_action = compute_frame_state_action(
+            raw,
+            start,
+            fk,
+            action_eef,
+            action_head,
+            state_frame=state_frame,
+            action_t=action_start,
+            policy_action_schema=policy_action_schema,
+        )
+        raw_left = mat_to_pos6d(
+            np.asarray(raw["action/eef/left"][action_start], dtype=np.float64)
+        )
+        raw_head = mat_to_pos6d(
+            np.asarray(raw["action/head"][action_start], dtype=np.float64)
+        )
+        raw_grip_left = float(
+            float(raw["action/gripper/left"][action_start])
+            >= GRIPPER_BINARY_THRESHOLD
+        )
+        raw_grip_right = float(
+            float(raw["action/gripper/right"][action_start])
+            >= GRIPPER_BINARY_THRESHOLD
+        )
         raw_base = np.asarray(raw["obs/base/pose"][start], dtype=np.float64)
-        depth_start = np.asarray(raw["obs/images/head_depth"][start])
+        raw_chassis_intent = (
+            np.asarray(
+                raw["action/chassis/intent_body"][action_start],
+                dtype=np.float64,
+            )
+            if policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+            else None
+        )
+        depth_start = (
+            np.asarray(raw["obs/images/head_depth"][start])
+            if "obs/images/head_depth" in raw
+            else None
+        )
     if not np.allclose(state, exp_state, atol=1e-4):
         raise RuntimeError(f"verify[{split}]: stored state[0] != recompute at frame {start}")
     if not np.allclose(action, exp_action, atol=1e-4):
@@ -1371,6 +2864,18 @@ def verify(
         raise RuntimeError(f"verify[{split}]: action left block is not the verbatim world target")
     if not np.allclose(action[20:29], raw_head, atol=1e-4):
         raise RuntimeError(f"verify[{split}]: action head block is not the verbatim world target")
+    if float(action[9]) != raw_grip_left or float(action[19]) != raw_grip_right:
+        raise RuntimeError(
+            f"verify[{split}]: action grippers do not come from raw action frame "
+            f"{action_start}"
+        )
+    if raw_chassis_intent is not None and not np.allclose(
+        action[29:32], raw_chassis_intent, atol=1e-7
+    ):
+        raise RuntimeError(
+            f"verify[{split}]: joystick chassis intent is not the exact raw "
+            f"action frame {action_start}"
+        )
     if not np.allclose(state[29:32], raw_base, atol=1e-5):
         raise RuntimeError(f"verify[{split}]: state base dims != obs/base/pose[{start}]")
     for idx in GRIPPER_DIMS:
@@ -1380,20 +2885,31 @@ def verify(
                 f"({float(action[idx])})"
             )
 
-    # Depth sidecar roundtrip (episode 0, frame 0 == the window start).
+    # Optional SDK-depth sidecar roundtrip (episode 0, frame 0 == window start).
+    # Stereo-only raw takes deliberately have neither raw SDK depth nor this sidecar.
     depth_path = _sidecar_path(variant_root, "depth", 0)
-    if not depth_path.exists():
-        raise RuntimeError(f"verify[{split}]: depth sidecar missing: {depth_path}")
-    with np.load(depth_path) as data:
-        depth_stack = data["depth"]
-    if depth_stack.dtype != np.uint16 or depth_stack.shape[1:] != (resize_h, resize_w):
-        raise RuntimeError(
-            f"verify[{split}]: depth sidecar {depth_stack.dtype} "
-            f"{depth_stack.shape[1:]} != uint16 ({resize_h}, {resize_w})"
+    depth_stack: np.ndarray | None = None
+    if depth_start is None:
+        if depth_path.exists():
+            raise RuntimeError(
+                f"verify[{split}]: stereo-only raw unexpectedly produced depth sidecar "
+                f"{depth_path}"
+            )
+    else:
+        if not depth_path.exists():
+            raise RuntimeError(f"verify[{split}]: depth sidecar missing: {depth_path}")
+        with np.load(depth_path) as data:
+            depth_stack = data["depth"]
+        if depth_stack.dtype != np.uint16 or depth_stack.shape[1:] != (resize_h, resize_w):
+            raise RuntimeError(
+                f"verify[{split}]: depth sidecar {depth_stack.dtype} "
+                f"{depth_stack.shape[1:]} != uint16 ({resize_h}, {resize_w})"
+            )
+        expected_depth = cv2.resize(
+            depth_start, (resize_w, resize_h), interpolation=cv2.INTER_NEAREST
         )
-    expected_depth = cv2.resize(depth_start, (resize_w, resize_h), interpolation=cv2.INTER_NEAREST)
-    if not np.array_equal(depth_stack[0], expected_depth):
-        raise RuntimeError(f"verify[{split}]: depth sidecar[0] roundtrip mismatch")
+        if not np.array_equal(depth_stack[0], expected_depth):
+            raise RuntimeError(f"verify[{split}]: depth sidecar[0] roundtrip mismatch")
 
     # Calib sidecar: keys/shapes + the static intrinsic rescale.
     calib_path = _sidecar_path(variant_root, "calib", 0)
@@ -1435,9 +2951,26 @@ def verify(
             f"{sorted(expected_timing | {'timestamp_ns'})}"
         )
 
+    metadata_path = _metadata_sidecar_path(variant_root, 0)
+    if not metadata_path.exists():
+        raise RuntimeError(f"verify[{split}]: provenance sidecar missing: {metadata_path}")
+    with h5py.File(first_item["path"], "r") as raw, h5py.File(metadata_path, "r") as sidecar:
+        raw_meta = _hdf5_leaf_arrays(raw["meta"]) if "meta" in raw else {}
+        sidecar_meta = _hdf5_leaf_arrays(sidecar["meta"])
+        if set(raw_meta) != set(sidecar_meta):
+            raise RuntimeError(
+                f"verify[{split}]: provenance sidecar meta keys differ from raw: "
+                f"{sorted(sidecar_meta)} != {sorted(raw_meta)}"
+            )
+        for key in raw_meta:
+            if not np.array_equal(raw_meta[key], sidecar_meta[key]):
+                raise RuntimeError(
+                    f"verify[{split}]: provenance sidecar meta/{key} mismatch"
+                )
+
     logging.info(
         "verify[%s] OK: head_rgb=%s wrist_rgb=%s (%s) state=%s action=%s depth=%s "
-        "calib=extrinsic%s+base%s+intrinsic%s timing=%s",
+        "calib=extrinsic%s+base%s+intrinsic%s timing=%s provenance=%s",
         split,
         tuple(head_rgb.shape),
         tuple(wrist_rgb.shape),
@@ -1446,12 +2979,43 @@ def verify(
         else "left only",
         tuple(state.shape),
         tuple(action.shape),
-        tuple(depth_stack.shape),
+        tuple(depth_stack.shape) if depth_stack is not None else "absent",
         tuple(extrinsic_sc.shape),
         tuple(base_extrinsic_sc.shape),
         tuple(intrinsic_sc.shape),
         sorted(timing_keys),
+        metadata_path.name,
     )
+
+
+def apply_shared_xyz_env_state_stats(dataset) -> None:
+    """Replace element-wise (3,2,3) stats with one shared statistic per XYZ."""
+    from lerobot.datasets.compute_stats import get_feature_stats  # noqa: PLC0415
+    from lerobot.datasets.io_utils import write_stats  # noqa: PLC0415
+
+    values = np.asarray(dataset.hf_dataset[OBS_ENV_STATE_KEY], dtype=np.float32)
+    if values.ndim != 4 or tuple(values.shape[1:]) != STRUCTURED_ENV_STATE_SHAPE:
+        raise RuntimeError(
+            f"processed {OBS_ENV_STATE_KEY} must be (T,3,2,3), got "
+            f"{values.shape}"
+        )
+    shared = get_feature_stats(
+        values.reshape(-1, 3),
+        axis=0,
+        keepdims=False,
+    )
+    dataset.meta.stats[OBS_ENV_STATE_KEY] = {
+        name: (
+            value
+            if name == "count"
+            else np.broadcast_to(
+                np.asarray(value).reshape(1, 1, 3),
+                STRUCTURED_ENV_STATE_SHAPE,
+            ).copy()
+        )
+        for name, value in shared.items()
+    }
+    write_stats(dataset.meta.stats, dataset.root)
 
 
 def convert_dataset(
@@ -1469,11 +3033,14 @@ def convert_dataset(
     split_map: Mapping[tuple[str, int], str] | None = None,
     positions_dir: Path | None = None,
     object_nums: int = DEFAULT_OBJECT_NUMS,
+    structured_env_state_from_raw: bool = False,
+    default_split: str = DEFAULT_SPLIT,
+    pose_action_offset: int = 0,
 ) -> dict:
     """Full conversion (needs lerobot + tqdm -- run in the dexmate_lerobot env).
 
     Splits the episodes per ``split_map`` (from split.csv) into
-    ``<root>/<split>/<repo_id>/`` datasets (unlisted -> :data:`DEFAULT_SPLIT`); one tqdm
+    ``<root>/<split>/<repo_id>/`` datasets (unlisted -> ``default_split``); one tqdm
     bar spans every episode across splits, and each split is ``verify()``-ed after it is
     written. Returns ``{split: LeRobotDataset}``.
 
@@ -1482,20 +3049,58 @@ def convert_dataset(
     ``<positions_dir>/<source>/episode_<N>.npz`` -- pre-validated for ALL episodes before
     any dataset is created/overwritten (fail fast, keyed by ``(source, raw_index)``).
     """
-    from lerobot.datasets import LeRobotDataset, recompute_stats
-    from tqdm import tqdm
+    from lerobot.datasets import LeRobotDataset, recompute_stats  # noqa: PLC0415
+    from tqdm import tqdm  # noqa: PLC0415
 
+    if not isinstance(pose_action_offset, int) or pose_action_offset < 0:
+        raise ValueError(
+            f"pose_action_offset must be a non-negative integer, got {pose_action_offset!r}"
+        )
+    if structured_env_state_from_raw and positions_dir is not None:
+        raise ValueError(
+            "--structured-env-state-from-raw and --positions-dir are mutually "
+            "exclusive; simulation ground truth must remain authoritative"
+        )
     work = build_work_list(raw_dir, include_recovery_data)
-    splits = assign_splits(work, split_map or {}, include_recovery_data)
+    # State dims 29:32 and every world-frame composition depend on this sensor. A
+    # mixed-source dataset would present one feature with two physical meanings.
+    # Validate before latency audits and, critically, before any output is removed.
+    base_pose_source = validate_work_base_pose_contract(work)
+    policy_action_contract = validate_work_policy_action_contract(work)
+    policy_action_schema = str(policy_action_contract["policy_action_schema"])
+    action_axes = list(policy_action_contract["action_axes"])
+    if (
+        policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+        and state_frame != "base"
+    ):
+        raise ValueError(
+            "joystick/current-base policy actions require --state-frame base; a "
+            "world-frame achieved-pose state would silently mix coordinate systems"
+        )
+    camera_alignment_contract = validate_work_camera_alignment_contract(work)
+    splits = assign_splits(
+        work,
+        split_map or {},
+        include_recovery_data,
+        default_split=default_split,
+    )
     n_recovery = sum(item["source"] == "recovery" for item in work)
     logging.info(
-        "Port plan: %d episode(s) = %d raw + %d recovery -> splits {%s} (state_frame=%s)",
+        "Port plan: %d episode(s) = %d raw + %d recovery -> splits {%s} "
+        "(state_frame=%s, action_schema=%s, base_pose_source=%s, camera_alignment=%s)",
         len(work),
         len(work) - n_recovery,
         n_recovery,
         ", ".join(f"{s}:{len(v)}" for s, v in splits.items()),
         state_frame,
+        policy_action_schema,
+        base_pose_source,
+        camera_alignment_contract["mode"],
     )
+
+    # Mandatory and deliberately before any output path is removed or created. The
+    # zarr and MoF sibling porters call this same shared gate.
+    audit_work_list(work)
 
     # Fixed per dataset, so decide once across ALL takes before any split is created.
     has_right_wrist = detect_right_wrist_presence(work)
@@ -1516,6 +3121,10 @@ def convert_dataset(
     # pre-existing-dir check below removes anything -- a missing/bad npz must abort with no
     # data written or deleted. Keyed by (source, raw_index) via the positions subdir.
     env_state_by_key: dict[tuple[str, int], np.ndarray] = {}
+    structured_by_key: dict[
+        tuple[str, int],
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    ] = {}
     if positions_dir is not None:
         env_state_by_key = validate_all_episode_positions(positions_dir, work, object_nums)
         logging.info(
@@ -1525,10 +3134,17 @@ def convert_dataset(
             len(env_state_by_key),
             positions_dir,
         )
+    elif structured_env_state_from_raw:
+        structured_by_key = validate_all_structured_env_state(work)
+        logging.info(
+            "Structured simulator ENV-state ON: loaded semantic (3,2,3) "
+            "condition, task plan, and progress targets for %d episode(s)",
+            len(structured_by_key),
+        )
 
     # Fail fast on pre-existing split dirs BEFORE any heavy work / partial writes.
     variant_roots = {s: Path(root) / s / repo_id for s in splits}
-    for split, variant_root in variant_roots.items():
+    for variant_root in variant_roots.values():
         if variant_root.exists():
             if not overwrite:
                 raise RuntimeError(f"{variant_root} already exists. Use --overwrite to replace it.")
@@ -1550,6 +3166,8 @@ def convert_dataset(
                     resize_w,
                     object_nums if positions_dir is not None else None,
                     has_right_wrist=has_right_wrist,
+                    structured_env_state=structured_env_state_from_raw,
+                    action_axes=action_axes,
                 ),
                 root=variant_root,
                 robot_type=ROBOT_TYPE,
@@ -1557,11 +3175,23 @@ def convert_dataset(
             )
             split_total = 0
             for processed_idx, item in enumerate(items):
-                env_vec = (
-                    env_state_by_key[(item["source"], item["raw_index"])]
-                    if positions_dir is not None
-                    else None
-                )
+                key = (item["source"], item["raw_index"])
+                if structured_env_state_from_raw:
+                    (
+                        env_vec,
+                        task_sequence,
+                        progress_index,
+                        active_task_id,
+                    ) = structured_by_key[key]
+                else:
+                    env_vec = (
+                        env_state_by_key[key]
+                        if positions_dir is not None
+                        else None
+                    )
+                    task_sequence = None
+                    progress_index = None
+                    active_task_id = None
                 num_before, num_after = add_episode(
                     dataset,
                     item["path"],
@@ -1573,8 +3203,13 @@ def convert_dataset(
                     episode_idx=processed_idx,
                     fps=fps,
                     state_frame=state_frame,
+                    policy_action_schema=policy_action_schema,
+                    pose_action_offset=pose_action_offset,
                     trim=item["trim"],
                     env_state_vec=env_vec,
+                    task_sequence=task_sequence,
+                    progress_index=progress_index,
+                    active_task_id=active_task_id,
                 )
                 split_total += num_after
                 log_rows.append(
@@ -1590,6 +3225,8 @@ def convert_dataset(
                 pbar.update(1)
             dataset.finalize()
             dataset = recompute_stats(dataset, skip_image_video=True)
+            if structured_env_state_from_raw:
+                apply_shared_xyz_env_state_stats(dataset)
             _write_meta(
                 variant_root,
                 split,
@@ -1598,14 +3235,31 @@ def convert_dataset(
                 resize_h,
                 resize_w,
                 task,
+                base_pose_source,
+                camera_alignment_contract,
+                policy_action_schema=policy_action_schema,
+                pose_action_offset=pose_action_offset,
                 object_nums=object_nums if positions_dir is not None else None,
+                structured_env_state=structured_env_state_from_raw,
             )
             first = items[0]
-            first_env = (
-                env_state_by_key[(first["source"], first["raw_index"])]
-                if positions_dir is not None
-                else None
-            )
+            first_key = (first["source"], first["raw_index"])
+            if structured_env_state_from_raw:
+                (
+                    first_env,
+                    first_sequence,
+                    first_progress,
+                    first_task_id,
+                ) = structured_by_key[first_key]
+            else:
+                first_env = (
+                    env_state_by_key[first_key]
+                    if positions_dir is not None
+                    else None
+                )
+                first_sequence = None
+                first_progress = None
+                first_task_id = None
             verify(
                 dataset,
                 first,
@@ -1617,6 +3271,11 @@ def convert_dataset(
                 variant_root,
                 split,
                 env_state_vec=first_env,
+                task_sequence=first_sequence,
+                progress_index=first_progress,
+                active_task_id=first_task_id,
+                pose_action_offset=pose_action_offset,
+                policy_action_schema=policy_action_schema,
             )
             datasets[split] = dataset
             grand_total += split_total
@@ -1686,12 +3345,20 @@ def main() -> None:
         dest="split_csv",
         type=Path,
         default=None,
-        help="CSV assigning episodes to train/val/test (default "
+        help="CSV assigning episodes to a declared benchmark split (default "
         "<raw-dir>/split.csv). Rows 'episode, split' where episode is "
-        "'<N>' (raw) or 'recovery/<N>'; unlisted episodes -> train. Each "
+        "'<N>' (raw) or 'recovery/<N>'; unlisted episodes use "
+        "--default-split. Each "
         "split is written to <root>/<split>/<repo_id>/. If the DEFAULT "
-        "file is absent all episodes -> train; an explicitly-passed "
+        "file is absent all episodes use --default-split; an explicitly-passed "
         "missing file errors.",
+    )
+    parser.add_argument(
+        "--default-split",
+        choices=ALL_SPLITS,
+        default=DEFAULT_SPLIT,
+        help="split assigned to episodes absent from split.csv; use this when "
+        "porting one collector split directory directly",
     )
     parser.add_argument(
         "--positions-dir",
@@ -1707,6 +3374,26 @@ def main() -> None:
         "its npz (validated up front); off by default.",
     )
     parser.add_argument(
+        "--structured-env-state-from-raw",
+        action="store_true",
+        help="use simulator ground truth task/env_state (3,2,3) and the "
+        "categorical task_sequence, progress_index target, and checked "
+        "active_task_id directly from raw HDF5. This is "
+        "mutually exclusive with --positions-dir and never flattens the "
+        "condition.",
+    )
+    parser.add_argument(
+        "--action-offset",
+        "--pose-action-offset",
+        dest="pose_action_offset",
+        type=int,
+        default=0,
+        help="read the complete action label (EEF/head targets and both gripper "
+        "commands) this many raw frames in the future, terminally repeating the "
+        "last complete action; observations stay at the current frame (default 0). "
+        "--pose-action-offset is retained as a legacy alias.",
+    )
+    parser.add_argument(
         "--object_nums",
         "--object-nums",
         dest="object_nums",
@@ -1720,6 +3407,11 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     if args.positions_dir is not None and args.object_nums < 1:
         raise SystemExit(f"--object_nums must be >= 1, got {args.object_nums}")
+    if args.positions_dir is not None and args.structured_env_state_from_raw:
+        raise SystemExit(
+            "--positions-dir and --structured-env-state-from-raw are mutually "
+            "exclusive"
+        )
 
     state_frame = "world" if args.world_state else "base"
     if state_frame not in STATE_FRAMES:  # defensive; STATE_FRAMES is the source of truth
@@ -1740,7 +3432,11 @@ def main() -> None:
         elif explicit_split:
             raise RuntimeError(f"--split-csv not found: {split_csv}")
         else:
-            logging.info("No split csv at %s; all episodes -> %s", split_csv, DEFAULT_SPLIT)
+            logging.info(
+                "No split csv at %s; all episodes -> %s",
+                split_csv,
+                args.default_split,
+            )
             split_map = {}
         convert_dataset(
             args.raw_dir,
@@ -1757,6 +3453,9 @@ def main() -> None:
             split_map=split_map,
             positions_dir=args.positions_dir,
             object_nums=args.object_nums,
+            structured_env_state_from_raw=args.structured_env_state_from_raw,
+            default_split=args.default_split,
+            pose_action_offset=args.pose_action_offset,
         )
     except Exception as exc:  # CLI boundary: name the failure, exit 1
         logging.error("%s", exc)

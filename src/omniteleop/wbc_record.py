@@ -9,6 +9,12 @@ field plus the local monotonic arrival time, so replay is faithful to what the
 follower would have seen live; only the source (a file) and the clock (stretched)
 differ.
 
+``ReplaySource`` has a second entry point, :meth:`ReplaySource.from_episode_hdf5`:
+it replays the REAL-ROBOT follower's own ``EpisodeRecorder`` take by re-issuing the
+world-frame ``action/eef``/``action/head`` targets it handed to ``ik.solve()``, so one
+recorded take can be re-driven through a re-tuned ``follower/wbik.yaml``. Both entry
+points take the same ``speed`` scale.
+
 Light by design (``VRJointData`` + numpy; ``h5py`` only at file I/O), so the
 recorder/replayer is unit-testable without any robot, sim, or solver imports.
 """
@@ -22,6 +28,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from omniteleop.common.schemas import VRJointData
+from omniteleop.wbc_policy_format import JOYSTICK_POLICY_ACTION_SCHEMA
 
 # Flattened-4x4 pose fields, recorded as (N, 16) float64 + a per-frame presence flag
 # (the leader publishes empty lists for these outside teleop).
@@ -41,6 +48,109 @@ _BOOL_FIELDS = ("estop", "exit_requested", "home_requested")
 _STAGE_WIDTH = 16
 DEFAULT_REPLAY_GAP_LIMIT_MULTIPLE = 5.0
 DEFAULT_WBC_VR_OUTPUT = "/tmp/wbc_vr.mp4"
+
+# --- Episode-HDF5 replay (ReplaySource.from_episode_hdf5) ---------------------------
+# The real-robot follower's OWN take (``EpisodeRecorder`` schema, written by
+# ``wbc_vr_robot.py --record``) stores, per frame, the WORLD-frame 4x4 targets it handed
+# VERBATIM to ``ik.solve()``. Replaying THOSE -- instead of the leader's VRJointData
+# stream -- re-drives the identical operator intent through a RE-TUNED
+# ``follower/wbik.yaml``, so two parameter sets can be compared on one take.
+# VRJointData field -> episode dataset path.
+_EPISODE_POSE_DATASETS = {
+    "left_ee_pose": "action/eef/left",
+    "right_ee_pose": "action/eef/right",
+    "head_ee_pose": "action/head",
+}
+_EPISODE_SCALAR_DATASETS = {
+    "left_gripper": "action/gripper/left",
+    "right_gripper": "action/gripper/right",
+}
+_EPISODE_TIME_DATASET = "timestamp_ns"
+_EPISODE_JOYSTICK_INTENT_DATASET = "action/chassis/intent_body"
+
+
+def _decode_episode_frames(
+    arrays: dict[str, np.ndarray],
+    *,
+    chassis_dataset: str | None = None,
+) -> list[tuple[float, VRJointData]]:
+    """Rebuild ``(recv_mono, VRJointData)`` rows from an episode take's action targets.
+
+    Only the solver INPUTS are consumed (the ``action/eef/*`` + ``action/head`` 4x4
+    targets and the ``action/gripper/*`` trigger commands): everything the follower
+    computed FROM them -- joint commands, base twist, obs -- is deliberately dropped so
+    the replay re-solves with the current ``wbik.yaml``. Arrival times come from the
+    frame ``timestamp_ns`` (the recorder's wall clock), which is what makes the replay
+    honour the take's real cadence including any recording stall.
+
+    Every frame is synthesized as engaged teleop (``estop=False``,
+    ``calib_stage="teleop"``): an episode only ever contains frames recorded while the
+    follower was engaged and past leader calibration.
+    """
+    ts = np.asarray(arrays[_EPISODE_TIME_DATASET], dtype=np.int64)
+    if ts.ndim != 1 or ts.size < 2:
+        raise ValueError(
+            f"{_EPISODE_TIME_DATASET} must be a 1-D array of >= 2 frames, got shape {ts.shape}"
+        )
+    n = int(ts.size)
+    if not np.all(np.diff(ts) > 0):
+        bad = int(np.argmin(np.diff(ts)))
+        raise ValueError(
+            f"{_EPISODE_TIME_DATASET} must be strictly increasing; frames {bad} -> {bad + 1} "
+            f"go {int(ts[bad])} -> {int(ts[bad + 1])} ns"
+        )
+    poses: dict[str, np.ndarray] = {}
+    for fld, path in _EPISODE_POSE_DATASETS.items():
+        mat = np.asarray(arrays[path], dtype=np.float64)
+        if mat.shape != (n, 4, 4):
+            raise ValueError(f"{path} must have shape {(n, 4, 4)}, got {mat.shape}")
+        if not np.all(np.isfinite(mat)):
+            raise ValueError(f"{path} contains non-finite values")
+        # Homogeneous bottom row: catches a transposed/garbage pose before it is handed
+        # to the IK as a Cartesian target.
+        if not np.allclose(mat[:, 3, :], [0.0, 0.0, 0.0, 1.0], atol=1e-5):
+            raise ValueError(f"{path} rows are not homogeneous 4x4 transforms")
+        poses[fld] = mat
+    scalars: dict[str, np.ndarray] = {}
+    for fld, path in _EPISODE_SCALAR_DATASETS.items():
+        val = np.asarray(arrays[path], dtype=np.float64)
+        if val.shape != (n,):
+            raise ValueError(f"{path} must have shape {(n,)}, got {val.shape}")
+        if not np.all(np.isfinite(val)):
+            raise ValueError(f"{path} contains non-finite values")
+        scalars[fld] = val
+    chassis: np.ndarray | None = None
+    if chassis_dataset is not None:
+        if chassis_dataset not in arrays:
+            raise ValueError(
+                f"joystick episode is missing required {chassis_dataset}; refusing to "
+                "guess human intent from the feedback-shaped hardware twist"
+            )
+        chassis = np.asarray(arrays[chassis_dataset], dtype=np.float64)
+        if chassis.shape != (n, 3):
+            raise ValueError(f"{chassis_dataset} must have shape {(n, 3)}, got {chassis.shape}")
+        if not np.all(np.isfinite(chassis)):
+            raise ValueError(f"{chassis_dataset} contains non-finite values")
+    recv = (ts - ts[0]) * 1e-9
+    frames: list[tuple[float, VRJointData]] = []
+    for i in range(n):
+        kwargs: dict = {
+            "timestamp_ns": int(ts[i]),
+            "calib_stage": "teleop",
+            "estop": False,
+        }
+        for fld, mat in poses.items():
+            kwargs[fld] = mat[i].reshape(16).tolist()
+        for fld, val in scalars.items():
+            kwargs[fld] = float(val[i])
+        if chassis is not None:
+            kwargs.update(
+                chassis_vx=float(chassis[i, 0]),
+                chassis_vy=float(chassis[i, 1]),
+                chassis_wz=float(chassis[i, 2]),
+            )
+        frames.append((float(recv[i]), VRJointData(**kwargs)))
+    return frames
 
 
 def resolve_record_paths(
@@ -230,6 +340,9 @@ class ReplaySource:
         frames: list[tuple[float, VRJointData]],
         speed: float,
         clock: Callable[[], float] = time.perf_counter,
+        *,
+        head_targets_pre_filtered: bool = False,
+        replay_kind: str = "leader_stream",
     ) -> None:
         if not np.isfinite(speed) or speed <= 0.0:
             raise ValueError(f"speed must be finite and > 0, got {speed}")
@@ -238,6 +351,8 @@ class ReplaySource:
         mono0 = frames[0][0]
         self.speed = float(speed)
         self._clock = clock
+        self.head_targets_pre_filtered = bool(head_targets_pre_filtered)
+        self.replay_kind = str(replay_kind)
         self._vr = [vr for _, vr in frames]
         # Scaled release offsets from start (monotonically non-decreasing).
         self._release = [max(0.0, (m - mono0) / self.speed) for m, _ in frames]
@@ -299,4 +414,143 @@ class ReplaySource:
                 )
             grp = f["frames"]
             arrays = {key: grp[key][()] for key in grp}
-        return cls(_decode_frames(arrays), speed, clock)
+        return cls(
+            _decode_frames(arrays),
+            speed,
+            clock,
+            head_targets_pre_filtered=False,
+            replay_kind="leader_stream",
+        )
+
+    @classmethod
+    def from_episode_hdf5(
+        cls,
+        path: str,
+        speed: float = 1.0,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> ReplaySource:
+        """Build a source from an ``EpisodeRecorder`` take (``wbc_vr_robot.py --record``).
+
+        Replays the take's own ``action/eef/{left,right}`` + ``action/head`` solver
+        targets (see :func:`_decode_episode_frames`) at the recorded cadence, so the same
+        operator intent can be re-driven through a re-tuned ``follower/wbik.yaml``.
+        ``speed`` stretches that cadence exactly as it does for :meth:`from_hdf5` (the
+        followers pass ``vr_teleop.replay_speed`` from their own config file; 1.0 = the
+        take's real time).
+        """
+        import h5py  # noqa: PLC0415 -- optional dep, only needed when replaying from a file
+
+        wanted = (
+            _EPISODE_TIME_DATASET,
+            *_EPISODE_POSE_DATASETS.values(),
+            *_EPISODE_SCALAR_DATASETS.values(),
+        )
+        with h5py.File(path, "r") as f:
+            missing = [key for key in wanted if key not in f]
+            if missing:
+                schema = f.attrs.get("schema", "")
+                hint = (
+                    " -- this is a wbc_vr_stream/v1 leader recording (wbc_vr_record.py); "
+                    "the real-robot follower now replays its OWN episode takes"
+                    if schema == "wbc_vr_stream/v1" else ""
+                )
+                raise ValueError(
+                    f"{path}: not a wbc_vr_robot episode take, missing {missing}{hint}"
+                )
+            arrays = {key: f[key][()] for key in wanted}
+        return cls(
+            _decode_episode_frames(arrays),
+            speed,
+            clock,
+            head_targets_pre_filtered=True,
+            replay_kind="wbc_episode",
+        )
+
+    @classmethod
+    def from_joystick_hdf5(
+        cls,
+        path: str,
+        speed: float = 1.0,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> ReplaySource:
+        """Replay either a raw joystick leader stream or a joystick episode take.
+
+        Leader streams carry pre-filter headset targets and their published chassis
+        command directly. Episode takes carry already-filtered Cartesian targets plus
+        the explicitly recorded follower-effective joystick intent. The distinction is
+        retained on ``head_targets_pre_filtered`` so the shared follower loop applies
+        the head filter exactly once.
+        """
+        import h5py  # noqa: PLC0415 -- optional dep, only needed for replay
+
+        with h5py.File(path, "r") as f:
+            root_schema = f.attrs.get("schema", "")
+            if isinstance(root_schema, bytes):
+                root_schema = root_schema.decode("utf-8", errors="replace")
+            if root_schema == "wbc_vr_stream/v1":
+                is_stream = True
+            else:
+                is_stream = False
+                def text(key: str) -> str | None:
+                    if key not in f:
+                        return None
+                    value = np.asarray(f[key][()])
+                    if value.shape != ():
+                        raise ValueError(f"{path}: {key} must be scalar text")
+                    scalar = value.item()
+                    return (
+                        bytes(scalar).decode("utf-8")
+                        if isinstance(scalar, (bytes, np.bytes_))
+                        else str(scalar)
+                    )
+
+                declarations = {
+                    "meta/schema": "omniteleop_joystick_mobile_raw/v1",
+                    "meta/control_mode": "joystick",
+                    "meta/policy_action_schema": JOYSTICK_POLICY_ACTION_SCHEMA,
+                    "meta/action_target_frame": "current_base",
+                    "meta/eef_target_frame": "current_base",
+                    "meta/head_target_frame": "current_base",
+                }
+                actual = {key: text(key) for key in declarations}
+                if not any(
+                    actual[key] == expected for key, expected in declarations.items()
+                ):
+                    raise ValueError(
+                        f"{path}: expected a wbc_vr_stream/v1 file or joystick episode, "
+                        f"got metadata {actual}"
+                    )
+                bad = [
+                    f"{key}={actual[key]!r} (expected {expected!r})"
+                    for key, expected in declarations.items()
+                    if actual[key] != expected
+                ]
+                if bad:
+                    raise ValueError(
+                        f"{path}: incomplete/conflicting joystick replay contract: "
+                        + "; ".join(bad)
+                    )
+                wanted = (
+                    _EPISODE_TIME_DATASET,
+                    *_EPISODE_POSE_DATASETS.values(),
+                    *_EPISODE_SCALAR_DATASETS.values(),
+                    _EPISODE_JOYSTICK_INTENT_DATASET,
+                )
+                missing = [key for key in wanted if key not in f]
+                if missing:
+                    raise ValueError(
+                        f"{path}: joystick episode is missing required datasets {missing}"
+                    )
+                arrays = {key: f[key][()] for key in wanted}
+        if is_stream:
+            return cls.from_hdf5(path, speed, clock)
+        return cls(
+            _decode_episode_frames(
+                arrays,
+                chassis_dataset=_EPISODE_JOYSTICK_INTENT_DATASET,
+            ),
+            speed,
+            clock,
+            head_targets_pre_filtered=True,
+            replay_kind="joystick_episode",
+        )

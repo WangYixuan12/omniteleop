@@ -55,8 +55,8 @@ Panels:
   * 3D world -- depth point cloud (world frame), per-arm EEF markers/frames
     (red = ``action`` world target, blue = ``observation.state`` achieved->world),
     head frames (red target / blue achieved, the latter coincident with the camera),
-    the mobile base triad + its full odometry path (gold), optional
-    ``observation.environment_state`` position-condition markers, and the head
+    the mobile base triad + its full odometry path (gold), the
+    ``observation.environment_state`` task-condition markers, and the head
     camera pinhole/frustum.
   * Zarr policy comparison -- Stored RGB 3D, Policy RGB 3D and (only when consumed)
     Policy masks 3D, with identical initial cameras and shared world context.
@@ -79,6 +79,24 @@ Panels:
   * Gripper time series (left, right) -- red = ``action`` (binary command),
     blue = ``observation.state`` (raw reading).
   * Base pose time series -- ``base_x`` / ``base_y`` (m) and ``base_yaw`` (rad).
+  * Progress / active task (structured datasets only) -- gold =
+    ``progress_index``, the ordinal stage-head target; violet = ``active_task_id``,
+    the semantic task it resolves to. They track each other only for the
+    ``[0,1,2]`` plan; under ``[0,2,1]`` they visibly diverge after the first
+    transition, which is the whole reason the two are stored separately.
+
+Structured simulator conditioning (``port_wbc_mobile_hdf5.py
+--structured-env-state-from-raw``): when ``observation.environment_state`` is
+``(3, 2, 3)`` the viewer keeps the task and role axes instead of flattening them.
+Rows are SEMANTIC task identities, never execution order, so the row the policy
+reads is ``env_state[active_task_id]`` -- with a ``[0,2,1]`` plan,
+``env_state[progress_index]`` is the wrong one. Each frame the selected
+source/destination pair is drawn large in orange/cyan and joined by a link, the
+other four points stay small and grey, and only the active pair is labelled. The
+loader also re-checks the plan, monotonic progress, and
+``active_task_id == task_sequence[progress_index]``, so a mislabelled episode
+raises here rather than rendering a plausible-looking wrong pair. Flat SceneDiff
+``object_nums * 3`` datasets keep their previous behaviour unchanged.
 
 Matplotlib (shown after the viewer is populated):
   * Per-arm EEF xyz -- red = ``action`` (world), blue = ``observation.state``
@@ -166,9 +184,31 @@ _COLOR_MASK_DST = (0, 220, 255)   # cyan
 _COLOR_MASK_BG = (120, 120, 120)  # gray
 OBS_ENV_STATE_KEY = "observation.environment_state"
 
+# ── Structured simulator conditioning (port_wbc_mobile_hdf5.py
+#    --structured-env-state-from-raw). env_state is indexed by SEMANTIC task, not
+#    by execution order; the plan maps ordinal progress to task identity, and the
+#    policy consumes only env_state[active_task_id]. ────────────────────────────
+OBS_TASK_SEQUENCE_KEY = "observation.task_sequence"
+PROGRESS_INDEX_KEY = "progress_index"
+ACTIVE_TASK_ID_KEY = "active_task_id"
+STRUCTURED_ENV_STATE_SHAPE = (3, 2, 3)
+_DEFAULT_TASK_NAMES = ("drawer", "plate", "jar")
+_DEFAULT_ROLE_NAMES = ("src", "dst")
+# The selected row is the only part of the condition the policy reads, so it is
+# drawn bright and large while the five-sixths it ignores stay dim and small.
+_COLOR_ACTIVE_SRC = (255, 170, 0)
+_COLOR_ACTIVE_DST = (0, 235, 255)
+_COLOR_INACTIVE = (110, 110, 120)
+_COLOR_PROGRESS = (255, 210, 0)
+_COLOR_ACTIVE_TASK = (170, 120, 255)
+
 _GRIPPER_Y_MIN = -0.2
 _GRIPPER_Y_MAX = 1.1
+_PROGRESS_Y_MIN = -0.3
+_PROGRESS_Y_MAX = 2.3
 _POS_COND_RADIUS_3D = 0.018
+_POS_COND_RADIUS_ACTIVE = 0.030
+_POS_COND_RADIUS_INACTIVE = 0.011
 _MOF_CLOUD_RADIUS = 0.004   # < the 0.006 horizon points, so the GT chunk stays legible
 _HEAD_DEPTH_ENTITY = "/world/camera/depth"
 _HEAD_EEF_STATE_ENTITY = "/world/camera/eef_state_2d"
@@ -270,29 +310,139 @@ def head_optional_hidden_overrides() -> dict[str, rrb.EntityBehavior]:
     }
 
 
-def load_processed_wbc_position_condition(dataset) -> dict[str, np.ndarray | list[str]] | None:
-    """Read optional processed-WBC position condition from ``observation.environment_state``.
+def _frame_column(dataset, key: str, dtype) -> np.ndarray:
+    """Stack one non-image dataset column over the whole episode."""
+    rows = []
+    for idx in range(len(dataset)):
+        frame = dataset[idx]
+        if key not in frame:
+            raise KeyError(
+                f"{key} is declared in dataset features but missing from frame {idx}"
+            )
+        value = frame[key]
+        arr = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+        rows.append(np.asarray(arr, dtype=dtype).reshape(-1))
+    return np.stack(rows)
 
-    The porter writes this as a flat ``object_nums * 3`` world-frame vector on every
-    frame. This helper reshapes it to ``(N, object_nums, 3)`` and derives point labels
-    from the feature axis names when available.
+
+def _structured_point_labels(meta: Mapping | None) -> list[str]:
+    """``drawer_src``, ``drawer_dst``, ``plate_src``, ... in ``(task, role)`` order.
+
+    The ``_src``/``_dst`` suffixes are what ``vis_episode``'s shared colour and
+    link helpers key on, so naming the points this way makes the structured
+    condition render with the same source/destination semantics as the flat
+    SceneDiff one.
+    """
+    tasks = _DEFAULT_TASK_NAMES
+    roles = _DEFAULT_ROLE_NAMES
+    if isinstance(meta, Mapping):
+        declared_tasks = meta.get("env_state_task_names")
+        declared_roles = meta.get("env_state_role_names")
+        if isinstance(declared_tasks, (list, tuple)) and len(declared_tasks) == 3:
+            tasks = tuple(str(name) for name in declared_tasks)
+        if isinstance(declared_roles, (list, tuple)) and len(declared_roles) == 2:
+            roles = tuple(str(name) for name in declared_roles)
+    return [f"{task}_{role}" for task in tasks for role in roles]
+
+
+def load_structured_task_condition(dataset, meta: Mapping | None) -> dict | None:
+    """Read the semantic ``(3, 2, 3)`` condition plus its plan and progress labels.
+
+    ``env_state`` is indexed by semantic task identity and never moves; the
+    episode's ``task_sequence`` is the only mapping from ordinal progress to task
+    identity, so ``env_state[progress_index]`` is the WRONG row whenever the plan
+    is not ``[0, 1, 2]``. This resolves the row the policy actually selects,
+    ``env_state[active_task_id]``, and re-checks the integrity equation the raw
+    writer and porter both enforce, so a mislabelled episode fails here instead of
+    quietly rendering the wrong pair of points.
+
+    Returns ``None`` for flat SceneDiff datasets, which keep their old path.
+    """
+    features = getattr(getattr(dataset, "meta", None), "features", {})
+    feature = features.get(OBS_ENV_STATE_KEY)
+    if not isinstance(feature, Mapping):
+        return None
+    if tuple(feature.get("shape", ())) != STRUCTURED_ENV_STATE_SHAPE:
+        return None
+    missing = [
+        key
+        for key in (OBS_TASK_SEQUENCE_KEY, PROGRESS_INDEX_KEY, ACTIVE_TASK_ID_KEY)
+        if key not in features
+    ]
+    if missing:
+        raise ValueError(
+            f"{OBS_ENV_STATE_KEY} is {STRUCTURED_ENV_STATE_SHAPE} but the plan and "
+            f"progress labels are missing: {missing}. This dataset predates the "
+            "structured schema -- re-port it with "
+            "port_wbc_mobile_hdf5.py --structured-env-state-from-raw."
+        )
+
+    n = len(dataset)
+    env_state = _frame_column(dataset, OBS_ENV_STATE_KEY, np.float32).reshape(
+        (n,) + STRUCTURED_ENV_STATE_SHAPE
+    )
+    task_sequence = _frame_column(dataset, OBS_TASK_SEQUENCE_KEY, np.int64)
+    progress_index = _frame_column(dataset, PROGRESS_INDEX_KEY, np.int64).reshape(n)
+    active_task_id = _frame_column(dataset, ACTIVE_TASK_ID_KEY, np.int64).reshape(n)
+
+    if not np.all(np.isfinite(env_state)):
+        bad = np.argwhere(~np.isfinite(env_state))[0]
+        raise ValueError(f"{OBS_ENV_STATE_KEY} has a non-finite value at {bad.tolist()}")
+    if not np.all(env_state == env_state[0]):
+        raise ValueError(f"{OBS_ENV_STATE_KEY} must be constant within an episode")
+    if task_sequence.shape != (n, 3) or not np.all(task_sequence == task_sequence[0]):
+        raise ValueError(f"{OBS_TASK_SEQUENCE_KEY} must be a constant (3,) plan per episode")
+    plan = tuple(int(value) for value in task_sequence[0])
+    if sorted(plan) != [0, 1, 2]:
+        raise ValueError(f"{OBS_TASK_SEQUENCE_KEY} must permute the three tasks, got {plan}")
+    if progress_index[0] != 0 or progress_index[-1] != 2:
+        raise ValueError(f"{PROGRESS_INDEX_KEY} must run 0 -> 2, got {progress_index[[0, -1]]}")
+    steps = np.diff(progress_index)
+    if np.any((steps < 0) | (steps > 1)):
+        raise ValueError(f"{PROGRESS_INDEX_KEY} must be monotonic and advance only by one")
+    expected = task_sequence[0][progress_index]
+    if not np.array_equal(active_task_id, expected):
+        bad = int(np.flatnonzero(active_task_id != expected)[0])
+        raise ValueError(
+            f"{ACTIVE_TASK_ID_KEY}[{bad}] = {active_task_id[bad]} but "
+            f"{OBS_TASK_SEQUENCE_KEY}[{PROGRESS_INDEX_KEY}[{bad}]] = {expected[bad]}"
+        )
+
+    labels = _structured_point_labels(meta)
+    # (N, 6, 3) in (task, role) order so the shared point-cloud path can log it
+    # unchanged; the active pair is indices 2*a and 2*a+1.
+    points = env_state.reshape(n, 6, 3)
+    transitions = (np.flatnonzero(steps) + 1).tolist()
+    return {
+        "points": points,
+        "labels": labels,
+        "plan": plan,
+        "progress_index": progress_index,
+        "active_task_id": active_task_id,
+        "transitions": transitions,
+        "task_names": [label.rsplit("_", 1)[0] for label in labels[::2]],
+        "normalization": (
+            str(meta.get("env_state_normalization")) if isinstance(meta, Mapping) else None
+        ),
+        "frame": str(meta.get("env_state_frame")) if isinstance(meta, Mapping) else None,
+    }
+
+
+def load_processed_wbc_position_condition(dataset) -> dict[str, np.ndarray | list[str]] | None:
+    """Read a FLAT SceneDiff position condition from ``observation.environment_state``.
+
+    The SceneDiff porter writes this as a flat ``object_nums * 3`` world-frame
+    vector on every frame. This helper reshapes it to ``(N, object_nums, 3)`` and
+    derives point labels from the feature axis names when available. Structured
+    ``(3, 2, 3)`` simulator datasets go through
+    :func:`load_structured_task_condition` instead, which keeps the task and role
+    axes and resolves the selected row.
     """
     features = getattr(getattr(dataset, "meta", None), "features", {})
     if OBS_ENV_STATE_KEY not in features:
         return None
 
-    rows: list[np.ndarray] = []
-    for idx in range(len(dataset)):
-        frame = dataset[idx]
-        if OBS_ENV_STATE_KEY not in frame:
-            raise KeyError(
-                f"{OBS_ENV_STATE_KEY} is declared in dataset features but missing from frame {idx}"
-            )
-        value = frame[OBS_ENV_STATE_KEY]
-        arr = value.numpy() if hasattr(value, "numpy") else np.asarray(value)
-        rows.append(np.asarray(arr, dtype=np.float32).reshape(-1))
-
-    env_state = np.stack(rows).astype(np.float32)
+    env_state = _frame_column(dataset, OBS_ENV_STATE_KEY, np.float32)
     if env_state.shape[1] == 0 or env_state.shape[1] % 3 != 0:
         raise ValueError(
             f"{OBS_ENV_STATE_KEY} must have a non-empty multiple-of-3 width, "
@@ -347,19 +497,20 @@ def load_lerobot_episode(dataset_root: Path, episode_index: int) -> dict:
             f"(omniteleop.wbc_policy_format.ACTION_AXES).\n got:      {action_axes}\n "
             f"expected: {list(ACTION_AXES)}"
         )
-    # left/right wrist name the ARM. Left is required; right is present only for
-    # datasets ported from two-wrist takes (see port_wbc_mobile_hdf5.build_features).
-    for key in ("observation.images.head_rgb", "observation.images.left_wrist_rgb"):
-        if key not in dataset.meta.features:
-            raise ValueError(f"{dataset_root.name} is missing {key}.")
+    # left/right wrist name the ARM; both are optional (see the wrist_arms
+    # computation below, which skips whichever wrist keys are absent).
+    if "observation.images.head_rgb" not in dataset.meta.features:
+        raise ValueError(f"{dataset_root.name} is missing observation.images.head_rgb.")
 
     # observation.state EEF/head frame (porter dexmate_meta.json). "base" (the
     # default) must be composed to world for display; "world" (--world-state
     # dataset) is already world-frame -- do NOT re-compose.
     state_frame = "base"
     meta_json = dataset_root / "dexmate_meta.json"
+    porter_meta: dict | None = None
     if meta_json.exists():
-        state_frame = json.loads(meta_json.read_text()).get("state_frame", "base")
+        porter_meta = json.loads(meta_json.read_text())
+        state_frame = porter_meta.get("state_frame", "base")
     if state_frame not in ("base", "world"):
         raise ValueError(f"unexpected state_frame {state_frame!r} in {meta_json}")
 
@@ -387,13 +538,22 @@ def load_lerobot_episode(dataset_root: Path, episode_index: int) -> dict:
         raise ValueError(f"depth sidecar dtype {depth_stack.dtype}, expected uint16")
 
     sample_rgb = _rgb_to_hwc(dataset[0]["observation.images.head_rgb"])
+    # Structured simulator datasets keep the (3,2,3) task/role axes and carry the
+    # plan and progress labels; flat SceneDiff datasets keep the older path.
+    structured = load_structured_task_condition(dataset, porter_meta)
+    position_condition = (
+        {"points": structured["points"], "labels": structured["labels"]}
+        if structured is not None
+        else load_processed_wbc_position_condition(dataset)
+    )
     return {
         "kind": "lerobot", "label": str(dataset_root), "N": n,
         "fps": float(dataset.fps) if dataset.fps else 10.0,
         "state": state, "action": action, "state_frame": state_frame,
         "dataset": dataset, "depth": depth_stack, "extrinsic": extrinsic_stack,
         "intrinsic": intrinsic_stack, "hw": sample_rgb.shape[:2],
-        "position_condition": load_processed_wbc_position_condition(dataset),
+        "position_condition": position_condition,
+        "structured_condition": structured,
     }
 
 
@@ -1268,6 +1428,7 @@ def main() -> None:
     print(f"observation.state EEF/head frame: {state_frame}")
 
     position_condition = source["position_condition"]
+    structured = source.get("structured_condition")
     position_condition_points: np.ndarray | None = None
     position_condition_labels: list[str] = []
     position_condition_colors: np.ndarray | None = None
@@ -1283,6 +1444,31 @@ def main() -> None:
             position_condition_colors = _raw_vis_episode.position_condition_colors(
                 position_condition_labels
             )
+    # Structured datasets recolour per frame instead: only env_state[active_task_id]
+    # reaches the policy, so the selected pair is highlighted and the rest dimmed.
+    structured_colors: np.ndarray | None = None
+    structured_radii: np.ndarray | None = None
+    structured_frame_labels: list[list[str]] | None = None
+    if structured is not None:
+        active = structured["active_task_id"]
+        structured_colors = np.tile(
+            np.asarray(_COLOR_INACTIVE, dtype=np.uint8), (len(active), 6, 1)
+        )
+        structured_radii = np.full((len(active), 6), _POS_COND_RADIUS_INACTIVE, np.float32)
+        rows = np.arange(len(active))
+        structured_colors[rows, 2 * active] = _COLOR_ACTIVE_SRC
+        structured_colors[rows, 2 * active + 1] = _COLOR_ACTIVE_DST
+        structured_radii[rows, 2 * active] = _POS_COND_RADIUS_ACTIVE
+        structured_radii[rows, 2 * active + 1] = _POS_COND_RADIUS_ACTIVE
+        # Only the selected pair is named, so the 3D view stays readable and what
+        # the policy is conditioned on right now is unambiguous.
+        structured_frame_labels = []
+        for task in active:
+            names = ["" for _ in range(6)]
+            base = structured["labels"][2 * int(task)].rsplit("_", 1)[0]
+            names[2 * int(task)] = f"{base}_src (active)"
+            names[2 * int(task) + 1] = f"{base}_dst (active)"
+            structured_frame_labels.append(names)
 
     if has_camera:
         depth_stack = source["depth"]
@@ -1365,7 +1551,30 @@ def main() -> None:
     print(f"  base drove x∈[{base_xy[:,0].min():.2f},{base_xy[:,0].max():.2f}] "
           f"y∈[{base_xy[:,1].min():.2f},{base_xy[:,1].max():.2f}] m, "
           f"yaw∈[{base_yaw.min():.3f},{base_yaw.max():.3f}] rad")
-    if position_condition_points is not None:
+    if structured is not None:
+        names = structured["task_names"]
+        plan = structured["plan"]
+        progress = structured["progress_index"]
+        bounds = [0, *structured["transitions"], N]
+        print(
+            f"  task plan: {list(plan)} -> "
+            + " -> ".join(names[task] for task in plan)
+        )
+        for ordinal, task in enumerate(plan):
+            start, end = bounds[ordinal], bounds[ordinal + 1]
+            src, dst = structured["points"][0][2 * task], structured["points"][0][2 * task + 1]
+            print(
+                f"    progress {ordinal} = task {task} ({names[task]}): "
+                f"frames [{start},{end}) | src {np.round(src, 3)} -> dst {np.round(dst, 3)}"
+            )
+        print(
+            f"  condition: (3,2,3) semantic, frame {structured['frame']}, "
+            f"normalization {structured['normalization']}; "
+            f"active_task_id == task_sequence[progress_index] holds on all {N} frames"
+        )
+        if len(structured["transitions"]) != 2 or progress[-1] != 2:
+            print("  WARNING: episode does not contain exactly three progress stages")
+    elif position_condition_points is not None:
         print(
             f"  position condition: {len(position_condition_labels)} world points "
             f"({', '.join(position_condition_labels)})"
@@ -1437,13 +1646,23 @@ def main() -> None:
             ],
         )
 
-    bottom_row = rrb.Horizontal(
+    bottom_plots = [
         _cursor_range("plots/gripper_left", "Left gripper",
                       (_GRIPPER_Y_MIN, _GRIPPER_Y_MAX)),
         _cursor_range("plots/gripper_right", "Right gripper",
                       (_GRIPPER_Y_MIN, _GRIPPER_Y_MAX)),
         _cursor_range("plots/base_pose", "Base pose"),
-        column_shares=[1.0, 1.0, 1.0],
+    ]
+    if structured is not None:
+        # Ordinal progress against semantic task identity: the two coincide only
+        # for the [0,1,2] plan, and seeing them diverge is the point.
+        bottom_plots.append(
+            _cursor_range("plots/progress", "Progress / active task",
+                          (_PROGRESS_Y_MIN, _PROGRESS_Y_MAX))
+        )
+    bottom_row = rrb.Horizontal(
+        *bottom_plots,
+        column_shares=[1.0] * len(bottom_plots),
     )
     if is_zarr:
         common_3d = [
@@ -1573,6 +1792,16 @@ def main() -> None:
         ),
         static=True,
     )
+    if structured is not None:
+        rr.log(
+            "plots/progress",
+            rr.SeriesLines(
+                colors=[_COLOR_PROGRESS, _COLOR_ACTIVE_TASK],
+                names=["progress_index (target)", "active_task_id (semantic)"],
+                widths=[2.5, 2.5],
+            ),
+            static=True,
+        )
 
     # Full base odometry path (static gold line + points) so the whole drive is
     # visible while the per-frame base triad moves along it.
@@ -1766,9 +1995,44 @@ def main() -> None:
         else:
             raise ValueError(f"unsupported source kind {source['kind']!r}")
 
-        # Optional processed SceneDiff position condition, already in the same
-        # engage-origin world frame as action and base odometry.
-        if position_condition_points is not None and position_condition_colors is not None:
+        # The task condition, already in the same engage-origin world frame as
+        # action and base odometry. Structured datasets highlight the row the
+        # policy selects this frame; flat SceneDiff ones keep static colours.
+        if structured is not None:
+            pc_points = position_condition_points[idx]
+            finite = np.all(np.isfinite(pc_points), axis=1)
+            if finite.any():
+                rr.log(
+                    "world/position_condition/points",
+                    rr.Points3D(
+                        pc_points[finite],
+                        colors=structured_colors[idx][finite],
+                        radii=structured_radii[idx][finite],
+                        labels=[
+                            name
+                            for name, keep in zip(structured_frame_labels[idx], finite)
+                            if keep
+                        ],
+                        show_labels=True,
+                    ),
+                )
+            else:
+                rr.log("world/position_condition/points", rr.Clear(recursive=False))
+            # The transfer the selected task encodes: source to destination.
+            task = int(structured["active_task_id"][idx])
+            pair = pc_points[[2 * task, 2 * task + 1]]
+            if np.all(np.isfinite(pair)):
+                rr.log(
+                    "world/position_condition/active_link",
+                    rr.LineStrips3D(
+                        [pair.astype(np.float32)],
+                        colors=[_COLOR_ACTIVE_DST],
+                        radii=0.004,
+                    ),
+                )
+            else:
+                rr.log("world/position_condition/active_link", rr.Clear(recursive=False))
+        elif position_condition_points is not None and position_condition_colors is not None:
             pc_points = position_condition_points[idx]
             finite = np.all(np.isfinite(pc_points), axis=1)
             label_arr = np.asarray(position_condition_labels, dtype=object)
@@ -1804,6 +2068,13 @@ def main() -> None:
         # Base pose scalars: x, y, yaw.
         rr.log("plots/base_pose",
                rr.Scalars([float(state[idx, 29]), float(state[idx, 30]), float(state[idx, 31])]))
+        # Ordinal progress (the stage-head target) against the semantic task it
+        # resolves to through the plan.
+        if structured is not None:
+            rr.log("plots/progress", rr.Scalars([
+                float(structured["progress_index"][idx]),
+                float(structured["active_task_id"][idx]),
+            ]))
 
     if figs and args.save is None and args.connect is None:
         plt.show()

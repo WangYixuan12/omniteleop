@@ -97,7 +97,15 @@ from omniteleop.wbc_pointcloud import (
     sampler_signature,
     world_t_head_from_state,
 )
-from omniteleop.wbc_policy_format import ACTION_AXES, STATE_AXES, base_pose_to_mat
+from omniteleop.wbc_policy_format import (
+    ACTION_AXES,
+    JOYSTICK_ACTION_AXES,
+    JOYSTICK_POLICY_ACTION_SCHEMA,
+    STATE_AXES,
+    WBC_POLICY_ACTION_SCHEMA,
+    action_axes_for_policy_schema,
+    base_pose_to_mat,
+)
 
 
 def _load_rollout():
@@ -186,7 +194,8 @@ class ManiFlowBundle:
                 raise ValueError(f"{ckpt}: not a ManiFlow checkpoint (missing '{key}')")
         cfg = payload["cfg"]
 
-        # Schema gate: the checkpoint must speak the WBC 32/29 point-cloud schema.
+        # Schema gate: legacy WBC checkpoints emit 29-D world targets; joystick
+        # checkpoints emit the same pose/gripper blocks plus 3-D body-frame intent.
         shape_meta = OmegaConf.to_container(cfg.shape_meta, resolve=True)
         pc_shape = tuple(shape_meta["obs"]["point_cloud"]["shape"])
         state_dim = int(shape_meta["obs"]["agent_pos"]["shape"][0])
@@ -195,10 +204,25 @@ class ManiFlowBundle:
             raise ValueError(
                 f"{ckpt}: point_cloud shape {pc_shape}, expected (N, {POINT_CHANNELS})"
             )
-        if state_dim != len(STATE_AXES) or action_dim != len(ACTION_AXES):
+        if state_dim != len(STATE_AXES) or action_dim not in (
+            len(ACTION_AXES),
+            len(JOYSTICK_ACTION_AXES),
+        ):
             raise ValueError(
-                f"{ckpt}: agent_pos={state_dim}/action={action_dim} do not match the WBC "
-                f"schema ({len(STATE_AXES)}/{len(ACTION_AXES)}); wrong checkpoint?")
+                f"{ckpt}: agent_pos={state_dim}/action={action_dim} do not match a "
+                f"supported schema ({len(STATE_AXES)}/29 or 32); wrong checkpoint?"
+            )
+        self.action_dim = action_dim
+        self.policy_action_schema = (
+            JOYSTICK_POLICY_ACTION_SCHEMA
+            if action_dim == len(JOYSTICK_ACTION_AXES)
+            else WBC_POLICY_ACTION_SCHEMA
+        )
+        self.action_target_frame = (
+            "current_base"
+            if self.policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+            else "world"
+        )
         self.num_points = int(pc_shape[0])
 
         self.conditioning_spec = ConditioningSpec(
@@ -219,6 +243,15 @@ class ManiFlowBundle:
         self.point_sampling_mode = self.conditioning_spec.point_sampling_mode
         self.mask_channels = self.conditioning_spec.mask_channels
         self.action_frame_mode = self.conditioning_spec.action_frame_mode
+        if (
+            self.policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+            and self.action_frame_mode == "mof"
+        ):
+            raise ValueError(
+                "32-D joystick actions are incompatible with MoF world lifting"
+            )
+        if self.policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA:
+            self.action_frame_mode = "current_base"
         self.use_env_state = self.conditioning_spec.needs_env_state
         self.env_state_dim = (
             self.conditioning_spec.object_nums * 3 if self.use_env_state else 0
@@ -256,6 +289,16 @@ class ManiFlowBundle:
         self.meta_path = self.meta_path.expanduser().resolve()
         self.pointcloud_meta_sha256 = _sha256_file(self.meta_path)
         meta = self._load_meta(self.meta_path)
+        self.policy_action_schema_provenance = str(self.meta_path)
+        raw_base_pose_source = meta.get("base_pose_source")
+        self.base_pose_source = (
+            None
+            if raw_base_pose_source is None
+            else rollout._checked_base_pose_source(  # noqa: SLF001
+                raw_base_pose_source, str(self.meta_path)
+            )
+        )
+        self.base_pose_source_provenance = str(self.meta_path)
         self.env_dino_meta = meta.get("env_dino")
         self.state_frame = meta["state_frame"]
         self.crop_min = tuple(float(v) for v in meta["crop_min"])
@@ -365,12 +408,48 @@ class ManiFlowBundle:
             raise ValueError(f"{path}: unsupported RNG scheme {meta['rng_scheme']!r}")
         if meta.get("point_channels") != ["x", "y", "z", "r", "g", "b"]:
             raise ValueError(f"{path}: invalid point channel order")
-        if not str(meta.get("action_frame", "")).startswith("world"):
+        expected_schema = getattr(
+            self, "policy_action_schema", WBC_POLICY_ACTION_SCHEMA
+        )
+        declared_schema = meta.get("policy_action_schema")
+        if declared_schema is None and expected_schema == WBC_POLICY_ACTION_SCHEMA:
+            # Compatibility for v3 WBC sidecars written before action schemas were
+            # explicit. A 32-D model never receives this inference concession.
+            declared_schema = WBC_POLICY_ACTION_SCHEMA
+        if declared_schema != expected_schema:
+            raise ValueError(
+                f"{path}: policy_action_schema {declared_schema!r} does not match "
+                f"the checkpoint's {expected_schema!r}"
+            )
+        expected_action_axes = list(action_axes_for_policy_schema(expected_schema))
+        if meta.get("action_axes") != expected_action_axes:
+            raise ValueError(
+                f"{path}: action axis order differs from {expected_schema!r}"
+            )
+        action_frame = str(meta.get("action_frame", ""))
+        if expected_schema == JOYSTICK_POLICY_ACTION_SCHEMA:
+            if action_frame != "current_base":
+                raise ValueError(
+                    f"{path}: joystick action_frame must be 'current_base', got "
+                    f"{action_frame!r}"
+                )
+            chassis = meta.get("chassis_action")
+            expected_chassis = {
+                "axes": expected_action_axes[-3:],
+                "frame": "current_base_body",
+                "source_dataset": "action/chassis/intent_body",
+                "temporal_hold": "zero_order_hold_between_record_ticks",
+            }
+            if not isinstance(chassis, dict) or any(
+                chassis.get(key) != value for key, value in expected_chassis.items()
+            ):
+                raise ValueError(
+                    f"{path}: missing or incompatible joystick chassis_action contract"
+                )
+        elif not action_frame.startswith("world"):
             raise ValueError(f"{path}: action_frame is not engage-origin world")
         if meta.get("state_axes") != list(STATE_AXES):
             raise ValueError(f"{path}: state axis order differs from the WBC contract")
-        if meta.get("action_axes") != list(ACTION_AXES):
-            raise ValueError(f"{path}: action axis order differs from the WBC contract")
         if not np.isfinite(float(meta["fps"])) or float(meta["fps"]) <= 0:
             raise ValueError(f"{path}: fps must be finite and positive")
         intrinsic = np.asarray(meta["intrinsic"])
@@ -402,6 +481,11 @@ class ManiFlowBundle:
             raise ValueError(f"{path}: point_frame {meta['point_frame']!r} is not world-frame")
         if meta["state_frame"] not in ("base", "world"):
             raise ValueError(f"{path}: unexpected state_frame {meta['state_frame']!r}")
+        if (
+            expected_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+            and meta["state_frame"] != "base"
+        ):
+            raise ValueError(f"{path}: joystick policy requires state_frame='base'")
         if self.conditioning_spec.needs_point_mask:
             point_mask = meta.get("point_mask")
             expected = {
@@ -451,9 +535,11 @@ class ManiFlowBundle:
         return (f"ManiFlow {type(self.policy).__name__} ({self.weights}) on {self.device}; "
                 f"point_cloud {self.num_points}x{POINT_CHANNELS} world-frame, crop "
                 f"{list(self.crop_min)}..{list(self.crop_max)}; state_frame={self.state_frame}; "
+                f"base_pose_source={self.base_pose_source or 'undeclared'}; "
                 f"position_condition={self.position_condition_mode}, "
                 f"sampling={self.point_sampling_mode}, mask_channels={self.mask_channels}, "
-                f"action_frame={self.action_frame_mode}; "
+                f"action={self.policy_action_schema}/{self.action_dim}D "
+                f"frame={self.action_target_frame}; "
                 f"n_obs_steps={self.n_obs_steps} n_action_steps={self.n_action_steps} "
                 f"num_inference_steps={self.num_inference_steps}; meta={self.meta_path}")
 
@@ -566,7 +652,7 @@ class ManiFlowBundle:
                 if self._torch.is_autocast_enabled("cuda"):
                     raise RuntimeError("ManiFlow policy warm-up leaked CUDA autocast")
                 action = result.get("action")
-                expected = (1, self.n_action_steps, len(ACTION_AXES))
+                expected = (1, self.n_action_steps, self.action_dim)
                 if action is None or tuple(action.shape) != expected:
                     shape = None if action is None else tuple(action.shape)
                     raise ValueError(
@@ -898,7 +984,15 @@ class ManiFlowBundle:
             "position_condition_mode": np.asarray(spec.position_condition_mode.encode()),
             "point_sampling_mode": np.asarray(spec.point_sampling_mode.encode()),
             "mask_channels": np.asarray(spec.mask_channels),
-            "action_frame_mode": np.asarray(spec.action_frame_mode.encode()),
+            "action_frame_mode": np.asarray(self.action_frame_mode.encode()),
+            "policy_action_schema": np.asarray(
+                self.policy_action_schema.encode()
+            ),
+            "policy_action_schema_provenance": np.asarray(
+                self.policy_action_schema_provenance.encode()
+            ),
+            "action_target_frame": np.asarray(self.action_target_frame.encode()),
+            "action_dim": np.asarray(self.action_dim, np.int64),
             "pointcloud_meta": np.asarray(str(self.meta_path).encode("utf-8")),
             "pointcloud_meta_sha256": np.asarray(
                 self.pointcloud_meta_sha256.encode()
@@ -909,6 +1003,13 @@ class ManiFlowBundle:
             "n_action_steps": np.asarray(self.n_action_steps, np.int64),
             "dataset_fps": np.asarray(self.dataset_fps, np.float64),
         }
+        if self.base_pose_source is not None:
+            metadata["base_pose_source"] = np.asarray(
+                self.base_pose_source.encode()
+            )
+            metadata["base_pose_source_provenance"] = np.asarray(
+                self.base_pose_source_provenance.encode()
+            )
         if spec.action_frame_mode == "mof":
             metadata.update({
                 "mof_enabled_experts": np.asarray(
@@ -1146,7 +1247,7 @@ class ManiFlowBundle:
         ) for index in range(len(raws))]
 
     def predict_chunk(self, obs_history) -> np.ndarray:
-        """One forward pass -> ``(n_action_steps, 29)`` float32 ABSOLUTE world actions.
+        """One forward pass -> schema-selected 29-D or 32-D policy actions.
 
         ``obs_history`` is oldest-first at the dataset cadence, at most ``n_obs_steps``
         long; a shorter history is left-padded by repeating the oldest sample, matching
@@ -1197,14 +1298,15 @@ class ManiFlowBundle:
         policy_s = time.perf_counter() - policy_t0
         memory = self._record_device_memory()
         chunk = result["action"]
+        action_dim = int(getattr(self, "action_dim", len(ACTION_AXES)))
         if chunk.ndim != 3 or chunk.shape[0] != 1 or chunk.shape[1] != self.n_action_steps:
             raise ValueError(
                 f"predict_action returned {tuple(chunk.shape)}; expected "
-                f"(1, {self.n_action_steps}, {len(ACTION_AXES)})")
+                f"(1, {self.n_action_steps}, {action_dim})")
         out = np.asarray(
             chunk.detach().cpu().numpy(), dtype=np.float32
         ).reshape(-1, chunk.shape[-1])
-        if out.shape != (self.n_action_steps, len(ACTION_AXES)) or not np.all(np.isfinite(out)):
+        if out.shape != (self.n_action_steps, action_dim) or not np.all(np.isfinite(out)):
             raise ValueError(f"bad action chunk {out.shape} (or non-finite)")
         if self._last_inference_trace is None:
             self._last_inference_trace = {}

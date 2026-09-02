@@ -58,9 +58,9 @@ def validate_config(
     default_ang_speed: float,
 ) -> None:
     """Validate closed-loop config and its fallback speed limits."""
-    if config.source not in ("none", "odom"):
+    if config.source not in ("none", "odom", "arkit"):
         raise ValueError(
-            "--closed-loop-source must be one of 'none' or 'odom', "
+            "--closed-loop-source must be one of 'none', 'odom' or 'arkit', "
             f"got {config.source!r}"
         )
     positive = {
@@ -158,6 +158,7 @@ def project_planar_twist_single_axis(
     deadband: float,
     hysteresis_ratio: float = 0.0,
     prev_axis: Optional[int] = None,
+    retain_axis_on_quiet: bool = False,
 ) -> tuple[np.ndarray, Optional[int]]:
     """Keep only the dominant planar-twist axis (vx XOR vy XOR wz); zero the others.
 
@@ -170,7 +171,8 @@ def project_planar_twist_single_axis(
     different axis beats it by that fraction (and only while ``prev_axis`` itself stays at or
     above ``deadband``), so two near-equal axes do not chatter the chassis at the loop rate.
     Returns ``(projected_twist, active_axis)``; thread ``active_axis`` back in as ``prev_axis``
-    next tick (reset to ``None`` on hold / standstill).
+    next tick. By default quiet clears the axis. ``retain_axis_on_quiet=True`` instead returns
+    ``prev_axis`` with a zero command, for WBIK to preserve axis memory across quiet solves.
     """
     out = np.asarray(twist, dtype=np.float64).copy()
     if out.shape != (3,):
@@ -187,7 +189,7 @@ def project_planar_twist_single_axis(
     norm = np.abs(out) / caps
     k = int(np.argmax(norm))
     if norm[k] < deadband:
-        return np.zeros(3), None
+        return np.zeros(3), prev_axis if retain_axis_on_quiet else None
     if (
         prev_axis is not None
         and prev_axis != k

@@ -65,6 +65,7 @@ class JoystickBaseShaper:
     xy_max_vel: float                 # WBC base_xy_max_vel (single-axis normalization)
     yaw_max_vel: float                # WBC base_yaw_max_vel
     single_axis_deadband: float
+    dispatch_single_axis_deadband: float
     single_axis_hysteresis_ratio: float
     intent_xy_max_vel: float           # joystick mapping cap used to normalize stick intent
     intent_yaw_max_vel: float
@@ -170,6 +171,7 @@ class JoystickBaseShaper:
             xy_max_vel=self.xy_max_vel,
             yaw_max_vel=self.yaw_max_vel,
             single_axis_deadband=self.single_axis_deadband,
+            dispatch_single_axis_deadband=self.dispatch_single_axis_deadband,
             single_axis_hysteresis_ratio=self.single_axis_hysteresis_ratio,
             prev_axis=self.prev_axis,
             preferred_axis=intent_axis,
@@ -198,6 +200,7 @@ class JoystickBaseShaper:
             xy_max_vel=float(cfg.base_xy_max_vel),
             yaw_max_vel=float(cfg.base_yaw_max_vel),
             single_axis_deadband=float(cfg.base_single_axis_deadband),
+            dispatch_single_axis_deadband=float(cfg.base_dispatch_single_axis_deadband),
             single_axis_hysteresis_ratio=float(cfg.base_single_axis_hysteresis_ratio),
             intent_xy_max_vel=float(args.joystick_stick_max_vx),
             intent_yaw_max_vel=float(args.joystick_stick_max_wz),

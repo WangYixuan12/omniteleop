@@ -80,11 +80,19 @@ def load_reference_ee_poses(
     ik: Optional[VegaWholeBodyIK] = None,
     *,
     frame_idx: int = -1,
+    target_frame: str = "world",
 ) -> Optional[tuple[np.ndarray, np.ndarray]]:
     """Load reference L/R EEF poses from a raw-data episode's observed frame.
 
-    By default this reconstructs the final recorded frame.
+    By default this reconstructs the final recorded frame in the engage-origin
+    ``world`` frame. ``target_frame="base"`` holds the model root at zero and is
+    required by joystick control, whose Cartesian targets are interpreted in the
+    robot's current base at every tick.
     """
+    if target_frame not in {"world", "base"}:
+        raise ValueError(
+            f"target_frame must be 'world' or 'base', got {target_frame!r}"
+        )
     ref_path = optional_reference_path(path)
     if ref_path is None:
         return None
@@ -124,7 +132,7 @@ def load_reference_ee_poses(
             HEAD_JOINTS,
             _episode_joint_frame(f, "obs/joint/head", HEAD_JOINTS, frame_idx),
         )
-        if "obs/base/pose" in f:
+        if target_frame == "world" and "obs/base/pose" in f:
             base = np.asarray(f["obs/base/pose"], dtype=float)
             if base.ndim != 2 or base.shape[1] != 3:
                 raise ValueError(

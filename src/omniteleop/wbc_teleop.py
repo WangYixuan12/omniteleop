@@ -28,6 +28,7 @@ follower tests, the same discipline as :mod:`omniteleop.wbc_stream`.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -261,17 +262,24 @@ class VRJointSubscriber:
         self.node = Node(name=name, namespace=namespace)
         self.topic = get_config().get_topic("vr_joints", "vr/joints")
         self._latest: Optional[VRJointData] = None
+        # Replace the decoded command together with the local wall-clock instant at
+        # which its subscriber callback ran. The follower records this separately from
+        # VRJointData.timestamp_ns (leader publish time), making delivery/queue latency
+        # measurable instead of folding it into the episode commit timestamp.
+        self._latest_sample: Optional[tuple[VRJointData, int]] = None
         self._sink = sink
         self.sub = self.node.create_subscriber(
             self.topic, self._on_msg, decoder=DictDataCodec.decode
         )
 
     def _on_msg(self, data: dict) -> None:
+        receive_wall_ns = time.time_ns()
         try:
             vr = VRJointData(**data)
         except (TypeError, ValueError):
             return  # ignore malformed frames
         self._latest = vr
+        self._latest_sample = (vr, receive_wall_ns)
         if self._sink is not None:
             try:
                 self._sink(vr)
@@ -282,6 +290,15 @@ class VRJointSubscriber:
     def latest(self) -> Optional[VRJointData]:
         """Most recently received ``VRJointData`` (None before the first frame)."""
         return self._latest
+
+    @property
+    def latest_sample(self) -> Optional[tuple[VRJointData, int]]:
+        """Latest command plus its local subscriber-callback wall timestamp.
+
+        The tuple is replaced in one assignment, so the command and receive stamp cannot
+        be torn across two Zenoh callbacks when the 100 Hz follower reads them.
+        """
+        return self._latest_sample
 
     @property
     def done(self) -> bool:

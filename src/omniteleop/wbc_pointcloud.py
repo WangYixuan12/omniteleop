@@ -6,11 +6,13 @@ reproduce this preprocessing BIT-FOR-BIT -- a train/deploy mismatch in the frame
 crop, or the depth scale silently poisons the policy (same reason ``wbc_policy_format``
 is shared by the porter and the rollout).
 
-Frame convention: points are expressed in the ENGAGE-ORIGIN WORLD frame -- the same
-frame as the 29-D ``action`` targets, the ``observation.state[29:32]`` odometry anchor,
-and the SceneDiff object positions. The base MOVES, so the head pose must be composed
-through the odometry (``world_T_zed = world_T_base @ base_T_zed``); a base-frame or
-camera-frame cloud would not share the action frame. The camera is the ZED
+Frame convention: points are expressed in the ENGAGE-ORIGIN WORLD frame, matching the
+29-D WBC action targets, ``observation.state[29:32]`` odometry anchor, and SceneDiff
+object positions. A 32-D joystick policy deliberately keeps its action targets in the
+current-base frame while observing this world cloud plus a base-frame proprioceptive
+state; that mixed observation/action frame contract is explicit in the dataset sidecar.
+The base MOVES, so the head pose must be composed through odometry
+(``world_T_zed = world_T_base @ base_T_zed``). The camera is the ZED
 ``zed_depth_frame`` (optical: z forward, x right, y down), matching the pinhole
 backprojection below.
 
@@ -159,11 +161,23 @@ def crop_workspace(
     crop_max: tuple[float, float, float] = CROP_MAX,
     *,
     return_mask: bool = False,
+    frame_t_world: np.ndarray | None = None,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
-    """Keep only the points strictly inside the world-frame workspace box.
+    """Keep only the points strictly inside the workspace box.
 
     ``return_mask=True`` additionally returns the (M,) keep mask over the INPUT rows,
     so per-point side data can follow the same selection.
+
+    ``frame_t_world`` (4,4) makes the box FOLLOW A MOVING FRAME -- pass ``base_T_world`` to crop
+    in the robot's base frame. Points are tested after transforming by it and returned unchanged
+    in world coordinates, so only the selection changes. Default None keeps the historical
+    fixed-world-box behaviour bit-for-bit.
+
+    A fixed world box cannot describe a long-horizon take at all: on the sim dish2rack episodes
+    the two objects span y in [-3.52, +0.33] against a box covering [-0.90, +1.05], and z in
+    [+0.22, +0.75] against a box starting at +0.60, so the destination falls entirely outside it.
+    Widening the box to the whole route (1.05 x 3.85 m of floor) instead spreads the 1024-point
+    budget over mostly-empty room.
     """
     if cloud.ndim != 2 or cloud.shape[1] != POINT_CHANNELS:
         raise ValueError(f"cloud must be (M, {POINT_CHANNELS}), got {cloud.shape}")
@@ -173,7 +187,14 @@ def crop_workspace(
         raise ValueError(f"crop bounds must be 3-vectors, got {lo.shape}, {hi.shape}")
     if not np.all(lo < hi):
         raise ValueError(f"crop_min {crop_min} must be strictly below crop_max {crop_max}")
-    keep = np.all((cloud[:, :3] > lo) & (cloud[:, :3] < hi), axis=1)
+    xyz = cloud[:, :3]
+    if frame_t_world is not None:
+        frame_t_world = np.asarray(frame_t_world, dtype=np.float64)
+        if frame_t_world.shape != (4, 4) or not np.all(np.isfinite(frame_t_world)):
+            raise ValueError(f"frame_t_world must be a finite (4,4), got {frame_t_world.shape}")
+        xyz = (frame_t_world[:3, :3] @ xyz.T.astype(np.float64)).T + frame_t_world[:3, 3]
+        xyz = xyz.astype(np.float32)
+    keep = np.all((xyz > lo) & (xyz < hi), axis=1)
     if return_mask:
         return cloud[keep], keep
     return cloud[keep]
@@ -190,6 +211,7 @@ def build_world_cloud(
     min_depth: float = MIN_DEPTH_M,
     max_depth: float = MAX_DEPTH_M,
     return_pixel_index: bool = False,
+    frame_t_world: np.ndarray | None = None,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Unproject + crop one head frame into a variable-length ``(M, 6)`` world cloud.
 
@@ -199,11 +221,12 @@ def build_world_cloud(
     if not return_pixel_index:
         cloud = unproject_head_frame(depth_mm, rgb, intrinsic, world_t_cam,
                                      min_depth=min_depth, max_depth=max_depth)
-        return crop_workspace(cloud, crop_min, crop_max)
+        return crop_workspace(cloud, crop_min, crop_max, frame_t_world=frame_t_world)
     cloud, pix_idx = unproject_head_frame(depth_mm, rgb, intrinsic, world_t_cam,
                                           min_depth=min_depth, max_depth=max_depth,
                                           return_pixel_index=True)
-    cropped, keep = crop_workspace(cloud, crop_min, crop_max, return_mask=True)
+    cropped, keep = crop_workspace(cloud, crop_min, crop_max, return_mask=True,
+                                   frame_t_world=frame_t_world)
     return cropped, pix_idx[keep]
 
 
@@ -301,3 +324,112 @@ def resample_clouds(
     if return_indices:
         return out, indices
     return out
+
+
+def build_resampled_world_clouds(
+    depth_mm: np.ndarray,
+    rgb: np.ndarray,
+    intrinsic: np.ndarray,
+    world_t_cam: np.ndarray,
+    *,
+    num_points: int,
+    pool_size: int,
+    rng: np.random.Generator,
+    crop_min: tuple[float, float, float] = CROP_MIN,
+    crop_max: tuple[float, float, float] = CROP_MAX,
+    min_depth: float = MIN_DEPTH_M,
+    max_depth: float = MAX_DEPTH_M,
+    masks: np.ndarray | None = None,
+    object_nums: int = 2,
+    crop_frames: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, dict[str, np.ndarray]]:
+    """Build a window of sampled clouds and optional labels through one row lineage.
+
+    Supplying ``masks`` changes neither point values nor RNG draws. Pixel labels follow
+    valid-depth selection, workspace crop, uniform pooling, and XYZ-only FPS indices.
+    """
+    depth_mm = np.asarray(depth_mm)
+    rgb = np.asarray(rgb)
+    world_t_cam = np.asarray(world_t_cam)
+    if depth_mm.ndim != 3:
+        raise ValueError(f"depth window must be (T,H,W), got {depth_mm.shape}")
+    frames, height, width = depth_mm.shape
+    if depth_mm.dtype != np.uint16:
+        raise ValueError(f"depth window must be uint16 millimetres, got {depth_mm.dtype}")
+    if rgb.shape != (frames, height, width, 3):
+        raise ValueError(
+            f"rgb window {rgb.shape} != {(frames, height, width, 3)}"
+        )
+    if rgb.dtype != np.uint8:
+        raise ValueError(f"rgb window must be uint8, got {rgb.dtype}")
+    intrinsic = np.asarray(intrinsic)
+    if intrinsic.shape != (3, 3) or not np.all(np.isfinite(intrinsic)):
+        raise ValueError(f"intrinsic must be a finite (3,3) matrix, got {intrinsic.shape}")
+    if world_t_cam.shape != (frames, 4, 4):
+        raise ValueError(
+            f"world_t_cam window {world_t_cam.shape} != {(frames, 4, 4)}"
+        )
+    if not np.all(np.isfinite(world_t_cam)):
+        raise ValueError("world_t_cam window contains non-finite values")
+    if frames < 1:
+        raise ValueError("observation window is empty")
+    if masks is not None:
+        masks = np.asarray(masks)
+        if masks.shape != (frames, height, width) or masks.dtype not in (
+            np.dtype(np.uint8), np.dtype(np.int8)
+        ):
+            raise ValueError(
+                f"masks must be {(frames, height, width)} uint8/int8, got "
+                f"{masks.shape} {masks.dtype}"
+            )
+        if masks.min() < 0 or masks.max() > object_nums:
+            raise ValueError(f"mask labels must be in [0,{object_nums}]")
+
+    clouds: list[np.ndarray] = []
+    labels: list[np.ndarray] = []
+    for frame_index in range(frames):
+        kwargs = dict(
+            crop_min=crop_min,
+            crop_max=crop_max,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            frame_t_world=None if crop_frames is None else crop_frames[frame_index],
+        )
+        if masks is None:
+            cloud = build_world_cloud(
+                depth_mm[frame_index], rgb[frame_index], intrinsic,
+                world_t_cam[frame_index], **kwargs
+            )
+        else:
+            cloud, pixel_indices = build_world_cloud(
+                depth_mm[frame_index], rgb[frame_index], intrinsic,
+                world_t_cam[frame_index], return_pixel_index=True, **kwargs
+            )
+            labels.append(masks[frame_index].ravel()[pixel_indices])
+        clouds.append(cloud)
+
+    point_mask = None
+    if masks is None:
+        point_cloud = resample_clouds(
+            clouds, num_points, pool_size=pool_size, rng=rng
+        )
+    else:
+        point_cloud, source_indices = resample_clouds(
+            clouds, num_points, pool_size=pool_size, rng=rng, return_indices=True
+        )
+        point_mask = np.stack([
+            frame_labels[source_indices[frame_index]]
+            for frame_index, frame_labels in enumerate(labels)
+        ]).astype(np.int8, copy=False)
+
+    diagnostics = {
+        "cropped_point_counts": np.asarray(
+            [len(cloud) for cloud in clouds], dtype=np.int64
+        ),
+    }
+    if point_mask is not None:
+        diagnostics["selected_label_counts"] = np.stack([
+            np.bincount(frame, minlength=object_nums + 1)
+            for frame in point_mask
+        ]).astype(np.int64, copy=False)
+    return point_cloud, point_mask, diagnostics

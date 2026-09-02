@@ -14,7 +14,7 @@ validate-then-swap hole without retaining all masks in memory.
 from __future__ import annotations
 
 import hashlib
-import logging
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,14 +31,172 @@ MASK_SEED_FRAME0 = (
     "tracker_render (bilinear+antialias+0.5, IoU-gated vs native seed)"
 )
 MASK_FRAME0_IOU_MIN = 0.8
+POINT_MASK_SELECTION = (
+    "index propagation through valid->crop->pool->FPS "
+    "(point_cloud bit-identical to a maskless build)"
+)
 
 DINO_DIM = 1280
 DINO_MODEL = "dinov3_vith16plus"
 DINO_SOURCE = "original/rgb_scenediff.png [0,1] + video_1 RLEs"
 DINO_INPUT_SCALE = "[0,1]"
 
+SCENE_POSITION_ERROR_MAX_M = 0.020
+SCENE_VALID_DEPTH_MIN_FRACTION = 0.95
+SCENE_WINSOR_FRACTION = 0.02
+
 _TASK_LABELS = (1, 2)
 _SHA256_HEX_LEN = 64
+
+
+def scene_consistency_report(
+    mask: np.ndarray,
+    depth_mm: np.ndarray,
+    intrinsic: np.ndarray,
+    world_t_cam: np.ndarray,
+    positions_task: np.ndarray,
+    *,
+    min_depth_m: float,
+    max_depth_m: float,
+) -> dict[str, np.ndarray]:
+    """Compute the full-depth, largest-component 2%-winsorized centroid gate."""
+    mask = np.asarray(mask)
+    depth_mm = np.asarray(depth_mm)
+    intrinsic = np.asarray(intrinsic, dtype=np.float64)
+    world_t_cam = np.asarray(world_t_cam, dtype=np.float64)
+    positions_task = np.asarray(positions_task, dtype=np.float64)
+    object_nums = int(positions_task.shape[0])
+    if mask.shape != depth_mm.shape or mask.ndim != 2:
+        raise ValueError(f"mask/depth shapes disagree: {mask.shape} / {depth_mm.shape}")
+    if mask.dtype not in (np.dtype(np.uint8), np.dtype(np.int8)):
+        raise ValueError(f"mask must be uint8/int8, got {mask.dtype}")
+    if positions_task.shape != (object_nums, 3) or object_nums < 1:
+        raise ValueError(f"positions_task must be (K,3), got {positions_task.shape}")
+    if intrinsic.shape != (3, 3) or world_t_cam.shape != (4, 4):
+        raise ValueError("intrinsic/world_t_cam have invalid shapes")
+    if mask.min() < 0 or mask.max() > object_nums:
+        raise ValueError(f"mask contains a label outside 0..{object_nums}")
+
+    depth_m = depth_mm.astype(np.float64) * 1e-3
+    valid_depth = (depth_m > min_depth_m) & (depth_m < max_depth_m)
+    centroids = np.empty((object_nums, 3), dtype=np.float64)
+    areas = np.empty(object_nums, dtype=np.int64)
+    largest_areas = np.empty(object_nums, dtype=np.int64)
+    valid_fractions = np.empty(object_nums, dtype=np.float64)
+    for slot in range(object_nums):
+        selected = (mask == slot + 1).astype(np.uint8)
+        areas[slot] = int(selected.sum())
+        if areas[slot] == 0:
+            raise ValueError(f"task slot {slot} mask is empty")
+        count, components, stats, _ = cv2.connectedComponentsWithStats(
+            selected, connectivity=8
+        )
+        if count <= 1:
+            raise ValueError(f"task slot {slot} has no connected component")
+        component_id = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        component = components == component_id
+        largest_areas[slot] = int(component.sum())
+        valid = component & valid_depth
+        valid_fractions[slot] = float(valid.sum()) / float(largest_areas[slot])
+        if valid_fractions[slot] < SCENE_VALID_DEPTH_MIN_FRACTION:
+            raise ValueError(
+                f"task slot {slot} valid-depth fraction {valid_fractions[slot]:.3f} "
+                f"< {SCENE_VALID_DEPTH_MIN_FRACTION:.3f}"
+            )
+        rows, cols = np.nonzero(valid)
+        z = depth_m[valid]
+        x = (cols - intrinsic[0, 2]) / intrinsic[0, 0] * z
+        y = (rows - intrinsic[1, 2]) / intrinsic[1, 1] * z
+        camera = np.stack((x, y, z, np.ones_like(z)), axis=1)
+        world = (world_t_cam @ camera.T).T[:, :3]
+        if not np.all(np.isfinite(world)):
+            raise ValueError(f"task slot {slot} has non-finite world points")
+        lower = np.quantile(world, SCENE_WINSOR_FRACTION, axis=0)
+        upper = np.quantile(world, 1.0 - SCENE_WINSOR_FRACTION, axis=0)
+        centroids[slot] = np.clip(world, lower, upper).mean(axis=0)
+
+    errors = np.linalg.norm(centroids - positions_task, axis=1)
+    return {
+        "mask_areas": areas,
+        "largest_component_areas": largest_areas,
+        "valid_depth_fractions": valid_fractions.astype(np.float32),
+        "centroids_world": centroids.astype(np.float32),
+        "position_errors_m": errors.astype(np.float32),
+    }
+
+
+def require_scene_consistency(*args, **kwargs) -> dict[str, np.ndarray]:
+    """Return the report or fail when either task slot exceeds the 20 mm contract."""
+    report = scene_consistency_report(*args, **kwargs)
+    errors = report["position_errors_m"]
+    if np.any(errors > SCENE_POSITION_ERROR_MAX_M):
+        raise ValueError(
+            f"live object position errors {errors.tolist()} exceed "
+            f"{SCENE_POSITION_ERROR_MAX_M:.3f} m"
+        )
+    return report
+
+
+def validate_live_condition_with_tracker(
+    owner,
+    condition,
+    fresh,
+    *,
+    min_depth_m: float,
+    max_depth_m: float,
+    stage_dir: Path | str,
+    tracker_compile: bool,
+) -> dict:
+    """Run one disposable validation session and persist its evidentiary report."""
+    if fresh.world_frame_epoch != condition.world_frame_epoch:
+        raise RuntimeError("world-frame epoch changed after object bootstrap")
+    if fresh.head_timestamp_ns <= condition.camera_timestamp_ns:
+        raise RuntimeError("validation RGB-D frame is not newer than the bootstrap")
+    capacity = max(16, int(owner.max_obj_ptrs_in_encoder))
+    with owner.start(
+        condition.bootstrap_rgb,
+        condition.seed_task_slots,
+        frame_capacity=capacity,
+    ) as validation_session:
+        validation_mask = validation_session.step_many(fresh.rgb[None])[0]
+        frame0_iou = np.asarray(validation_session.frame0_ious, np.float32)
+    report = require_scene_consistency(
+        validation_mask,
+        fresh.depth_mm,
+        condition.intrinsic,
+        fresh.world_t_cam,
+        condition.positions,
+        min_depth_m=min_depth_m,
+        max_depth_m=max_depth_m,
+    )
+    stage_dir = Path(stage_dir)
+    with (stage_dir / "validation_mask.npz").open("xb") as stream:
+        np.savez_compressed(
+            stream,
+            mask=validation_mask,
+            head_timestamp_ns=np.int64(fresh.head_timestamp_ns),
+            frame0_iou=frame0_iou,
+            **report,
+        )
+    with (stage_dir / "validation_capture.npz").open("xb") as stream:
+        np.savez_compressed(
+            stream,
+            rgb=fresh.rgb,
+            depth_mm=fresh.depth_mm,
+            world_t_cam=fresh.world_t_cam,
+            head_timestamp_ns=np.int64(fresh.head_timestamp_ns),
+            world_frame_epoch=np.int64(fresh.world_frame_epoch),
+        )
+    serializable = {
+        "head_timestamp_ns": int(fresh.head_timestamp_ns),
+        "world_frame_epoch": int(fresh.world_frame_epoch),
+        "tracker_compile": bool(tracker_compile),
+        "frame0_iou": frame0_iou.tolist(),
+        **{key: value.tolist() for key, value in report.items()},
+    }
+    with (stage_dir / "validation_report.json").open("x") as stream:
+        json.dump(serializable, stream, indent=2)
+    return serializable
 
 
 def _sha256_file(path: Path) -> str:
@@ -229,22 +387,16 @@ def validate_mask_artifact(
 
     initial_stat = path.stat()
     with np.load(path, allow_pickle=False) as npz:
-        has_schema = "artifact_schema" in npz.files
-        if has_schema:
-            schema = str(_required_scalar(npz, "artifact_schema", path))
-            if schema != MASK_ARTIFACT_SCHEMA:
-                raise ValueError(
-                    f"{path}: artifact_schema {schema!r} != {MASK_ARTIFACT_SCHEMA!r}"
-                )
-            if "tracked_rgb_sha256" not in npz.files:
-                raise ValueError(f"{path}: schema artifact is missing tracked_rgb_sha256")
-        elif "tracked_rgb_sha256" in npz.files:
+        schema = str(_required_scalar(npz, "artifact_schema", path))
+        if schema != MASK_ARTIFACT_SCHEMA:
             raise ValueError(
-                f"{path}: tracked_rgb_sha256 exists without artifact_schema"
+                f"{path}: artifact_schema {schema!r} != {MASK_ARTIFACT_SCHEMA!r}"
             )
+        if "tracked_rgb_sha256" not in npz.files:
+            raise ValueError(f"{path}: schema artifact is missing tracked_rgb_sha256")
 
         frame_count, height, width, rgb_digest = _raw_rgb_contract(
-            raw_hdf5, compute_digest=has_schema
+            raw_hdf5, compute_digest=True
         )
         masks = _required_array(
             npz,
@@ -318,14 +470,13 @@ def validate_mask_artifact(
             )
         _required_scalar(npz, "created", path)
 
-        if has_schema:
-            stored_rgb_sha = str(
-                _required_scalar(npz, "tracked_rgb_sha256", path)
+        stored_rgb_sha = str(
+            _required_scalar(npz, "tracked_rgb_sha256", path)
+        )
+        if len(stored_rgb_sha) != _SHA256_HEX_LEN or stored_rgb_sha != rgb_digest:
+            raise ValueError(
+                f"{path}: tracked_rgb_sha256 does not match {raw_hdf5}"
             )
-            if len(stored_rgb_sha) != _SHA256_HEX_LEN or stored_rgb_sha != rgb_digest:
-                raise ValueError(
-                    f"{path}: tracked_rgb_sha256 does not match {raw_hdf5}"
-                )
 
         if masks.min() < 0 or masks.max() > len(_TASK_LABELS):
             raise ValueError(f"{path}: masks contain a label outside 0..2")
@@ -389,13 +540,6 @@ def validate_mask_artifact(
         or initial_stat.st_mtime_ns != validated_stat.st_mtime_ns
     ):
         raise RuntimeError(f"{path}: mask artifact changed during validation")
-    if not has_schema:
-        logging.warning(
-            "%s: legacy mask artifact has no RGB content digest; exact path, slot, "
-            "positions, pixels, QC, and tracker contracts were verified. Rebuild or "
-            "restamp it with the current builder for full content provenance.",
-            path,
-        )
     return ValidatedMaskArtifact(
         path=path,
         frame_count=frame_count,
@@ -459,6 +603,9 @@ def load_dino_artifact(
         base_sha = str(_required_scalar(sidecar, "base_sha256", sidecar_npz))
         model = str(_required_scalar(sidecar, "dino_model", sidecar_npz))
         source = str(_required_scalar(sidecar, "dino_source", sidecar_npz))
+        input_scale = str(_required_scalar(
+            sidecar, "dino_input_scale", sidecar_npz
+        ))
         _required_scalar(sidecar, "created", sidecar_npz)
 
     if base_sha != _sha256_file(positions_npz):
@@ -469,6 +616,10 @@ def load_dino_artifact(
         raise ValueError(f"{sidecar_npz}: dino_model {model!r} != {DINO_MODEL!r}")
     if source != DINO_SOURCE:
         raise ValueError(f"{sidecar_npz}: dino_source {source!r} != {DINO_SOURCE!r}")
+    if input_scale != DINO_INPUT_SCALE:
+        raise ValueError(
+            f"{sidecar_npz}: dino_input_scale {input_scale!r} != {DINO_INPUT_SCALE!r}"
+        )
     if not np.array_equal(stored_order, base_order):
         raise ValueError(f"{sidecar_npz}: order disagrees with {positions_npz}")
     if not np.array_equal(stored_ids, base_ids):

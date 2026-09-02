@@ -92,7 +92,13 @@ class JoystickVRLeader(WBCVRLeader):
         self._joystick_axis_deadband = cfg.base_single_axis_deadband
         self._joystick_axis_hysteresis = joystick_cfg.single_axis_hysteresis_ratio
         self._joystick_axis: Optional[int] = None
-        super().__init__(args, wbc_config=cfg, teleop_config=teleop_cfg)
+        self._debug_sticks = bool(getattr(args, "debug_sticks", False))
+        super().__init__(
+            args,
+            wbc_config=cfg,
+            teleop_config=teleop_cfg,
+            reference_target_frame="base",
+        )
 
     def _calibrate(self, headset_pose: np.ndarray) -> None:
         # Engage is a fresh operator command sequence, matching the follower/IK latch reset.
@@ -180,18 +186,20 @@ class JoystickVRLeader(WBCVRLeader):
         else:
             self._joystick_axis = None
         vx, vy, wz = (float(v) for v in chassis)
-        # DIAGNOSTIC (temporary): print the RAW sticks the leader receives from WebXR and the
-        # mapped chassis, ~2 Hz. If the sticks read [0, 0] while you push them, the data is not
-        # reaching the leader (browser/reader); if they are non-zero but chassis is 0, it is the
-        # deadzone/mapping. Remove once the base drives.
-        now = time.perf_counter()
-        if now - getattr(self, "_dbg_stick_t", 0.0) > 0.5:
-            self._dbg_stick_t = now
-            print(f"\n[joystick dbg] L_stick={[round(float(x), 3) for x in left]} "
-                  f"R_stick={[round(float(x), 3) for x in right]} "
-                  f"click(L,R)=({transforms.get('left_thumbstick_click')},"
-                  f"{transforms.get('right_thumbstick_click')}) "
-                  f"-> vx={vx:+.2f} vy={vy:+.2f} wz={wz:+.2f}")
+        # Bring-up diagnostic, off unless --debug-sticks. Reads the RAW sticks WebXR delivers
+        # beside the mapped chassis twist at ~2 Hz, which separates the two ways the base
+        # stays still: sticks [0, 0] while you push them means the data is not reaching the
+        # leader (browser/reader), non-zero sticks with a zero chassis means the deadzone or
+        # the mapping.
+        if getattr(self, "_debug_sticks", False):
+            now = time.perf_counter()
+            if now - getattr(self, "_dbg_stick_t", 0.0) > 0.5:
+                self._dbg_stick_t = now
+                print(f"\n[joystick dbg] L_stick={[round(float(x), 3) for x in left]} "
+                      f"R_stick={[round(float(x), 3) for x in right]} "
+                      f"click(L,R)=({transforms.get('left_thumbstick_click')},"
+                      f"{transforms.get('right_thumbstick_click')}) "
+                      f"-> vx={vx:+.2f} vy={vy:+.2f} wz={wz:+.2f}")
         return vx, vy, wz
 
 
@@ -213,7 +221,8 @@ def main() -> None:
     parser.add_argument("--headset-hud", action=argparse.BooleanOptionalAction, default=True,
                         help="show the robot camera/status HUD in the Quest (default: enabled).")
     parser.add_argument("--hud-rate", type=float, default=DEFAULT_HEADSET_HUD_RATE,
-                        help=f"headset HUD refresh rate in Hz (default {DEFAULT_HEADSET_HUD_RATE:g}).")
+                        help="headset HUD refresh rate in Hz "
+                             f"(default {DEFAULT_HEADSET_HUD_RATE:g}).")
     parser.add_argument("--hud-cameras", nargs="+", choices=(
         "head_left_rgb", "head_right_rgb", "head_depth", "left_wrist_rgb", "right_wrist_rgb"
     ), default=list(_DEFAULT_HUD_CAMERAS),
@@ -232,6 +241,10 @@ def main() -> None:
                         help="averaging window for --calibrate-ee-offset (default 1.5).")
     parser.add_argument("--debug-vr", dest="debug_vr", default=None,
                         help="write a per-tick RAW-VR diagnostic HDF5 under this directory.")
+    parser.add_argument("--debug-sticks", action="store_true",
+                        help="print the raw WebXR thumbstick values beside the mapped chassis "
+                             "twist at ~2 Hz. Bring-up aid for a base that will not drive; "
+                             "off by default.")
     args = parser.parse_args()
 
     # Publish rate = follower cmd_rate from wbik.yaml (leader/follower cannot drift).

@@ -13,8 +13,12 @@ Emitted per split (``<out-root>/<name>_<split>.zarr``), the layout ManiFlow's
 
     data/point_cloud   (T, num_points, 6) float32   world XYZ + RGB[0,1]
     data/state         (T, 32)            float32   agent_pos
-    data/action        (T, 29)            float32
-    data/env_state     (T, object_nums*3) float32   only with --positions-dir; see below
+    data/action        (T, 29 or 32)      float32   schema-selected policy action
+    data/env_state     (T, object_nums*3) float32   legacy --positions-dir mode
+                       (T, 3, 2, 3)       float32   --structured-env-state-from-raw
+    data/task_sequence (T, 3)             int64     structured mode; categorical input
+    data/progress_index(T, 1)             int64     structured mode; target only
+    data/active_task_id(T, 1)             int64     structured mode; integrity target
     data/env_dino      (T, object_nums*D) float32   only with --dino: frame-0 DINOv3
                                                     region features (task-slot order),
                                                     constant per episode
@@ -25,8 +29,9 @@ Emitted per split (``<out-root>/<name>_<split>.zarr``), the layout ManiFlow's
 
 Point cloud (see ``omniteleop.wbc_pointcloud``): head depth is unprojected through the
 static intrinsic and the FK head pose composed with the odometry base pose, giving points
-in the ENGAGE-ORIGIN WORLD frame -- the same frame as the 29-D ``action`` targets, the
-``state[29:32]`` odometry anchor, and the SceneDiff object positions. Points are cropped
+in the ENGAGE-ORIGIN WORLD frame. Legacy WBC actions are 29-D engage-world targets;
+joystick actions are 32-D current-base targets plus the post-projection body-frame
+chassis intent. ``state[29:32]`` remains the engage-world odometry anchor. Points are cropped
 to the measured task volume, uniformly pooled, then farthest-point-sampled to
 ``--num-points``. Colours ride along because ManiFlow slices ``[..., :3]`` when
 ``use_pc_color=False``, making colour a train-time flag rather than a reconversion.
@@ -96,7 +101,16 @@ import numpy as np
 
 from omniteleop.wbc_artifacts import (
     DINO_INPUT_SCALE,
+    DINO_MODEL,
+    DINO_SOURCE,
+    MASK_ARTIFACT_SCHEMA,
+    MASK_FRAME0_IOU_MIN,
+    MASK_IMAGE_SIZE,
     MASK_LEGEND,
+    MASK_RGB_KEY,
+    MASK_SEED_FRAME0,
+    MASK_TRACKER,
+    POINT_MASK_SELECTION,
     ValidatedMaskArtifact,
     load_dino_artifact,
     validate_mask_artifact,
@@ -104,15 +118,23 @@ from omniteleop.wbc_artifacts import (
 from omniteleop.wbc_pointcloud import (
     CROP_MAX,
     CROP_MIN,
+    DEPTH_SCALE_M,
     MAX_DEPTH_M,
     MIN_DEPTH_M,
     POINT_CHANNELS,
+    build_resampled_world_clouds,
     build_world_cloud,
     resample_clouds,
     sampler_signature,
     world_t_head_from_state,
 )
-from omniteleop.wbc_policy_format import ACTION_AXES, STATE_AXES, WBCPolicyFK
+from omniteleop.wbc_policy_format import (
+    JOYSTICK_POLICY_ACTION_SCHEMA,
+    STATE_AXES,
+    WBC_POLICY_ACTION_SCHEMA,
+    WBCPolicyFK,
+    action_axes_for_policy_schema,
+)
 
 
 def _load_hdf5_porter():
@@ -144,6 +166,48 @@ DEFAULT_POOL_SIZE = 16384
 # short-window reads, large enough to compress well.
 DEFAULT_CHUNK_FRAMES = 32
 DEFAULT_STATE_FRAME = "world"
+
+
+def validate_camera_preprocessing_contract(work: list[dict]) -> dict:
+    """Require one exact native RGB-D/intrinsic contract across all source takes."""
+    expected = None
+    for item in work:
+        path = Path(item["path"])
+        with h5py.File(path, "r") as raw:
+            required = (
+                "obs/images/head_left_rgb",
+                "obs/images/head_depth",
+                "obs/images/intrinsic",
+            )
+            missing = [key for key in required if key not in raw]
+            if missing:
+                raise RuntimeError(f"{path}: missing camera datasets {missing}")
+            rgb = raw["obs/images/head_left_rgb"]
+            depth = raw["obs/images/head_depth"]
+            intrinsic = np.asarray(raw["obs/images/intrinsic"])
+            current = {
+                "head_image_hw": [int(rgb.shape[1]), int(rgb.shape[2])],
+                "rgb_dtype": str(rgb.dtype),
+                "depth_dtype": str(depth.dtype),
+                "intrinsic": intrinsic.astype(np.float64).tolist(),
+            }
+            if rgb.ndim != 4 or rgb.shape[-1] != 3 or rgb.dtype != np.uint8:
+                raise ValueError(f"{path}: invalid head RGB contract {rgb.shape} {rgb.dtype}")
+            if depth.shape != rgb.shape[:3] or depth.dtype != np.uint16:
+                raise ValueError(f"{path}: invalid head depth contract {depth.shape} {depth.dtype}")
+            if intrinsic.shape != (3, 3) or not np.all(np.isfinite(intrinsic)):
+                raise ValueError(f"{path}: invalid intrinsic {intrinsic.shape}")
+        if expected is None:
+            expected = current
+        elif current != expected:
+            raise ValueError(
+                f"{path}: camera preprocessing contract differs from the first episode: "
+                f"{current} != {expected}"
+            )
+    if expected is None:
+        raise ValueError("no source episodes to validate")
+    return expected
+
 
 def validate_all_episode_masks(
     masks_dir: Path,
@@ -209,15 +273,17 @@ def episode_arrays(hdf5_path: Path, fk: WBCPolicyFK, fps: int, *,
                    trim: tuple[int, int] | None, num_points: int, pool_size: int,
                    state_frame: str, crop_min: tuple[float, float, float],
                    crop_max: tuple[float, float, float], min_depth: float,
+                   crop_frame: str = "world",
                    max_depth: float, rng: np.random.Generator,
                    mask_artifact: ValidatedMaskArtifact | None = None,
+                   policy_action_schema: str = WBC_POLICY_ACTION_SCHEMA,
                    ) -> tuple[
                        np.ndarray, np.ndarray, np.ndarray, int, int, int,
                        np.ndarray | None,
                    ]:
     """Build one raw take's policy arrays and raw-frame window.
 
-    Returns ``(point_cloud (T',N,6), state (T',32), action (T',29), T_raw,
+    Returns ``(point_cloud (T',N,6), state (T',32), action (T',29|32), T_raw,
     raw_start, raw_end_exclusive, point_mask (T',N) int8 | None)``.
 
     ``T'`` is the kept window: the leading-NaN-gripper drop for a raw episode, or the
@@ -229,11 +295,26 @@ def episode_arrays(hdf5_path: Path, fk: WBCPolicyFK, fps: int, *,
     re-projection). The cloud values and the rng draw sequence are identical with and
     without masks.
     """
+    action_axes = action_axes_for_policy_schema(policy_action_schema)
     ep = porter.load_and_validate_episode(hdf5_path, fps)
-    start, end = porter._resolve_window(ep["frame_count"], ep["t0"], trim, hdf5_path)
+    if ep["policy_action_schema"] != policy_action_schema:
+        raise RuntimeError(
+            f"{hdf5_path}: episode policy action schema "
+            f"{ep['policy_action_schema']!r} != dataset schema "
+            f"{policy_action_schema!r}"
+        )
+    start, end = porter.resolve_episode_window(
+        ep["frame_count"], ep["t0"], trim, hdf5_path
+    )
     kept = end - start
     intrinsic = ep["intrinsic"]
     rgb, depth = ep["rgb"], ep["depth"]
+    if depth is None:
+        raise RuntimeError(
+            f"{hdf5_path}: point-cloud export requires obs/images/head_depth. "
+            "This stereo-only take is valid for image-policy export, but offline "
+            "FoundationStereo depth must be materialized before using the zarr porter."
+        )
 
     mask_frames = None
     if mask_artifact is not None:
@@ -250,45 +331,53 @@ def episode_arrays(hdf5_path: Path, fk: WBCPolicyFK, fps: int, *,
         mask_frames = mask_artifact.load_masks()
 
     states = np.empty((kept, len(STATE_AXES)), dtype=np.float32)
-    actions = np.empty((kept, len(ACTION_AXES)), dtype=np.float32)
-    clouds: list[np.ndarray] = []
-    labels: list[np.ndarray] = []
-
+    actions = np.empty((kept, len(action_axes)), dtype=np.float32)
     with h5py.File(hdf5_path, "r") as raw:
         for i, t in enumerate(range(start, end)):
-            action_eef, action_head = porter.load_action_targets_world(raw, t)
+            action_eef, action_head = porter.load_action_targets(raw, t)
             state, action = porter.compute_frame_state_action(
-                raw, t, fk, action_eef, action_head, state_frame=state_frame)
+                raw,
+                t,
+                fk,
+                action_eef,
+                action_head,
+                state_frame=state_frame,
+                policy_action_schema=policy_action_schema,
+            )
             states[i], actions[i] = state, action
-            if mask_frames is None:
-                clouds.append(build_world_cloud(
-                    depth[t], rgb[t], intrinsic,
-                    world_t_head_from_state(state, state_frame),
-                    crop_min=crop_min, crop_max=crop_max,
-                    min_depth=min_depth, max_depth=max_depth))
-            else:
-                cloud, pix_idx = build_world_cloud(
-                    depth[t], rgb[t], intrinsic,
-                    world_t_head_from_state(state, state_frame),
-                    crop_min=crop_min, crop_max=crop_max,
-                    min_depth=min_depth, max_depth=max_depth,
-                    return_pixel_index=True)
-                clouds.append(cloud)
-                labels.append(mask_frames[t].ravel()[pix_idx])
-
-    point_mask = None
-    if mask_frames is None:
-        point_cloud = resample_clouds(clouds, num_points, pool_size=pool_size, rng=rng)
-    else:
-        point_cloud, chosen = resample_clouds(
-            clouds, num_points, pool_size=pool_size, rng=rng, return_indices=True)
-        point_mask = np.empty((kept, num_points), dtype=np.int8)
-        for i in range(kept):
-            point_mask[i] = labels[i][chosen[i]].astype(np.int8)
+    world_t_cams = np.stack([
+        world_t_head_from_state(state, state_frame) for state in states
+    ])
+    # A fixed WORLD box cannot describe a take where the robot drives between stations: on the
+    # long-horizon sim episodes the objects span 3.85 m in y against a 1.95 m box, and the
+    # floor-standing receptacles sit below its z floor, so the destination is cropped away
+    # entirely. `--crop-frame base` carries the same box with the robot instead.
+    crop_frames = None
+    if crop_frame == "base":
+        from omniteleop.wbc_policy_format import base_pose_to_mat  # noqa: PLC0415
+        crop_frames = np.stack([
+            np.linalg.inv(base_pose_to_mat(state[29:32])) for state in states
+        ])
+    point_cloud, point_mask, diagnostics = build_resampled_world_clouds(
+        depth[start:end],
+        rgb[start:end],
+        intrinsic,
+        world_t_cams,
+        num_points=num_points,
+        pool_size=pool_size,
+        rng=rng,
+        crop_min=crop_min,
+        crop_max=crop_max,
+        crop_frames=crop_frames,
+        min_depth=min_depth,
+        max_depth=max_depth,
+        masks=None if mask_frames is None else mask_frames[start:end],
+    )
 
     logging.info("  %s: %d frames [%d,%d) of %d, crop kept %d..%d pts/frame%s",
                  hdf5_path.name, kept, start, end, ep["frame_count"],
-                 min(c.shape[0] for c in clouds), max(c.shape[0] for c in clouds),
+                 diagnostics["cropped_point_counts"].min(),
+                 diagnostics["cropped_point_counts"].max(),
                  "" if point_mask is None else
                  f", obj pts/frame {int((point_mask > 0).sum(1).min())}.."
                  f"{int((point_mask > 0).sum(1).max())}")
@@ -332,12 +421,26 @@ def _zarr_create_array(group, name: str, *, major: int, data=None, **kwargs):
 def write_split_zarr(zarr_path: Path, items: list[dict], fk: WBCPolicyFK, args,
                      rng: np.random.Generator,
                      env_state_by_key: dict[tuple[str, int], np.ndarray] | None,
+                     structured_by_key: dict[
+                         tuple[str, int],
+                         tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+                     ] | None,
                      env_dino_by_key: dict[tuple[str, int], np.ndarray] | None,
                      mask_artifacts: dict[
                          tuple[str, int], ValidatedMaskArtifact
                      ] | None,
                      ) -> tuple[int, int, list[dict]]:
     """Write one split incrementally; return episode/frame counts and raw provenance."""
+    policy_action_schema = getattr(
+        args, "policy_action_schema", WBC_POLICY_ACTION_SCHEMA
+    )
+    action_axes = tuple(
+        getattr(args, "action_axes", action_axes_for_policy_schema(policy_action_schema))
+    )
+    if action_axes != tuple(action_axes_for_policy_schema(policy_action_schema)):
+        raise ValueError(
+            f"action_axes do not match policy schema {policy_action_schema!r}"
+        )
     compressor = _zarr_blosc()
     root, major = _zarr_writable_root(zarr_path)
     data, meta = root.create_group("data"), root.create_group("meta")
@@ -352,15 +455,32 @@ def write_split_zarr(zarr_path: Path, items: list[dict], fk: WBCPolicyFK, args,
         dtype="float32", compressor=compressor)
     action_ds = _zarr_create_array(
         data, "action", major=major,
-        shape=(0, len(ACTION_AXES)), chunks=(100, len(ACTION_AXES)),
+        shape=(0, len(action_axes)), chunks=(100, len(action_axes)),
         dtype="float32", compressor=compressor)
     env_ds = None
-    if env_state_by_key is not None:
+    if structured_by_key is not None:
+        env_ds = _zarr_create_array(
+            data, "env_state", major=major,
+            shape=(0, 3, 2, 3), chunks=(100, 3, 2, 3),
+            dtype="float32", compressor=compressor)
+        task_sequence_ds = _zarr_create_array(
+            data, "task_sequence", major=major,
+            shape=(0, 3), chunks=(100, 3), dtype="int64", compressor=compressor)
+        progress_ds = _zarr_create_array(
+            data, "progress_index", major=major,
+            shape=(0, 1), chunks=(100, 1), dtype="int64", compressor=compressor)
+        active_task_ds = _zarr_create_array(
+            data, "active_task_id", major=major,
+            shape=(0, 1), chunks=(100, 1), dtype="int64", compressor=compressor)
+    elif env_state_by_key is not None:
         env_dim = args.object_nums * 3
         env_ds = _zarr_create_array(
             data, "env_state", major=major,
             shape=(0, env_dim), chunks=(100, env_dim),
             dtype="float32", compressor=compressor)
+        task_sequence_ds = progress_ds = active_task_ds = None
+    else:
+        task_sequence_ds = progress_ds = active_task_ds = None
     dino_ds = None
     if env_dino_by_key is not None:
         dino_dim = next(iter(env_dino_by_key.values())).shape[0]
@@ -369,6 +489,8 @@ def write_split_zarr(zarr_path: Path, items: list[dict], fk: WBCPolicyFK, args,
             shape=(0, dino_dim), chunks=(100, dino_dim),
             dtype="float32", compressor=compressor)
         dino_ds.attrs["dino_input_scale"] = DINO_INPUT_SCALE
+        dino_ds.attrs["dino_model"] = DINO_MODEL
+        dino_ds.attrs["dino_source"] = DINO_SOURCE
     mask_ds = None
     if mask_artifacts is not None:
         mask_ds = _zarr_create_array(
@@ -386,8 +508,10 @@ def write_split_zarr(zarr_path: Path, items: list[dict], fk: WBCPolicyFK, args,
             item["path"], fk, args.fps, trim=item["trim"], num_points=args.num_points,
             pool_size=args.pool_size, state_frame=args.state_frame,
             crop_min=tuple(args.crop_min), crop_max=tuple(args.crop_max),
+            crop_frame=args.crop_frame,
             min_depth=args.min_depth, max_depth=args.max_depth, rng=rng,
-            mask_artifact=mask_artifact)
+            mask_artifact=mask_artifact,
+            policy_action_schema=policy_action_schema)
         if raw_end - raw_start != len(states):
             raise RuntimeError(
                 f"{item['path']}: manifest raw window [{raw_start},{raw_end}) has "
@@ -398,8 +522,15 @@ def write_split_zarr(zarr_path: Path, items: list[dict], fk: WBCPolicyFK, args,
         state_ds.append(states)
         action_ds.append(actions)
         if env_ds is not None:
-            env_vec = env_state_by_key[key]
-            env_ds.append(np.tile(env_vec, (len(states), 1)))
+            if structured_by_key is not None:
+                condition, sequence, progress, active = structured_by_key[key]
+                env_ds.append(np.broadcast_to(condition, (len(states), 3, 2, 3)).copy())
+                task_sequence_ds.append(np.broadcast_to(sequence, (len(states), 3)).copy())
+                progress_ds.append(progress[raw_start:raw_end, None])
+                active_task_ds.append(active[raw_start:raw_end, None])
+            else:
+                env_vec = env_state_by_key[key]
+                env_ds.append(np.tile(env_vec, (len(states), 1)))
         if dino_ds is not None:
             dino_vec = env_dino_by_key[key]
             dino_ds.append(np.tile(dino_vec, (len(states), 1)))
@@ -437,9 +568,23 @@ def verify_split_zarr(
     """Reopen a written zarr and cross-check it against a fresh recomputation."""
     import zarr  # noqa: PLC0415
 
+    policy_action_schema = getattr(
+        args, "policy_action_schema", WBC_POLICY_ACTION_SCHEMA
+    )
+    action_axes = tuple(
+        getattr(args, "action_axes", action_axes_for_policy_schema(policy_action_schema))
+    )
+    if action_axes != tuple(action_axes_for_policy_schema(policy_action_schema)):
+        raise ValueError(
+            f"action_axes do not match policy schema {policy_action_schema!r}"
+        )
+
     root = zarr.open(str(zarr_path), mode="r")
     required = ["data/point_cloud", "data/state", "data/action", "meta/episode_ends"]
-    for flag, key in ((args.positions_dir, "env_state"), (args.dino, "env_dino"),
+    structured = bool(getattr(args, "structured_env_state_from_raw", False))
+    for flag, key in (((args.positions_dir is not None or structured), "env_state"),
+                      (structured, "task_sequence"), (structured, "progress_index"),
+                      (structured, "active_task_id"), (args.dino, "env_dino"),
                       (args.masks_dir, "point_mask")):
         if flag:
             required.append(f"data/{key}")
@@ -455,7 +600,7 @@ def verify_split_zarr(
     if point_cloud.shape[1:] != (args.num_points, POINT_CHANNELS):
         raise RuntimeError(f"{zarr_path}: point_cloud {point_cloud.shape[1:]} != "
                            f"({args.num_points}, {POINT_CHANNELS})")
-    if state.shape != (frames, len(STATE_AXES)) or action.shape != (frames, len(ACTION_AXES)):
+    if state.shape != (frames, len(STATE_AXES)) or action.shape != (frames, len(action_axes)):
         raise RuntimeError(f"{zarr_path}: state {state.shape} / action {action.shape} "
                            f"disagree with {frames} frames")
     for name, arr in (("point_cloud", point_cloud), ("state", state), ("action", action)):
@@ -473,21 +618,33 @@ def verify_split_zarr(
     # consumes rng draws sequentially from a per-split default_rng(seed), so a fresh
     # generator's first draw reproduces frame 0 of the first episode exactly.
     ep = porter.load_and_validate_episode(first_item["path"], args.fps)
-    start, _ = porter._resolve_window(ep["frame_count"], ep["t0"], first_item["trim"],
+    start, _ = porter.resolve_episode_window(ep["frame_count"], ep["t0"], first_item["trim"],
                                       first_item["path"])
     with h5py.File(first_item["path"], "r") as raw:
-        action_eef, action_head = porter.load_action_targets_world(raw, start)
+        action_eef, action_head = porter.load_action_targets(raw, start)
         exp_state, exp_action = porter.compute_frame_state_action(
-            raw, start, fk, action_eef, action_head, state_frame=args.state_frame)
+            raw,
+            start,
+            fk,
+            action_eef,
+            action_head,
+            state_frame=args.state_frame,
+            policy_action_schema=policy_action_schema,
+        )
     if not np.allclose(state[0], exp_state, atol=1e-4):
         raise RuntimeError(f"{zarr_path}: state[0] != recompute at raw frame {start}")
     if not np.allclose(action[0], exp_action, atol=1e-4):
         raise RuntimeError(f"{zarr_path}: action[0] != recompute at raw frame {start}")
 
     world_t_cam = world_t_head_from_state(exp_state, args.state_frame)
+    exp_frame_t_world = None
+    if args.crop_frame == "base":
+        from omniteleop.wbc_policy_format import base_pose_to_mat  # noqa: PLC0415
+        exp_frame_t_world = np.linalg.inv(base_pose_to_mat(exp_state[29:32]))
     exp_cloud, exp_pix = build_world_cloud(
         ep["depth"][start], ep["rgb"][start], ep["intrinsic"], world_t_cam,
         crop_min=tuple(args.crop_min), crop_max=tuple(args.crop_max),
+        frame_t_world=exp_frame_t_world,
         min_depth=args.min_depth, max_depth=args.max_depth, return_pixel_index=True)
     exp_pc, exp_chosen = resample_clouds(
         [exp_cloud], args.num_points, pool_size=args.pool_size,
@@ -533,6 +690,10 @@ def verify_split_zarr(
                 f"{zarr_path}: env_dino dino_input_scale attr "
                 f"{env_dino.attrs.get('dino_input_scale')!r} != {DINO_INPUT_SCALE!r}"
             )
+        if env_dino.attrs.get("dino_model") != DINO_MODEL:
+            raise RuntimeError(f"{zarr_path}: env_dino dino_model attr is invalid")
+        if env_dino.attrs.get("dino_source") != DINO_SOURCE:
+            raise RuntimeError(f"{zarr_path}: env_dino dino_source attr is invalid")
         first_ep_dino = np.asarray(env_dino[:int(episode_ends[0])])
         if not np.array_equal(first_ep_dino,
                               np.tile(exp_dino, (len(first_ep_dino), 1))):
@@ -554,16 +715,55 @@ def verify_split_zarr(
                                f"npz vector for {first_item['source']}/"
                                f"episode_{first_item['raw_index']}")
 
+    if structured:
+        condition, sequence, progress, active = porter.load_structured_env_state_from_raw(
+            first_item["path"]
+        )
+        first_end = int(episode_ends[0])
+        raw_start = porter.resolve_episode_window(
+            len(progress), porter.load_and_validate_episode(first_item["path"], args.fps)["t0"],
+            first_item["trim"], first_item["path"]
+        )[0]
+        stored_env = np.asarray(root["data/env_state"][:first_end])
+        stored_sequence = np.asarray(root["data/task_sequence"][:first_end])
+        stored_progress = np.asarray(root["data/progress_index"][:first_end, 0])
+        stored_active = np.asarray(root["data/active_task_id"][:first_end, 0])
+        if stored_env.shape != (first_end, 3, 2, 3) or stored_env.dtype != np.float32:
+            raise RuntimeError(f"{zarr_path}: invalid structured env_state {stored_env.shape}")
+        if not np.array_equal(stored_env, np.broadcast_to(condition, stored_env.shape)):
+            raise RuntimeError(f"{zarr_path}: structured env_state episode 0 is not constant")
+        if not np.array_equal(stored_sequence, np.broadcast_to(sequence, stored_sequence.shape)):
+            raise RuntimeError(f"{zarr_path}: task_sequence episode 0 differs from raw")
+        if not np.array_equal(stored_progress, progress[raw_start:raw_start + first_end]):
+            raise RuntimeError(f"{zarr_path}: progress_index episode 0 differs from raw")
+        if not np.array_equal(stored_active, active[raw_start:raw_start + first_end]):
+            raise RuntimeError(f"{zarr_path}: active_task_id episode 0 differs from raw")
+
     logging.info("verify[%s] OK: point_cloud=%s state=%s action=%s episodes=%d frames=%d%s",
                  zarr_path.name, point_cloud.shape, state.shape, action.shape,
                  len(episode_ends), frames,
-                 "" if args.positions_dir is None else " env_state=" + str(
+                 "" if args.positions_dir is None and not structured else " env_state=" + str(
                      tuple(root["data/env_state"].shape)))
 
 
 def write_meta_sidecar(zarr_path: Path, split: str, args, episodes: int, frames: int,
-                       episode_manifest: list[dict]) -> None:
+                       episode_manifest: list[dict], camera_contract: dict,
+                       base_pose_source: str,
+                       camera_alignment_contract: dict) -> None:
     """Record the exact preprocessing the live rollout must reproduce."""
+    policy_action_schema = getattr(
+        args, "policy_action_schema", WBC_POLICY_ACTION_SCHEMA
+    )
+    action_axes = tuple(
+        getattr(args, "action_axes", action_axes_for_policy_schema(policy_action_schema))
+    )
+    action_target_frame = getattr(
+        args,
+        "action_target_frame",
+        "current_base"
+        if policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+        else "world",
+    )
     if len(episode_manifest) != episodes:
         raise RuntimeError(
             f"episode manifest has {len(episode_manifest)} entries for {episodes} episodes"
@@ -580,12 +780,17 @@ def write_meta_sidecar(zarr_path: Path, split: str, args, episodes: int, frames:
     if expected_start != frames:
         raise RuntimeError(f"episode manifest terminates at {expected_start}, expected {frames}")
     meta = {
-        "schema": "wbc_maniflow_pointcloud_v2",
+        "schema": (
+            "wbc_maniflow_pointcloud_v4_structured_task_plan"
+            if getattr(args, "structured_env_state_from_raw", False)
+            else "wbc_maniflow_pointcloud_v3"
+        ),
         "split": split,
         "num_points": args.num_points,
         "point_channels": ["x", "y", "z", "r", "g", "b"],
-        "point_frame": "world (engage-origin, same as action targets)",
+        "point_frame": "world (engage-origin)",
         "crop_min": list(args.crop_min), "crop_max": list(args.crop_max),
+        "crop_frame": args.crop_frame,
         "min_depth_m": args.min_depth, "max_depth_m": args.max_depth,
         "pool_size": args.pool_size, "downsample": "uniform pool -> farthest point sample",
         # Exact downsampler identity; the live rollout refuses a mismatch (see
@@ -593,12 +798,38 @@ def write_meta_sidecar(zarr_path: Path, split: str, args, episodes: int, frames:
         # the deploy cloud away from the one the policy trained on).
         **sampler_signature(),
         "state_axes": list(STATE_AXES), "state_frame": args.state_frame,
-        "action_axes": list(ACTION_AXES),
-        "action_frame": "world (verbatim ik.solve targets, engage-origin)",
+        "base_pose_source": base_pose_source,
+        "camera_alignment_mode": camera_alignment_contract["mode"],
+        "camera_alignment_clock_domain": camera_alignment_contract["clock_domain"],
+        "camera_alignment_max_abs_skew_ns": camera_alignment_contract[
+            "max_abs_skew_ns"
+        ],
+        "camera_alignment_max_camera_age_ns": camera_alignment_contract[
+            "max_camera_age_ns"
+        ],
+        "camera_alignment_verified": bool(camera_alignment_contract["verified"]),
+        "policy_action_schema": policy_action_schema,
+        "action_axes": list(action_axes),
+        "action_frame": action_target_frame,
         "fps": args.fps, "episodes": episodes, "frames": frames,
         "seed": args.seed,
+        "rng_scheme": "numpy.default_rng(seed); one choice draw per frame",
+        "depth_scale_m": DEPTH_SCALE_M,
+        **camera_contract,
         "episode_manifest": episode_manifest,
     }
+    if policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA:
+        meta["chassis_action"] = {
+            "axes": list(action_axes[-3:]),
+            "frame": "current_base_body",
+            "source_dataset": "action/chassis/intent_body",
+            "meaning": (
+                "operator command after deadzone, enabled-DOF masking, and "
+                "single-axis projection; before integration, PD, slew limiting, "
+                "and dispatch"
+            ),
+            "temporal_hold": "zero_order_hold_between_record_ticks",
+        }
     if args.positions_dir is not None:
         meta["env_state"] = {
             "object_nums": args.object_nums,
@@ -607,6 +838,20 @@ def write_meta_sidecar(zarr_path: Path, split: str, args, episodes: int, frames:
             "positions_dir": str(args.positions_dir),
             "constant_per_episode": True,
         }
+    if getattr(args, "structured_env_state_from_raw", False):
+        meta["env_state"] = {
+            "shape": [3, 2, 3],
+            "task_names": ["drawer", "plate", "jar"],
+            "role_order": ["source", "destination"],
+            "frame": "world (engage-origin, same as point_cloud/action)",
+            "source": "raw task/env_state",
+            "constant_per_episode": True,
+        }
+        meta["task_plan"] = {
+            "task_sequence": "categorical policy input; supported [0,1,2] or [0,2,1]",
+            "progress_index": "target-only ordinal 0->1->2",
+            "active_task_id": "target-only integrity check: task_sequence[progress_index]",
+        }
     if args.dino:
         meta["env_dino"] = {
             "object_nums": args.object_nums,
@@ -614,14 +859,21 @@ def write_meta_sidecar(zarr_path: Path, split: str, args, episodes: int, frames:
                       "region features (see extract_object_dino_feats.py)",
             "constant_per_episode": True,
             "dino_input_scale": DINO_INPUT_SCALE,
+            "dino_model": DINO_MODEL,
+            "dino_source": DINO_SOURCE,
         }
     if args.masks_dir is not None:
         meta["point_mask"] = {
+            "artifact_schema": MASK_ARTIFACT_SCHEMA,
             "legend": MASK_LEGEND,
             "masks_dir": str(args.masks_dir),
-            "tracker": "sam3.1_multiplex (scene_diff build_wbc_masks.py)",
-            "selection": "index propagation through valid->crop->pool->FPS "
-                         "(point_cloud bit-identical to a maskless build)",
+            "tracker": MASK_TRACKER,
+            "builder": "scene_diff/scripts/build_wbc_masks.py",
+            "source_rgb_key": MASK_RGB_KEY,
+            "tracker_image_size": MASK_IMAGE_SIZE,
+            "seed_frame0": MASK_SEED_FRAME0,
+            "frame0_iou_min": MASK_FRAME0_IOU_MIN,
+            "selection": POINT_MASK_SELECTION,
         }
     with zarr_path.with_suffix(".meta.json").open("x") as stream:
         stream.write(json.dumps(meta, indent=2))
@@ -635,6 +887,11 @@ def convert(args) -> None:
             "confirming its contents are no longer needed, then rerun. This porter "
             "never reuses or overwrites an output root."
         )
+    structured = bool(getattr(args, "structured_env_state_from_raw", False))
+    if structured and args.positions_dir is not None:
+        raise ValueError(
+            "--structured-env-state-from-raw and --positions-dir are mutually exclusive"
+        )
     if args.dino and args.positions_dir is None:
         raise ValueError("--dino needs --positions-dir")
     if args.masks_dir is not None and args.positions_dir is None:
@@ -644,6 +901,22 @@ def convert(args) -> None:
         )
 
     work = porter.build_work_list(args.raw_dir, args.include_recovery_data)
+    base_pose_source = porter.validate_work_base_pose_contract(work)
+    policy_action_contract = porter.validate_work_policy_action_contract(work)
+    args.policy_action_schema = str(policy_action_contract["policy_action_schema"])
+    args.action_axes = tuple(policy_action_contract["action_axes"])
+    args.action_target_frame = str(policy_action_contract["action_target_frame"])
+    if (
+        args.policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+        and args.state_frame != "base"
+    ):
+        raise ValueError(
+            "joystick/current-base policy actions require --state-frame base; a "
+            "world-frame achieved-pose state would silently mix coordinate systems"
+        )
+    camera_alignment_contract = porter.validate_work_camera_alignment_contract(work)
+    porter.audit_work_list(work)
+    camera_contract = validate_camera_preprocessing_contract(work)
 
     explicit_split = args.split_csv is not None
     split_csv = args.split_csv if explicit_split else args.raw_dir / "split.csv"
@@ -653,24 +926,44 @@ def convert(args) -> None:
     elif explicit_split:
         raise RuntimeError(f"--split-csv not found: {split_csv}")
     else:
-        logging.info("No split csv at %s; all episodes -> train", split_csv)
+        logging.info(
+            "No split csv at %s; all episodes -> %s",
+            split_csv,
+            getattr(args, "default_split", porter.DEFAULT_SPLIT),
+        )
         split_map = {}
-    splits = porter.assign_splits(work, split_map, args.include_recovery_data)
+    splits = porter.assign_splits(
+        work,
+        split_map,
+        args.include_recovery_data,
+        default_split=getattr(args, "default_split", porter.DEFAULT_SPLIT),
+    )
 
     n_recovery = sum(item["source"] == "recovery" for item in work)
     logging.info("Port plan: %d episode(s) = %d raw + %d recovery -> {%s} "
-                 "(state_frame=%s, num_points=%d)", len(work), len(work) - n_recovery,
+                 "(state_frame=%s, action_schema=%s, base_pose_source=%s, "
+                 "num_points=%d)",
+                 len(work), len(work) - n_recovery,
                  n_recovery, ", ".join(f"{s}:{len(v)}" for s, v in splits.items()),
-                 args.state_frame, args.num_points)
+                 args.state_frame, args.policy_action_schema, base_pose_source,
+                 args.num_points)
 
     # Load and validate every external artifact before creating the output root.
     env_state_by_key = None
+    structured_by_key = None
     if args.positions_dir is not None:
         env_state_by_key = porter.validate_all_episode_positions(
             args.positions_dir, work, args.object_nums)
         logging.info("Position conditioning ON: %d env-state vector(s) (%d-D, world frame) "
                      "from %s", len(env_state_by_key), args.object_nums * 3,
                      args.positions_dir)
+    elif structured:
+        structured_by_key = porter.validate_all_structured_env_state(work)
+        logging.info(
+            "Structured task plan ON: %d episode(s), env_state (3,2,3), "
+            "categorical task_sequence + target-only progress/task labels",
+            len(structured_by_key),
+        )
     env_dino_by_key = None
     if args.dino:
         env_dino_by_key = validate_all_episode_dino(
@@ -701,11 +994,13 @@ def convert(args) -> None:
                 args,
                 rng,
                 env_state_by_key,
+                structured_by_key,
                 env_dino_by_key,
                 mask_artifacts,
             )
             write_meta_sidecar(
-                path, split, args, episodes, frames, episode_manifest
+                path, split, args, episodes, frames, episode_manifest,
+                camera_contract, base_pose_source, camera_alignment_contract,
             )
             first_key = (items[0]["source"], items[0]["raw_index"])
             first_mask = None if mask_artifacts is None else mask_artifacts[first_key]
@@ -740,15 +1035,21 @@ def main() -> None:
                         help=f"uniform pool before FPS (default {DEFAULT_POOL_SIZE})")
     parser.add_argument("--chunk-frames", type=int, default=DEFAULT_CHUNK_FRAMES)
     parser.add_argument("--state-frame", choices=("world", "base"), default=DEFAULT_STATE_FRAME,
-                        help="frame of the agent_pos EEF/head blocks. Default 'world' so "
-                             "agent_pos shares the frame of the point cloud and the action; "
-                             "'base' reproduces the LeRobot porter's egocentric state.")
+                        help="frame of the agent_pos EEF/head blocks. Default 'world' "
+                             "matches legacy WBC point-cloud/action data; 'base' is the "
+                             "egocentric LeRobot layout and is required automatically for "
+                             "32-D joystick/current-base actions.")
     parser.add_argument("--crop-min", type=float, nargs=3, default=list(CROP_MIN),
                         metavar=("X", "Y", "Z"),
                         help=f"world-frame workspace lower bound (default {CROP_MIN})")
     parser.add_argument("--crop-max", type=float, nargs=3, default=list(CROP_MAX),
                         metavar=("X", "Y", "Z"),
                         help=f"world-frame workspace upper bound (default {CROP_MAX})")
+    parser.add_argument("--crop-frame", "--crop_frame", dest="crop_frame",
+                        choices=("world", "base"), default="world",
+                        help="frame the workspace crop is expressed in. 'world' (default) is the "
+                             "fixed box hardware takes use; 'base' carries the box with the robot, "
+                             "which is required for long-horizon takes that drive between stations")
     parser.add_argument("--min-depth", type=float, default=MIN_DEPTH_M)
     parser.add_argument("--max-depth", type=float, default=MAX_DEPTH_M)
     parser.add_argument("--seed", type=int, default=0,
@@ -759,13 +1060,27 @@ def main() -> None:
                              "after the raw episodes. Requires <dir>/trim.csv, exactly as "
                              "scripts/port_wbc_mobile_hdf5.py.")
     parser.add_argument("--split-csv", "--split_csv", dest="split_csv", type=Path, default=None,
-                        help="CSV assigning episodes to train/val/test (default "
+                        help="CSV assigning episodes to a benchmark split (default "
                              "<raw-dir>/split.csv). Each split gets its own zarr.")
+    parser.add_argument(
+        "--default-split",
+        choices=porter.ALL_SPLITS,
+        default=porter.DEFAULT_SPLIT,
+        help="split assigned to episodes absent from split.csv; use this when "
+        "porting one collector split directory directly",
+    )
     parser.add_argument("--positions-dir", "--positions_dir", dest="positions_dir",
                         type=Path, default=None,
                         help="SceneDiff positions root (<dir>/<source>/episode_<N>.npz, "
                              "source in {raw, recovery}). Enables data/env_state; every "
                              "episode MUST have a valid npz.")
+    parser.add_argument(
+        "--structured-env-state-from-raw",
+        action="store_true",
+        help="load simulator-native task/env_state (3,2,3), task/task_sequence, "
+        "progress_index, and active_task_id directly from each raw HDF5 episode; "
+        "mutually exclusive with --positions-dir",
+    )
     parser.add_argument("--object-nums", "--object_nums", dest="object_nums", type=int,
                         default=porter.DEFAULT_OBJECT_NUMS,
                         help="conditioned objects per episode; env_state is "
@@ -789,6 +1104,10 @@ def main() -> None:
     if args.dino and args.positions_dir is None:
         raise SystemExit("--dino needs --positions-dir (the sidecars live next to the "
                          "positions NPZs)")
+    if args.structured_env_state_from_raw and args.positions_dir is not None:
+        raise SystemExit(
+            "--structured-env-state-from-raw and --positions-dir are mutually exclusive"
+        )
     if args.masks_dir is not None and args.positions_dir is None:
         raise SystemExit("--masks-dir needs --positions-dir so mask labels are verified "
                          "against the current SceneDiff slot mapping")
