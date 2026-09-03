@@ -9,7 +9,9 @@ also differs in Cartesian target frame and head mode, not only in how the base m
   * the base is EXCLUDED from the whole-body IK (``WBCConfig.lock_base_in_ik`` -> the QP
     coordinates torso + arms only, against a base held at the origin), and
   * the chassis is driven DIRECTLY from the leader's joystick ``chassis_vx/vy/wz`` through
-    the shared :class:`omniteleop.follower.joystick_base.JoystickBaseShaper` -- the SAME
+    the shared :class:`omniteleop.follower.joystick_base.JoystickBaseShaper`. Stick/model
+    magnitude is discarded after direction selection: translation uses one configured
+    fixed speed and yaw another. The intent then follows the SAME
     ``pd_twist`` -> ``shape_twist`` -> single-axis path the WBC follower applies to its QP
     base twist, so a take shapes the base identically in sim and on hardware. The head runs
     ``head_mode: track`` (neck pan/tilt via ``solve_head``; the base does NOT follow it).
@@ -39,7 +41,11 @@ import numpy as np
 
 from omniteleop.follower.joystick_base import JoystickBaseShaper
 from omniteleop.follower.whole_body_ik import VegaWholeBodyIK, WBCConfig
-from omniteleop.wbc_policy_format import JOYSTICK_POLICY_ACTION_SCHEMA
+from omniteleop.wbc_policy_format import (
+    JOYSTICK_FIXED_SPEED_MAPPING,
+    JOYSTICK_POLICY_ACTION_SCHEMA,
+    JOYSTICK_RAW_EPISODE_SCHEMA_V2,
+)
 from omniteleop.wbc_robot_util import base_quiet_dispatch, parse_enable_mask
 from omniteleop.wbc_teleop import (
     JoystickTeleopConfig,
@@ -63,7 +69,7 @@ ReplaySource = _base.ReplaySource
 _publish_abort_status = _base._publish_abort_status
 peek_next_episode_id = _base.peek_next_episode_id
 
-_JOYSTICK_RAW_EPISODE_SCHEMA = "omniteleop_joystick_mobile_raw/v1"
+_JOYSTICK_RAW_EPISODE_SCHEMA = JOYSTICK_RAW_EPISODE_SCHEMA_V2
 
 
 class JoystickHardwareDriver(HardwareDriver):
@@ -71,7 +77,7 @@ class JoystickHardwareDriver(HardwareDriver):
 
     Everything except the base -- homing, the per-joint clamp/dispatch, grippers, odometry,
     recording -- is inherited unchanged. ``_drive_base`` is overridden to shape the leader's
-    ``chassis_*`` joystick twist through :class:`JoystickBaseShaper` (whose integrated pose
+    ``chassis_*`` joystick direction through :class:`JoystickBaseShaper` (whose integrated pose
     reference is odometry-PD tracked and single-axis projected exactly like
     the WBC base path) and dispatch it with the SAME swerve quiet-hold logic as the parent.
     """
@@ -196,7 +202,7 @@ class JoystickHardwareDriver(HardwareDriver):
         """Keep policy intent and controller state beside the applied base command.
 
         ``action/chassis/intent_body`` is the 32-D joystick policy label: the
-        follower-effective intent after DOF masking/single-axis projection and before
+        follower-effective fixed-speed intent after DOF masking/single-axis projection and before
         integration, odometry feedback, slew limiting, or hardware dispatch. The parent
         already records the shaped command actually sent as ``action/joint/chassis_*``.
         """
@@ -245,6 +251,13 @@ class JoystickHardwareDriver(HardwareDriver):
             "chassis_intent_units": np.bytes_("m_per_s,m_per_s,rad_per_s"),
             "chassis_intent_stage": np.bytes_("post_mask_projection_pre_controller"),
             "chassis_intent_temporal_semantics": np.bytes_("zero_order_hold"),
+            "chassis_intent_mapping": np.bytes_(JOYSTICK_FIXED_SPEED_MAPPING),
+            "chassis_translation_speed_mps": np.float64(
+                self._shaper.translation_speed
+            ),
+            "chassis_rotation_speed_radps": np.float64(
+                self._shaper.rotation_speed
+            ),
             "applied_chassis_group": np.bytes_("action/joint"),
             "measured_chassis_group": np.bytes_("obs/joint"),
             "chassis_dataset_axes": np.asarray(
@@ -404,6 +417,8 @@ def _run_joystick_ik_mode(args: argparse.Namespace, enable: dict) -> None:
             "joystick_stick_max_vx": float(args.joystick_stick_max_vx),
             "joystick_stick_max_vy": float(args.joystick_stick_max_vy),
             "joystick_stick_max_wz": float(args.joystick_stick_max_wz),
+            "joystick_translation_speed": float(args.joystick_translation_speed),
+            "joystick_rotation_speed": float(args.joystick_rotation_speed),
             "joystick_single_axis_hysteresis_ratio": float(
                 args.joystick_single_axis_hysteresis_ratio
             ),
@@ -414,7 +429,8 @@ def _run_joystick_ik_mode(args: argparse.Namespace, enable: dict) -> None:
     print("=" * 72)
     print(f"[wbc_joystick_robot] REAL ROBOT (JOYSTICK base). enabled={enabled} grippers=on | "
           f"{'REPLAY ' + format(args.speed, 'g') + 'x' if replay else 'LIVE'} | "
-          f"base_max={args.base_max_speed:g}m/s | base_dofs={cfg.base_dofs} | "
+          f"fixed_speed={args.joystick_translation_speed:g}m/s,"
+          f"{args.joystick_rotation_speed:g}rad/s | base_dofs={cfg.base_dofs} | "
           f"torso_ik={'fixed' if cfg.lock_torso_in_ik else 'free'} | "
           f"single_axis={cfg.enable_base_single_axis}")
     if args.arkit_base != "off":

@@ -160,8 +160,10 @@ class VRTeleopConfig:
 
 @dataclass(frozen=True)
 class JoystickTeleopConfig:
-    """Joystick-specific intent-selection policy from ``joystick_teleop``."""
+    """Joystick-specific direction and speed policy from ``joystick_teleop``."""
 
+    translation_speed: float
+    rotation_speed: float
     single_axis_hysteresis_ratio: float
 
     @classmethod
@@ -197,10 +199,16 @@ class JoystickTeleopConfig:
                     f"{cfg_path}: {JOYSTICK_TELEOP_SECTION}.{name} must be a number, "
                     f"got {raw!r}"
                 ) from None
-            if not math.isfinite(value) or value < 0.0:
+            strictly_positive = name in {"translation_speed", "rotation_speed"}
+            invalid = (
+                not math.isfinite(value)
+                or (value <= 0.0 if strictly_positive else value < 0.0)
+            )
+            if invalid:
+                bound = "> 0" if strictly_positive else ">= 0"
                 raise ValueError(
                     f"{cfg_path}: {JOYSTICK_TELEOP_SECTION}.{name} must be finite and "
-                    f">= 0, got {raw!r}"
+                    f"{bound}, got {raw!r}"
                 )
             values[name] = value
         return cls(**values)
@@ -231,10 +239,12 @@ def bind_vr_teleop_args(args, config: VRTeleopConfig, *, head_track: bool = Fals
 def bind_joystick_teleop_args(
     args, vr_config: VRTeleopConfig, joystick_config: JoystickTeleopConfig
 ) -> None:
-    """Bind shared joystick intent scales onto a follower namespace."""
+    """Bind shared joystick direction-selection and fixed-speed policy."""
     args.joystick_stick_max_vx = vr_config.stick_max_vx
     args.joystick_stick_max_vy = vr_config.stick_max_vy
     args.joystick_stick_max_wz = vr_config.stick_max_wz
+    args.joystick_translation_speed = joystick_config.translation_speed
+    args.joystick_rotation_speed = joystick_config.rotation_speed
     args.joystick_single_axis_hysteresis_ratio = (
         joystick_config.single_axis_hysteresis_ratio
     )

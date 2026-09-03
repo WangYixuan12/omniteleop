@@ -3,8 +3,10 @@
 The joystick-teleop followers (``scripts/wbc_joystick_robot.py`` on hardware,
 ``scripts/wbc_joystick_record.py`` in SAPIEN) drive the chassis DIRECTLY from the
 controller thumbsticks instead of from the whole-body QP: the base is excluded from the
-IK (``WBCConfig.lock_base_in_ik``) and the operator commands ``chassis_vx/vy/wz`` by hand.
-This module turns that raw stick twist into a wheel command through the SAME closed-loop
+IK (``WBCConfig.lock_base_in_ik``) and the operator selects a chassis direction by hand.
+After deadband/masking/axis selection, this module maps every active translation to one
+fixed linear speed and every active turn to one fixed angular speed. It then turns that
+intent into a wheel command through the SAME closed-loop
 path the WBC followers use for their QP base twist -- ``pd_twist`` feedback on a base pose
 reference, then ``shape_twist`` (deadband -> clamp -> slew), post-deadband, the
 ``base_dofs`` policy mask, and the single-axis projection -- so a take recorded in sim
@@ -41,6 +43,38 @@ from omniteleop.follower.base_closed_loop import (
 )
 
 
+def fixed_speed_planar_twist(
+    twist: np.ndarray,
+    *,
+    translation_speed: float,
+    rotation_speed: float,
+) -> np.ndarray:
+    """Map nonzero planar intent to fixed translation/yaw speeds.
+
+    The x/y direction is preserved and normalized to ``translation_speed``; yaw keeps
+    only its sign and uses ``rotation_speed``. With the default single-axis policy this
+    produces exactly one of ``+/-translation_speed`` or ``+/-rotation_speed``. Keeping
+    the vector form also gives direction-only behavior if single-axis mode is disabled.
+    """
+    value = np.asarray(twist, dtype=float)
+    if value.shape != (3,) or not np.all(np.isfinite(value)):
+        raise ValueError(f"planar twist must be finite (3,), got {value!r}")
+    speeds = np.asarray([translation_speed, rotation_speed], dtype=float)
+    if not np.all(np.isfinite(speeds)) or np.any(speeds <= 0.0):
+        raise ValueError(
+            "fixed joystick translation/rotation speeds must be finite and > 0, "
+            f"got {speeds.tolist()}"
+        )
+
+    out = np.zeros(3, dtype=float)
+    linear_norm = float(np.linalg.norm(value[:2]))
+    if linear_norm > 0.0:
+        out[:2] = value[:2] * (float(translation_speed) / linear_norm)
+    if value[2] != 0.0:
+        out[2] = np.copysign(float(rotation_speed), value[2])
+    return out
+
+
 @dataclass
 class JoystickBaseShaper:
     """Shape a raw joystick body twist ``(vx, vy, wz)`` into a chassis command.
@@ -70,6 +104,8 @@ class JoystickBaseShaper:
     intent_xy_max_vel: float           # joystick mapping cap used to normalize stick intent
     intent_yaw_max_vel: float
     intent_hysteresis_ratio: float
+    translation_speed: float           # fixed active translation magnitude (m/s)
+    rotation_speed: float              # fixed active yaw magnitude (rad/s)
 
     # -- per-tick carry state (reset on engage; parked on hold) --------------------
     cmd_pose: np.ndarray = field(default_factory=lambda: np.zeros(3))
@@ -117,8 +153,12 @@ class JoystickBaseShaper:
         slew anchor, and single-axis latch.
         """
         allow_yaw_hold = self._allow_yaw_hold
-        max_lin = self.max_speed
-        max_ang = 2.0 * self.max_speed
+        # The shared base_max_speed remains a hard safety ceiling, but joystick motion
+        # has its own lower fixed-speed contract. Capping the PD correction here is
+        # essential: otherwise accumulated pose error could still accelerate the
+        # chassis above the operator-selected speed.
+        max_lin = min(self.max_speed, self.translation_speed)
+        max_ang = min(2.0 * self.max_speed, self.rotation_speed)
         # Feed-forward = the stick twist, STRICTLY masked to the base policy (no yaw-hold
         # exemption): in "xy" the operator's deliberate yaw is dropped so the reference
         # never rotates, the analog of the WBC follower's QP-pinned result.base_twist. The
@@ -141,6 +181,11 @@ class JoystickBaseShaper:
                 hysteresis_ratio=self.intent_hysteresis_ratio,
                 prev_axis=self.prev_axis,
             )
+        joy = fixed_speed_planar_twist(
+            joy,
+            translation_speed=self.translation_speed,
+            rotation_speed=self.rotation_speed,
+        )
         self.last_projected_joystick = np.asarray(joy, dtype=float).copy()
         self.last_intent_axis = intent_axis
         # Open-loop reference integrator (see module docstring).
@@ -205,4 +250,6 @@ class JoystickBaseShaper:
             intent_xy_max_vel=float(args.joystick_stick_max_vx),
             intent_yaw_max_vel=float(args.joystick_stick_max_wz),
             intent_hysteresis_ratio=float(args.joystick_single_axis_hysteresis_ratio),
+            translation_speed=float(args.joystick_translation_speed),
+            rotation_speed=float(args.joystick_rotation_speed),
         )

@@ -155,7 +155,11 @@ from omniteleop.wbc_policy_format import (
     ACTION_AXES,
     GRIPPER_BINARY_THRESHOLD,
     GRIPPER_DIMS,
+    JOYSTICK_FIXED_SPEED_MAPPING,
     JOYSTICK_POLICY_ACTION_SCHEMA,
+    JOYSTICK_RAW_EPISODE_SCHEMA_V1,
+    JOYSTICK_RAW_EPISODE_SCHEMA_V2,
+    JOYSTICK_RAW_EPISODE_SCHEMAS,
     SKIP_NORMALIZATION_DIMS,
     STATE_AXES,
     STATE_FRAMES,
@@ -210,21 +214,25 @@ _BASE_POSE_SOURCES = frozenset({"wheel_odometry", "arkit"})
 _RAW_SCHEMA_V3 = "omniteleop_wbc_mobile_raw/v3"
 _RAW_SCHEMA_V4 = "omniteleop_wbc_mobile_raw/v4"
 _RAW_SCHEMA_V5 = "omniteleop_wbc_mobile_raw/v5"
-_RAW_JOYSTICK_SCHEMA_V1 = "omniteleop_joystick_mobile_raw/v1"
+_RAW_JOYSTICK_SCHEMA_V1 = JOYSTICK_RAW_EPISODE_SCHEMA_V1
+_RAW_JOYSTICK_SCHEMA_V2 = JOYSTICK_RAW_EPISODE_SCHEMA_V2
 _RAW_SCHEMAS_WITH_EXPLICIT_BASE = frozenset({
     _RAW_SCHEMA_V3,
     _RAW_SCHEMA_V4,
     _RAW_SCHEMA_V5,
     _RAW_JOYSTICK_SCHEMA_V1,
+    _RAW_JOYSTICK_SCHEMA_V2,
 })
 _RAW_SCHEMAS_WITH_CAMERA_ALIGNMENT = frozenset({
-    _RAW_SCHEMA_V4, _RAW_SCHEMA_V5, _RAW_JOYSTICK_SCHEMA_V1,
+    _RAW_SCHEMA_V4, _RAW_SCHEMA_V5,
+    _RAW_JOYSTICK_SCHEMA_V1, _RAW_JOYSTICK_SCHEMA_V2,
 })
 _RAW_SCHEMAS_WITH_GRIPPER_PROVENANCE = frozenset({
-    _RAW_SCHEMA_V4, _RAW_SCHEMA_V5, _RAW_JOYSTICK_SCHEMA_V1,
+    _RAW_SCHEMA_V4, _RAW_SCHEMA_V5,
+    _RAW_JOYSTICK_SCHEMA_V1, _RAW_JOYSTICK_SCHEMA_V2,
 })
 _RAW_SCHEMAS_WITH_GRIPPER_REUSE = frozenset({
-    _RAW_SCHEMA_V5, _RAW_JOYSTICK_SCHEMA_V1,
+    _RAW_SCHEMA_V5, _RAW_JOYSTICK_SCHEMA_V1, _RAW_JOYSTICK_SCHEMA_V2,
 })
 
 # Strict ``episode_<int>.hdf5`` name; excludes any ``episode_*_debug.hdf5`` sidecar.
@@ -445,6 +453,23 @@ def _read_optional_hdf5_text(
     )
 
 
+def _read_required_positive_hdf5_scalar(
+    f: h5py.File, key: str, source: str | Path
+) -> float:
+    """Read one required finite positive numeric scalar dataset."""
+    if key not in f or not isinstance(f[key], h5py.Dataset):
+        raise RuntimeError(f"{source}: missing required scalar dataset {key}")
+    value = np.asarray(f[key][()])
+    if value.shape != () or value.dtype.kind not in "iuf":
+        raise RuntimeError(
+            f"{source}: {key} must be a numeric scalar, got {value.shape} {value.dtype}"
+        )
+    result = float(value)
+    if not np.isfinite(result) or result <= 0.0:
+        raise RuntimeError(f"{source}: {key} must be finite and > 0, got {result!r}")
+    return result
+
+
 def _inspect_open_base_pose_contract(
     f: h5py.File, source: str | Path
 ) -> dict[str, str | bool | None]:
@@ -604,14 +629,13 @@ def _inspect_open_policy_action_contract(
     }
 
     joystick_markers = (
-        raw_schema == _RAW_JOYSTICK_SCHEMA_V1,
+        raw_schema in JOYSTICK_RAW_EPISODE_SCHEMAS,
         policy_schema == JOYSTICK_POLICY_ACTION_SCHEMA,
         control_mode == "joystick",
     )
     is_joystick = any(joystick_markers)
     if is_joystick:
         expected = {
-            "raw schema": (raw_schema, _RAW_JOYSTICK_SCHEMA_V1),
             "meta/control_mode": (control_mode, "joystick"),
             "meta/policy_action_schema": (
                 policy_schema,
@@ -630,7 +654,10 @@ def _inspect_open_policy_action_contract(
                 "current_base",
             ),
         }
-        bad = [
+        bad = ([] if raw_schema in JOYSTICK_RAW_EPISODE_SCHEMAS else [
+            f"raw schema={raw_schema!r} (expected one of "
+            f"{sorted(JOYSTICK_RAW_EPISODE_SCHEMAS)!r})"
+        ]) + [
             f"{name}={actual!r} (expected {wanted!r})"
             for name, (actual, wanted) in expected.items()
             if actual != wanted
@@ -651,10 +678,63 @@ def _inspect_open_policy_action_contract(
                 f"{source}: action/chassis/intent_body frame count {intent.shape[0]} "
                 f"!= action/eef/left {f['action/eef/left'].shape[0]}"
             )
+        if raw_schema == _RAW_JOYSTICK_SCHEMA_V2:
+            intent_mapping = _read_optional_hdf5_text(
+                f, "meta/chassis_intent_mapping", source
+            )
+            if intent_mapping != JOYSTICK_FIXED_SPEED_MAPPING:
+                raise RuntimeError(
+                    f"{source}: meta/chassis_intent_mapping={intent_mapping!r}; "
+                    f"expected {JOYSTICK_FIXED_SPEED_MAPPING!r}"
+                )
+            translation_speed = _read_required_positive_hdf5_scalar(
+                f, "meta/chassis_translation_speed_mps", source
+            )
+            rotation_speed = _read_required_positive_hdf5_scalar(
+                f, "meta/chassis_rotation_speed_radps", source
+            )
+            linear_norm = np.linalg.norm(np.asarray(intent[:, :2], dtype=float), axis=1)
+            active_linear = linear_norm > 1e-8
+            active_yaw = np.abs(np.asarray(intent[:, 2], dtype=float)) > 1e-8
+            if np.any(
+                active_linear
+                & ~np.isclose(linear_norm, translation_speed, rtol=1e-5, atol=1e-7)
+            ):
+                row = int(np.flatnonzero(
+                    active_linear
+                    & ~np.isclose(
+                        linear_norm, translation_speed, rtol=1e-5, atol=1e-7
+                    )
+                )[0])
+                raise RuntimeError(
+                    f"{source}: fixed-direction chassis translation at frame {row} has "
+                    f"speed {linear_norm[row]:.9g}, expected {translation_speed:.9g} m/s"
+                )
+            if np.any(
+                active_yaw
+                & ~np.isclose(
+                    np.abs(intent[:, 2]), rotation_speed, rtol=1e-5, atol=1e-7
+                )
+            ):
+                row = int(np.flatnonzero(
+                    active_yaw
+                    & ~np.isclose(
+                        np.abs(intent[:, 2]), rotation_speed, rtol=1e-5, atol=1e-7
+                    )
+                )[0])
+                raise RuntimeError(
+                    f"{source}: fixed-direction chassis yaw at frame {row} has speed "
+                    f"{abs(float(intent[row, 2])):.9g}, expected "
+                    f"{rotation_speed:.9g} rad/s"
+                )
+        else:
+            intent_mapping = "analog_magnitude/v1"
+            translation_speed = None
+            rotation_speed = None
         resolved_schema = JOYSTICK_POLICY_ACTION_SCHEMA
         action_frame = "current_base"
     else:
-        if raw_schema == _RAW_JOYSTICK_SCHEMA_V1 or control_mode == "joystick":
+        if raw_schema in JOYSTICK_RAW_EPISODE_SCHEMAS or control_mode == "joystick":
             raise RuntimeError(f"{source}: malformed joystick policy contract")
         if policy_schema not in (None, WBC_POLICY_ACTION_SCHEMA):
             raise RuntimeError(
@@ -667,6 +747,9 @@ def _inspect_open_policy_action_contract(
                 )
         resolved_schema = WBC_POLICY_ACTION_SCHEMA
         action_frame = "world"
+        intent_mapping = None
+        translation_speed = None
+        rotation_speed = None
 
     return {
         "policy_action_schema": resolved_schema,
@@ -674,6 +757,9 @@ def _inspect_open_policy_action_contract(
         "action_target_frame": action_frame,
         "control_mode": control_mode or ("joystick" if is_joystick else "wbc"),
         "raw_schema": raw_schema,
+        "chassis_intent_mapping": intent_mapping,
+        "chassis_translation_speed_mps": translation_speed,
+        "chassis_rotation_speed_radps": rotation_speed,
     }
 
 
@@ -686,9 +772,9 @@ def inspect_episode_policy_action_contract(hdf5_path: Path) -> dict[str, object]
 
 def validate_work_policy_action_contract(work: list[dict]) -> dict[str, object]:
     """Require every take in one processed dataset to share one action meaning."""
-    contracts: dict[tuple[str, str], list[Path]] = {}
+    contracts: dict[tuple[object, ...], list[Path]] = {}
     failures: list[str] = []
-    first_by_key: dict[tuple[str, str], dict[str, object]] = {}
+    first_by_key: dict[tuple[object, ...], dict[str, object]] = {}
     for item in work:
         path = Path(item["path"])
         try:
@@ -696,6 +782,9 @@ def validate_work_policy_action_contract(work: list[dict]) -> dict[str, object]:
             key = (
                 str(contract["policy_action_schema"]),
                 str(contract["action_target_frame"]),
+                contract["chassis_intent_mapping"],
+                contract["chassis_translation_speed_mps"],
+                contract["chassis_rotation_speed_radps"],
             )
             contracts.setdefault(key, []).append(path)
             first_by_key.setdefault(key, contract)
@@ -710,12 +799,12 @@ def validate_work_policy_action_contract(work: list[dict]) -> dict[str, object]:
         raise RuntimeError("cannot validate policy action contract for an empty work list")
     if len(contracts) != 1:
         detail = ", ".join(
-            f"{schema}/{frame}={len(paths)} (e.g. {paths[0]})"
-            for (schema, frame), paths in sorted(contracts.items())
+            f"{key}={len(paths)} (e.g. {paths[0]})"
+            for key, paths in sorted(contracts.items(), key=lambda item: repr(item[0]))
         )
         raise RuntimeError(
-            "source episodes mix policy action contracts; keep joystick/current-base "
-            f"and WBC/world datasets separate: {detail}"
+            "source episodes mix policy action contracts; keep WBC/world, analog "
+            "joystick, and each fixed-speed joystick profile separate: " + detail
         )
     key = next(iter(contracts))
     return first_by_key[key]
@@ -2580,6 +2669,7 @@ def _write_meta(
     base_pose_source: str,
     camera_alignment_contract: dict,
     policy_action_schema: str = WBC_POLICY_ACTION_SCHEMA,
+    policy_action_contract: Mapping[str, object] | None = None,
     pose_action_offset: int = 0,
     object_nums: int | None = None,
     structured_env_state: bool = False,
@@ -2635,6 +2725,18 @@ def _write_meta(
             "chassis_intent_stage": "post_mask_projection_pre_controller",
             "chassis_intent_temporal_semantics": "zero_order_hold",
         })
+        if policy_action_contract is not None:
+            meta.update({
+                "chassis_intent_mapping": policy_action_contract[
+                    "chassis_intent_mapping"
+                ],
+                "chassis_translation_speed_mps": policy_action_contract[
+                    "chassis_translation_speed_mps"
+                ],
+                "chassis_rotation_speed_radps": policy_action_contract[
+                    "chassis_rotation_speed_radps"
+                ],
+            })
     # Constant ENV-state conditioning (only when --positions-dir was used).
     # Env-state is world-frame and per-episode CONSTANT.
     if structured_env_state:
@@ -3238,6 +3340,7 @@ def convert_dataset(
                 base_pose_source,
                 camera_alignment_contract,
                 policy_action_schema=policy_action_schema,
+                policy_action_contract=policy_action_contract,
                 pose_action_offset=pose_action_offset,
                 object_nums=object_nums if positions_dir is not None else None,
                 structured_env_state=structured_env_state_from_raw,

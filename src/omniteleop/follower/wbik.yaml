@@ -360,6 +360,11 @@ vr_teleop:
 
 # Joystick-pipeline-only axis switching policy.
 joystick_teleop:
+  # Direction-only base control: once a stick direction passes the deadband and wins
+  # single-axis selection, translation uses one fixed speed and yaw uses another.
+  # Stick magnitude does not modulate chassis speed.
+  translation_speed: 0.15  # m/s
+  rotation_speed: 0.25     # rad/s
   # Joystick direction is explicit operator intent: switch axes immediately instead of
   # retaining the previous axis with the QP-noise hysteresis used by WBC base motion.
   single_axis_hysteresis_ratio: 0.0

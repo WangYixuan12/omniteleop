@@ -10,6 +10,7 @@ exactly as the real joystick follower does:
     robot as the base moves;
   * the chassis is driven from the leader's joystick ``chassis_vx/vy/wz`` through the SAME
     :class:`omniteleop.follower.joystick_base.JoystickBaseShaper` the real follower uses, so
+    stick magnitude selects only direction, fixed translation/yaw speeds are applied, and
     the base is shaped identically in sim and on hardware;
   * head runs ``head_mode: track`` (neck pan/tilt via ``solve_head``; base does not follow).
 
@@ -71,6 +72,8 @@ def _shaper_args(
         base_yaw_hold_in_xy=vt.base_yaw_hold_in_xy,
         joystick_stick_max_vx=vt.stick_max_vx,
         joystick_stick_max_wz=vt.stick_max_wz,
+        joystick_translation_speed=joystick.translation_speed,
+        joystick_rotation_speed=joystick.rotation_speed,
         joystick_single_axis_hysteresis_ratio=joystick.single_axis_hysteresis_ratio,
     )
 
@@ -201,8 +204,11 @@ def main() -> None:
         source.start()
     t0 = time.perf_counter()
     last_print = 0.0
-    print("[wbc_joystick] base control: JOYSTICK -> shared JoystickBaseShaper (odom-PD + "
-          "shape_twist + single-axis) -> set_velocity; e-stop / failed solve zeros the base.")
+    print("[wbc_joystick] base control: JOYSTICK direction -> fixed "
+          f"{joystick_cfg.translation_speed:g}m/s translation / "
+          f"{joystick_cfg.rotation_speed:g}rad/s yaw -> shared JoystickBaseShaper "
+          "(odom-PD + shape_twist + single-axis) -> set_velocity; "
+          "e-stop / failed solve zeros the base.")
 
     try:
         while True:

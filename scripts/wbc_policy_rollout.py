@@ -156,6 +156,7 @@ from omniteleop.wbc_policy_format import (
     GRIPPER_BINARY_THRESHOLD,
     JOYSTICK_ACTION_AXES,
     JOYSTICK_POLICY_ACTION_SCHEMA,
+    JOYSTICK_RAW_EPISODE_SCHEMAS,
     STATE_AXES,
     WBC_POLICY_ACTION_SCHEMA,
     WBCPolicyFK,
@@ -1370,7 +1371,7 @@ class RecordedEpisodeSource:
             chassis_intent = (
                 self._required(f, "action/chassis/intent_body")
                 if (
-                    schema == "omniteleop_joystick_mobile_raw/v1"
+                    schema in JOYSTICK_RAW_EPISODE_SCHEMAS
                     or policy_schema == JOYSTICK_POLICY_ACTION_SCHEMA
                     or control_mode == "joystick"
                 )
@@ -1380,7 +1381,6 @@ class RecordedEpisodeSource:
         joystick = chassis_intent is not None
         if joystick:
             declarations = {
-                "meta/schema": (schema, "omniteleop_joystick_mobile_raw/v1"),
                 "meta/policy_action_schema": (
                     policy_schema, JOYSTICK_POLICY_ACTION_SCHEMA
                 ),
@@ -1389,7 +1389,10 @@ class RecordedEpisodeSource:
                 "meta/eef_target_frame": (eef_target_frame, "current_base"),
                 "meta/head_target_frame": (head_target_frame, "current_base"),
             }
-            bad = [
+            bad = ([] if schema in JOYSTICK_RAW_EPISODE_SCHEMAS else [
+                f"meta/schema={schema!r} (expected one of "
+                f"{sorted(JOYSTICK_RAW_EPISODE_SCHEMAS)!r})"
+            ]) + [
                 f"{key}={actual!r} (expected {expected!r})"
                 for key, (actual, expected) in declarations.items()
                 if actual != expected
@@ -1418,7 +1421,7 @@ class RecordedEpisodeSource:
             "omniteleop_wbc_mobile_raw/v3",
             "omniteleop_wbc_mobile_raw/v4",
             "omniteleop_wbc_mobile_raw/v5",
-            "omniteleop_joystick_mobile_raw/v1",
+            *JOYSTICK_RAW_EPISODE_SCHEMAS,
         } and declared_source is None:
             raise RuntimeError(
                 f"{self.path}: explicit-base raw replay is missing "

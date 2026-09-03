@@ -13,7 +13,11 @@ from omniteleop.wbc_policy_format import (
     GRIPPER_BINARY_THRESHOLD,
     GRIPPER_DIMS,
     JOYSTICK_ACTION_AXES,
+    JOYSTICK_FIXED_SPEED_MAPPING,
     JOYSTICK_POLICY_ACTION_SCHEMA,
+    JOYSTICK_RAW_EPISODE_SCHEMA_V1,
+    JOYSTICK_RAW_EPISODE_SCHEMA_V2,
+    JOYSTICK_RAW_EPISODE_SCHEMAS,
     POSITION_DIMS,
     ROTATION_DIMS,
     SKIP_NORMALIZATION_DIMS,
@@ -60,6 +64,12 @@ def test_joystick_action_schema_extends_wbc_with_body_twist():
     assert action_axes_for_policy_schema(JOYSTICK_POLICY_ACTION_SCHEMA) == JOYSTICK_ACTION_AXES
     with pytest.raises(ValueError, match="policy action schema"):
         action_axes_for_policy_schema("unknown/v99")
+
+    assert JOYSTICK_RAW_EPISODE_SCHEMAS == {
+        JOYSTICK_RAW_EPISODE_SCHEMA_V1,
+        JOYSTICK_RAW_EPISODE_SCHEMA_V2,
+    }
+    assert JOYSTICK_FIXED_SPEED_MAPPING == "fixed_direction/v1"
 
 
 def test_pos6d_roundtrip_preserves_pose_columns():

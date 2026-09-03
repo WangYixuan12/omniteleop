@@ -71,6 +71,12 @@ STATE_AXES = ACTION_AXES + BASE_AXES
 # hardware dispatch. It is therefore a human control decision rather than controller state.
 WBC_POLICY_ACTION_SCHEMA = "wbc_eef_head_v1"
 JOYSTICK_POLICY_ACTION_SCHEMA = "omniteleop_wbc_joystick_action/v1"
+JOYSTICK_RAW_EPISODE_SCHEMA_V1 = "omniteleop_joystick_mobile_raw/v1"
+JOYSTICK_RAW_EPISODE_SCHEMA_V2 = "omniteleop_joystick_mobile_raw/v2"
+JOYSTICK_RAW_EPISODE_SCHEMAS = frozenset(
+    {JOYSTICK_RAW_EPISODE_SCHEMA_V1, JOYSTICK_RAW_EPISODE_SCHEMA_V2}
+)
+JOYSTICK_FIXED_SPEED_MAPPING = "fixed_direction/v1"
 CHASSIS_INTENT_AXES = [
     "chassis_intent_vx_body",
     "chassis_intent_vy_body",

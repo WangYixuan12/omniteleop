@@ -21,7 +21,10 @@ from scipy.spatial.transform import Rotation
 
 from omniteleop.common.schemas import VRJointData
 from omniteleop.follower.base_closed_loop import integrate_se2
-from omniteleop.follower.joystick_base import JoystickBaseShaper
+from omniteleop.follower.joystick_base import (
+    JoystickBaseShaper,
+    fixed_speed_planar_twist,
+)
 from omniteleop.follower.whole_body_ik import (
     LEFT_EE_FRAME,
     RIGHT_EE_FRAME,
@@ -51,6 +54,8 @@ def _shaper_args(vt: VRTeleopConfig) -> SimpleNamespace:
         base_yaw_hold_in_xy=vt.base_yaw_hold_in_xy,
         joystick_stick_max_vx=vt.stick_max_vx,
         joystick_stick_max_wz=vt.stick_max_wz,
+        joystick_translation_speed=joystick.translation_speed,
+        joystick_rotation_speed=joystick.rotation_speed,
         joystick_single_axis_hysteresis_ratio=joystick.single_axis_hysteresis_ratio,
     )
 
@@ -114,15 +119,35 @@ def _drive(cfg, joy, ticks=300, blocked=False):
 
 def test_shaper_drives_forward():
     cmds, _ = _drive(WBCConfig(), [0.3, 0.0, 0.0])
-    assert cmds[-1][0] > 0.2 and abs(cmds[-1][1]) < 1e-9 and abs(cmds[-1][2]) < 1e-9
+    assert cmds[-1][0] == pytest.approx(0.15)
+    assert abs(cmds[-1][1]) < 1e-9 and abs(cmds[-1][2]) < 1e-9
 
 
 def test_shaper_command_speed_capped_when_blocked():
     # The reference itself is unbounded when blocked (no lead clamp); the emitted wheel
-    # command must still respect base_max_speed via pd_twist/shape_twist's limit_twist.
-    vt = VRTeleopConfig.from_yaml()
+    # Pose-error feedback must not exceed the lower joystick fixed-speed envelope.
+    joystick = JoystickTeleopConfig.from_yaml()
     cmds, _ = _drive(WBCConfig(), [0.3, 0.0, 0.0], ticks=400, blocked=True)
-    assert float(np.max(np.abs(cmds))) <= vt.base_max_speed + 1e-6
+    assert float(np.max(np.linalg.norm(cmds[:, :2], axis=1))) <= (
+        joystick.translation_speed + 1e-6
+    )
+    yaw_cmds, _ = _drive(WBCConfig(), [0.0, 0.0, 0.5], ticks=400, blocked=True)
+    assert float(np.max(np.abs(yaw_cmds[:, 2]))) <= joystick.rotation_speed + 1e-6
+
+
+def test_fixed_speed_mapping_preserves_direction_not_stick_magnitude():
+    slow = fixed_speed_planar_twist(
+        np.array([0.03, 0.04, -0.01]),
+        translation_speed=0.15,
+        rotation_speed=0.25,
+    )
+    fast = fixed_speed_planar_twist(
+        np.array([0.3, 0.4, -0.8]),
+        translation_speed=0.15,
+        rotation_speed=0.25,
+    )
+    np.testing.assert_allclose(slow, [0.09, 0.12, -0.25])
+    np.testing.assert_allclose(fast, slow)
 
 
 def test_shaper_single_axis_projection():
@@ -239,6 +264,8 @@ def _leader_stub(calib=None):
     L._joystick_yaw_max_vel = vt.stick_max_wz
     L._joystick_axis_deadband = cfg.base_single_axis_deadband
     L._joystick_axis_hysteresis = joystick_cfg.single_axis_hysteresis_ratio
+    L._joystick_translation_speed = joystick_cfg.translation_speed
+    L._joystick_rotation_speed = joystick_cfg.rotation_speed
     L._joystick_axis = None
     return m, L
 
@@ -281,11 +308,11 @@ def test_leader_thumbstick_right_drives_left_turns():
         return {"left_thumbstick": np.array(left), "right_thumbstick": np.array(right)}
 
     vx, vy, wz = L._thumbstick_to_chassis(stick([0, 0], [0, -1]))  # right up -> forward
-    assert vx > 0 and abs(vy) < 1e-9 and abs(wz) < 1e-9
+    assert vx == pytest.approx(0.15) and abs(vy) < 1e-9 and abs(wz) < 1e-9
     vx, vy, wz = L._thumbstick_to_chassis(stick([0, 0], [1, 0]))   # right right -> strafe
-    assert abs(vx) < 1e-9 and vy < 0 and abs(wz) < 1e-9
+    assert abs(vx) < 1e-9 and vy == pytest.approx(-0.15) and abs(wz) < 1e-9
     vx, vy, wz = L._thumbstick_to_chassis(stick([1, 0], [0, 0]))   # left right -> yaw
-    assert abs(vx) < 1e-9 and abs(vy) < 1e-9 and wz < 0
+    assert abs(vx) < 1e-9 and abs(vy) < 1e-9 and wz == pytest.approx(-0.25)
     vx, vy, wz = L._thumbstick_to_chassis(stick([0, 1], [0, 0]))   # left Y unused
     assert abs(vx) < 1e-9 and abs(vy) < 1e-9 and abs(wz) < 1e-9
 
@@ -300,7 +327,7 @@ def test_leader_publishes_diagonal_strafe_as_single_axis():
     vx, vy, wz = L._thumbstick_to_chassis(transforms)
 
     assert abs(vx) < 1e-9
-    assert vy < 0.0
+    assert vy == pytest.approx(-0.15)
     assert abs(wz) < 1e-9
     assert L._joystick_axis == 1
 
@@ -375,10 +402,11 @@ def test_real_follower_drive_base_and_hold():
     assert kind == "vel"
     assert abs(kw["vx"]) < 1e-9 and kw["vy"] > 0.0 and abs(kw["wz"]) < 1e-9
     np.testing.assert_allclose(d._dbg["rx_chassis"], [0.13, 0.17, 0.0])
-    np.testing.assert_allclose(d._dbg["projected_chassis"], [0.0, 0.17, 0.0])
+    np.testing.assert_allclose(d._dbg["projected_chassis"], [0.0, 0.15, 0.0])
     assert d._dbg["joystick_axis"] == 1
 
     metadata = d._recording_control_metadata()
+    assert metadata["schema"] == np.bytes_("omniteleop_joystick_mobile_raw/v2")
     assert metadata["control_mode"] == np.bytes_("joystick")
     assert metadata["demonstration_source"] == np.bytes_("human_teleoperation")
     assert metadata["eef_target_frame"] == np.bytes_("current_base")
@@ -388,6 +416,9 @@ def test_real_follower_drive_base_and_hold():
         "omniteleop_wbc_joystick_action/v1"
     )
     assert metadata["base_reference_source"] == np.bytes_("joystick_integrator")
+    assert metadata["chassis_intent_mapping"] == np.bytes_("fixed_direction/v1")
+    assert float(metadata["chassis_translation_speed_mps"]) == pytest.approx(0.15)
+    assert float(metadata["chassis_rotation_speed_radps"]) == pytest.approx(0.25)
     assert metadata["applied_chassis_group"] == np.bytes_("action/joint")
     assert metadata["measured_chassis_group"] == np.bytes_("obs/joint")
     np.testing.assert_array_equal(
@@ -524,6 +555,8 @@ def test_joystick_parser_supplies_every_inherited_driver_argument(monkeypatch):
     assert args.record_max_camera_skew_ms >= 0.0
     assert args.record_max_camera_age_ms > 0.0
     assert args.lock_torso_in_ik is None
+    assert args.joystick_translation_speed == pytest.approx(0.15)
+    assert args.joystick_rotation_speed == pytest.approx(0.25)
 
 
 def test_joystick_exception_path_quarantines_recording():
@@ -568,17 +601,26 @@ def test_joystick_raw_stream_replay_marks_head_targets_unfiltered(tmp_path):
     assert source._vr[0].chassis_vx == pytest.approx(0.2)
 
 
-def _write_joystick_replay_episode(path, *, include_intent: bool = True):
+def _write_joystick_replay_episode(
+    path,
+    *,
+    include_intent: bool = True,
+    schema: str = "omniteleop_joystick_mobile_raw/v1",
+):
     n = 2
     poses = np.broadcast_to(np.eye(4), (n, 4, 4)).copy()
     with h5py.File(path, "w") as f:
-        f["meta/schema"] = np.asarray(b"omniteleop_joystick_mobile_raw/v1")
+        f["meta/schema"] = np.asarray(schema.encode())
         f["meta/control_mode"] = np.asarray(b"joystick")
         f["meta/policy_action_schema"] = np.asarray(
             b"omniteleop_wbc_joystick_action/v1"
         )
         for key in ("action_target_frame", "eef_target_frame", "head_target_frame"):
             f[f"meta/{key}"] = np.asarray(b"current_base")
+        if schema.endswith("/v2"):
+            f["meta/chassis_intent_mapping"] = np.asarray(b"fixed_direction/v1")
+            f["meta/chassis_translation_speed_mps"] = np.float64(0.15)
+            f["meta/chassis_rotation_speed_radps"] = np.float64(0.25)
         f["timestamp_ns"] = np.array([1_000_000_000, 1_100_000_000], np.int64)
         f["action/eef/left"] = poses
         f["action/eef/right"] = poses
@@ -586,9 +628,12 @@ def _write_joystick_replay_episode(path, *, include_intent: bool = True):
         f["action/gripper/left"] = np.zeros(n, np.float32)
         f["action/gripper/right"] = np.ones(n, np.float32)
         if include_intent:
-            f["action/chassis/intent_body"] = np.array(
-                [[0.2, 0.0, 0.0], [0.0, -0.1, 0.3]], np.float32
+            intent = (
+                [[0.15, 0.0, 0.0], [0.0, -0.15, 0.0]]
+                if schema.endswith("/v2")
+                else [[0.2, 0.0, 0.0], [0.0, -0.1, 0.3]]
             )
+            f["action/chassis/intent_body"] = np.asarray(intent, np.float32)
 
 
 def test_joystick_episode_replay_restores_intent_and_skips_second_head_filter(
@@ -609,6 +654,17 @@ def test_joystick_episode_replay_restores_intent_and_skips_second_head_filter(
         ],
         [0.0, -0.1, 0.3],
     )
+
+
+def test_joystick_episode_replay_accepts_fixed_speed_raw_v2(tmp_path):
+    path = tmp_path / "episode_0.hdf5"
+    _write_joystick_replay_episode(
+        path, schema="omniteleop_joystick_mobile_raw/v2"
+    )
+
+    source = ReplaySource.from_joystick_hdf5(str(path))
+
+    assert source.replay_kind == "joystick_episode"
 
 
 def test_joystick_episode_replay_refuses_to_guess_intent_from_applied_twist(

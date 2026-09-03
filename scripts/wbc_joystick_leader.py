@@ -22,10 +22,12 @@ paradigm requires:
 
   * **Thumbstick mapping: RIGHT stick drives, LEFT stick turns.** Right stick Y ->
     ``chassis_vx`` (forward/back), right stick X -> ``chassis_vy`` (strafe), left stick X
-    -> ``chassis_wz`` (yaw). When configured, the leader projects this mapped twist to one
-    dominant axis before publishing; the follower enforces the same policy again before
-    integrating its base reference. Unlike the base follower, which ignores these fields
-    and derives base motion from the whole-body QP, joystick mode drives from them directly.
+    -> ``chassis_wz`` (yaw). Stick magnitude selects no speed: after the deadband and
+    configured dominant-axis projection, every translation is published at the configured
+    fixed linear speed and every turn at the fixed angular speed. The follower enforces the
+    same contract again before integrating its base reference. Unlike the base follower,
+    which ignores these fields and derives base motion from the whole-body QP, joystick mode
+    drives from them directly.
 
   * Hands are DECOUPLED from head tracking: a lost/invalid headset frame no longer freezes
     the hand targets (the base leader holds them because its hand position needs the live
@@ -50,6 +52,7 @@ from omniteleop.follower.base_closed_loop import (
     mask_planar_twist_for_base_dofs,
     project_planar_twist_single_axis_for_base_dofs,
 )
+from omniteleop.follower.joystick_base import fixed_speed_planar_twist
 from omniteleop.follower.whole_body_ik import WBCConfig
 from omniteleop.wbc_teleop import JoystickTeleopConfig, VRTeleopConfig
 
@@ -91,6 +94,8 @@ class JoystickVRLeader(WBCVRLeader):
         self._joystick_yaw_max_vel = teleop_cfg.stick_max_wz
         self._joystick_axis_deadband = cfg.base_single_axis_deadband
         self._joystick_axis_hysteresis = joystick_cfg.single_axis_hysteresis_ratio
+        self._joystick_translation_speed = joystick_cfg.translation_speed
+        self._joystick_rotation_speed = joystick_cfg.rotation_speed
         self._joystick_axis: Optional[int] = None
         self._debug_sticks = bool(getattr(args, "debug_sticks", False))
         super().__init__(
@@ -185,6 +190,11 @@ class JoystickVRLeader(WBCVRLeader):
             )
         else:
             self._joystick_axis = None
+        chassis = fixed_speed_planar_twist(
+            chassis,
+            translation_speed=self._joystick_translation_speed,
+            rotation_speed=self._joystick_rotation_speed,
+        )
         vx, vy, wz = (float(v) for v in chassis)
         # Bring-up diagnostic, off unless --debug-sticks. Reads the RAW sticks WebXR delivers
         # beside the mapped chassis twist at ~2 Hz, which separates the two ways the base

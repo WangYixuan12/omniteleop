@@ -28,7 +28,12 @@ from typing import Callable, Optional
 import numpy as np
 
 from omniteleop.common.schemas import VRJointData
-from omniteleop.wbc_policy_format import JOYSTICK_POLICY_ACTION_SCHEMA
+from omniteleop.wbc_policy_format import (
+    JOYSTICK_FIXED_SPEED_MAPPING,
+    JOYSTICK_POLICY_ACTION_SCHEMA,
+    JOYSTICK_RAW_EPISODE_SCHEMA_V2,
+    JOYSTICK_RAW_EPISODE_SCHEMAS,
+)
 
 # Flattened-4x4 pose fields, recorded as (N, 16) float64 + a per-frame presence flag
 # (the leader publishes empty lists for these outside teleop).
@@ -505,7 +510,6 @@ class ReplaySource:
                     )
 
                 declarations = {
-                    "meta/schema": "omniteleop_joystick_mobile_raw/v1",
                     "meta/control_mode": "joystick",
                     "meta/policy_action_schema": JOYSTICK_POLICY_ACTION_SCHEMA,
                     "meta/action_target_frame": "current_base",
@@ -513,14 +517,18 @@ class ReplaySource:
                     "meta/head_target_frame": "current_base",
                 }
                 actual = {key: text(key) for key in declarations}
+                raw_schema = text("meta/schema")
                 if not any(
                     actual[key] == expected for key, expected in declarations.items()
-                ):
+                ) and raw_schema not in JOYSTICK_RAW_EPISODE_SCHEMAS:
                     raise ValueError(
                         f"{path}: expected a wbc_vr_stream/v1 file or joystick episode, "
-                        f"got metadata {actual}"
+                        f"got metadata {{'meta/schema': {raw_schema!r}, **{actual!r}}}"
                     )
-                bad = [
+                bad = ([] if raw_schema in JOYSTICK_RAW_EPISODE_SCHEMAS else [
+                    f"meta/schema={raw_schema!r} (expected one of "
+                    f"{sorted(JOYSTICK_RAW_EPISODE_SCHEMAS)!r})"
+                ]) + [
                     f"{key}={actual[key]!r} (expected {expected!r})"
                     for key, expected in declarations.items()
                     if actual[key] != expected
@@ -530,6 +538,29 @@ class ReplaySource:
                         f"{path}: incomplete/conflicting joystick replay contract: "
                         + "; ".join(bad)
                     )
+                if raw_schema == JOYSTICK_RAW_EPISODE_SCHEMA_V2:
+                    mapping = text("meta/chassis_intent_mapping")
+                    if mapping != JOYSTICK_FIXED_SPEED_MAPPING:
+                        raise ValueError(
+                            f"{path}: meta/chassis_intent_mapping={mapping!r}; "
+                            f"expected {JOYSTICK_FIXED_SPEED_MAPPING!r}"
+                        )
+                    for key in (
+                        "meta/chassis_translation_speed_mps",
+                        "meta/chassis_rotation_speed_radps",
+                    ):
+                        if key not in f:
+                            raise ValueError(f"{path}: missing required {key}")
+                        value = np.asarray(f[key][()])
+                        if (
+                            value.shape != ()
+                            or value.dtype.kind not in "iuf"
+                            or not np.isfinite(float(value))
+                            or float(value) <= 0.0
+                        ):
+                            raise ValueError(
+                                f"{path}: {key} must be a finite positive scalar"
+                            )
                 wanted = (
                     _EPISODE_TIME_DATASET,
                     *_EPISODE_POSE_DATASETS.values(),

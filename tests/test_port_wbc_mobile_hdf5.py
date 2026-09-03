@@ -23,7 +23,9 @@ import pytest
 from omniteleop.wbc_policy_format import (
     ACTION_AXES,
     JOYSTICK_ACTION_AXES,
+    JOYSTICK_FIXED_SPEED_MAPPING,
     JOYSTICK_POLICY_ACTION_SCHEMA,
+    JOYSTICK_RAW_EPISODE_SCHEMA_V2,
     STATE_AXES,
     WBCPolicyFK,
     base_pose_to_mat,
@@ -278,6 +280,43 @@ def test_joystick_policy_contract_appends_latched_chassis_intent(porter, fk, tmp
     assert state.shape == (32,)
     assert action.shape == (32,)
     np.testing.assert_allclose(action[-3:], intent[t])
+
+
+def test_fixed_speed_joystick_contract_is_explicit_and_validated(porter, tmp_path):
+    path = _write_raw(
+        tmp_path / "episode_0.hdf5", base_pose_source="wheel_odometry"
+    )
+    intent = np.array(
+        [[0.15, 0.0, 0.0], [0.0, -0.15, 0.0], [0.0, 0.0, 0.25]],
+        dtype=np.float32,
+    )
+    with h5py.File(path, "a") as raw:
+        for key in ("meta/schema", "meta/provenance/schema"):
+            del raw[key]
+            raw[key] = np.asarray(JOYSTICK_RAW_EPISODE_SCHEMA_V2.encode())
+        raw["meta/control_mode"] = np.asarray(b"joystick")
+        raw["meta/action_target_frame"] = np.asarray(b"current_base")
+        raw["meta/eef_target_frame"] = np.asarray(b"current_base")
+        raw["meta/head_target_frame"] = np.asarray(b"current_base")
+        raw["meta/policy_action_schema"] = np.asarray(
+            JOYSTICK_POLICY_ACTION_SCHEMA.encode()
+        )
+        raw["meta/chassis_intent_mapping"] = np.asarray(
+            JOYSTICK_FIXED_SPEED_MAPPING.encode()
+        )
+        raw["meta/chassis_translation_speed_mps"] = np.float64(0.15)
+        raw["meta/chassis_rotation_speed_radps"] = np.float64(0.25)
+        raw["action/chassis/intent_body"] = intent
+
+    contract = porter.inspect_episode_policy_action_contract(path)
+    assert contract["chassis_intent_mapping"] == JOYSTICK_FIXED_SPEED_MAPPING
+    assert contract["chassis_translation_speed_mps"] == pytest.approx(0.15)
+    assert contract["chassis_rotation_speed_radps"] == pytest.approx(0.25)
+
+    with h5py.File(path, "r+") as raw:
+        raw["action/chassis/intent_body"][1] = [0.0, -0.12, 0.0]
+    with pytest.raises(RuntimeError, match="fixed-direction chassis translation"):
+        porter.inspect_episode_policy_action_contract(path)
 
 
 def test_policy_contract_rejects_mixed_wbc_and_joystick_takes(porter, tmp_path):
