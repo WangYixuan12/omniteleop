@@ -22,7 +22,7 @@ Episode file schema (T = kept frames)::
     left_ee_pos/quat        (T,3)/(T,4) f32   ENGAGE-ORIGIN WORLD, quat wxyz (pytorch3d)
     right_ee_pos/quat       (T,3)/(T,4) f32
     head_pos/quat           (T,3)/(T,4) f32
-    base_pos/base_quat      (T,3)/(T,4) f32   planar odometry pose lifted to 3-D
+    base_pos/base_quat      (T,3)/(T,4) f32   canonical planar pose lifted to 3-D
     proprioception_grippers (T,2) f32          raw FC03 readings (state dims 9/19)
     action                  (T,29) f32         verbatim world targets, COLUMN rot6d
     env_state               (T, object_nums*3) f32   SceneDiff positions, constant
@@ -66,7 +66,12 @@ import h5py
 import numpy as np
 from safetensors.numpy import save_file
 
-from omniteleop.wbc_policy_format import ACTION_AXES, STATE_AXES, WBCPolicyFK
+from omniteleop.wbc_policy_format import (
+    ACTION_AXES,
+    STATE_AXES,
+    WBC_POLICY_ACTION_SCHEMA,
+    WBCPolicyFK,
+)
 
 
 def _load_hdf5_porter() -> "types.ModuleType":
@@ -160,13 +165,18 @@ def episode_arrays(
     for name, (pos_sl, rot_sl) in _ENTITY_BLOCKS.items():
         arrays[f"{name}_pos"] = states[:, pos_sl]
         arrays[f"{name}_quat"] = _rot6d_columns_to_quat_wxyz(states[:, rot_sl])
-    # Planar odometry base pose lifted to a 3-D world pose (z = 0, yaw about z).
+    # Canonical planar base pose lifted to a 3-D world pose (z = 0, yaw about z).
     x, y, yaw = states[:, 29], states[:, 30], states[:, 31]
     arrays["base_pos"] = np.stack([x, y, np.zeros_like(x)], axis=1).astype(np.float32)
     half = (yaw / 2.0).astype(np.float64)
     arrays["base_quat"] = np.stack(
         [np.cos(half), np.zeros_like(half), np.zeros_like(half), np.sin(half)], axis=1
     ).astype(np.float32)
+
+    # safetensors serialises straight from the array's buffer pointer and IGNORES strides,
+    # so a non-contiguous view -- every `states[:, ...]` slice/gather above -- would be
+    # written in the wrong order and silently corrupt the episode. Copy into C order first.
+    arrays = {key: np.ascontiguousarray(value) for key, value in arrays.items()}
 
     meta = {
         "num_frames_before": int(ep["frame_count"]),
@@ -211,6 +221,16 @@ def build_args(**overrides: object) -> Namespace:
 
 def convert(args: Namespace) -> None:
     work = porter.build_work_list(args.raw_dir, args.include_recovery_data)
+    base_pose_source = porter.validate_work_base_pose_contract(work)
+    policy_action_contract = porter.validate_work_policy_action_contract(work)
+    if policy_action_contract["policy_action_schema"] != WBC_POLICY_ACTION_SCHEMA:
+        raise ValueError(
+            "MoF export only supports the 29-D WBC world-action contract; "
+            "joystick/current-base 32-D actions must use the standard HDF5 or "
+            "point-cloud Zarr porter"
+        )
+    camera_alignment_contract = porter.validate_work_camera_alignment_contract(work)
+    porter.audit_work_list(work)
 
     explicit_split = args.split_csv is not None
     split_csv = args.split_csv if explicit_split else Path(args.raw_dir) / "split.csv"
@@ -232,11 +252,14 @@ def convert(args: Namespace) -> None:
 
     n_recovery = sum(item["source"] == "recovery" for item in work)
     logging.info(
-        "Port plan: %d episode(s) = %d raw + %d recovery -> {%s}",
+        "Port plan: %d episode(s) = %d raw + %d recovery -> {%s} "
+        "(base_pose_source=%s, camera_alignment=%s)",
         len(work),
         len(work) - n_recovery,
         n_recovery,
         ", ".join(f"{s}:{len(v)}" for s, v in splits.items()),
+        base_pose_source,
+        camera_alignment_contract["mode"],
     )
 
     out_dir = Path(args.out_root) / args.name
@@ -299,9 +322,26 @@ def convert(args: Namespace) -> None:
         "rotation_convention": "column",
         "quaternion_convention": "wxyz",
         "state_frame": "world",
-        "obs_frame": "world (engage-origin; base = planar odometry pose lifted to 3-D)",
+        "base_pose_source": base_pose_source,
+        "camera_alignment_mode": camera_alignment_contract["mode"],
+        "camera_alignment_clock_domain": camera_alignment_contract["clock_domain"],
+        "camera_alignment_max_abs_skew_ns": camera_alignment_contract[
+            "max_abs_skew_ns"
+        ],
+        "camera_alignment_max_camera_age_ns": camera_alignment_contract[
+            "max_camera_age_ns"
+        ],
+        "camera_alignment_verified": bool(camera_alignment_contract["verified"]),
+        "obs_frame": (
+            "world (engage-origin; base = canonical planar pose lifted to 3-D)"
+        ),
         "action_axes": list(ACTION_AXES),
         "action_frame": "world (verbatim ik.solve targets, engage-origin)",
+        # This porter currently exposes no relabeling option: row t is raw action t.
+        # Stamp it explicitly so deployment never has to guess.
+        "action_offset_frames": 0,
+        "pose_action_offset_frames": 0,
+        "action_offset_semantics": "all action components shifted together",
         "env_state": {
             "object_nums": args.object_nums,
             "axes": porter.env_state_axes(args.object_nums),

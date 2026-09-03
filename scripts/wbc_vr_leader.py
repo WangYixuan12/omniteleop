@@ -147,8 +147,9 @@ INVALID_RIGHT_POSE = np.array(
     [[0.0, 0.0, 1.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
 )
 
-DEFAULT_CERT = "/home/yixuan/omniteleop/tests/cert.pem"
-DEFAULT_KEY = "/home/yixuan/omniteleop/tests/key.pem"
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CERT = str(_REPO_ROOT / "tests" / "cert.pem")
+DEFAULT_KEY = str(_REPO_ROOT / "tests" / "key.pem")
 _TRIGGER_PRESS = 0.7  # right grip value counted as a press
 _TRACK_ATOL = 1e-6  # tolerance for matching the untracked sentinel poses
 DEFAULT_HEADSET_HUD_RATE = 10.0
@@ -372,6 +373,7 @@ class WBCVRLeader:
         *,
         wbc_config: Optional[WBCConfig] = None,
         teleop_config: Optional[VRTeleopConfig] = None,
+        reference_target_frame: str = "world",
     ) -> None:
         self.rate = args.rate
         self.hold_seconds = args.hold_seconds
@@ -409,18 +411,11 @@ class WBCVRLeader:
             print(f"[wbc_vr_leader] EEF orientation offset loaded from {self._ee_offset_file} "
                   f"(L {ol:.1f} deg, R {orr:.1f} deg from identity).")
 
-        # Zenoh publisher on the same topic the follower subscribes to.
-        self.node = Node(name="wbc_vr_leader", namespace=args.namespace)
-        config = get_config()
-        self.topic = config.get_topic("vr_joints", "vr/joints")
-        self.pub = self.node.create_publisher(self.topic, encoder=DictDataCodec.encode)
+        # NOTE: the Zenoh node/publisher are deliberately created LATER, after the
+        # headset HUD -- see the block below the HUD for why the order is load-bearing.
         self._follower_status: Optional[WBCFollowerStatus] = None
         self._follower_status_t: Optional[float] = None
         self._status_lock = threading.Lock()
-        self.status_topic = config.get_topic("wbc_follower_status", WBC_FOLLOWER_STATUS_TOPIC)
-        self.status_sub = self.node.create_subscriber(
-            self.status_topic, self._on_follower_status, decoder=DictDataCodec.decode
-        )
 
         # Calibration reference head pose, from the whole-body IK model's *nominal*
         # posture (NOT the legacy INIT_JOINT constants). At nominal the planar base
@@ -446,7 +441,11 @@ class WBCVRLeader:
         self._align_gate: Optional[ReferenceAlignmentGate] = None
         self._last_alignment_status: Optional[HandAlignmentStatus] = None
         if self._align_reference_path is not None:
-            ref = load_reference_ee_poses(self._align_reference_path, ik)
+            ref = load_reference_ee_poses(
+                self._align_reference_path,
+                ik,
+                target_frame=reference_target_frame,
+            )
             assert ref is not None
             # Gate the head against the NOMINAL head pose (self.T_base_head, the WBC nominal
             # posture head FK in the base frame) so an episode only starts once the operator
@@ -456,7 +455,8 @@ class WBCVRLeader:
             print(
                 "[wbc_vr_leader] alignment reference loaded from "
                 f"{self._align_reference_path} "
-                f"(pos_tol={REFERENCE_ALIGN_POS_TOL_MM:g}mm, "
+                f"({reference_target_frame} target frame, "
+                f"pos_tol={REFERENCE_ALIGN_POS_TOL_MM:g}mm, "
                 f"rot_tol={REFERENCE_ALIGN_ROT_TOL_DEG:g}deg, "
                 f"head_pos_tol={REFERENCE_ALIGN_HEAD_POS_TOL_MM:g}mm, "
                 f"head_rot_tol={REFERENCE_ALIGN_HEAD_ROT_TOL_DEG:g}deg, "
@@ -476,6 +476,26 @@ class WBCVRLeader:
         )
         self._hud_period = 1.0 / float(args.hud_rate) if args.hud_rate > 0.0 else float("inf")
         self._hud_rate = float(args.hud_rate)
+
+        # ── Zenoh node + publisher: created AFTER the HUD, ON PURPOSE. ─────────────
+        # The HUD builds its own dexcontrol ``Robot`` for the camera streams. If that
+        # construction fails (robot unreachable, a wrist publisher not running, ...),
+        # the half-built Robot is garbage-collected and its ``__del__`` calls
+        # ``Robot.shutdown()`` -> ``dexcomm.cleanup_session()``, which closes the
+        # PROCESS-WIDE shared Zenoh session. The HUD swallows its own failure, so any
+        # publisher created BEFORE this point silently becomes dead and the first
+        # publish in run() dies with "Zenoh error: Publisher is closed" -- far from the
+        # real cause. Creating the node here means we always get a live session,
+        # whether or not the HUD tore the previous one down.
+        # Do not move this block back above the HUD.
+        self.node = Node(name="wbc_vr_leader", namespace=args.namespace)
+        config = get_config()
+        self.topic = config.get_topic("vr_joints", "vr/joints")
+        self.pub = self.node.create_publisher(self.topic, encoder=DictDataCodec.encode)
+        self.status_topic = config.get_topic("wbc_follower_status", WBC_FOLLOWER_STATUS_TOPIC)
+        self.status_sub = self.node.create_subscriber(
+            self.status_topic, self._on_follower_status, decoder=DictDataCodec.decode
+        )
 
         # State
         self.stage = "static"  # "static" (estop) or "teleop"
@@ -863,11 +883,28 @@ class WBCVRLeader:
 
                 if self.stage == "static":
                     if self._trigger_held(transforms):
-                        if not (_is_valid_pose(transforms["head"])
-                                and _is_tracked(vr_l, INVALID_LEFT_POSE)
-                                and _is_tracked(vr_r, INVALID_RIGHT_POSE)):
-                            print("\n[wbc_vr_leader] headset + both controllers must be "
-                                  "tracked to calibrate — hold them in view and retry.")
+                        # Name the OFFENDING input(s). The grip-trigger hold that got us here
+                        # is decoupled from the pose stream -- vr_client.html sets
+                        # right_squeeze from the session squeezestart/squeezeend events, which
+                        # do NOT go through isControllerSource(), while the wrist poses come
+                        # from the filtered inputSources loop and stay identityPose() when
+                        # nothing passes. So a pinch (hand tracking) or a half-awake
+                        # controller can satisfy the hold while a wrist is still untracked,
+                        # and the bare "both controllers" message left no way to tell which.
+                        untracked = []
+                        if not _is_valid_pose(transforms["head"]):
+                            untracked.append("headset")
+                        if not _is_tracked(vr_l, INVALID_LEFT_POSE):
+                            untracked.append("left controller")
+                        if not _is_tracked(vr_r, INVALID_RIGHT_POSE):
+                            untracked.append("right controller")
+                        if untracked:
+                            print(f"\n[wbc_vr_leader] cannot calibrate: {', '.join(untracked)} "
+                                  "not tracked (pose reads the untracked sentinel). Wake the "
+                                  "controller(s) with a button press, hold them in headset "
+                                  "view, and make sure the Quest is in CONTROLLER mode -- if "
+                                  "hand tracking took over, a pinch still triggers the hold "
+                                  "but sends no controller pose.")
                         else:
                             self._calibrate(transforms["head"])
                             # head_target must be ready BEFORE mapping hands: the hand

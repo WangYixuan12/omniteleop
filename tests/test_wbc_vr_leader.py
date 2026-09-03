@@ -7,6 +7,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import pytest
 
 from omniteleop.leader import wbc_reference_alignment as ref_align
 
@@ -336,6 +337,27 @@ def test_load_reference_ee_poses_reconstructs_last_obs_frame_by_default(tmp_path
         right_ref,
         leader_mod._to_mat(ik.frame_pose(leader_mod.RIGHT_EE_FRAME, q_last)),
     )
+
+    # Joystick targets are interpreted in the current base, so their alignment
+    # references must reconstruct the same joints with the root held at zero.
+    local_ref = ref_align.load_reference_ee_poses(str(path), ik, target_frame="base")
+    assert local_ref is not None
+    q_local = q_last.copy()
+    q_local[0] = 0.0
+    q_local[1] = 0.0
+    q_local[2] = 1.0
+    q_local[3] = 0.0
+    np.testing.assert_allclose(
+        local_ref[0], leader_mod._to_mat(ik.frame_pose(leader_mod.LEFT_EE_FRAME, q_local))
+    )
+    np.testing.assert_allclose(
+        local_ref[1], leader_mod._to_mat(ik.frame_pose(leader_mod.RIGHT_EE_FRAME, q_local))
+    )
+
+
+def test_load_reference_ee_poses_rejects_unknown_target_frame():
+    with pytest.raises(ValueError, match="target_frame"):
+        ref_align.load_reference_ee_poses(None, target_frame="camera")
 
 
 def test_reference_alignment_requires_stable_window():

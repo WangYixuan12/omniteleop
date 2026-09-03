@@ -6,18 +6,34 @@ Drives the real robot from a LeRobot checkpoint trained on the
 
   observation.state (32,) = base-frame ACHIEVED L/R EEF pos3+rot6+gripper and
       zed_depth_frame head pos3+rot6 (WBC FK on measured joints, base zero) +
-      the measured odometry base pose (x, y, yaw) in the engage-origin world.
-  action (29,) = WORLD-frame L/R EEF + head targets (pos3+rot6) + binary grippers.
+      the canonical measured base pose (x, y, yaw) in the engage-origin world
+      (wheel odometry or ARKit, as declared by the training dataset).
+  action (29,) = WORLD-frame L/R EEF + head targets (pos3+rot6) + binary grippers,
+      for the original whole-body-base controller; or
+  action (32,) = current-base versions of those 29 values + body-frame joystick
+      chassis intent (vx, vy, wz), for joystick-collected policies.
 
-The action is decoded with NO base composition, ever: ``split_policy_action``
-only rebuilds the three 4x4 poses (Gram-Schmidt on the 6-D rotation) and the
-policy's world targets go straight into the ``TargetInterpolator`` ->
-``ik.solve(left, right, dt, head_target=...)`` path. The learned/replayed head
+The action is decoded with NO base composition: ``split_policy_action`` rebuilds
+the three 4x4 poses (Gram-Schmidt on the 6-D rotation). WBC world targets go to
+the whole-body solver; joystick current-base targets go to base-locked arm IK,
+while the appended chassis intent is held ZOH at 10 Hz and processed by the same
+causal 100 Hz joystick integrator/PD/slew/dispatch path used for collection. The
+learned/replayed head
 target is already the post-LPF/post-deadband solver input recorded in
 ``action/head``, so rollout does not filter it a second time. Engage mirrors
 teleop: ``ik.reset()`` +
 ``OdometryThread.reset_origin()`` re-anchor the world frame at the rollout
 start pose.
+
+The base-pose source is a deployment contract, not a tuning choice. New LeRobot
+checkpoints auto-resolve it from ``train_config.json -> dataset.root ->
+dexmate_meta.json``; moved datasets use ``--policy-dataset-meta`` and legacy
+checkpoints require ``--policy-base-pose-source wheel_odometry``. Rollout refuses
+to construct the hardware driver when this source disagrees with ``--arkit-base``.
+For a checkpoint with wrist-image inputs, the ported dataset also declares the exact
+camera selection contract (clock domain, head-to-wrist skew ceiling, and capture-age
+ceiling). Rollout requires verified head-capture-nearest training data and refuses to
+construct hardware unless the live ``--record-max-camera-{skew,age}-ms`` values match.
 
 Hardware access reuses ``wbc_vr_robot.HardwareDriver`` (same homing gate,
 per-tick joint clamp, base PD/shaping, gripper pass-through, Robotiq FC03
@@ -41,7 +57,8 @@ every new rollout before recording and inference begin.
 Inference is asynchronous (ported from deps/rby1-wbc, see plan.md): an
 inference worker thread gathers ``n_obs_steps`` fresh observations at the
 dataset cadence, predicts a WHOLE action chunk every ``--policy-interval``
-seconds, stamps frame k with the wall-clock time ``t_obs + k / dataset_fps``,
+seconds, stamps frame k with the wall-clock time
+``t_obs + (training_action_offset + k) / dataset_fps``,
 drops frames already unreachable by ``inference_end + --execution-latency``,
 and queues the rest into a ``ScheduledPolicyAction`` buffer. The main 100 Hz
 loop runs a 10 Hz sampler that lerps/slerps the scheduled trajectory at "now"
@@ -50,8 +67,10 @@ stalls a WBC tick. If inference dies or the buffer runs dry, ``last_cmd_wall``
 stops advancing and the existing ``--source-timeout`` watchdog holds the robot.
 Scheduling math lives entirely on the workstation ``perf_counter`` timeline;
 the camera ``timestamp_ns`` (SDK capture time on the camera-publisher-host
-clock) is used only for same-publisher freshness gating (never converted
-across clocks).
+clock) is used for same-publisher freshness gating and, for multi-camera
+policies, mapped through the recording-time camera clock calibrations so each
+live head observation receives the same capture-nearest wrist pairing used by
+the training recorder.
 
 Run in the dexmate_lerobot conda env ON the robot (needs lerobot + the hardware
 SDK). Checkpoints emit absolute actions: observation.state EEF/head are
@@ -100,6 +119,7 @@ import argparse
 import gc
 import importlib.util
 import itertools
+import json
 import shutil
 import signal
 import tempfile
@@ -134,8 +154,12 @@ from omniteleop.wbc_pointcloud import MAX_DEPTH_M, MIN_DEPTH_M
 from omniteleop.wbc_policy_format import (
     ACTION_AXES,
     GRIPPER_BINARY_THRESHOLD,
+    JOYSTICK_ACTION_AXES,
+    JOYSTICK_POLICY_ACTION_SCHEMA,
     STATE_AXES,
+    WBC_POLICY_ACTION_SCHEMA,
     WBCPolicyFK,
+    action_axes_for_policy_schema,
     base_pose_to_mat,
     build_state_vector,
     mat_to_pos6d,
@@ -147,6 +171,9 @@ DEFAULT_ROLLOUT_SAVE_DIR = str(Path("~/Dexmate/data/raw_data_rollout").expanduse
 DEFAULT_REPLAY_SAVE_DIR = str(Path("~/Dexmate/data/replay_raw_data").expanduser())
 DEFAULT_ALIGN_SECONDS = 3.0
 DEFAULT_ALIGN_TIMEOUT_S = 20.0
+# Terminal save deadline. Healthy streaming finalization is normally sub-second; this
+# generous bound exists only so a dead writer/filesystem cannot wedge robot teardown.
+_RECORDER_SAVE_TIMEOUT_S = 120.0
 # Recorded inter-frame gaps beyond this get a load-time warning: record_tick skips
 # during holds, so a legit take can gap; replay then holds (stale-source) and glides
 # across the gap -- safe, but the operator should know the take pauses.
@@ -156,6 +183,28 @@ REPLAY_GAP_WARN_S = 0.5
 # IK/base transient). Fail closed instead.
 REPLAY_START_POS_TOL_M = 0.15
 REPLAY_START_ROT_TOL_DEG = 30.0
+_BASE_POSE_SOURCES = frozenset({"wheel_odometry", "arkit"})
+_CAMERA_FUTURE_TOLERANCE_NS = 10_000_000
+_CAMERA_ALIGNMENT_MODES = frozenset(
+    {
+        "head_capture_nearest",
+        "latest_arrived_compatibility",
+        "latest_arrived_legacy_unverified",
+    }
+)
+_CAMERA_ALIGNMENT_FIELDS = (
+    "camera_alignment_mode",
+    "camera_alignment_clock_domain",
+    "camera_alignment_max_abs_skew_ns",
+    "camera_alignment_max_camera_age_ns",
+    "camera_alignment_verified",
+)
+_ACTION_OFFSET_SEMANTICS = "all action components shifted together"
+_ACTION_TIMING_CONFIG_FIELDS = (
+    "dataset_fps",
+    "action_offset_frames",
+    "action_offset_semantics",
+)
 
 # --- Checkpoint-driven live SceneDiff object bootstrap -------------------------------
 # Mobile analog of live_scenediff_rollout.py: after reference alignment we capture ONE
@@ -175,21 +224,815 @@ DEFAULT_SCENE_REFERENCE = "/home/yixuan/Dexmate/data/scene_diff/_before/referenc
 # prompt are shared with the tabletop path in omniteleop.follower.scenediff_live (imported
 # above): the single-frame HDF5 layout and the run_live_pos_condition.sh env interface are
 # cross-repo CONTRACTS, kept in ONE place. Only the mobile-specific pieces live below --
-# the FK world_T_zed (base-odometry composition) and the flat single-stage env-state.
+# the FK world_T_zed (canonical base-pose composition) and the flat single-stage env-state.
 
 
-def split_policy_action(action: np.ndarray) -> dict[str, np.ndarray | np.float32]:
-    """29-D policy action -> world-frame 4x4 targets + binary gripper commands.
+def _checked_base_pose_source(value, context: str) -> str:
+    """Return a valid canonical pose-source name or fail with provenance."""
+    source = str(value)
+    if source not in _BASE_POSE_SOURCES:
+        raise ValueError(
+            f"{context}: base_pose_source={source!r}; expected one of "
+            f"{sorted(_BASE_POSE_SOURCES)}"
+        )
+    return source
+
+
+def _dataset_meta_file(path: str | Path) -> Path:
+    """Accept either ``dexmate_meta.json`` itself or its dataset directory."""
+    candidate = Path(path).expanduser()
+    return candidate / "dexmate_meta.json" if candidate.is_dir() else candidate
+
+
+def _checked_policy_action_schema(value, context: str) -> str:
+    schema = str(value)
+    try:
+        action_axes_for_policy_schema(schema)
+    except ValueError as exc:
+        raise ValueError(f"{context}: {exc}") from exc
+    return schema
+
+
+def _read_dataset_policy_action_schema(
+    path: str | Path, *, required: bool
+) -> tuple[str, Path] | None:
+    """Read and validate the porter's action layout/frame declaration."""
+    meta_path = _dataset_meta_file(path)
+    if not meta_path.is_file():
+        if required:
+            raise FileNotFoundError(f"policy training dataset metadata not found: {meta_path}")
+        return None
+    try:
+        payload = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read policy training metadata {meta_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{meta_path}: expected a JSON object")
+    value = payload.get("policy_action_schema", payload.get("schema"))
+    if value is None:
+        if required:
+            raise ValueError(f"{meta_path}: missing policy_action_schema")
+        return None
+    schema = _checked_policy_action_schema(value, str(meta_path))
+    expected_axes = action_axes_for_policy_schema(schema)
+    if "action_axes" in payload and list(payload["action_axes"]) != expected_axes:
+        raise ValueError(
+            f"{meta_path}: action_axes disagree with {schema!r}"
+        )
+    action_frame = str(payload.get("action_frame", ""))
+    expected_prefix = (
+        "current_base" if schema == JOYSTICK_POLICY_ACTION_SCHEMA else "world"
+    )
+    if action_frame and not action_frame.startswith(expected_prefix):
+        raise ValueError(
+            f"{meta_path}: action_frame={action_frame!r} disagrees with {schema!r}"
+        )
+    return schema, meta_path.resolve()
+
+
+def _discover_checkpoint_policy_action_schema(
+    policy_path: str | Path,
+    policy_config,
+    *,
+    explicit_dataset_meta: str | Path | None = None,
+) -> tuple[str | None, str]:
+    """Resolve the versioned 29-D/32-D action meaning from checkpoint provenance."""
+    declarations: list[tuple[str, str]] = []
+    config_value = getattr(policy_config, "policy_action_schema", None)
+    if config_value not in (None, ""):
+        declarations.append(
+            (_checked_policy_action_schema(config_value, "checkpoint config"), "config.json")
+        )
+    checkpoint = Path(policy_path).expanduser()
+    candidates: list[tuple[Path, bool]] = []
+    if explicit_dataset_meta is not None:
+        candidates.append((_dataset_meta_file(explicit_dataset_meta), True))
+    elif checkpoint.is_dir():
+        candidates.append((checkpoint / "dexmate_meta.json", False))
+        train_config_path = checkpoint / "train_config.json"
+        if train_config_path.is_file():
+            try:
+                train_config = json.loads(train_config_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"cannot read {train_config_path}: {exc}") from exc
+            dataset = train_config.get("dataset") if isinstance(train_config, dict) else None
+            dataset_root = dataset.get("root") if isinstance(dataset, dict) else None
+            if dataset_root:
+                candidates.append((_dataset_meta_file(str(dataset_root)), False))
+    seen: set[Path] = set()
+    for candidate, required in candidates:
+        key = candidate.expanduser().absolute()
+        if key in seen:
+            continue
+        seen.add(key)
+        loaded = _read_dataset_policy_action_schema(candidate, required=required)
+        if loaded is not None:
+            schema, resolved = loaded
+            declarations.append((schema, str(resolved)))
+    schemas = {schema for schema, _origin in declarations}
+    if len(schemas) > 1:
+        detail = ", ".join(f"{origin} -> {schema}" for schema, origin in declarations)
+        raise ValueError(f"checkpoint policy-action provenance disagrees: {detail}")
+    if not declarations:
+        return None, "undeclared"
+    return declarations[0][0], "; ".join(origin for _schema, origin in declarations)
+
+
+def _read_dataset_base_pose_source(path: str | Path, *, required: bool) -> tuple[str, Path] | None:
+    """Read the canonical source stamped by ``port_wbc_mobile_hdf5.py``."""
+    meta_path = _dataset_meta_file(path)
+    if not meta_path.is_file():
+        if required:
+            raise FileNotFoundError(f"policy training dataset metadata not found: {meta_path}")
+        return None
+    try:
+        payload = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read policy training metadata {meta_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{meta_path}: expected a JSON object")
+    value = payload.get("base_pose_source")
+    if value is None:
+        if required:
+            raise ValueError(
+                f"{meta_path}: missing base_pose_source; pass the original v3 porter "
+                "metadata or use --policy-base-pose-source for a legacy dataset"
+            )
+        return None
+    return _checked_base_pose_source(value, str(meta_path)), meta_path.resolve()
+
+
+def _discover_checkpoint_base_pose_source(
+    policy_path: str | Path,
+    policy_config,
+    *,
+    explicit_dataset_meta: str | Path | None = None,
+) -> tuple[str | None, str]:
+    """Discover the training pose source from config/ported-dataset provenance.
+
+    LeRobot checkpoints save ``train_config.json`` beside ``config.json``. Its
+    ``dataset.root`` points back to the porter's ``dexmate_meta.json``. A copied
+    ``dexmate_meta.json`` in the checkpoint is also accepted so moved checkpoints
+    remain self-contained. All available declarations must agree.
+    """
+    declarations: list[tuple[str, str]] = []
+    config_value = getattr(policy_config, "base_pose_source", None)
+    if config_value not in (None, ""):
+        declarations.append(
+            (_checked_base_pose_source(config_value, "checkpoint config"), "config.json")
+        )
+
+    checkpoint = Path(policy_path).expanduser()
+    meta_candidates: list[tuple[Path, bool]] = []
+    if explicit_dataset_meta is not None:
+        meta_candidates.append((_dataset_meta_file(explicit_dataset_meta), True))
+    elif checkpoint.is_dir():
+        meta_candidates.append((checkpoint / "dexmate_meta.json", False))
+        train_config_path = checkpoint / "train_config.json"
+        if train_config_path.is_file():
+            try:
+                train_config = json.loads(train_config_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"cannot read {train_config_path}: {exc}") from exc
+            dataset = train_config.get("dataset") if isinstance(train_config, dict) else None
+            dataset_root = dataset.get("root") if isinstance(dataset, dict) else None
+            if dataset_root:
+                meta_candidates.append(
+                    (_dataset_meta_file(str(dataset_root)), False)
+                )
+
+    seen: set[Path] = set()
+    for candidate, required in meta_candidates:
+        key = candidate.expanduser().absolute()
+        if key in seen:
+            continue
+        seen.add(key)
+        loaded = _read_dataset_base_pose_source(candidate, required=required)
+        if loaded is not None:
+            source, resolved = loaded
+            declarations.append((source, str(resolved)))
+
+    sources = {source for source, _origin in declarations}
+    if len(sources) > 1:
+        detail = ", ".join(f"{origin} -> {source}" for source, origin in declarations)
+        raise ValueError(f"checkpoint base-pose provenance disagrees: {detail}")
+    if not declarations:
+        return None, "undeclared"
+    return declarations[0][0], "; ".join(origin for _source, origin in declarations)
+
+
+def _checked_camera_alignment_contract(values: dict, context: str) -> dict:
+    """Validate one ported training/live multi-camera timing declaration."""
+    mode = str(values["camera_alignment_mode"])
+    clock_domain = str(values["camera_alignment_clock_domain"])
+    max_skew_ns = values["camera_alignment_max_abs_skew_ns"]
+    max_camera_age_ns = values["camera_alignment_max_camera_age_ns"]
+    verified = values["camera_alignment_verified"]
+    if mode not in _CAMERA_ALIGNMENT_MODES:
+        raise ValueError(
+            f"{context}: camera_alignment_mode={mode!r}; expected one of "
+            f"{sorted(_CAMERA_ALIGNMENT_MODES)}"
+        )
+    if not isinstance(verified, (bool, np.bool_)):
+        raise ValueError(f"{context}: camera_alignment_verified must be boolean")
+    verified = bool(verified)
+    if max_skew_ns is not None:
+        if isinstance(max_skew_ns, (bool, np.bool_)) or not isinstance(
+            max_skew_ns, (int, np.integer)
+        ):
+            raise ValueError(
+                f"{context}: camera_alignment_max_abs_skew_ns must be an integer or null"
+            )
+        max_skew_ns = int(max_skew_ns)
+    if max_camera_age_ns is not None:
+        if isinstance(max_camera_age_ns, (bool, np.bool_)) or not isinstance(
+            max_camera_age_ns, (int, np.integer)
+        ):
+            raise ValueError(
+                f"{context}: camera_alignment_max_camera_age_ns must be an integer or null"
+            )
+        max_camera_age_ns = int(max_camera_age_ns)
+
+    if mode == "head_capture_nearest":
+        if clock_domain != "local_via_camera_ntp":
+            raise ValueError(
+                f"{context}: head_capture_nearest requires local_via_camera_ntp"
+            )
+        if (
+            max_skew_ns is None
+            or max_skew_ns <= 0
+            or max_camera_age_ns is None
+            or max_camera_age_ns <= 0
+            or not verified
+        ):
+            raise ValueError(
+                f"{context}: head_capture_nearest requires positive skew/age bounds "
+                "and camera_alignment_verified=true"
+            )
+    elif mode == "latest_arrived_compatibility":
+        if (
+            clock_domain != "local_via_camera_ntp"
+            or max_skew_ns != 0
+            or max_camera_age_ns is None
+            or max_camera_age_ns <= 0
+            or verified
+        ):
+            raise ValueError(
+                f"{context}: latest_arrived_compatibility requires local clock, "
+                "zero skew bound, positive age bound, and verified=false"
+            )
+    elif (
+        clock_domain != "raw_publisher_clock_unverified"
+        or max_skew_ns is not None
+        or max_camera_age_ns is not None
+        or verified
+    ):
+        raise ValueError(
+            f"{context}: latest_arrived_legacy_unverified requires raw unverified "
+            "clock, null skew bound, and verified=false"
+        )
+    return {
+        "mode": mode,
+        "clock_domain": clock_domain,
+        "max_abs_skew_ns": max_skew_ns,
+        "max_camera_age_ns": max_camera_age_ns,
+        "verified": verified,
+    }
+
+
+def _read_dataset_camera_alignment_contract(
+    path: str | Path, *, required: bool
+) -> tuple[dict, Path] | None:
+    meta_path = _dataset_meta_file(path)
+    if not meta_path.is_file():
+        if required:
+            raise FileNotFoundError(f"policy training dataset metadata not found: {meta_path}")
+        return None
+    try:
+        payload = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read policy training metadata {meta_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{meta_path}: expected a JSON object")
+    present = {key for key in _CAMERA_ALIGNMENT_FIELDS if key in payload}
+    if not present:
+        if required:
+            raise ValueError(
+                f"{meta_path}: missing camera-alignment metadata; re-port the dataset "
+                "or explicitly declare the legacy checkpoint contract"
+            )
+        return None
+    if present != set(_CAMERA_ALIGNMENT_FIELDS):
+        raise ValueError(
+            f"{meta_path}: partial camera-alignment metadata; has {sorted(present)}, "
+            f"missing {sorted(set(_CAMERA_ALIGNMENT_FIELDS) - present)}"
+        )
+    contract = _checked_camera_alignment_contract(payload, str(meta_path))
+    return contract, meta_path.resolve()
+
+
+def _discover_checkpoint_camera_alignment_contract(
+    policy_path: str | Path,
+    policy_config,
+    *,
+    explicit_dataset_meta: str | Path | None = None,
+) -> tuple[dict | None, str]:
+    """Discover and cross-check the training image-pairing contract."""
+    declarations: list[tuple[dict, str]] = []
+    sentinel = object()
+    config_values = {
+        key: getattr(policy_config, key, sentinel) for key in _CAMERA_ALIGNMENT_FIELDS
+    }
+    config_present = {key for key, value in config_values.items() if value is not sentinel}
+    if config_present:
+        if config_present != set(_CAMERA_ALIGNMENT_FIELDS):
+            raise ValueError(
+                "checkpoint config has partial camera-alignment metadata; has "
+                f"{sorted(config_present)}, missing "
+                f"{sorted(set(_CAMERA_ALIGNMENT_FIELDS) - config_present)}"
+            )
+        declarations.append(
+            (
+                _checked_camera_alignment_contract(config_values, "checkpoint config"),
+                "config.json",
+            )
+        )
+
+    checkpoint = Path(policy_path).expanduser()
+    meta_candidates: list[tuple[Path, bool]] = []
+    if explicit_dataset_meta is not None:
+        meta_candidates.append((_dataset_meta_file(explicit_dataset_meta), True))
+    elif checkpoint.is_dir():
+        meta_candidates.append((checkpoint / "dexmate_meta.json", False))
+        train_config_path = checkpoint / "train_config.json"
+        if train_config_path.is_file():
+            try:
+                train_config = json.loads(train_config_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"cannot read {train_config_path}: {exc}") from exc
+            dataset = train_config.get("dataset") if isinstance(train_config, dict) else None
+            dataset_root = dataset.get("root") if isinstance(dataset, dict) else None
+            if dataset_root:
+                meta_candidates.append((_dataset_meta_file(str(dataset_root)), False))
+
+    seen: set[Path] = set()
+    for candidate, required in meta_candidates:
+        key = candidate.expanduser().absolute()
+        if key in seen:
+            continue
+        seen.add(key)
+        loaded = _read_dataset_camera_alignment_contract(candidate, required=required)
+        if loaded is not None:
+            contract, resolved = loaded
+            declarations.append((contract, str(resolved)))
+
+    signatures = {
+        (
+            contract["mode"],
+            contract["clock_domain"],
+            contract["max_abs_skew_ns"],
+            contract["max_camera_age_ns"],
+            contract["verified"],
+        )
+        for contract, _origin in declarations
+    }
+    if len(signatures) > 1:
+        detail = ", ".join(
+            f"{origin} -> {contract}" for contract, origin in declarations
+        )
+        raise ValueError(f"checkpoint camera-alignment provenance disagrees: {detail}")
+    if not declarations:
+        return None, "undeclared"
+    return declarations[0][0], "; ".join(origin for _contract, origin in declarations)
+
+
+def _checked_action_timing_contract(values: dict, context: str) -> dict:
+    """Validate the cadence and coherent future-label offset used for training."""
+    fps = values["dataset_fps"]
+    offset = values["action_offset_frames"]
+    semantics = str(values["action_offset_semantics"])
+    if isinstance(fps, (bool, np.bool_)) or not isinstance(
+        fps, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError(f"{context}: dataset_fps must be numeric")
+    fps = float(fps)
+    if not np.isfinite(fps) or fps <= 0.0:
+        raise ValueError(f"{context}: dataset_fps must be finite and > 0, got {fps!r}")
+    if isinstance(offset, (bool, np.bool_)) or not isinstance(offset, (int, np.integer)):
+        raise ValueError(f"{context}: action_offset_frames must be an integer")
+    offset = int(offset)
+    if offset < 0:
+        raise ValueError(
+            f"{context}: action_offset_frames must be >= 0, got {offset}"
+        )
+    if semantics != _ACTION_OFFSET_SEMANTICS:
+        raise ValueError(
+            f"{context}: action_offset_semantics={semantics!r}; expected "
+            f"{_ACTION_OFFSET_SEMANTICS!r}"
+        )
+    return {
+        "dataset_fps": fps,
+        "action_offset_frames": offset,
+        "action_offset_semantics": semantics,
+    }
+
+
+def _read_dataset_action_timing_contract(
+    path: str | Path, *, required: bool
+) -> tuple[dict, Path] | None:
+    """Read the porter's action-label timing declaration from one dataset sidecar."""
+    meta_path = _dataset_meta_file(path)
+    if not meta_path.is_file():
+        if required:
+            raise FileNotFoundError(f"policy training dataset metadata not found: {meta_path}")
+        return None
+    try:
+        payload = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read policy training metadata {meta_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{meta_path}: expected a JSON object")
+
+    # ``fps`` exists in older sidecars, so it alone does not imply that the newer
+    # action-offset contract is present. Any offset field does, and then the complete
+    # declaration is mandatory.
+    offset_fields = {
+        "action_offset_frames",
+        "pose_action_offset_frames",
+        "action_offset_semantics",
+    }
+    present = offset_fields.intersection(payload)
+    if not present:
+        if required:
+            raise ValueError(
+                f"{meta_path}: missing action-timing metadata; re-port the dataset or "
+                "explicitly declare the legacy checkpoint offset"
+            )
+        return None
+    required_fields = {"fps", "action_offset_frames", "action_offset_semantics"}
+    missing = sorted(required_fields - set(payload))
+    if missing:
+        raise ValueError(
+            f"{meta_path}: partial action-timing metadata; missing {missing}"
+        )
+    if (
+        "pose_action_offset_frames" in payload
+        and payload["pose_action_offset_frames"] != payload["action_offset_frames"]
+    ):
+        raise ValueError(
+            f"{meta_path}: pose_action_offset_frames disagrees with "
+            "action_offset_frames"
+        )
+    contract = _checked_action_timing_contract(
+        {
+            "dataset_fps": payload["fps"],
+            "action_offset_frames": payload["action_offset_frames"],
+            "action_offset_semantics": payload["action_offset_semantics"],
+        },
+        str(meta_path),
+    )
+    return contract, meta_path.resolve()
+
+
+def _discover_checkpoint_action_timing_contract(
+    policy_path: str | Path,
+    policy_config,
+    *,
+    explicit_dataset_meta: str | Path | None = None,
+) -> tuple[dict | None, str]:
+    """Discover and cross-check cadence/label-offset provenance for a checkpoint."""
+    declarations: list[tuple[dict, str]] = []
+    sentinel = object()
+    config_values = {
+        key: getattr(policy_config, key, sentinel)
+        for key in _ACTION_TIMING_CONFIG_FIELDS
+    }
+    config_present = {
+        key for key, value in config_values.items() if value is not sentinel
+    }
+    if config_present:
+        if config_present != set(_ACTION_TIMING_CONFIG_FIELDS):
+            raise ValueError(
+                "checkpoint config has partial action-timing metadata; has "
+                f"{sorted(config_present)}, missing "
+                f"{sorted(set(_ACTION_TIMING_CONFIG_FIELDS) - config_present)}"
+            )
+        declarations.append(
+            (
+                _checked_action_timing_contract(config_values, "checkpoint config"),
+                "config.json",
+            )
+        )
+
+    checkpoint = Path(policy_path).expanduser()
+    meta_candidates: list[tuple[Path, bool]] = []
+    if explicit_dataset_meta is not None:
+        meta_candidates.append((_dataset_meta_file(explicit_dataset_meta), True))
+    elif checkpoint.is_dir():
+        meta_candidates.append((checkpoint / "dexmate_meta.json", False))
+        train_config_path = checkpoint / "train_config.json"
+        if train_config_path.is_file():
+            try:
+                train_config = json.loads(train_config_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"cannot read {train_config_path}: {exc}") from exc
+            dataset = train_config.get("dataset") if isinstance(train_config, dict) else None
+            dataset_root = dataset.get("root") if isinstance(dataset, dict) else None
+            if dataset_root:
+                meta_candidates.append((_dataset_meta_file(str(dataset_root)), False))
+
+    seen: set[Path] = set()
+    for candidate, required in meta_candidates:
+        key = candidate.expanduser().absolute()
+        if key in seen:
+            continue
+        seen.add(key)
+        loaded = _read_dataset_action_timing_contract(candidate, required=required)
+        if loaded is not None:
+            contract, resolved = loaded
+            declarations.append((contract, str(resolved)))
+
+    signatures = {
+        (
+            contract["dataset_fps"],
+            contract["action_offset_frames"],
+            contract["action_offset_semantics"],
+        )
+        for contract, _origin in declarations
+    }
+    if len(signatures) > 1:
+        detail = ", ".join(
+            f"{origin} -> {contract}" for contract, origin in declarations
+        )
+        raise ValueError(f"checkpoint action-timing provenance disagrees: {detail}")
+    if not declarations:
+        return None, "undeclared"
+    return declarations[0][0], "; ".join(origin for _contract, origin in declarations)
+
+
+def _runtime_base_pose_source(arkit_mode: str) -> str:
+    """Canonical source selected by the shared hardware driver's control mode."""
+    return "arkit" if str(arkit_mode) == "control" else "wheel_odometry"
+
+
+def _resolve_rollout_base_pose_source(
+    *,
+    arkit_mode: str,
+    policy=None,
+    replay_source=None,
+    cli_source: str | None = None,
+) -> tuple[str, str]:
+    """Bind training/replay semantics to the live control source, fail closed."""
+    runtime_source = _runtime_base_pose_source(arkit_mode)
+    if policy is not None:
+        declared = getattr(policy, "base_pose_source", None)
+        if declared is not None:
+            declared = _checked_base_pose_source(declared, "checkpoint metadata")
+        if cli_source is not None:
+            cli_source = _checked_base_pose_source(cli_source, "command line")
+        if declared is not None and cli_source is not None and declared != cli_source:
+            raise ValueError(
+                f"--policy-base-pose-source={cli_source} contradicts checkpoint "
+                f"metadata {declared}"
+            )
+        expected = declared or cli_source
+        if expected is None:
+            raise ValueError(
+                "checkpoint does not declare base_pose_source. Pass "
+                "--policy-dataset-meta <ported_dataset>/dexmate_meta.json, or for a "
+                "legacy checkpoint explicitly pass --policy-base-pose-source "
+                "wheel_odometry"
+            )
+        provenance = str(
+            getattr(policy, "base_pose_source_provenance", "--policy-base-pose-source")
+            if declared is not None
+            else "--policy-base-pose-source"
+        )
+    elif replay_source is not None:
+        expected = _checked_base_pose_source(
+            getattr(replay_source, "base_pose_source", None), "replay episode"
+        )
+        provenance = str(getattr(replay_source, "path", "replay episode"))
+    else:
+        raise ValueError("base-pose source resolution needs a policy or replay episode")
+
+    if expected != runtime_source:
+        required_mode = "control" if expected == "arkit" else "off or record"
+        raise ValueError(
+            f"training/replay base_pose_source={expected} ({provenance}), but "
+            f"--arkit-base {arkit_mode} makes live policy/control state use "
+            f"{runtime_source}; use --arkit-base {required_mode}"
+        )
+    if policy is not None:
+        policy.base_pose_source = expected
+        policy.base_pose_source_provenance = provenance
+    return expected, runtime_source
+
+
+def _runtime_camera_alignment_contract(
+    max_skew_ms: float, max_camera_age_ms: float
+) -> dict:
+    if not np.isfinite(max_skew_ms) or max_skew_ms < 0:
+        raise ValueError("camera skew bound must be finite and >= 0")
+    if not np.isfinite(max_camera_age_ms) or max_camera_age_ms <= 0:
+        raise ValueError("camera age bound must be finite and > 0")
+    max_skew_ns = int(round(float(max_skew_ms) * 1e6))
+    return {
+        "mode": (
+            "head_capture_nearest"
+            if max_skew_ns > 0
+            else "latest_arrived_compatibility"
+        ),
+        "clock_domain": "local_via_camera_ntp",
+        "max_abs_skew_ns": max_skew_ns,
+        "max_camera_age_ns": int(round(float(max_camera_age_ms) * 1e6)),
+        "verified": max_skew_ns > 0,
+    }
+
+
+def _resolve_rollout_camera_alignment(
+    *,
+    policy,
+    runtime_max_skew_ms: float,
+    runtime_max_camera_age_ms: float,
+    cli_mode: str | None = None,
+    cli_max_skew_ms: float | None = None,
+    cli_max_camera_age_ms: float | None = None,
+) -> tuple[dict | None, dict]:
+    """Bind a multi-view checkpoint to the exact live frame-selection contract."""
+    runtime = _runtime_camera_alignment_contract(
+        runtime_max_skew_ms, runtime_max_camera_age_ms
+    )
+    wrist_arms = tuple(getattr(policy, "wrist_arms", ()))
+    if not wrist_arms:
+        return None, runtime
+
+    declared = getattr(policy, "camera_alignment_contract", None)
+    if declared is not None:
+        declared = _checked_camera_alignment_contract(
+            {
+                "camera_alignment_mode": declared["mode"],
+                "camera_alignment_clock_domain": declared["clock_domain"],
+                "camera_alignment_max_abs_skew_ns": declared["max_abs_skew_ns"],
+                "camera_alignment_max_camera_age_ns": declared["max_camera_age_ns"],
+                "camera_alignment_verified": declared["verified"],
+            },
+            "checkpoint metadata",
+        )
+
+    cli_contract = None
+    if cli_mode is not None:
+        if cli_max_skew_ms is None:
+            cli_max_skew_ms = 0.0 if cli_mode == "latest_arrived_compatibility" else None
+        if cli_max_skew_ms is None:
+            raise ValueError(
+                "--policy-camera-max-skew-ms is required with "
+                "--policy-camera-alignment-mode head_capture_nearest"
+            )
+        if cli_max_camera_age_ms is None:
+            raise ValueError(
+                "--policy-camera-max-age-ms is required with a legacy checkpoint "
+                "camera-alignment declaration"
+            )
+        cli_contract = _runtime_camera_alignment_contract(
+            cli_max_skew_ms, cli_max_camera_age_ms
+        )
+        if cli_contract["mode"] != cli_mode:
+            raise ValueError(
+                f"--policy-camera-alignment-mode {cli_mode} contradicts "
+                f"--policy-camera-max-skew-ms {cli_max_skew_ms:g}"
+            )
+
+    if declared is not None and cli_contract is not None and declared != cli_contract:
+        raise ValueError(
+            f"command-line camera alignment {cli_contract} contradicts checkpoint "
+            f"metadata {declared}"
+        )
+    expected = declared or cli_contract
+    if expected is None:
+        raise ValueError(
+            "multi-camera checkpoint does not declare its training camera-alignment "
+            "contract. Pass --policy-dataset-meta <ported_dataset>/dexmate_meta.json, "
+            "or explicitly pass --policy-camera-alignment-mode and "
+            "--policy-camera-max-skew-ms/--policy-camera-max-age-ms for a legacy "
+            "checkpoint"
+        )
+    if not expected["verified"]:
+        raise ValueError(
+            f"multi-camera checkpoint was trained with unverified alignment mode "
+            f"{expected['mode']!r}; re-record/retrain from verified "
+            "head-capture-nearest data"
+        )
+    if expected != runtime:
+        provenance = getattr(
+            policy, "camera_alignment_provenance", "command-line declaration"
+        )
+        raise ValueError(
+            f"training camera alignment {expected} ({provenance}) does not exactly "
+            f"match live recorder/inference alignment {runtime}; set "
+            "--record-max-camera-skew-ms to the training bound"
+        )
+    policy.camera_alignment_contract = expected
+    if declared is None:
+        policy.camera_alignment_provenance = "command-line declaration"
+    return expected, runtime
+
+
+def _resolve_rollout_action_timing(
+    *,
+    policy,
+    runtime_dataset_fps: float,
+    cli_action_offset_frames: int | None = None,
+) -> dict:
+    """Bind training label timing to the live chunk scheduler, fail closed."""
+    if not np.isfinite(runtime_dataset_fps) or runtime_dataset_fps <= 0.0:
+        raise ValueError("--dataset-fps must be finite and > 0")
+    runtime_dataset_fps = float(runtime_dataset_fps)
+
+    declared_fps = getattr(policy, "dataset_fps", None)
+    declared_offset = getattr(policy, "action_offset_frames", None)
+    if (declared_fps is None) != (declared_offset is None):
+        raise ValueError(
+            "checkpoint has a partial action-timing declaration; dataset_fps and "
+            "action_offset_frames must be declared together"
+        )
+    declared = None
+    if declared_fps is not None:
+        declared = _checked_action_timing_contract(
+            {
+                "dataset_fps": declared_fps,
+                "action_offset_frames": declared_offset,
+                "action_offset_semantics": getattr(
+                    policy, "action_offset_semantics", _ACTION_OFFSET_SEMANTICS
+                ),
+            },
+            "checkpoint metadata",
+        )
+
+    cli_offset = None
+    if cli_action_offset_frames is not None:
+        cli_offset = _checked_action_timing_contract(
+            {
+                "dataset_fps": runtime_dataset_fps,
+                "action_offset_frames": cli_action_offset_frames,
+                "action_offset_semantics": _ACTION_OFFSET_SEMANTICS,
+            },
+            "command line",
+        )
+
+    if declared is not None and not np.isclose(
+        declared["dataset_fps"], runtime_dataset_fps, rtol=0.0, atol=1e-9
+    ):
+        raise ValueError(
+            f"--dataset-fps {runtime_dataset_fps:g} != training metadata "
+            f"{declared['dataset_fps']:g}"
+        )
+    if (
+        declared is not None
+        and cli_offset is not None
+        and declared["action_offset_frames"] != cli_offset["action_offset_frames"]
+    ):
+        raise ValueError(
+            f"--policy-action-offset-frames={cli_offset['action_offset_frames']} "
+            f"contradicts checkpoint metadata {declared['action_offset_frames']}"
+        )
+
+    resolved = declared or cli_offset
+    if resolved is None:
+        raise ValueError(
+            "checkpoint does not declare action_offset_frames. Pass "
+            "--policy-dataset-meta <ported_dataset>/dexmate_meta.json, or for a "
+            "legacy zero-offset checkpoint explicitly pass "
+            "--policy-action-offset-frames 0"
+        )
+    # The command-line cadence is authoritative at runtime after the exact-match check.
+    resolved = dict(resolved)
+    resolved["dataset_fps"] = runtime_dataset_fps
+    policy.dataset_fps = runtime_dataset_fps
+    policy.action_offset_frames = resolved["action_offset_frames"]
+    policy.action_offset_semantics = resolved["action_offset_semantics"]
+    if declared is None:
+        policy.action_timing_provenance = "command-line declaration"
+    return resolved
+
+
+def split_policy_action(
+    action: np.ndarray,
+) -> dict[str, np.ndarray | np.float32 | None]:
+    """29-D WBC or 32-D joystick action -> pose, gripper, and chassis targets.
 
     Pure reshaping: positions pass through, 6-D rotations are re-orthonormalized
-    by ``pos6d_to_mat``. The outputs are ALREADY world-frame ``ik.solve()``
-    targets -- never compose them with any base pose, at the 10 Hz policy tick
-    or the 100 Hz WBC tick. Postprocessed gripper predictions are thresholded at
-    the same value used to binarize the training actions.
+    by ``pos6d_to_mat``. The outputs are already in the action schema's declared
+    frame (engage-world for 29-D WBC, current-base for 32-D joystick) -- never
+    compose them with a base pose at the 10 Hz policy tick or 100 Hz IK tick.
+    Postprocessed gripper predictions are thresholded at the same value used to
+    binarize the training actions.
     """
     action = np.asarray(action, dtype=np.float32).reshape(-1)
-    if action.shape != (len(ACTION_AXES),):
-        raise ValueError(f"expected {len(ACTION_AXES)}-D WBC action, got {action.shape}")
+    if action.shape not in ((len(ACTION_AXES),), (len(JOYSTICK_ACTION_AXES),)):
+        raise ValueError(
+            f"expected 29-D or 32-D WBC/joystick action, got {action.shape}"
+        )
     if not np.all(np.isfinite(action)):
         raise ValueError("policy action contains non-finite values")
     return {
@@ -198,6 +1041,11 @@ def split_policy_action(action: np.ndarray) -> dict[str, np.ndarray | np.float32
         "head": pos6d_to_mat(action[20:29]),
         "left_gripper": np.float32(action[9] >= GRIPPER_BINARY_THRESHOLD),
         "right_gripper": np.float32(action[19] >= GRIPPER_BINARY_THRESHOLD),
+        "chassis": (
+            None
+            if action.shape == (len(ACTION_AXES),)
+            else action[29:32].copy()
+        ),
     }
 
 
@@ -207,8 +1055,9 @@ def encode_replay_action(
     head: np.ndarray,
     grip_left,
     grip_right,
+    chassis: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Replayed targets -> the 29-D ``ACTION_AXES`` vector a policy would emit.
+    """Replayed targets -> the matching 29-D WBC or 32-D joystick vector.
 
     Only for the ``policy_io`` log, so replay and live rollouts are directly
     diffable; the robot itself is driven from the 4x4 matrices, never from this
@@ -217,9 +1066,16 @@ def encode_replay_action(
     grips = np.asarray([grip_left, grip_right], dtype=np.float32)
     if not np.all(np.isfinite(grips)):
         raise ValueError(f"replay gripper commands must be finite, got {grips}")
-    return np.concatenate(
-        [mat_to_pos6d(left), grips[:1], mat_to_pos6d(right), grips[1:2], mat_to_pos6d(head)]
-    ).astype(np.float32)
+    parts = [
+        mat_to_pos6d(left), grips[:1], mat_to_pos6d(right), grips[1:2],
+        mat_to_pos6d(head),
+    ]
+    if chassis is not None:
+        chassis_arr = np.asarray(chassis, dtype=np.float32).reshape(-1)
+        if chassis_arr.shape != (3,) or not np.all(np.isfinite(chassis_arr)):
+            raise ValueError(f"replay chassis intent must be finite (3,), got {chassis_arr}")
+        parts.append(chassis_arr)
+    return np.concatenate(parts).astype(np.float32)
 
 
 @dataclass(frozen=True)
@@ -233,17 +1089,54 @@ class ScheduledPolicyAction:
     """
 
     timestamp: float
-    left: np.ndarray            # (4, 4) world-frame ik.solve target
+    left: np.ndarray            # (4, 4) target in the policy action frame
     right: np.ndarray           # (4, 4)
     head: np.ndarray            # (4, 4)
     grip_left: np.float32
     grip_right: np.float32
+    # Joystick policy: body-frame post-projection intent, held ZOH between knots.
+    # None preserves the deployed 29-D WBC action contract.
+    chassis: np.ndarray | None = None
+
+
+def chunk_schedule_timestamps(
+    *,
+    observation_time: float,
+    frame_count: int,
+    dataset_dt: float,
+    action_offset_frames: int,
+) -> np.ndarray:
+    """Wall-clock schedule for labels sourced from ``obs_index + offset``.
+
+    A porter offset changes the physical time represented by every action label; it
+    is not merely dataset provenance. Row ``k`` therefore belongs at
+    ``observation_time + (action_offset_frames + k) * dataset_dt``. This keeps
+    inference latency visible to the stale-frame drop instead of executing a future
+    target early.
+    """
+    if not np.isfinite(observation_time):
+        raise ValueError("observation_time must be finite")
+    if isinstance(frame_count, bool) or not isinstance(frame_count, (int, np.integer)):
+        raise ValueError("frame_count must be an integer")
+    if frame_count < 1:
+        raise ValueError("frame_count must be >= 1")
+    if not np.isfinite(dataset_dt) or dataset_dt <= 0.0:
+        raise ValueError("dataset_dt must be finite and > 0")
+    if isinstance(action_offset_frames, (bool, np.bool_)) or not isinstance(
+        action_offset_frames, (int, np.integer)
+    ):
+        raise ValueError("action_offset_frames must be an integer")
+    if action_offset_frames < 0:
+        raise ValueError("action_offset_frames must be >= 0")
+    return float(observation_time) + float(dataset_dt) * (
+        int(action_offset_frames) + np.arange(int(frame_count), dtype=np.float64)
+    )
 
 
 def scheduled_actions_from_chunk(
     chunk: np.ndarray, timestamps: np.ndarray
 ) -> list[ScheduledPolicyAction]:
-    """Decode an ``(n, 29)`` action chunk + per-frame wall-clock timestamps.
+    """Decode an ``(n, 29|32)`` action chunk + per-frame wall-clock timestamps.
 
     Row ``k`` goes through ``split_policy_action`` (the same decode as a single
     policy action: Gram-Schmidt re-orthonormalization, NO base composition) and
@@ -252,10 +1145,13 @@ def scheduled_actions_from_chunk(
     """
     chunk = np.asarray(chunk, dtype=np.float32)
     ts = np.asarray(timestamps, dtype=np.float64).reshape(-1)
-    if chunk.ndim != 2 or chunk.shape[0] < 1 or chunk.shape[0] != ts.shape[0]:
+    valid_dim = chunk.ndim == 2 and chunk.shape[1] in (
+        len(ACTION_AXES), len(JOYSTICK_ACTION_AXES)
+    )
+    if not valid_dim or chunk.shape[0] < 1 or chunk.shape[0] != ts.shape[0]:
         raise ValueError(
             f"chunk {chunk.shape} / timestamps {ts.shape}: expected (n>=1, "
-            f"{len(ACTION_AXES)}) with one timestamp per frame"
+            "29|32) with one timestamp per frame"
         )
     if not np.all(np.isfinite(ts)) or (ts.size > 1 and not np.all(np.diff(ts) > 0)):
         raise ValueError("chunk timestamps must be finite and strictly increasing")
@@ -266,6 +1162,7 @@ def scheduled_actions_from_chunk(
             timestamp=float(ts[k]),
             left=targets["left"], right=targets["right"], head=targets["head"],
             grip_left=targets["left_gripper"], grip_right=targets["right_gripper"],
+            chassis=targets["chassis"],
         ))
     return out
 
@@ -289,7 +1186,9 @@ def drop_stale_actions(
 def _interpolate_scheduled(
     prev: ScheduledPolicyAction, future: ScheduledPolicyAction, query_time: float
 ) -> ScheduledPolicyAction:
-    """Blend poses at ``query_time`` while holding the previous binary grippers."""
+    """Blend poses while holding discrete grippers and chassis intent ZOH."""
+    if (prev.chassis is None) != (future.chassis is None):
+        raise ValueError("cannot interpolate across WBC/joystick action schemas")
     if future.timestamp <= prev.timestamp:
         return future
     alpha = float(np.clip(
@@ -302,6 +1201,7 @@ def _interpolate_scheduled(
         head=_blend_pose(prev.head, future.head, alpha),
         grip_left=prev.grip_left,
         grip_right=prev.grip_right,
+        chassis=(None if prev.chassis is None else prev.chassis.copy()),
     )
 
 
@@ -350,6 +1250,9 @@ class ActionScheduleBuffer:
             raise ValueError(
                 "scheduled actions must carry finite, strictly increasing timestamps"
             )
+        has_chassis = [action.chassis is not None for action in actions]
+        if any(has_chassis) and not all(has_chassis):
+            raise ValueError("one scheduled chunk cannot mix WBC and joystick actions")
         with self._lock:
             if self._terminal_underflow:
                 raise RuntimeError(
@@ -384,10 +1287,10 @@ class ActionScheduleBuffer:
                 out = future  # before the first knot: command it verbatim (early glide)
             else:
                 out = _interpolate_scheduled(prev, future, query_time)
-            gripper_source = passed if passed is not None else (
+            discrete_source = passed if passed is not None else (
                 prev if prev is not None else future
             )
-            if out is None or gripper_source is None:
+            if out is None or discrete_source is None:
                 if self._armed:
                     self._terminal_underflow = True
                     raise RuntimeError(
@@ -397,8 +1300,13 @@ class ActionScheduleBuffer:
             executed = replace(
                 out,
                 timestamp=float(query_time),
-                grip_left=gripper_source.grip_left,
-                grip_right=gripper_source.grip_right,
+                grip_left=discrete_source.grip_left,
+                grip_right=discrete_source.grip_right,
+                chassis=(
+                    None
+                    if discrete_source.chassis is None
+                    else discrete_source.chassis.copy()
+                ),
             )
             self._last_executed = executed
             return executed
@@ -415,6 +1323,7 @@ class ReplayFrame:
     grip_left: np.floating
     grip_right: np.floating
     segment_duration: float
+    chassis: np.ndarray | None = None
 
 
 class RecordedEpisodeSource:
@@ -450,6 +1359,81 @@ class RecordedEpisodeSource:
             grip_left = self._required(f, "action/gripper/left")
             grip_right = self._required(f, "action/gripper/right")
             ts = self._required(f, "timestamp_ns")
+            schema = self._optional_text(f, "meta/schema")
+            policy_schema = self._optional_text(f, "meta/policy_action_schema")
+            control_mode = self._optional_text(f, "meta/control_mode")
+            action_target_frame = self._optional_text(f, "meta/action_target_frame")
+            eef_target_frame = self._optional_text(f, "meta/eef_target_frame")
+            head_target_frame = self._optional_text(f, "meta/head_target_frame")
+            declared_source = self._optional_text(f, "meta/obs_base_pose_source")
+            control_source = self._optional_text(f, "meta/base_control_pose_source")
+            chassis_intent = (
+                self._required(f, "action/chassis/intent_body")
+                if (
+                    schema == "omniteleop_joystick_mobile_raw/v1"
+                    or policy_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+                    or control_mode == "joystick"
+                )
+                else None
+            )
+
+        joystick = chassis_intent is not None
+        if joystick:
+            declarations = {
+                "meta/schema": (schema, "omniteleop_joystick_mobile_raw/v1"),
+                "meta/policy_action_schema": (
+                    policy_schema, JOYSTICK_POLICY_ACTION_SCHEMA
+                ),
+                "meta/control_mode": (control_mode, "joystick"),
+                "meta/action_target_frame": (action_target_frame, "current_base"),
+                "meta/eef_target_frame": (eef_target_frame, "current_base"),
+                "meta/head_target_frame": (head_target_frame, "current_base"),
+            }
+            bad = [
+                f"{key}={actual!r} (expected {expected!r})"
+                for key, (actual, expected) in declarations.items()
+                if actual != expected
+            ]
+            if bad:
+                raise RuntimeError(
+                    f"{self.path}: conflicting joystick replay contract: "
+                    + "; ".join(bad)
+                )
+            self.policy_action_schema = JOYSTICK_POLICY_ACTION_SCHEMA
+            self.action_target_frame = "current_base"
+        else:
+            if policy_schema not in (None, WBC_POLICY_ACTION_SCHEMA):
+                raise RuntimeError(
+                    f"{self.path}: unsupported policy action schema {policy_schema!r}"
+                )
+            if action_target_frame not in (None, "engage_origin_world", "world"):
+                raise RuntimeError(
+                    f"{self.path}: WBC replay action frame must be world, got "
+                    f"{action_target_frame!r}"
+                )
+            self.policy_action_schema = WBC_POLICY_ACTION_SCHEMA
+            self.action_target_frame = "world"
+
+        if schema in {
+            "omniteleop_wbc_mobile_raw/v3",
+            "omniteleop_wbc_mobile_raw/v4",
+            "omniteleop_wbc_mobile_raw/v5",
+            "omniteleop_joystick_mobile_raw/v1",
+        } and declared_source is None:
+            raise RuntimeError(
+                f"{self.path}: explicit-base raw replay is missing "
+                "meta/obs_base_pose_source"
+            )
+        self.base_pose_source = _checked_base_pose_source(
+            declared_source or "wheel_odometry", self.path
+        )
+        if control_source is not None:
+            control_source = _checked_base_pose_source(control_source, self.path)
+            if control_source != self.base_pose_source:
+                raise RuntimeError(
+                    f"{self.path}: replay canonical base source {self.base_pose_source} "
+                    f"!= recorded control source {control_source}"
+                )
 
         if ts.ndim != 1 or ts.shape[0] < 1:
             raise RuntimeError(f"{self.path}: timestamp_ns must be (T>=1,), got {ts.shape}")
@@ -483,6 +1467,16 @@ class RecordedEpisodeSource:
                 raise RuntimeError(f"{self.path}: {name} must be ({n},), got {grips.shape}")
             if not np.all(np.isfinite(grips)):
                 raise RuntimeError(f"{self.path}: {name} contains non-finite values")
+        if chassis_intent is not None:
+            if chassis_intent.shape != (n, 3):
+                raise RuntimeError(
+                    f"{self.path}: action/chassis/intent_body must be ({n},3), "
+                    f"got {chassis_intent.shape}"
+                )
+            if not np.all(np.isfinite(chassis_intent)):
+                raise RuntimeError(
+                    f"{self.path}: action/chassis/intent_body contains non-finite values"
+                )
 
         self._left = np.asarray(left, dtype=np.float64)
         self._right = np.asarray(right, dtype=np.float64)
@@ -490,6 +1484,11 @@ class RecordedEpisodeSource:
         # Raw dtype on purpose: replay must send bit-identical gripper commands.
         self._grip_left = grip_left
         self._grip_right = grip_right
+        self._chassis_intent = (
+            None
+            if chassis_intent is None
+            else np.asarray(chassis_intent, dtype=np.float32)
+        )
         self._rel_s = (ts - ts[0]).astype(np.float64) / 1e9
         self._n = n
         self._wall0: float | None = None
@@ -509,6 +1508,22 @@ class RecordedEpisodeSource:
                 "episode recorded by the updated wbc_vr_robot.py --record"
             )
         return np.asarray(f[key])
+
+    def _optional_text(self, f, key: str) -> str | None:
+        if key not in f:
+            return None
+        value = np.asarray(f[key][()])
+        if value.shape != ():
+            raise RuntimeError(f"{self.path}: {key} must be scalar text")
+        scalar = value.item()
+        if isinstance(scalar, (bytes, np.bytes_)):
+            try:
+                return bytes(scalar).decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise RuntimeError(f"{self.path}: {key} is not valid UTF-8") from exc
+        if isinstance(scalar, str):
+            return scalar
+        raise RuntimeError(f"{self.path}: {key} must be scalar text")
 
     @property
     def n_frames(self) -> int:
@@ -558,6 +1573,11 @@ class RecordedEpisodeSource:
             grip_left=self._grip_left[i],
             grip_right=self._grip_right[i],
             segment_duration=0.0 if i == 0 else float(self._rel_s[i] - self._rel_s[i - 1]),
+            chassis=(
+                None
+                if self._chassis_intent is None
+                else self._chassis_intent[i].copy()
+            ),
         )
 
 
@@ -576,6 +1596,8 @@ def wbc_tick(
     last_cmd_wall: float | None,
     live_head_filters: bool,
     estop: bool = False,
+    source_timestamp_ns: int = -1,
+    source_receive_wall_ns: int = -1,
 ):
     """One 100 Hz WBC tick: interpolate -> head shaping -> solve -> actuate -> record.
 
@@ -592,7 +1614,12 @@ def wbc_tick(
     if live_head_filters:
         head_target = head_lpf.filter(head_target, dt)
         head_target = head_deadband.filter(head_target)
-    result = ik.solve(left_target, right_target, dt, head_target=head_target)
+    head_mode = str(getattr(getattr(driver, "cfg", None), "head_mode", "ik"))
+    if head_mode == "track":
+        head_joints = ik.solve_head(head_target, dt)
+        result = ik.solve(left_target, right_target, dt, head_joints=head_joints)
+    else:
+        result = ik.solve(left_target, right_target, dt, head_target=head_target)
     hold_reason = driver.extra_hold(now, last_cmd_wall, estop=estop)
     # compute_hold_reason deliberately returns None on estop (the caller owns that
     # layer), so estop must be OR'd in here, exactly like the teleop follower.
@@ -600,24 +1627,28 @@ def wbc_tick(
     driver.actuate(result, float(grip_left), float(grip_right), enable, hold, dt)
     if driver._episode is not None:  # noqa: SLF001 -- same recording path as teleop
         driver.record_tick(result, hold, now, left_target=left_target,
-                           right_target=right_target, head_target=head_target)
+                           right_target=right_target, head_target=head_target,
+                           source_timestamp_ns=source_timestamp_ns,
+                           source_receive_wall_ns=source_receive_wall_ns)
     return result, hold, hold_reason
 
 
-def load_alignment_references(path: str, ik) -> tuple[np.ndarray, np.ndarray]:
+def load_alignment_references(
+    path: str, ik, *, target_frame: str = "world"
+) -> tuple[np.ndarray, np.ndarray]:
     """Reference L/R EEF poses via the leader's loader (no reimplemented parsing)."""
     from omniteleop.leader.wbc_reference_alignment import (  # noqa: PLC0415 -- heavy
         load_reference_ee_poses,
     )
 
-    ref = load_reference_ee_poses(path, ik)
+    ref = load_reference_ee_poses(path, ik, target_frame=target_frame)
     if ref is None:
         raise RuntimeError(f"alignment reference episode yielded no poses: {path!r}")
     return ref
 
 
 def _achieved_world_ee_poses(driver, fk: WBCPolicyFK) -> tuple[np.ndarray, np.ndarray]:
-    """Where the arms ACTUALLY are: measured-joint FK composed with odometry."""
+    """Where the arms ACTUALLY are in the canonical control-feedback world."""
     measured = driver._read_measured_joints()  # noqa: SLF001 -- deliberate reuse
     for grp in ("torso", "left_arm", "right_arm", "head"):
         if measured.get(grp) is None:
@@ -626,7 +1657,26 @@ def _achieved_world_ee_poses(driver, fk: WBCPolicyFK) -> tuple[np.ndarray, np.nd
         raise RuntimeError("odometry required to verify alignment in the world frame")
     q = fk.q_from_raw(
         measured["torso"], measured["left_arm"], measured["right_arm"], measured["head"],
-        base_xyyaw=np.asarray(driver._odom.pose, dtype=float),  # noqa: SLF001
+        base_xyyaw=_policy_base_pose(driver),
+    )
+    return fk.frame_pose(fk.left_ee_frame, q), fk.frame_pose(fk.right_ee_frame, q)
+
+
+def _achieved_ee_poses(
+    driver, fk: WBCPolicyFK, *, target_frame: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Measured arm poses in the action frame selected by the policy contract."""
+    if target_frame == "world":
+        return _achieved_world_ee_poses(driver, fk)
+    if target_frame != "current_base":
+        raise ValueError(f"unsupported action target frame {target_frame!r}")
+    measured = driver._read_measured_joints()  # noqa: SLF001 -- deliberate reuse
+    for grp in ("torso", "left_arm", "right_arm", "head"):
+        if measured.get(grp) is None:
+            raise RuntimeError(f"measured {grp} joints unavailable; cannot verify alignment")
+    q = fk.q_from_raw(
+        measured["torso"], measured["left_arm"], measured["right_arm"],
+        measured["head"], base_xyyaw=None,
     )
     return fk.frame_pose(fk.left_ee_frame, q), fk.frame_pose(fk.right_ee_frame, q)
 
@@ -751,22 +1801,66 @@ def _load_wbc_vr_robot():
     return module
 
 
+def _load_wbc_joystick_robot():
+    """Load the joystick follower's IK/driver without making scripts a package."""
+    path = Path(__file__).resolve().parent / "wbc_joystick_robot.py"
+    spec = importlib.util.spec_from_file_location(
+        "wbc_joystick_robot_for_rollout", path
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 @dataclass(frozen=True)
 class PolicyObservation:
-    """One raw (unbatched) policy observation sample."""
+    """One raw policy observation plus the exact sensor/state timing it used."""
 
     state: np.ndarray               # (32,) float32, frame per the checkpoint
     head_rgb: np.ndarray            # (H, W, 3) uint8
     # arm ("left"/"right") -> (H, W, 3) uint8. Empty when the policy has no wrist
     # input; carries exactly the arms the checkpoint declares.
     wrist_rgb: dict[str, np.ndarray]
+    base_pose: np.ndarray | None = None
+    head_frame_ns: int = -1
+    head_receive_wall_ns: int = -1
+    wrist_frame_ns: dict[str, int] | None = None
+    wrist_receive_wall_ns: dict[str, int] | None = None
+    # Corrected head-local minus wrist-local capture skew for exactly the images above.
+    camera_skew_ns: dict[str, int] | None = None
+    # Capture-to-grab-end age in the local clock after camera-host correction.
+    camera_age_ns: dict[str, int] | None = None
+    grab_start_wall_ns: int = -1
+    grab_end_wall_ns: int = -1
+    state_sensor_read_start_wall_ns: int = -1
+    state_sensor_read_end_wall_ns: int = -1
+    state_ready_wall_ns: int = -1
+    ready_wall_ns: int = -1
+    ready_perf_s: float = float("nan")
+    gripper_event_count: dict[str, int] | None = None
+    gripper_read_wall_ns: dict[str, int] | None = None
+
+
+@dataclass(frozen=True)
+class _PolicyStateReading:
+    """One internally consistent state vector and its local read bracket."""
+
+    state: np.ndarray
+    base_pose: np.ndarray
+    sensor_read_start_wall_ns: int
+    sensor_read_end_wall_ns: int
+    state_ready_wall_ns: int
+    gripper_event_count: dict[str, int]
+    gripper_read_wall_ns: dict[str, int]
 
 
 class _PolicyBundle:
     """Checkpoint + pre/post processors + chunk-level inference for the WBC schema."""
 
     def __init__(self, policy_path: str, device: str | None = None,
-                 scene_diff_repo: str = DEFAULT_SCENE_DIFF_REPO) -> None:
+                 scene_diff_repo: str = DEFAULT_SCENE_DIFF_REPO,
+                 dataset_meta_path: str | None = None) -> None:
         import torch  # noqa: PLC0415 -- heavy, hardware/GPU path only
         from lerobot.configs import PreTrainedConfig  # noqa: PLC0415
         from lerobot.policies import (  # noqa: PLC0415
@@ -779,7 +1873,47 @@ class _PolicyBundle:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         pcfg = PreTrainedConfig.from_pretrained(policy_path)
         pcfg.pretrained_path = policy_path
+        (
+            declared_policy_action_schema,
+            self.policy_action_schema_provenance,
+        ) = _discover_checkpoint_policy_action_schema(
+            policy_path,
+            pcfg,
+            explicit_dataset_meta=dataset_meta_path,
+        )
         self.checkpoint_path = str(Path(policy_path).expanduser().resolve())
+        (
+            self.base_pose_source,
+            self.base_pose_source_provenance,
+        ) = _discover_checkpoint_base_pose_source(
+            policy_path,
+            pcfg,
+            explicit_dataset_meta=dataset_meta_path,
+        )
+        (
+            self.camera_alignment_contract,
+            self.camera_alignment_provenance,
+        ) = _discover_checkpoint_camera_alignment_contract(
+            policy_path,
+            pcfg,
+            explicit_dataset_meta=dataset_meta_path,
+        )
+        action_timing, self.action_timing_provenance = (
+            _discover_checkpoint_action_timing_contract(
+                policy_path,
+                pcfg,
+                explicit_dataset_meta=dataset_meta_path,
+            )
+        )
+        self.dataset_fps = (
+            None if action_timing is None else action_timing["dataset_fps"]
+        )
+        self.action_offset_frames = (
+            None if action_timing is None else action_timing["action_offset_frames"]
+        )
+        self.action_offset_semantics = (
+            None if action_timing is None else action_timing["action_offset_semantics"]
+        )
         self.position_condition_mode = str(
             getattr(pcfg, "position_condition_mode", "not_applicable")
         )
@@ -802,11 +1936,49 @@ class _PolicyBundle:
         out_feats = self.policy.config.output_features
         state_dim = int(in_feats[OBS_STATE].shape[0])
         action_dim = int(out_feats[ACTION].shape[0])
-        if state_dim != len(STATE_AXES) or action_dim != len(ACTION_AXES):
+        if state_dim != len(STATE_AXES) or action_dim not in (
+            len(ACTION_AXES), len(JOYSTICK_ACTION_AXES)
+        ):
             raise ValueError(
                 f"checkpoint dims state={state_dim}/action={action_dim} do not match "
-                f"the WBC schema ({len(STATE_AXES)}/{len(ACTION_AXES)}); wrong checkpoint?"
+                f"the supported WBC schemas ({len(STATE_AXES)}/29 or "
+                "32); wrong checkpoint?"
             )
+        self.action_dim = action_dim
+        inferred_policy_action_schema = (
+            JOYSTICK_POLICY_ACTION_SCHEMA
+            if action_dim == len(JOYSTICK_ACTION_AXES)
+            else WBC_POLICY_ACTION_SCHEMA
+        )
+        if (
+            declared_policy_action_schema is not None
+            and declared_policy_action_schema != inferred_policy_action_schema
+        ):
+            raise ValueError(
+                "checkpoint output dimension contradicts policy-action provenance: "
+                f"{action_dim}-D implies {inferred_policy_action_schema!r}, but "
+                f"metadata declares {declared_policy_action_schema!r}"
+            )
+        if (
+            inferred_policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+            and declared_policy_action_schema is None
+        ):
+            raise ValueError(
+                "32-D checkpoint has no versioned joystick action declaration. Pass "
+                "--policy-dataset-meta for the original ported dataset; refusing to "
+                "guess the chassis/frame semantics from dimension alone."
+            )
+        self.policy_action_schema = inferred_policy_action_schema
+        self.action_target_frame = (
+            "current_base"
+            if self.policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+            else "world"
+        )
+        if self.policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA:
+            if self.action_frame_mode == "mof":
+                raise ValueError("32-D joystick actions are incompatible with MoF world lifting")
+            self.action_frame_mode = "current_base"
+            self.state_frame = "base"
         img_keys = [k for k in in_feats if k.startswith("observation.images.")]
         # left/right name the ARM the wrist camera is mounted on, matching the porter's
         # observation.images.{left,right}_wrist_rgb.
@@ -886,13 +2058,90 @@ class _PolicyBundle:
 
     def inference_metadata(self) -> dict[str, np.ndarray]:
         """Constant checkpoint metadata written once in the policy-IO episode."""
-        return {
+        policy_action_schema = str(
+            getattr(self, "policy_action_schema", WBC_POLICY_ACTION_SCHEMA)
+        )
+        action_dim = int(getattr(self, "action_dim", len(ACTION_AXES)))
+        action_target_frame = str(
+            getattr(
+                self,
+                "action_target_frame",
+                "current_base"
+                if policy_action_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+                else "world",
+            )
+        )
+        metadata = {
             "checkpoint_path": np.asarray(self.checkpoint_path.encode("utf-8")),
             "position_condition_mode": np.asarray(
                 self.position_condition_mode.encode("utf-8")
             ),
             "action_frame_mode": np.asarray(self.action_frame_mode.encode("utf-8")),
+            "policy_action_schema": np.asarray(
+                policy_action_schema.encode("utf-8")
+            ),
+            "policy_action_schema_provenance": np.asarray(
+                str(getattr(self, "policy_action_schema_provenance", "legacy inferred")).encode(
+                    "utf-8"
+                )
+            ),
+            "action_target_frame": np.asarray(
+                action_target_frame.encode("utf-8")
+            ),
+            "action_dim": np.asarray(action_dim, np.int64),
         }
+        source = getattr(self, "base_pose_source", None)
+        if source is not None:
+            metadata["base_pose_source"] = np.asarray(str(source).encode("utf-8"))
+            metadata["base_pose_source_provenance"] = np.asarray(
+                str(getattr(self, "base_pose_source_provenance", "unknown")).encode(
+                    "utf-8"
+                )
+            )
+        alignment = getattr(self, "camera_alignment_contract", None)
+        if alignment is not None:
+            metadata["camera_alignment_mode"] = np.asarray(
+                str(alignment["mode"]).encode("utf-8")
+            )
+            metadata["camera_alignment_clock_domain"] = np.asarray(
+                str(alignment["clock_domain"]).encode("utf-8")
+            )
+            if alignment["max_abs_skew_ns"] is not None:
+                metadata["camera_alignment_max_abs_skew_ns"] = np.asarray(
+                    alignment["max_abs_skew_ns"], np.int64
+                )
+            if alignment["max_camera_age_ns"] is not None:
+                metadata["camera_alignment_max_camera_age_ns"] = np.asarray(
+                    alignment["max_camera_age_ns"], np.int64
+                )
+            metadata["camera_alignment_verified"] = np.asarray(
+                bool(alignment["verified"]), np.bool_
+            )
+            metadata["camera_alignment_provenance"] = np.asarray(
+                str(getattr(self, "camera_alignment_provenance", "unknown")).encode(
+                    "utf-8"
+                )
+            )
+        dataset_fps = getattr(self, "dataset_fps", None)
+        action_offset_frames = getattr(self, "action_offset_frames", None)
+        if dataset_fps is not None and action_offset_frames is not None:
+            metadata["dataset_fps"] = np.asarray(dataset_fps, np.float64)
+            metadata["action_offset_frames"] = np.asarray(
+                action_offset_frames, np.int64
+            )
+            metadata["action_offset_semantics"] = np.asarray(
+                str(
+                    getattr(
+                        self, "action_offset_semantics", _ACTION_OFFSET_SEMANTICS
+                    )
+                ).encode("utf-8")
+            )
+            metadata["action_timing_provenance"] = np.asarray(
+                str(getattr(self, "action_timing_provenance", "unknown")).encode(
+                    "utf-8"
+                )
+            )
+        return metadata
 
     def last_inference_trace(self) -> dict | None:
         """Small CPU snapshot from the most recent completed inference."""
@@ -904,7 +2153,13 @@ class _PolicyBundle:
                 f"{'+'.join(f'{a}_wrist' for a in self.wrist_arms) or 'no-wrist'} "
                 f"@ {self.image_hw}; "
                 f"state_frame={self.state_frame}; "
-                f"action_frame={self.action_frame_mode}; "
+                f"base_pose_source={self.base_pose_source or 'undeclared'}; "
+                f"camera_alignment="
+                f"{(self.camera_alignment_contract or {}).get('mode', 'undeclared')}; "
+                f"timing={self.dataset_fps or 'undeclared'}fps/"
+                f"offset={self.action_offset_frames if self.action_offset_frames is not None else 'undeclared'}; "  # noqa: E501
+                f"action={self.policy_action_schema}/{self.action_dim}D "
+                f"frame={self.action_target_frame}; "
                 f"n_obs_steps={self.n_obs_steps} n_action_steps={self.n_action_steps}")
 
     def install_live_object_condition(self, condition: LiveObjectCondition) -> None:
@@ -1052,7 +2307,7 @@ class _PolicyBundle:
         return sample
 
     def predict_chunk(self, obs_history: Sequence[PolicyObservation]) -> np.ndarray:
-        """One full forward pass -> ``(n_action_steps, 29)`` float32 ABSOLUTE actions.
+        """One full forward pass -> ``(n_action_steps, action_dim)`` policy actions.
 
         ``obs_history`` is oldest-first at the DATASET cadence (1/fps apart, the
         spacing the n_obs_steps>1 policy was trained on -- NOT the replan
@@ -1105,15 +2360,16 @@ class _PolicyBundle:
                 model_env = batch[OBS_ENV_STATE]
                 if model_env.ndim == 2:
                     model_env = model_env.unsqueeze(1)
+        action_dim = int(getattr(self, "action_dim", len(ACTION_AXES)))
         if chunk.ndim != 3 or chunk.shape[0] != 1 or chunk.shape[1] < self.n_action_steps:
             raise ValueError(
                 f"predict_action_chunk returned {tuple(chunk.shape)}; expected "
-                f"(1, >={self.n_action_steps}, {len(ACTION_AXES)})"
+                f"(1, >={self.n_action_steps}, {action_dim})"
             )
         chunk = self.post(chunk[:, : self.n_action_steps])
         out = np.asarray(chunk.detach().cpu().numpy(), dtype=np.float32)
         out = out.reshape(-1, out.shape[-1])
-        if out.shape != (self.n_action_steps, len(ACTION_AXES)) or not np.all(
+        if out.shape != (self.n_action_steps, action_dim) or not np.all(
             np.isfinite(out)
         ):
             raise ValueError(f"bad action chunk {out.shape} (or non-finite)")
@@ -1170,41 +2426,241 @@ class _PolicyBundle:
         return np.asarray(self._chunk_tail.popleft(), dtype=np.float32).reshape(-1)
 
 
-def _build_state(driver, fk: WBCPolicyFK, state_frame: str = "base") -> np.ndarray:
-    """32-D observation.state from measured joints (FK base zero) + odom pose.
+def _policy_base_pose(driver) -> np.ndarray:
+    """Measured engage-origin pose from the source that closes the base PD loop."""
+    snapshot = getattr(driver, "policy_base_pose_snapshot", None)
+    if callable(snapshot):
+        pose = np.asarray(snapshot()["pose"], dtype=np.float64)
+    else:
+        pose = np.asarray(driver._odom.pose, dtype=np.float64)  # noqa: SLF001
+    if pose.shape != (3,) or not np.all(np.isfinite(pose)):
+        raise RuntimeError(f"policy base pose {pose!r} is not finite (3,)")
+    return pose
+
+
+def _build_state_reading(
+    driver, fk: WBCPolicyFK, state_frame: str = "base"
+) -> _PolicyStateReading:
+    """Build state from one odom snapshot and a counter-consistent gripper read.
 
     ``state_frame`` MUST match the checkpoint: ``"base"`` for ordinary policies,
     or whatever ``mof_state_frame`` declares for MoF ones. See ``build_state_vector``.
     """
+    read_start_ns = time.time_ns()
     measured = driver._read_measured_joints()  # noqa: SLF001 -- deliberate reuse
     for grp in ("torso", "left_arm", "right_arm", "head"):
         if measured.get(grp) is None:
             raise RuntimeError(f"measured {grp} joints unavailable/malformed; cannot build state")
+    if driver._odom is None:  # noqa: SLF001
+        raise RuntimeError("odometry required (--enable base) for the state base dims")
+
+    policy_base_snapshot = getattr(driver, "policy_base_pose_snapshot", None)
+    if callable(policy_base_snapshot):
+        base_state = policy_base_snapshot()
+        base_pose = np.asarray(base_state["pose"], dtype=np.float32)
+    else:  # lightweight compatibility for non-hardware diagnostics/tests
+        odom_snapshot = getattr(driver._odom, "snapshot", None)  # noqa: SLF001
+        if callable(odom_snapshot):
+            odom_state = odom_snapshot()
+            base_pose = np.asarray(odom_state["pose"], dtype=np.float32)
+        else:
+            base_pose = np.asarray(driver._odom.pose, dtype=np.float32)  # noqa: SLF001
+
+    # _poll_gripper_status_step writes value/status before incrementing the event
+    # counter. Retry the tiny read if the main thread crossed that commit edge so the
+    # value, status timestamp, and counter in this policy observation agree.
+    for _attempt in range(3):
+        counts_before = dict(getattr(driver, "_grip_status_event_count", {}))
+        grip_l = float(driver._last_obs_grip_left)  # noqa: SLF001
+        grip_r = float(driver._last_obs_grip_right)  # noqa: SLF001
+        statuses = dict(getattr(driver, "_last_grip_status", {}))
+        counts_after = dict(getattr(driver, "_grip_status_event_count", {}))
+        if counts_before == counts_after:
+            break
+    else:
+        raise RuntimeError("gripper status changed repeatedly while building policy state")
+    if not (np.isfinite(grip_l) and np.isfinite(grip_r)):
+        raise RuntimeError("gripper obs still NaN (no FC03 reply yet); cannot build state")
+    read_end_ns = time.time_ns()
+
     poses = fk.base_frame_poses(
         measured["torso"], measured["left_arm"], measured["right_arm"], measured["head"]
     )
-    if driver._odom is None:  # noqa: SLF001
-        raise RuntimeError("odometry required (--enable base) for the state base dims")
-    base_pose = np.asarray(driver._odom.pose, dtype=np.float32)  # noqa: SLF001
-    grip_l = float(driver._last_obs_grip_left)  # noqa: SLF001
-    grip_r = float(driver._last_obs_grip_right)  # noqa: SLF001
-    if not (np.isfinite(grip_l) and np.isfinite(grip_r)):
-        raise RuntimeError("gripper obs still NaN (no FC03 reply yet); cannot build state")
-    return build_state_vector(poses, base_pose, grip_l, grip_r, state_frame=state_frame)
+    state = build_state_vector(poses, base_pose, grip_l, grip_r, state_frame=state_frame)
+    ready_ns = time.time_ns()
+
+    def _status_read_ns(side: str) -> int:
+        status = statuses.get(side)
+        return int(status.get("read_wall_ns", -1)) if isinstance(status, dict) else -1
+
+    return _PolicyStateReading(
+        state=state,
+        base_pose=base_pose.copy(),
+        sensor_read_start_wall_ns=read_start_ns,
+        sensor_read_end_wall_ns=read_end_ns,
+        state_ready_wall_ns=ready_ns,
+        gripper_event_count={
+            side: int(counts_after.get(side, -1)) for side in ("left", "right")
+        },
+        gripper_read_wall_ns={side: _status_read_ns(side) for side in ("left", "right")},
+    )
 
 
-def _grab_policy_head_rgb(driver) -> tuple[np.ndarray, int] | None:
+def _build_state(driver, fk: WBCPolicyFK, state_frame: str = "base") -> np.ndarray:
+    """Compatibility view returning only the 32-D vector."""
+    return _build_state_reading(driver, fk, state_frame).state
+
+
+def _grab_policy_head_rgb(driver) -> tuple[np.ndarray, int, int] | None:
     """Read head RGB without repeatedly converting depth when the driver supports it.
 
-    Custom/test drivers that only implement the historical RGB-D helper keep
-    working through the fallback.  Both paths return the same publisher capture
-    timestamp used by the freshness gate.
+    Returns ``(image, publisher_capture_ns, local_receive_wall_ns)``. Custom/test
+    drivers with only the historical helpers keep working with receive ``-1``.
     """
+    sample_fn = getattr(driver, "_grab_head_rgb_sample", None)
+    if callable(sample_fn):
+        return sample_fn()
     rgb_only = getattr(driver, "_grab_head_rgb", None)
     if callable(rgb_only):
-        return rgb_only()
+        sample = rgb_only()
+        return None if sample is None else (sample[0], int(sample[1]), -1)
     rgbd = driver._grab_head_images()  # noqa: SLF001 -- backward-compatible audited read
-    return None if rgbd is None else (rgbd[0], int(rgbd[2]))
+    return None if rgbd is None else (rgbd[0], int(rgbd[2]), -1)
+
+
+def _grab_policy_wrist_rgb(driver, arm: str) -> tuple[np.ndarray, int, int] | None:
+    """Exact wrist sample, with a receive-less fallback for legacy test drivers."""
+    sample_fn = getattr(driver, "_grab_wrist_image_sample", None)
+    if callable(sample_fn):
+        return sample_fn(arm)
+    sample = driver._grab_wrist_image(arm)  # noqa: SLF001 -- compatibility cache read
+    return None if sample is None else (sample[0], int(sample[1]), -1)
+
+
+def _policy_observation_history_log(
+    observations: Sequence[PolicyObservation], t0: float
+) -> dict:
+    """Small, fixed-shape trace of every observation consumed by one inference."""
+    obs = list(observations)
+    if not obs:
+        raise ValueError("policy observation history cannot be empty")
+
+    def _mapping_value(sample: PolicyObservation, field_name: str, key: str) -> int:
+        mapping = getattr(sample, field_name)
+        return -1 if mapping is None else int(mapping.get(key, -1))
+
+    def _base_pose(sample: PolicyObservation) -> np.ndarray:
+        value = sample.base_pose
+        if value is None:
+            value = np.asarray(sample.state, dtype=np.float32)[29:32]
+        value = np.asarray(value, dtype=np.float32)
+        if value.shape != (3,) or not np.all(np.isfinite(value)):
+            raise RuntimeError(f"bad policy observation base pose {value!r}")
+        return value
+
+    return {
+        "state": np.stack([np.asarray(sample.state, np.float32) for sample in obs]),
+        "base_pose": np.stack([_base_pose(sample) for sample in obs]),
+        "timing": {
+            "head_frame_ns": np.asarray(
+                [sample.head_frame_ns for sample in obs], dtype=np.int64
+            ),
+            "head_receive_wall_ns": np.asarray(
+                [sample.head_receive_wall_ns for sample in obs], dtype=np.int64
+            ),
+            "left_wrist_frame_ns": np.asarray(
+                [_mapping_value(sample, "wrist_frame_ns", "left") for sample in obs],
+                dtype=np.int64,
+            ),
+            "right_wrist_frame_ns": np.asarray(
+                [_mapping_value(sample, "wrist_frame_ns", "right") for sample in obs],
+                dtype=np.int64,
+            ),
+            "left_wrist_receive_wall_ns": np.asarray(
+                [
+                    _mapping_value(sample, "wrist_receive_wall_ns", "left")
+                    for sample in obs
+                ],
+                dtype=np.int64,
+            ),
+            "right_wrist_receive_wall_ns": np.asarray(
+                [
+                    _mapping_value(sample, "wrist_receive_wall_ns", "right")
+                    for sample in obs
+                ],
+                dtype=np.int64,
+            ),
+            "head_minus_left_wrist_capture_ns": np.asarray(
+                [_mapping_value(sample, "camera_skew_ns", "left") for sample in obs],
+                dtype=np.int64,
+            ),
+            "head_minus_right_wrist_capture_ns": np.asarray(
+                [_mapping_value(sample, "camera_skew_ns", "right") for sample in obs],
+                dtype=np.int64,
+            ),
+            "head_camera_age_ns": np.asarray(
+                [_mapping_value(sample, "camera_age_ns", "head") for sample in obs],
+                dtype=np.int64,
+            ),
+            "left_wrist_camera_age_ns": np.asarray(
+                [_mapping_value(sample, "camera_age_ns", "left_wrist") for sample in obs],
+                dtype=np.int64,
+            ),
+            "right_wrist_camera_age_ns": np.asarray(
+                [_mapping_value(sample, "camera_age_ns", "right_wrist") for sample in obs],
+                dtype=np.int64,
+            ),
+            "grab_start_wall_ns": np.asarray(
+                [sample.grab_start_wall_ns for sample in obs], dtype=np.int64
+            ),
+            "grab_end_wall_ns": np.asarray(
+                [sample.grab_end_wall_ns for sample in obs], dtype=np.int64
+            ),
+            "state_sensor_read_start_wall_ns": np.asarray(
+                [sample.state_sensor_read_start_wall_ns for sample in obs], dtype=np.int64
+            ),
+            "state_sensor_read_end_wall_ns": np.asarray(
+                [sample.state_sensor_read_end_wall_ns for sample in obs], dtype=np.int64
+            ),
+            "state_ready_wall_ns": np.asarray(
+                [sample.state_ready_wall_ns for sample in obs], dtype=np.int64
+            ),
+            "ready_wall_ns": np.asarray(
+                [sample.ready_wall_ns for sample in obs], dtype=np.int64
+            ),
+            "ready_offset_s": np.asarray(
+                [sample.ready_perf_s - t0 for sample in obs], dtype=np.float64
+            ),
+            "left_gripper_event_count": np.asarray(
+                [
+                    _mapping_value(sample, "gripper_event_count", "left")
+                    for sample in obs
+                ],
+                dtype=np.int64,
+            ),
+            "right_gripper_event_count": np.asarray(
+                [
+                    _mapping_value(sample, "gripper_event_count", "right")
+                    for sample in obs
+                ],
+                dtype=np.int64,
+            ),
+            "left_gripper_read_wall_ns": np.asarray(
+                [
+                    _mapping_value(sample, "gripper_read_wall_ns", "left")
+                    for sample in obs
+                ],
+                dtype=np.int64,
+            ),
+            "right_gripper_read_wall_ns": np.asarray(
+                [
+                    _mapping_value(sample, "gripper_read_wall_ns", "right")
+                    for sample in obs
+                ],
+                dtype=np.int64,
+            ),
+        },
+    }
 
 
 class _InferenceWorker:
@@ -1213,15 +2669,14 @@ class _InferenceWorker:
     Each cycle: gather ``n_obs_steps`` freshness-gated observations spaced
     ``dataset_dt`` apart (the training cadence -- an n_obs_steps=2 policy must see
     0.1 s obs spacing, not the replan interval), run ``predict_chunk``, stamp
-    frame ``k`` with ``t_obs + k * dataset_dt`` (``t_obs`` = the LAST
-    observation's local grab time; frame 0 is the current-step command), drop
+    frame ``k`` with ``t_obs + (action_offset_frames + k) * dataset_dt``
+    (``t_obs`` = the LAST observation's local grab time), drop
     frames not strictly after ``inference_end + execution_latency``, and queue
     the survivors. All schedule math lives on the workstation ``perf_counter``
-    timeline; the camera ``frame_ns`` stamps (SDK capture time, camera-publisher-
-    host clock) are used ONLY for the same-publisher strictly-increasing freshness
-    gate and logged raw for offline latency analysis -- join them against the
-    episode file's ``meta/camera_ntp`` from the same run for absolute staleness
-    (plan.md clock-domain rules).
+    timeline. Camera ``frame_ns`` stamps are used for the same-publisher
+    strictly-increasing freshness gate and, for wrist policies, mapped through the
+    HardwareDriver's ``meta/camera_ntp`` offsets to choose the same head-nearest wrist
+    captures as training. Raw stamps, receive times, and corrected skews are logged.
 
     THREADING AUDIT (plan.md Task 4 Step 3) -- every cross-thread call is a
     read-only, thread-safe cache read:
@@ -1232,7 +2687,7 @@ class _InferenceWorker:
       historical ``_grab_head_images`` remains a compatibility fallback.
     * ``driver._read_measured_joints`` (via ``_build_state``): dexcontrol
       ``get_joint_pos`` subscriber-cache reads.
-    * ``driver._odom.pose``: OdometryThread property, lock-protected copy.
+    * ``driver.policy_base_pose_snapshot``: lock-protected odom/ARKit cache snapshots.
     * ``driver._last_obs_grip_left/right``: plain float reads (GIL-atomic),
       written only by the main thread's gripper polling.
 
@@ -1260,6 +2715,15 @@ class _InferenceWorker:
         self._io_log = io_log
         self._t0 = float(t0)
         self._dataset_dt = float(dataset_dt)
+        action_offset_frames = getattr(policy, "action_offset_frames", 0)
+        if isinstance(action_offset_frames, (bool, np.bool_)) or not isinstance(
+            action_offset_frames, (int, np.integer)
+        ) or action_offset_frames < 0:
+            raise ValueError(
+                "policy.action_offset_frames must be a non-negative integer, got "
+                f"{action_offset_frames!r}"
+            )
+        self._action_offset_frames = int(action_offset_frames)
         self._policy_interval = float(policy_interval)
         self._execution_latency = float(execution_latency)
         self._stop = stop_event
@@ -1270,6 +2734,58 @@ class _InferenceWorker:
         self._last_wrist_ns: dict[str, int] = {
             arm: -1 for arm in getattr(policy, "wrist_arms", ())
         }
+        self._max_camera_skew_ns = int(
+            getattr(driver, "_record_max_camera_skew_ns", 0)
+        )
+        self._max_camera_age_ns = int(
+            getattr(driver, "_record_max_camera_age_ns", 0)
+        )
+        self._align_policy_cameras = bool(
+            self._last_wrist_ns and self._max_camera_skew_ns > 0
+        )
+        if self._align_policy_cameras:
+            offsets = getattr(driver, "_camera_clock_offsets_ns", {})
+            required = {"head", *(f"{arm}_wrist" for arm in self._last_wrist_ns)}
+            missing = sorted(required - set(offsets))
+            if missing:
+                raise RuntimeError(
+                    "live policy camera alignment requires camera clock offsets for "
+                    f"{missing}; the HardwareDriver recording initialization must query "
+                    "all publisher clocks"
+                )
+            if not callable(getattr(driver, "_poll_camera_alignment_buffers", None)):
+                raise RuntimeError(
+                    "live policy camera alignment requires HardwareDriver's wrist "
+                    "and head history buffers"
+                )
+            if not callable(getattr(driver, "_select_aligned_camera_samples", None)):
+                raise RuntimeError(
+                    "live policy camera alignment requires HardwareDriver's "
+                    "freshest coherent capture-set selector"
+                )
+        if self._max_camera_age_ns > 0:
+            offsets = getattr(driver, "_camera_clock_offsets_ns", {})
+            required = {"head", *(f"{arm}_wrist" for arm in self._last_wrist_ns)}
+            missing = sorted(required - set(offsets))
+            if missing:
+                raise RuntimeError(
+                    "live policy camera-age gate requires camera clock offsets for "
+                    f"{missing}"
+                )
+            if not callable(getattr(driver, "_camera_capture_ages_ns", None)):
+                raise RuntimeError(
+                    "live policy camera-age gate requires HardwareDriver's corrected "
+                    "capture-age helper"
+                )
+        self._last_seen_head_ns = -1
+        grip_counts = getattr(driver, "_grip_status_event_count", None)
+        # HardwareDriver always exposes the counters. Compatibility drivers that do
+        # not are not freshness-gated on gripper telemetry.
+        self._last_grip_event_count: dict[str, int] = (
+            {side: int(grip_counts.get(side, 0)) for side in ("left", "right")}
+            if isinstance(grip_counts, dict)
+            else {}
+        )
         # Per-grab budget for a strictly-fresh frame: the cameras run ~15 fps, so a
         # new frame normally lands well inside 2 dataset periods; beyond that the
         # cycle is skipped and retried (record_tick's stale-grace abort backstops
@@ -1291,35 +2807,142 @@ class _InferenceWorker:
     def _grab_fresh_observation(self) -> PolicyObservation | None:
         """One freshness-gated observation, or None on timeout/stop.
 
-        Both publisher stamps must strictly advance past the previous sample this
-        worker used (same-clock comparison per publisher, mirroring record_tick's
-        guard): the policy must never see a camera frame twice.
+        Every publisher stamp and, on HardwareDriver, both FC03 event counters must
+        strictly advance past the previous sample. The policy therefore never sees a
+        duplicate image or silently repeated achieved-gripper observation.
         """
         deadline = time.perf_counter() + self._grab_timeout
         while not self._stop.is_set():
-            head = _grab_policy_head_rgb(self._driver)
-            wrists = {
-                arm: self._driver._grab_wrist_image(arm)  # noqa: SLF001 -- audited read
-                for arm in self._policy.wrist_arms
-            }
+            grab_start_wall_ns = time.time_ns()
+            selected_head_sample = None
+            selected_samples = None
+            camera_skew_ns: dict[str, int] = {}
+            if self._align_policy_cameras:
+                # Shared with the main recorder: bounded, lock-protected histories are
+                # continuously filled even while this thread runs GPU inference. Each
+                # consumer supplies independent cursors, so neither can steal frames.
+                self._driver._poll_camera_alignment_buffers()  # noqa: SLF001
+                (
+                    selected_head_sample,
+                    selected_samples,
+                    camera_skew_ns,
+                ) = self._driver._select_aligned_camera_samples(  # noqa: SLF001
+                    arms=tuple(self._last_wrist_ns),
+                    last_head_ns=self._last_head_ns,
+                    last_wrist_ns=self._last_wrist_ns,
+                    max_skew_ns=self._max_camera_skew_ns,
+                )
+                head = (
+                    None
+                    if selected_head_sample is None or selected_samples is None
+                    else (
+                        selected_head_sample.left_rgb,
+                        int(selected_head_sample.left_capture_ns),
+                        int(selected_head_sample.left_receive_ns),
+                    )
+                )
+                wrists = (
+                    {arm: None for arm in self._last_wrist_ns}
+                    if selected_samples is None
+                    else {
+                        arm: (sample[0], int(sample[1]), int(sample[2]))
+                        for arm, sample in selected_samples.items()
+                    }
+                )
+            else:
+                head = _grab_policy_head_rgb(self._driver)
+                wrists = {
+                    arm: _grab_policy_wrist_rgb(self._driver, arm)
+                    for arm in self._policy.wrist_arms
+                }
+            grab_end_wall_ns = time.time_ns()
             head_ns = None if head is None else int(head[1])
+            if head_ns is not None:
+                if head_ns < self._last_seen_head_ns:
+                    raise RuntimeError(
+                        "head camera capture timestamp moved backward by "
+                        f"{(self._last_seen_head_ns - head_ns) / 1e6:.3f} ms during "
+                        "policy observation gathering"
+                    )
+                self._last_seen_head_ns = head_ns
             wrist_ns = {
                 arm: (None if w is None else int(w[1])) for arm, w in wrists.items()
             }
+            camera_age_ns: dict[str, int] = {}
+            age_ok = True
+            if (
+                self._max_camera_age_ns > 0
+                and head_ns is not None
+                and all(ns is not None for ns in wrist_ns.values())
+            ):
+                camera_age_ns = self._driver._camera_capture_ages_ns(  # noqa: SLF001
+                    grab_end_wall_ns,
+                    head_ns=head_ns,
+                    wrist_ns={arm: int(ns) for arm, ns in wrist_ns.items()},
+                )
+                age_ok = all(
+                    -_CAMERA_FUTURE_TOLERANCE_NS <= age <= self._max_camera_age_ns
+                    for age in camera_age_ns.values()
+                )
+            grip_counts_raw = getattr(self._driver, "_grip_status_event_count", None)
+            grip_counts = (
+                {
+                    side: int(grip_counts_raw.get(side, 0))
+                    for side in ("left", "right")
+                }
+                if isinstance(grip_counts_raw, dict)
+                else {}
+            )
+            grippers_fresh = not self._last_grip_event_count or all(
+                grip_counts[side] > self._last_grip_event_count[side]
+                for side in ("left", "right")
+            )
             # Every declared stream must advance past what this worker last used, so the
             # policy never sees any camera frame twice.
             fresh = head_ns is not None and head_ns > self._last_head_ns and all(
                 ns is not None and ns > self._last_wrist_ns[arm]
                 for arm, ns in wrist_ns.items()
-            )
+            ) and grippers_fresh and age_ok
             if fresh:
-                state = _build_state(self._driver, self._fk, self._policy.state_frame)
+                reading = _build_state_reading(
+                    self._driver, self._fk, self._policy.state_frame
+                )
+                if self._last_grip_event_count and any(
+                    reading.gripper_event_count[side]
+                    <= self._last_grip_event_count[side]
+                    for side in ("left", "right")
+                ):
+                    # A compatibility/custom driver changed its counters during the
+                    # candidate read. Retry without committing any camera stamp.
+                    continue
                 self._last_head_ns = head_ns
                 for arm, ns in wrist_ns.items():
                     self._last_wrist_ns[arm] = ns
+                if self._last_grip_event_count:
+                    self._last_grip_event_count = dict(reading.gripper_event_count)
+                ready_wall_ns = time.time_ns()
+                ready_perf_s = time.perf_counter()
                 return PolicyObservation(
-                    state=state, head_rgb=head[0],
+                    state=reading.state, head_rgb=head[0],
                     wrist_rgb={arm: w[0] for arm, w in wrists.items()},
+                    base_pose=reading.base_pose,
+                    head_frame_ns=head_ns,
+                    head_receive_wall_ns=int(head[2]),
+                    wrist_frame_ns={arm: int(w[1]) for arm, w in wrists.items()},
+                    wrist_receive_wall_ns={
+                        arm: int(w[2]) for arm, w in wrists.items()
+                    },
+                    camera_skew_ns=dict(camera_skew_ns),
+                    camera_age_ns=dict(camera_age_ns),
+                    grab_start_wall_ns=grab_start_wall_ns,
+                    grab_end_wall_ns=grab_end_wall_ns,
+                    state_sensor_read_start_wall_ns=reading.sensor_read_start_wall_ns,
+                    state_sensor_read_end_wall_ns=reading.sensor_read_end_wall_ns,
+                    state_ready_wall_ns=reading.state_ready_wall_ns,
+                    ready_wall_ns=ready_wall_ns,
+                    ready_perf_s=ready_perf_s,
+                    gripper_event_count=reading.gripper_event_count,
+                    gripper_read_wall_ns=reading.gripper_read_wall_ns,
                 )
             if time.perf_counter() >= deadline:
                 return None
@@ -1340,7 +2963,11 @@ class _InferenceWorker:
             obs = self._grab_fresh_observation()
             if obs is None:
                 return None
-            prev_grab_t = time.perf_counter()
+            prev_grab_t = (
+                obs.ready_perf_s
+                if np.isfinite(obs.ready_perf_s)
+                else time.perf_counter()
+            )
             obs_list.append(obs)
         return obs_list, prev_grab_t
 
@@ -1361,14 +2988,23 @@ class _InferenceWorker:
                 if self._stop.is_set():
                     break
                 obs_list, t_obs = gathered
-                obs_ready_wall_ns = time.time_ns()
+                latest_obs = obs_list[-1]
+                obs_ready_wall_ns = int(latest_obs.ready_wall_ns)
+                observation_history = _policy_observation_history_log(
+                    obs_list, self._t0
+                )
                 t_pred0 = time.perf_counter()
                 chunk = self._policy.predict_chunk(obs_list)
                 if self._stop.is_set():
                     break
                 policy_end = time.perf_counter()
                 n = chunk.shape[0]
-                timestamps = t_obs + self._dataset_dt * np.arange(n, dtype=np.float64)
+                timestamps = chunk_schedule_timestamps(
+                    observation_time=t_obs,
+                    frame_count=n,
+                    dataset_dt=self._dataset_dt,
+                    action_offset_frames=self._action_offset_frames,
+                )
                 actions = scheduled_actions_from_chunk(chunk, timestamps)
                 queue_time = time.perf_counter()
                 kept = drop_stale_actions(actions, queue_time + self._execution_latency)
@@ -1390,17 +3026,21 @@ class _InferenceWorker:
                     print(f"\n[wbc_policy_rollout] WARNING: entire chunk stale "
                           f"(inference {policy_end - t_pred0:.2f}s + latency "
                           f"{self._execution_latency:g}s passed the last frame at "
-                          f"t_obs+{(n - 1) * self._dataset_dt:.2f}s); nothing queued")
+                          f"t_obs+{(self._action_offset_frames + n - 1) * self._dataset_dt:.2f}s); "
+                          "nothing queued")
                 schedule_end = time.perf_counter()
                 io_frame = {
                     "t": np.float64(t_obs - self._t0),
                     "timestamp_ns": np.int64(time.time_ns()),
-                    "state": obs_list[-1].state,
-                    # FULL pre-drop chunk: constant (n_action_steps, 29) shape so
+                    "state": latest_obs.state,
+                    "observation_history": observation_history,
+                    # FULL pre-drop chunk: constant (n_action_steps, action_dim) shape so
                     # EpisodeRecorder can np.stack; n_dropped says what was queued.
                     "action": chunk,
                     "action_offsets_s": (timestamps - self._t0).astype(np.float64),
-                    "base_pose": np.asarray(self._driver._odom.pose, np.float32),  # noqa: SLF001
+                    # Exact base pose embedded in the final model observation. The old
+                    # post-inference odom re-read could be hundreds of milliseconds newer.
+                    "base_pose": observation_history["base_pose"][-1],
                     "inference_s": np.float32(policy_end - t_pred0),
                     "scheduler_s": np.float32(schedule_end - policy_end),
                     # Actual completion of scheduler preparation, on the same
@@ -1415,10 +3055,63 @@ class _InferenceWorker:
                     "obs_ready_wall_ns": np.int64(obs_ready_wall_ns),
                     "obs_ready_offset_s": np.float64(t_obs - self._t0),
                     "n_dropped": np.int64(n - len(kept)),
-                    "head_frame_ns": np.int64(self._last_head_ns),
+                    "head_frame_ns": np.int64(latest_obs.head_frame_ns),
+                    "head_receive_wall_ns": np.int64(
+                        latest_obs.head_receive_wall_ns
+                    ),
                     # -1 when the policy declares no such wrist input.
-                    "left_wrist_frame_ns": np.int64(self._last_wrist_ns.get("left", -1)),
-                    "right_wrist_frame_ns": np.int64(self._last_wrist_ns.get("right", -1)),
+                    "left_wrist_frame_ns": np.int64(
+                        -1
+                        if latest_obs.wrist_frame_ns is None
+                        else latest_obs.wrist_frame_ns.get("left", -1)
+                    ),
+                    "right_wrist_frame_ns": np.int64(
+                        -1
+                        if latest_obs.wrist_frame_ns is None
+                        else latest_obs.wrist_frame_ns.get("right", -1)
+                    ),
+                    "left_wrist_receive_wall_ns": np.int64(
+                        -1
+                        if latest_obs.wrist_receive_wall_ns is None
+                        else latest_obs.wrist_receive_wall_ns.get("left", -1)
+                    ),
+                    "right_wrist_receive_wall_ns": np.int64(
+                        -1
+                        if latest_obs.wrist_receive_wall_ns is None
+                        else latest_obs.wrist_receive_wall_ns.get("right", -1)
+                    ),
+                    "head_minus_left_wrist_capture_ns": np.int64(
+                        -1
+                        if latest_obs.camera_skew_ns is None
+                        else latest_obs.camera_skew_ns.get("left", -1)
+                    ),
+                    "head_minus_right_wrist_capture_ns": np.int64(
+                        -1
+                        if latest_obs.camera_skew_ns is None
+                        else latest_obs.camera_skew_ns.get("right", -1)
+                    ),
+                    "head_camera_age_ns": np.int64(
+                        -1
+                        if latest_obs.camera_age_ns is None
+                        else latest_obs.camera_age_ns.get("head", -1)
+                    ),
+                    "left_wrist_camera_age_ns": np.int64(
+                        -1
+                        if latest_obs.camera_age_ns is None
+                        else latest_obs.camera_age_ns.get("left_wrist", -1)
+                    ),
+                    "right_wrist_camera_age_ns": np.int64(
+                        -1
+                        if latest_obs.camera_age_ns is None
+                        else latest_obs.camera_age_ns.get("right_wrist", -1)
+                    ),
+                    "state_sensor_read_start_wall_ns": np.int64(
+                        latest_obs.state_sensor_read_start_wall_ns
+                    ),
+                    "state_sensor_read_end_wall_ns": np.int64(
+                        latest_obs.state_sensor_read_end_wall_ns
+                    ),
+                    "state_ready_wall_ns": np.int64(latest_obs.state_ready_wall_ns),
                 }
                 trace_fn = getattr(self._policy, "last_inference_trace", None)
                 if trace_fn is not None:
@@ -1459,8 +3152,8 @@ def _live_world_T_zed(driver, fk: WBCPolicyFK) -> np.ndarray:
         dtype=np.float64,
     )
     if driver._odom is None:  # noqa: SLF001
-        raise RuntimeError("odometry required (--enable base) to anchor world_T_zed")
-    base_pose = np.asarray(driver._odom.pose, dtype=np.float64)  # noqa: SLF001
+        raise RuntimeError("base feedback required (--enable base) to anchor world_T_zed")
+    base_pose = _policy_base_pose(driver)
     world_T_zed = base_pose_to_mat(base_pose) @ base_T_zed
     if world_T_zed.shape != (4, 4) or not np.all(np.isfinite(world_T_zed)):
         raise RuntimeError(f"bad world_T_zed {world_T_zed.shape} (or non-finite)")
@@ -1678,36 +3371,73 @@ def _run_persistent_session(
 
 
 def _start_rollout_recorders(driver, io_log) -> None:
-    """Start reusable recorders with fresh camera/cadence state."""
-    if driver._episode is not None:  # noqa: SLF001 -- shared rollout recorder
-        driver._episode.start()  # noqa: SLF001
-        driver._last_rec_head_ns = -1  # noqa: SLF001
-        driver._last_rec_wrist_ns = dict.fromkeys(  # noqa: SLF001
-            driver._last_rec_wrist_ns, -1  # noqa: SLF001
-        )
-        driver._next_record_t = 0.0  # noqa: SLF001
-        driver._stale_since = None  # noqa: SLF001
-        driver._frame_age_log.clear()  # noqa: SLF001
+    """Start the paired recorders through the driver's canonical episode boundary."""
+    driver.start_recording_episode()
     io_log.start()
 
 
 def _set_policy_io_static(io_log, policy, *, args=None) -> None:
     """Refresh episode-specific policy and live-condition metadata before recording."""
-    if policy is None:
-        io_log.set_static({})
-        return
     static: dict = {}
-    metadata_fn = getattr(policy, "inference_metadata", None)
-    if metadata_fn is not None:
-        static["policy"] = metadata_fn()
-    condition_fn = getattr(policy, "live_condition_metadata", None)
-    if condition_fn is not None:
-        condition = condition_fn()
-        if condition is not None:
-            static["live_object_condition"] = condition
+    if policy is not None:
+        metadata_fn = getattr(policy, "inference_metadata", None)
+        if metadata_fn is not None:
+            static["policy"] = metadata_fn()
+        condition_fn = getattr(policy, "live_condition_metadata", None)
+        if condition_fn is not None:
+            condition = condition_fn()
+            if condition is not None:
+                static["live_object_condition"] = condition
     if args is not None:
+        static["runtime"] = {
+            "policy_action_schema": np.asarray(
+                str(
+                    getattr(args, "policy_action_schema", WBC_POLICY_ACTION_SCHEMA)
+                ).encode()
+            ),
+            "action_target_frame": np.asarray(
+                str(getattr(args, "action_target_frame", "world")).encode()
+            ),
+            "base_pose_source": np.asarray(
+                _runtime_base_pose_source(getattr(args, "arkit_base", "off")).encode()
+            ),
+            "arkit_mode": np.asarray(
+                str(getattr(args, "arkit_base", "off")).encode()
+            ),
+            "camera_alignment_mode": np.asarray(
+                (
+                    b"head_capture_nearest"
+                    if float(getattr(args, "record_max_camera_skew_ms", 0.0)) > 0
+                    else b"latest_arrived_compatibility"
+                )
+            ),
+            "camera_alignment_clock_domain": np.asarray(
+                b"local_via_camera_ntp"
+            ),
+            "camera_alignment_max_abs_skew_ns": np.asarray(
+                round(float(getattr(args, "record_max_camera_skew_ms", 0.0)) * 1e6),
+                np.int64,
+            ),
+            "camera_alignment_max_camera_age_ns": np.asarray(
+                round(float(getattr(args, "record_max_camera_age_ms", 0.0)) * 1e6),
+                np.int64,
+            ),
+            "camera_startup_timeout_ns": np.asarray(
+                round(float(getattr(args, "record_startup_timeout", 3.0)) * 1e9),
+                np.int64,
+            ),
+        }
         static["schedule"] = {
             "dataset_fps": np.asarray(args.dataset_fps, np.float64),
+            "action_offset_frames": np.asarray(
+                0 if policy is None else policy.action_offset_frames, np.int64
+            ),
+            "action_offset_s": np.asarray(
+                0.0
+                if policy is None
+                else policy.action_offset_frames / args.dataset_fps,
+                np.float64,
+            ),
             "policy_interval_s": np.asarray(args.policy_interval, np.float64),
             "execution_latency_s": np.asarray(args.execution_latency, np.float64),
             "command_fps": np.asarray(args.cmd_rate, np.float64),
@@ -1752,23 +3482,77 @@ def _prepare_rollout_episode_condition(args, driver, fk, policy, io_log) -> int:
     return episode_id
 
 
-def _wait_for_recorder_save(recorder) -> bool:
-    """Wait for one async save, returning whether Ctrl-C was deferred."""
+def _wait_for_recorder_save(
+    recorder,
+    *,
+    timeout_s: float = _RECORDER_SAVE_TIMEOUT_S,
+) -> bool:
+    """Wait boundedly for one async save, deferring Ctrl-C until disposition."""
     interrupted = False
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
     while recorder.saving:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            message = (
+                "[wbc_policy_rollout] recorder did not finish within "
+                f"{float(timeout_s):g}s ({type(recorder).__name__}); refusing to "
+                "wait forever"
+            )
+            invalidate = getattr(recorder, "invalidate_save", None)
+            if callable(invalidate):
+                invalidate(message)
+            if not recorder.saving:
+                return interrupted
+            raise TimeoutError(message)
         try:
-            time.sleep(0.05)
+            time.sleep(min(0.05, remaining))
         except KeyboardInterrupt:
             interrupted = True
     return interrupted
+
+
+def _call_recorder_terminal(action: Callable[[], str | None]) -> tuple[str | None, bool]:
+    """Run stop/abort as one SIGINT-deferred transition on the main thread.
+
+    A SIGINT between ``recording=False`` and the recorder's save/path setup used to make
+    the paired cleanup lose that path. Linux delivers a blocked pending SIGINT when the
+    old mask is restored; catch it *after* retaining the result and report it to the
+    caller for deferred re-raise once both files have a disposition.
+    """
+    can_mask = (
+        threading.current_thread() is threading.main_thread()
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "SIG_BLOCK")
+        and hasattr(signal, "SIG_SETMASK")
+    )
+    if not can_mask:
+        return action(), False
+
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    result: str | None = None
+    action_error: BaseException | None = None
+    try:
+        result = action()
+    except BaseException as exc:
+        action_error = exc
+
+    interrupted = False
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    except KeyboardInterrupt:
+        interrupted = True
+
+    if action_error is not None:
+        raise action_error
+    return result, interrupted
 
 
 def _stop_policy_io_log(io_log) -> None:
     """Stop and verify a standalone policy-IO recorder save."""
     if not io_log.recording:
         return
-    path = io_log.stop()
-    interrupted = _wait_for_recorder_save(io_log)
+    path, interrupted = _call_recorder_terminal(io_log.stop)
+    interrupted = _wait_for_recorder_save(io_log) or interrupted
     if io_log.last_save_error is not None:
         raise RuntimeError(
             f"[wbc_policy_rollout] policy IO save failed: {io_log.last_save_error}"
@@ -1779,8 +3563,22 @@ def _stop_policy_io_log(io_log) -> None:
         raise KeyboardInterrupt
 
 
-def _finish_rollout_episode(*, driver, io_log, stop_event, worker, policy=None) -> None:
-    """Stop motion and fully flush one episode without closing hardware."""
+def _finish_rollout_episode(
+    *,
+    driver,
+    io_log,
+    stop_event,
+    worker,
+    policy=None,
+    abort_reason: str | None = None,
+) -> None:
+    """Stop motion and fully finalize one episode without closing hardware.
+
+    A normal completion or operator Ctrl-C uses ``stop()`` for both paired logs. A
+    runtime failure uses ``abort()`` for both, preserving synchronized forensic
+    ``.partial`` files with ``complete=false`` while keeping them out of every training
+    glob.
+    """
     main_log = getattr(driver, "_episode", None)
     cleanup_errors: list[BaseException] = []
     recorder_errors: list[BaseException] = []
@@ -1822,6 +3620,24 @@ def _finish_rollout_episode(*, driver, io_log, stop_event, worker, policy=None) 
         finish_runtime = getattr(policy, "finish_episode_runtime", None)
         if finish_runtime is not None:
             run_cleanup_step(finish_runtime)
+
+    if not worker_joined:
+        cleanup_errors.append(
+            RuntimeError(
+                "[wbc_policy_rollout] inference worker still running after 10s; "
+                "refusing to start another rollout"
+            )
+        )
+    if worker is not None and worker.failed.is_set():
+        cleanup_errors.append(
+            RuntimeError(
+                f"[wbc_policy_rollout] inference worker died: {worker.fail_reason}"
+            )
+        )
+    effective_abort_reason = abort_reason
+    if effective_abort_reason is None and cleanup_errors:
+        first = cleanup_errors[0]
+        effective_abort_reason = f"{type(first).__name__}: {first}"
 
     if main_log is None:
         recorder_errors.append(
@@ -1867,23 +3683,61 @@ def _finish_rollout_episode(*, driver, io_log, stop_event, worker, policy=None) 
                     path: str | None = None
                     while recorder.recording:
                         try:
-                            path = recorder.stop()
+                            if effective_abort_reason is None:
+                                action = recorder.stop
+                            else:
+                                abort = getattr(recorder, "abort", None)
+                                if not callable(abort):
+                                    raise RuntimeError(
+                                        f"{type(recorder).__name__} has no abort() "
+                                        "quarantine API"
+                                    )
+                                action = lambda abort=abort: abort(effective_abort_reason)
+                            path, terminal_interrupted = _call_recorder_terminal(action)
+                            interrupted = terminal_interrupted or interrupted
                         except KeyboardInterrupt:
                             interrupted = True
                             continue
                         except BaseException as exc:
                             error = RuntimeError(
-                                f"[wbc_policy_rollout] {name} recorder stop failed: "
+                                f"[wbc_policy_rollout] {name} recorder "
+                                f"{'stop' if effective_abort_reason is None else 'abort'} "
+                                "failed: "
                                 f"{type(exc).__name__}: {exc}"
                             )
                             cleanup_errors.append(error)
                             recorder_errors.append(error)
+                            if (
+                                effective_abort_reason is not None
+                                and getattr(recorder, "recording", False)
+                            ):
+                                # Prevent the outer HardwareDriver.close() from falling
+                                # through to a normal complete save after quarantine
+                                # itself failed.
+                                try:
+                                    recorder.discard()
+                                except BaseException as discard_exc:
+                                    discard_error = RuntimeError(
+                                        f"[wbc_policy_rollout] {name} fallback discard "
+                                        f"failed: {type(discard_exc).__name__}: "
+                                        f"{discard_exc}"
+                                    )
+                                    cleanup_errors.append(discard_error)
+                                    recorder_errors.append(discard_error)
                         break
                     if path is not None:
                         paths.append(path)
 
-                for recorder in (main_log, io_log):
-                    interrupted = _wait_for_recorder_save(recorder) or interrupted
+                for name, recorder in (("main", main_log), ("policy IO", io_log)):
+                    try:
+                        interrupted = _wait_for_recorder_save(recorder) or interrupted
+                    except BaseException as exc:
+                        error = RuntimeError(
+                            f"[wbc_policy_rollout] {name} recorder save wait failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        cleanup_errors.append(error)
+                        recorder_errors.append(error)
 
                 for name, recorder in (("main", main_log), ("policy IO", io_log)):
                     save_error = getattr(recorder, "last_save_error", None)
@@ -1899,27 +3753,22 @@ def _finish_rollout_episode(*, driver, io_log, stop_event, worker, policy=None) 
                         Path(path).unlink(missing_ok=True)
                 else:
                     if paths:
-                        print(f"[wbc_policy_rollout] episode pair saved -> {paths}")
+                        disposition = (
+                            "saved"
+                            if effective_abort_reason is None
+                            else "quarantined incomplete"
+                        )
+                        print(
+                            f"[wbc_policy_rollout] episode pair {disposition} -> "
+                            f"{paths}"
+                        )
                     traj = getattr(driver, "_traj", None)
-                    if traj is not None:
+                    if traj is not None and effective_abort_reason is None:
                         run_cleanup_step(lambda: traj.flush(saved_id))
 
     cleanup_errors.extend(
         error for error in recorder_errors if error not in cleanup_errors
     )
-    if not worker_joined:
-        cleanup_errors.append(
-            RuntimeError(
-                "[wbc_policy_rollout] inference worker still running after 10s; "
-                "refusing to start another rollout"
-            )
-        )
-    if worker is not None and worker.failed.is_set():
-        cleanup_errors.append(
-            RuntimeError(
-                f"[wbc_policy_rollout] inference worker died: {worker.fail_reason}"
-            )
-        )
     if cleanup_errors:
         primary = cleanup_errors[0]
         for extra in cleanup_errors[1:]:
@@ -1935,6 +3784,7 @@ def _run_rollout_episode(
     policy,
     source: RecordedEpisodeSource | None,
     state_frame: str,
+    action_target_frame: str = "world",
     mode: str,
     ik,
     fk: WBCPolicyFK,
@@ -1981,6 +3831,9 @@ def _run_rollout_episode(
         head_lpf.reset(head0)
         head_deadband.reset(head0)
         driver.engage_reset(ik, left0, right0, head0)
+        latch_chassis = getattr(driver, "latch_chassis_intent", None)
+        if callable(latch_chassis):
+            latch_chassis(np.zeros(3, dtype=np.float32))
         driver._overstep_ticks = 0  # noqa: SLF001 -- per-episode safety history
         if policy is not None:
             policy.reset()
@@ -2002,14 +3855,21 @@ def _run_rollout_episode(
         start_left, start_right, start_head = left0, right0, head0
         did_align = False
         if args.align_reference:
-            left_ref, right_ref = load_alignment_references(args.align_reference, ik)
+            reference_frame = (
+                "base" if action_target_frame == "current_base" else "world"
+            )
+            left_ref, right_ref = load_alignment_references(
+                args.align_reference, ik, target_frame=reference_frame
+            )
             print(f"[wbc_policy_rollout] gliding to the reference pose from "
                   f"{args.align_reference} ...")
             run_reference_alignment(
                 ik=ik, driver=driver, enable=enable, interp=interp,
                 head_lpf=head_lpf, head_deadband=head_deadband,
                 left_ref=left_ref, right_ref=right_ref, head_current=head0, dt=dt,
-                read_achieved=lambda: _achieved_world_ee_poses(driver, fk),
+                read_achieved=lambda: _achieved_ee_poses(
+                    driver, fk, target_frame=action_target_frame
+                ),
             )
             start_left, start_right = left_ref, right_ref
             # No 100 Hz ticks run while blocked on Enter: stop/hold everything so
@@ -2058,6 +3918,8 @@ def _run_rollout_episode(
             worker.start()
         replay_end_wall: float | None = None
         last_cmd_wall: float | None = None
+        last_source_timestamp_ns = -1
+        last_source_receive_wall_ns = -1
         grip_l = np.float32(0.0)
         grip_r = np.float32(0.0)
         ticks = 0
@@ -2074,6 +3936,12 @@ def _run_rollout_episode(
             if source is not None:
                 frame = source.advance(now)
                 if frame is not None:
+                    if callable(latch_chassis):
+                        if frame.chassis is None:
+                            raise RuntimeError(
+                                "joystick replay frame is missing chassis intent"
+                            )
+                        latch_chassis(frame.chassis)
                     # Same observation assembly as the live branch: exercises the
                     # full camera/state pipeline during replay and yields a
                     # policy_io log directly diffable against a live rollout.
@@ -2109,19 +3977,22 @@ def _run_rollout_episode(
                                 now=now, duration=frame.segment_duration)
                     grip_l, grip_r = frame.grip_left, frame.grip_right
                     last_cmd_wall = now
+                    last_source_timestamp_ns = time.time_ns()
+                    last_source_receive_wall_ns = last_source_timestamp_ns
                     io_log.record({
                         "t": np.float64(now - t0),
                         "timestamp_ns": np.int64(time.time_ns()),
                         "state": state,
                         "action": encode_replay_action(
                             frame.left, frame.right, frame.head,
-                            frame.grip_left, frame.grip_right),
+                            frame.grip_left, frame.grip_right,
+                            chassis=frame.chassis),
                         "target": {
                             "left": frame.left.astype(np.float32),
                             "right": frame.right.astype(np.float32),
                             "head": frame.head.astype(np.float32),
                         },
-                        "base_pose": np.asarray(driver._odom.pose, np.float32),  # noqa: SLF001
+                        "base_pose": np.asarray(state[29:32], np.float32),
                         "inference_s": np.float32(0.0),  # no model ran
                     })
                     if source.done:
@@ -2143,11 +4014,21 @@ def _run_rollout_episode(
                 # interpolator segment by the inference duration).
                 scheduled = schedule_buffer.sample(now)
                 if scheduled is not None:
+                    if callable(latch_chassis):
+                        if scheduled.chassis is None:
+                            raise RuntimeError(
+                                "32-D joystick rollout received a 29-D scheduled action"
+                            )
+                        # The policy emits a 10 Hz intent. Keep it piecewise constant;
+                        # the driver's causal 100 Hz shaper supplies slew/PD/dispatch.
+                        latch_chassis(scheduled.chassis)
                     interp.push(scheduled.left, scheduled.right, scheduled.head,
                                 now=now, duration=cmd_period)
                     grip_l = scheduled.grip_left
                     grip_r = scheduled.grip_right
                     last_cmd_wall = now
+                    last_source_timestamp_ns = time.time_ns()
+                    last_source_receive_wall_ns = last_source_timestamp_ns
                 next_cmd_t += cmd_period
                 if now > next_cmd_t:
                     next_cmd_t = now + cmd_period
@@ -2159,6 +4040,8 @@ def _run_rollout_episode(
                 head_lpf=head_lpf, head_deadband=head_deadband, now=now, dt=dt,
                 grip_left=grip_l, grip_right=grip_r, last_cmd_wall=last_cmd_wall,
                 live_head_filters=False,
+                source_timestamp_ns=last_source_timestamp_ns,
+                source_receive_wall_ns=last_source_receive_wall_ns,
             )
 
             ticks += 1
@@ -2181,6 +4064,11 @@ def _run_rollout_episode(
                 stop_event=stop_event,
                 worker=worker,
                 policy=policy,
+                abort_reason=(
+                    None
+                    if isinstance(body_error, KeyboardInterrupt)
+                    else f"{type(body_error).__name__}: {body_error}"
+                ),
             )
         except BaseException as cleanup_error:
             if isinstance(body_error, KeyboardInterrupt):
@@ -2241,14 +4129,6 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
             "the state needs odometry"
         )
 
-    ik, cfg = mod._build_ik()  # noqa: SLF001 -- same solver construction as teleop
-    if cfg.head_mode != "ik":
-        raise SystemExit(
-            "[wbc_policy_rollout] wbik.yaml head_mode must be 'ik': the policy head "
-            "action is a zed_depth_frame pose target consumed by the head FrameTask"
-        )
-    print(f"[wbc_policy_rollout] model nq={ik.model.nq} head_mode={cfg.head_mode}")
-
     source: RecordedEpisodeSource | None = None
     policy: _PolicyBundle | None = None
     if args.replay_episode:
@@ -2264,18 +4144,29 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
             policy_factory(args.policy_path)
             if policy_factory is not None
             else _PolicyBundle(
-                args.policy_path, scene_diff_repo=args.scene_diff_repo
+                args.policy_path,
+                scene_diff_repo=args.scene_diff_repo,
+                dataset_meta_path=getattr(args, "policy_dataset_meta", None),
             )
         )
         state_frame = policy.state_frame
         print(f"[wbc_policy_rollout] {policy.describe()}")
-        if hasattr(policy, "dataset_fps") and not np.isclose(
-            float(policy.dataset_fps), float(args.dataset_fps), rtol=0.0, atol=1e-9
-        ):
-            raise SystemExit(
-                f"[wbc_policy_rollout] --dataset-fps {args.dataset_fps:g} != "
-                f"training metadata {float(policy.dataset_fps):g}; refusing to engage"
+        try:
+            action_timing = _resolve_rollout_action_timing(
+                policy=policy,
+                runtime_dataset_fps=float(args.dataset_fps),
+                cli_action_offset_frames=getattr(
+                    args, "policy_action_offset_frames", None
+                ),
             )
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(f"[wbc_policy_rollout] {exc}; refusing to engage") from exc
+        print(
+            "[wbc_policy_rollout] action timing contract: "
+            f"{action_timing['dataset_fps']:g} fps, labels/schedule +"
+            f"{action_timing['action_offset_frames']} frame(s) "
+            f"({action_timing['action_offset_frames'] / action_timing['dataset_fps']:.3f}s)"
+        )
         chunk_coverage = policy.n_action_steps / args.dataset_fps
         if args.policy_interval > chunk_coverage:
             print(f"[wbc_policy_rollout] WARNING: --policy-interval "
@@ -2284,11 +4175,146 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
                   f"{args.dataset_fps:g} fps): the scheduled buffer will run dry "
                   "between replans -> periodic stale-source holds")
 
+    declared_policy_schema = str(
+        getattr(
+            policy if policy is not None else source,
+            "policy_action_schema",
+            WBC_POLICY_ACTION_SCHEMA,
+        )
+    )
+    try:
+        policy_action_axes = action_axes_for_policy_schema(declared_policy_schema)
+    except ValueError as exc:
+        raise SystemExit(f"[wbc_policy_rollout] {exc}; refusing to engage") from exc
+    expected_action_dim = len(policy_action_axes)
+    declared_action_dim = getattr(policy, "action_dim", expected_action_dim)
+    if int(declared_action_dim) != expected_action_dim:
+        raise SystemExit(
+            "[wbc_policy_rollout] checkpoint action dimension contradicts its schema: "
+            f"{declared_action_dim} vs {declared_policy_schema} ({expected_action_dim})"
+        )
+    expected_target_frame = (
+        "current_base"
+        if declared_policy_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+        else "world"
+    )
+    declared_target_frame = str(
+        getattr(
+            policy if policy is not None else source,
+            "action_target_frame",
+            expected_target_frame,
+        )
+    )
+    if declared_target_frame != expected_target_frame:
+        raise SystemExit(
+            "[wbc_policy_rollout] policy action frame contradicts its schema: "
+            f"{declared_target_frame!r} vs {declared_policy_schema} "
+            f"({expected_target_frame!r})"
+        )
+    joystick_policy = declared_policy_schema == JOYSTICK_POLICY_ACTION_SCHEMA
+    args.policy_action_schema = declared_policy_schema
+    args.action_target_frame = expected_target_frame
+
+    lock_torso = getattr(args, "lock_torso_in_ik", None)
+    if joystick_policy:
+        joystick_mod = _load_wbc_joystick_robot()
+        ik, cfg = joystick_mod._build_joystick_ik(  # noqa: SLF001
+            getattr(args, "config", None), lock_torso_in_ik=lock_torso
+        )
+        driver_factory = lambda: joystick_mod.JoystickHardwareDriver(
+            args, ik, cfg, enable, source=None
+        )
+        if cfg.head_mode != "track" or not cfg.lock_base_in_ik:
+            raise SystemExit(
+                "[wbc_policy_rollout] joystick policy requires head_mode=track and "
+                "lock_base_in_ik=true"
+            )
+    else:
+        ik, cfg = (
+            mod._build_ik()  # noqa: SLF001
+            if lock_torso is None
+            else mod._build_ik(lock_torso_in_ik=lock_torso)  # noqa: SLF001
+        )
+        driver_factory = lambda: mod.HardwareDriver(args, ik, cfg, enable)
+        if cfg.head_mode != "ik":
+            raise SystemExit(
+                "[wbc_policy_rollout] 29-D WBC policy requires wbik.yaml "
+                "head_mode='ik'"
+            )
+    print(
+        f"[wbc_policy_rollout] model nq={ik.model.nq} head_mode={cfg.head_mode} "
+        f"action={declared_policy_schema} ({expected_action_dim}-D, "
+        f"{expected_target_frame})"
+    )
+
+    try:
+        base_pose_source, runtime_base_pose_source = _resolve_rollout_base_pose_source(
+            arkit_mode=getattr(args, "arkit_base", "off"),
+            policy=policy,
+            replay_source=source,
+            cli_source=getattr(args, "policy_base_pose_source", None),
+        )
+    except ValueError as exc:
+        raise SystemExit(f"[wbc_policy_rollout] {exc}") from exc
+    print(
+        f"[wbc_policy_rollout] base pose contract: training/replay={base_pose_source}, "
+        f"live control={runtime_base_pose_source}"
+    )
+    if policy is not None:
+        try:
+            camera_alignment, runtime_camera_alignment = (
+                _resolve_rollout_camera_alignment(
+                    policy=policy,
+                    runtime_max_skew_ms=float(
+                        getattr(
+                            args,
+                            "record_max_camera_skew_ms",
+                            getattr(mod, "DEFAULT_RECORD_MAX_CAMERA_SKEW_MS", 40.0),
+                        )
+                    ),
+                    runtime_max_camera_age_ms=float(
+                        getattr(
+                            args,
+                            "record_max_camera_age_ms",
+                            getattr(mod, "DEFAULT_RECORD_MAX_CAMERA_AGE_MS", 150.0),
+                        )
+                    ),
+                    cli_mode=getattr(args, "policy_camera_alignment_mode", None),
+                    cli_max_skew_ms=getattr(args, "policy_camera_max_skew_ms", None),
+                    cli_max_camera_age_ms=getattr(
+                        args, "policy_camera_max_age_ms", None
+                    ),
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SystemExit(f"[wbc_policy_rollout] {exc}") from exc
+        if camera_alignment is None:
+            print(
+                "[wbc_policy_rollout] camera alignment contract: head-only policy; "
+                "multi-camera parity not applicable"
+            )
+        else:
+            print(
+                "[wbc_policy_rollout] camera alignment contract: "
+                f"training/live={camera_alignment['mode']} <= "
+                f"{camera_alignment['max_abs_skew_ns'] / 1e6:g} ms skew, "
+                f"{camera_alignment['max_camera_age_ns'] / 1e6:g} ms age "
+                f"[{runtime_camera_alignment['clock_domain']}]"
+            )
+
     fk = WBCPolicyFK(ik=ik)  # FK on the live solver's own model
-    driver = mod.HardwareDriver(args, ik, cfg, enable)
+    driver = driver_factory()
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
     def run_initialized_session() -> None:
+        actual_source_fn = getattr(driver, "base_pose_source", None)
+        if callable(actual_source_fn):
+            actual_source = str(actual_source_fn())
+            if actual_source != base_pose_source:
+                raise RuntimeError(
+                    "hardware driver base-pose source changed after validation: "
+                    f"expected {base_pose_source}, got {actual_source}"
+                )
         io_log = EpisodeRecorder(str(Path(args.save_dir) / "policy_io"))
         if policy is not None:
             # Fail metadata/provenance construction before any episode prompt. The
@@ -2308,6 +4334,7 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
                 policy=policy,
                 source=source,
                 state_frame=state_frame,
+                action_target_frame=expected_target_frame,
                 mode=mode,
                 ik=ik,
                 fk=fk,
@@ -2337,6 +4364,52 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-path", default=None,
                         help="LeRobot checkpoint dir trained on the WBC 32/29 schema "
                              "(exactly one of --policy-path / --replay-episode).")
+    parser.add_argument(
+        "--policy-dataset-meta",
+        default=None,
+        help="ported training dataset's dexmate_meta.json (or its directory). "
+             "Normally auto-discovered through the checkpoint train_config.json; "
+             "use this if the dataset moved.",
+    )
+    parser.add_argument(
+        "--policy-action-offset-frames",
+        type=int,
+        default=None,
+        help="legacy-checkpoint fallback declaring the coherent future action-label "
+             "offset used by the porter. New checkpoints auto-read it from "
+             "--policy-dataset-meta; use 0 only for a confirmed zero-offset dataset.",
+    )
+    parser.add_argument(
+        "--policy-base-pose-source",
+        choices=tuple(sorted(_BASE_POSE_SOURCES)),
+        default=None,
+        help="legacy-checkpoint fallback declaring whether state[29:32] was trained "
+             "from wheel odometry or ARKit. New checkpoints auto-read this from "
+             "--policy-dataset-meta and reject a contradictory value.",
+    )
+    parser.add_argument(
+        "--policy-camera-alignment-mode",
+        choices=("head_capture_nearest", "latest_arrived_compatibility"),
+        default=None,
+        help="legacy-checkpoint fallback declaring how training selected wrist frames. "
+             "New checkpoints auto-read this from --policy-dataset-meta.",
+    )
+    parser.add_argument(
+        "--policy-camera-max-skew-ms",
+        type=float,
+        default=None,
+        help="legacy-checkpoint training skew bound. Required with "
+             "--policy-camera-alignment-mode head_capture_nearest; must match the "
+             "live --record-max-camera-skew-ms exactly.",
+    )
+    parser.add_argument(
+        "--policy-camera-max-age-ms",
+        type=float,
+        default=None,
+        help="legacy-checkpoint training capture-age ceiling. Required with "
+             "--policy-camera-alignment-mode and must match the live "
+             "--record-max-camera-age-ms exactly.",
+    )
     parser.add_argument("--replay-episode", default=None,
                         help="recorded episode_*.hdf5 (wbc_vr_robot.py --record schema) "
                              "to replay verbatim at real time through the same "
@@ -2350,6 +4423,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable", default="arms,torso,head,base",
                         help="DOF groups to actuate (rollout requires all four; the "
                              "grippers are always active).")
+    parser.add_argument(
+        "--lock-torso-in-ik",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override follower/wbik.yaml lock_torso_in_ik for either WBC or "
+             "joystick policy execution; omit to use the YAML value.",
+    )
     parser.add_argument("--namespace", default="",
                         help="Zenoh namespace (matches wbc_vr_robot; default empty).")
     parser.add_argument("--save-dir", default=None,
@@ -2391,6 +4471,69 @@ def build_parser() -> argparse.ArgumentParser:
     hw.add_argument("--record-rate", type=float, default=mod.DEFAULT_RECORD_RATE)
     hw.add_argument("--record-stale-grace", type=float,
                     default=mod.DEFAULT_RECORD_STALE_GRACE)
+    hw.add_argument(
+        "--record-startup-timeout",
+        type=float,
+        default=mod.DEFAULT_RECORD_STARTUP_TIMEOUT,
+        help="startup-only camera stability deadline before frame zero (default "
+             "matches wbc_vr_robot.py)",
+    )
+    hw.add_argument(
+        "--record-max-camera-skew-ms",
+        type=float,
+        default=mod.DEFAULT_RECORD_MAX_CAMERA_SKEW_MS,
+        help="maximum corrected head-to-each-wrist capture skew in recorded rollout "
+             "rows (default matches wbc_vr_robot.py)",
+    )
+    hw.add_argument(
+        "--record-max-camera-age-ms",
+        type=float,
+        default=mod.DEFAULT_RECORD_MAX_CAMERA_AGE_MS,
+        help="maximum corrected capture-to-selection age for recording and live "
+             "policy observations (default matches wbc_vr_robot.py)",
+    )
+    hw.add_argument(
+        "--streaming-recorder",
+        dest="streaming_recorder",
+        action="store_true",
+        default=True,
+        help="stream rollout episodes to HDF5 with bounded RAM (default on)",
+    )
+    hw.add_argument(
+        "--buffered-recorder",
+        dest="streaming_recorder",
+        action="store_false",
+        help="use the legacy in-RAM episode recorder",
+    )
+    hw.add_argument(
+        "--no-head-depth",
+        dest="no_head_depth",
+        action="store_true",
+        default=True,
+        help="do not subscribe to ZED SDK depth while rolling out (default on)",
+    )
+    hw.add_argument(
+        "--head-depth",
+        dest="no_head_depth",
+        action="store_false",
+        help="record legacy ZED SDK head depth",
+    )
+    hw.add_argument(
+        "--head-right-rgb",
+        action="store_true",
+        help="also record the rectified head right eye for offline stereo",
+    )
+    hw.add_argument(
+        "--wrist-right-rgb",
+        action="store_true",
+        help="also record the rectified right eye of both wrist cameras",
+    )
+    hw.add_argument(
+        "--arkit-base",
+        choices=("off", "record", "control"),
+        default="off",
+        help="iPhone base tracking mode passed through to the shared hardware driver",
+    )
 
     pc = parser.add_argument_group(
         "checkpoint-driven live object bootstrap (--policy-path only)"
@@ -2422,6 +4565,61 @@ def finalize_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
 
     if bool(args.policy_path) == bool(args.replay_episode):
         parser.error("exactly one of --policy-path / --replay-episode is required")
+    if args.replay_episode and (
+        args.policy_dataset_meta is not None
+        or args.policy_base_pose_source is not None
+        or args.policy_camera_alignment_mode is not None
+        or args.policy_camera_max_skew_ms is not None
+        or args.policy_camera_max_age_ms is not None
+    ):
+        parser.error(
+            "--policy-dataset-meta and policy contract fallbacks apply only with "
+            "--policy-path; replay reads its source from the episode"
+        )
+    if args.policy_path and args.policy_base_pose_source is not None:
+        runtime_source = _runtime_base_pose_source(args.arkit_base)
+        if args.policy_base_pose_source != runtime_source:
+            parser.error(
+                f"--policy-base-pose-source {args.policy_base_pose_source} conflicts "
+                f"with --arkit-base {args.arkit_base} (live source {runtime_source})"
+            )
+    if args.policy_camera_alignment_mode is None:
+        if (
+            args.policy_camera_max_skew_ms is not None
+            or args.policy_camera_max_age_ms is not None
+        ):
+            parser.error(
+                "--policy-camera-max-skew-ms/--policy-camera-max-age-ms require "
+                "--policy-camera-alignment-mode"
+            )
+    else:
+        if (
+            args.policy_camera_max_age_ms is None
+            or not np.isfinite(args.policy_camera_max_age_ms)
+            or args.policy_camera_max_age_ms <= 0
+        ):
+            parser.error(
+                "--policy-camera-alignment-mode requires finite "
+                "--policy-camera-max-age-ms > 0"
+            )
+    if args.policy_camera_alignment_mode == "head_capture_nearest":
+        if (
+            args.policy_camera_max_skew_ms is None
+            or not np.isfinite(args.policy_camera_max_skew_ms)
+            or args.policy_camera_max_skew_ms <= 0
+        ):
+            parser.error(
+                "head_capture_nearest requires finite "
+                "--policy-camera-max-skew-ms > 0"
+            )
+    elif (
+        args.policy_camera_alignment_mode == "latest_arrived_compatibility"
+        and args.policy_camera_max_skew_ms not in (None, 0.0)
+    ):
+        parser.error(
+            "latest_arrived_compatibility requires "
+            "--policy-camera-max-skew-ms 0 (or omit it)"
+        )
     if args.policy_path and not np.isfinite(args.scenediff_timeout):
         parser.error("--scenediff-timeout must be finite")
     if args.align_reference is None:
@@ -2456,6 +4654,17 @@ def finalize_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     args.base_max_speed = mod.DEFAULT_BASE_MAX_SPEED
     args.base_post_linear_deadband = mod.DEFAULT_BASE_POST_LINEAR_DEADBAND
     args.base_post_angular_deadband = mod.DEFAULT_BASE_POST_ANGULAR_DEADBAND
+    # Harmless for 29-D WBC rollouts and required by JoystickBaseShaper for 32-D
+    # checkpoints. Read the same canonical YAML sections as joystick collection.
+    from omniteleop.wbc_teleop import (  # noqa: PLC0415
+        JoystickTeleopConfig,
+        VRTeleopConfig,
+        bind_joystick_teleop_args,
+    )
+
+    joystick_vr_cfg = VRTeleopConfig.from_yaml()
+    joystick_cfg = JoystickTeleopConfig.from_yaml()
+    bind_joystick_teleop_args(args, joystick_vr_cfg, joystick_cfg)
 
     if args.max_seconds < 0 or not np.isfinite(args.max_seconds):
         parser.error("--max-seconds must be finite and >= 0")
@@ -2465,6 +4674,26 @@ def finalize_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--execution-latency must be finite and >= 0")
     if not np.isfinite(args.dataset_fps) or args.dataset_fps <= 0:
         parser.error("--dataset-fps must be finite and > 0")
+    if (
+        args.policy_action_offset_frames is not None
+        and args.policy_action_offset_frames < 0
+    ):
+        parser.error("--policy-action-offset-frames must be >= 0")
+    if (
+        not np.isfinite(args.record_max_camera_skew_ms)
+        or args.record_max_camera_skew_ms < 0
+    ):
+        parser.error("--record-max-camera-skew-ms must be finite and >= 0")
+    if (
+        not np.isfinite(args.record_max_camera_age_ms)
+        or args.record_max_camera_age_ms <= 0
+    ):
+        parser.error("--record-max-camera-age-ms must be finite and > 0")
+    if (
+        not np.isfinite(args.record_startup_timeout)
+        or args.record_startup_timeout <= 0
+    ):
+        parser.error("--record-startup-timeout must be finite and > 0")
 
 
 def main() -> None:

@@ -732,7 +732,7 @@ def main() -> None:
                             allow_yaw_hold=allow_yaw_hold,
                             xy_max_vel=cfg.base_xy_max_vel,
                             yaw_max_vel=cfg.base_yaw_max_vel,
-                            deadband=cfg.base_single_axis_deadband,
+                            deadband=cfg.base_dispatch_single_axis_deadband,
                             hysteresis_ratio=cfg.base_single_axis_hysteresis_ratio,
                             prev_axis=base_axis,
                         )

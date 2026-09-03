@@ -163,6 +163,11 @@ class RobotiqStatusMonitor:
         self._pending_requests: Deque[Dict[str, Any]] = deque()
         self._counters: Counter[str] = Counter()
         self._next_request_id = 0
+        # Modbus RTU replies carry no transaction id. After a request times out, the
+        # next syntactically valid FC03 reply is therefore ambiguous: it may be the late
+        # old reply or the reply to a replacement request. Sacrifice that one reply (and
+        # any replacement pending slot) rather than assigning fabricated provenance.
+        self._status_attribution_barrier = 0
         node = getattr(arm, "_node", None)
         if node is None:
             raise ValueError("arm has no dexcomm node")
@@ -213,9 +218,19 @@ class RobotiqStatusMonitor:
                 self._counters["other_status_discarded"] += 1
                 return
 
+            if self._status_attribution_barrier > 0:
+                self._status_attribution_barrier -= 1
+                if self._pending_requests:
+                    self._pending_requests.popleft()
+                    self._counters["ambiguous_pending_requests_discarded"] += 1
+                self._counters["ambiguous_statuses_discarded"] += 1
+                return
             request_event = self._pending_requests.popleft() if self._pending_requests else None
             if request_event is None:
+                # An unsolicited/late reply has no defensible request timestamps. Never
+                # expose it as obs/gripper provenance merely because its CRC is valid.
                 self._counters["unmatched_statuses"] += 1
+                return
             parsed = dict(parsed or {})
             parsed["response_timestamp_ns"] = (
                 resp.get("timestamp_ns") if isinstance(resp, dict) else None
@@ -264,15 +279,41 @@ class RobotiqStatusMonitor:
                     }
                 )
             self._counters["status_timeouts"] += len(expired)
+            self._status_attribution_barrier += len(expired)
         return expired
 
     def stats(self) -> Dict[str, int]:
         """Return monitor counters plus current queue depths."""
+        now_ns = time.monotonic_ns()
         with self._lock:
             stats = dict(self._counters)
             stats["queued_statuses"] = len(self._statuses)
             stats["pending_status_requests"] = len(self._pending_requests)
+            stats["status_attribution_barrier"] = self._status_attribution_barrier
+            stats["oldest_pending_age_ms"] = (
+                0
+                if not self._pending_requests
+                else max(
+                    0,
+                    (now_ns - int(self._pending_requests[0]["send_monotonic_ns"]))
+                    // 1_000_000,
+                )
+            )
         return stats
+
+    def pending_request_age_s(self) -> Optional[float]:
+        """Age of the oldest outstanding FC03/FC04 request, or ``None``.
+
+        The Hand-E pass-through is one shared Modbus request/response path.  A
+        command scheduler can use this age to leave a short write-free window after
+        a status request without freezing gripper control for an entire timeout.
+        """
+        now_ns = time.monotonic_ns()
+        with self._lock:
+            if not self._pending_requests:
+                return None
+            sent_ns = int(self._pending_requests[0]["send_monotonic_ns"])
+        return max(0.0, (now_ns - sent_ns) / 1e9)
 
     def close(self) -> None:
         """Best-effort subscriber cleanup for dexcomm versions that expose it."""

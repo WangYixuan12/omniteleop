@@ -22,7 +22,11 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file
 
-from omniteleop.wbc_policy_format import ACTION_AXES, WBCPolicyFK
+from omniteleop.wbc_policy_format import (
+    ACTION_AXES,
+    JOYSTICK_POLICY_ACTION_SCHEMA,
+    WBCPolicyFK,
+)
 
 
 def _load_by_path(module_name: str, relative: str) -> types.ModuleType:
@@ -133,7 +137,18 @@ def test_schema_layout_and_meta(ported: dict) -> None:
     assert meta["rotation_convention"] == "column"
     assert meta["quaternion_convention"] == "wxyz"
     assert meta["state_frame"] == "world"
+    assert meta["base_pose_source"] == "wheel_odometry"
+    assert meta["camera_alignment_mode"] == "latest_arrived_legacy_unverified"
+    assert meta["camera_alignment_clock_domain"] == (
+        "raw_publisher_clock_unverified"
+    )
+    assert meta["camera_alignment_max_abs_skew_ns"] is None
+    assert meta["camera_alignment_max_camera_age_ns"] is None
+    assert meta["camera_alignment_verified"] is False
     assert meta["action_axes"] == list(ACTION_AXES)
+    assert meta["action_offset_frames"] == 0
+    assert meta["pose_action_offset_frames"] == 0
+    assert meta["action_offset_semantics"] == "all action components shifted together"
     assert meta["env_state"]["constant_per_episode"] is True
     episodes = meta["episodes"]
     assert {e["split"] for e in episodes} == {"train", "test"}
@@ -212,6 +227,39 @@ def test_missing_positions_aborts_before_write(
         positions_dir=tmp_path / "positions",
     )
     with pytest.raises(RuntimeError, match="no dataset was written"):
+        mof_porter.convert(args)
+    assert not (out_root / "x").exists()
+
+
+def test_joystick_action_contract_is_rejected_before_mof_output(
+    tmp_path: Path, mof_porter: types.ModuleType, write_raw: Callable[..., Path]
+) -> None:
+    raw_dir = tmp_path / "raw_data"
+    raw_dir.mkdir()
+    path = write_raw(
+        raw_dir / "episode_0.hdf5", T=3, base_pose_source="wheel_odometry"
+    )
+    with h5py.File(path, "a") as raw:
+        for key in ("meta/schema", "meta/provenance/schema"):
+            del raw[key]
+            raw[key] = np.asarray(b"omniteleop_joystick_mobile_raw/v1")
+        raw["meta/control_mode"] = np.asarray(b"joystick")
+        raw["meta/action_target_frame"] = np.asarray(b"current_base")
+        raw["meta/eef_target_frame"] = np.asarray(b"current_base")
+        raw["meta/head_target_frame"] = np.asarray(b"current_base")
+        raw["meta/policy_action_schema"] = np.asarray(
+            JOYSTICK_POLICY_ACTION_SCHEMA.encode()
+        )
+        raw["action/chassis/intent_body"] = np.zeros((3, 3), np.float32)
+
+    out_root = tmp_path / "out"
+    args = mof_porter.build_args(
+        raw_dir=raw_dir,
+        out_root=out_root,
+        name="x",
+        positions_dir=tmp_path / "positions",
+    )
+    with pytest.raises(ValueError, match=r"MoF.*29-D WBC"):
         mof_porter.convert(args)
     assert not (out_root / "x").exists()
 

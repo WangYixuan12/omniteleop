@@ -142,16 +142,16 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=540)
     parser.add_argument("--video-fps", type=float, default=15.0)
-    parser.add_argument("--debug-hdf5", default=None,
-                        help="path for the per-tick base-debug HDF5 (rx_chassis, pd_raw/err, "
-                             "base_cmd, cmd_pose, base_pose, single-axis latch, gating). "
-                             "Default: auto-named wbc_joystick_dbg_<timestamp>.hdf5 in the cwd.")
-    parser.add_argument("--no-debug-hdf5", action="store_true",
-                        help="disable the per-tick base-debug HDF5 log.")
+    parser.add_argument("--debug-hdf5", nargs="?", const="", default=None, metavar="FILE",
+                        help="record the per-tick base debug trace (rx_chassis, pd_raw/err, "
+                             "base_cmd, cmd_pose, base_pose, single-axis latch, gating) to an "
+                             "HDF5, and print the ~2 Hz [follower dbg] line. Bare flag "
+                             "auto-names wbc_joystick_dbg_<timestamp>.hdf5 in the cwd; pass "
+                             "FILE for a specific path. Off by default.")
     args = parser.parse_args()
 
     dbg_log: Optional[_DbgLog] = None
-    if not args.no_debug_hdf5:
+    if args.debug_hdf5 is not None:
         dbg_path = args.debug_hdf5 or f"wbc_joystick_dbg_{time.strftime('%Y%m%d_%H%M%S')}.hdf5"
         dbg_log = _DbgLog(dbg_path)
         print(f"[wbc_joystick] base-debug HDF5 -> {dbg_path} (per-tick; written on exit)")
@@ -277,12 +277,12 @@ def main() -> None:
             robot.render(record_video=args.output is not None)
 
             # rx_chassis = joystick twist RECEIVED from the leader; base_cmd = shaped twist
-            # sent to set_velocity; base_pose = integrated sim base. Logged EVERY tick to the
-            # debug HDF5 (analyse the base direction offline), printed at ~2 Hz.
-            stage = vr.calib_stage if vr is not None else "?"
-            rxc = ((float(vr.chassis_vx), float(vr.chassis_vy), float(vr.chassis_wz))
-                   if vr is not None else (0.0, 0.0, 0.0))
+            # sent to set_velocity; base_pose = integrated sim base. Under --debug-hdf5 this
+            # is logged EVERY tick (analyse the base direction offline) and echoed at ~2 Hz.
             if dbg_log is not None:
+                stage = vr.calib_stage if vr is not None else "?"
+                rxc = ((float(vr.chassis_vx), float(vr.chassis_vy), float(vr.chassis_wz))
+                       if vr is not None else (0.0, 0.0, 0.0))
                 dbg_log.append(
                     t=t, stage=stage, estop=int(estop), hold_base=int(hold_base),
                     success=int(result.success),
@@ -298,14 +298,14 @@ def main() -> None:
                     left_tgt=np.asarray(left_target[:3, 3], dtype=np.float32),
                     right_tgt=np.asarray(right_target[:3, 3], dtype=np.float32),
                 )
-            if t - last_print >= 0.5:
-                last_print = t
-                bx, by, byaw = robot.base_pose
-                print(f"[follower dbg] t={t:5.1f}s {stage:7s} estop={estop} "
-                      f"hold_base={hold_base} rx_chassis=[{rxc[0]:+.2f} {rxc[1]:+.2f} "
-                      f"{rxc[2]:+.2f}] cmd=[{base_cmd[0]:+.2f} {base_cmd[1]:+.2f} "
-                      f"{base_cmd[2]:+.2f}] base=[{bx:+.2f} {by:+.2f} "
-                      f"{np.degrees(byaw):+4.0f}deg] axis={shaper.prev_axis}")
+                if t - last_print >= 0.5:
+                    last_print = t
+                    bx, by, byaw = robot.base_pose
+                    print(f"[follower dbg] t={t:5.1f}s {stage:7s} estop={estop} "
+                          f"hold_base={hold_base} rx_chassis=[{rxc[0]:+.2f} {rxc[1]:+.2f} "
+                          f"{rxc[2]:+.2f}] cmd=[{base_cmd[0]:+.2f} {base_cmd[1]:+.2f} "
+                          f"{base_cmd[2]:+.2f}] base=[{bx:+.2f} {by:+.2f} "
+                          f"{np.degrees(byaw):+4.0f}deg] axis={shaper.prev_axis}")
 
             sleep = dt - (time.perf_counter() - now)
             if sleep > 0:

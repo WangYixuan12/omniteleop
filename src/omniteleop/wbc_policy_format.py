@@ -9,10 +9,12 @@ gripper, base-frame achieved ``zed_depth_frame`` head pose (pos3 + rot6), then t
 measured odometry base pose ``(x, y, yaw)`` in the engage-origin world frame — the
 policy's only absolute world anchor (images are egocentric).
 
-``action`` (29,): the WORLD-frame targets given VERBATIM to ``ik.solve()`` at the
-record tick — left/right EEF targets + binary gripper commands + the
-post-LPF/post-deadband head target. Rollout feeds these straight back into the
-``TargetInterpolator`` -> ``ik.solve()`` path with no base composition.
+``action`` has two deliberately separate contracts. WBC v1 is 29-D: WORLD-frame
+targets given VERBATIM to ``ik.solve()`` at the record tick — left/right EEF targets,
+binary gripper commands, and the post-LPF/post-deadband head target. Joystick v1 is
+32-D: the same pose layout interpreted in the CURRENT base at each action time, plus
+the follower-effective body-frame chassis intent before base feedback/shaping. The
+schemas must never be mixed or inferred from vector length alone.
 
 numpy-only to IMPORT (like ``wbc_stream``): the porter, the rollout script, and
 stub-loaded recorder tests can import it without pulling pinocchio or hardware
@@ -62,6 +64,28 @@ HEAD_AXES = [
 BASE_AXES = ["base_x", "base_y", "base_yaw"]
 ACTION_AXES = LEFT_EEF_AXES + RIGHT_EEF_AXES + HEAD_AXES
 STATE_AXES = ACTION_AXES + BASE_AXES
+
+# Preserve the deployed 29-D WBC checkpoint contract while giving joystick data an
+# explicit, versioned action layout. The chassis label is the effective joystick intent
+# after DOF masking/single-axis projection, but before integration, odometry PD, slew, and
+# hardware dispatch. It is therefore a human control decision rather than controller state.
+WBC_POLICY_ACTION_SCHEMA = "wbc_eef_head_v1"
+JOYSTICK_POLICY_ACTION_SCHEMA = "omniteleop_wbc_joystick_action/v1"
+CHASSIS_INTENT_AXES = [
+    "chassis_intent_vx_body",
+    "chassis_intent_vy_body",
+    "chassis_intent_wz_body",
+]
+JOYSTICK_ACTION_AXES = ACTION_AXES + CHASSIS_INTENT_AXES
+
+
+def action_axes_for_policy_schema(schema: str) -> list[str]:
+    """Return a fresh axis list for a declared policy-action schema."""
+    if schema == WBC_POLICY_ACTION_SCHEMA:
+        return list(ACTION_AXES)
+    if schema == JOYSTICK_POLICY_ACTION_SCHEMA:
+        return list(JOYSTICK_ACTION_AXES)
+    raise ValueError(f"unknown policy action schema {schema!r}")
 
 # observation.state EEF/head frame. "base": achieved FK in the base frame (the
 # egocentric default). "world": each EEF/head block composed to the engage-origin
