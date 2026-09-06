@@ -101,11 +101,14 @@ head_ik_damp: 1.0e-2
 # --- Head whole-body IK mode (rby1 `ik` port) ------------------------------------------------
 # "track": head is externally commanded (solve(head_joints=...)) and pinned out of the QP. 
 # head_j1 stays at its current value (nominal_posture.head_j1) and head_j2/head_j3 are tracked.
-# "ik" (current default): the head DOFs become whole-body QP variables and a head FrameTask tracks
+# "ik": the head DOFs become whole-body QP variables and a head FrameTask tracks
 # the headset pose (solve(head_target=...)), so base + torso + head co-track it --
 # the base follows head turn/translation and is anchored when the head is still
 # (the rby1 head_pos_cost/head_ori_cost mechanism). NOTE: distinct from
 # vr_robot_controller's unrelated head_mode (track/fixed).
+# "fixed": the head is never commanded by the headset -- it stays at the nominal_posture
+# head joints (head_j1 -0.25, pan/tilt 0) for the whole take. The JOYSTICK followers do not
+# read this key; they take joystick_teleop.head_mode below ("fixed" for data collection).
 head_mode: "ik"
 # Head FrameTask weights for head_mode "ik" (ignored in "track"). Follow RBY1
 # head_pos_cost / head_ori_cost (10000). Roll about the camera forward axis is
@@ -360,11 +363,27 @@ vr_teleop:
 
 # Joystick-pipeline-only axis switching policy.
 joystick_teleop:
+  # Head policy for the joystick followers (they ignore the top-level head_mode, which
+  # would otherwise couple the base to the head). "track": neck pan/tilt follows the
+  # headset via solve_head. "fixed" (data collection 2026-09): the head stays at the
+  # nominal_posture head joints for the whole take, so every episode shares one
+  # head-camera pose relative to the body and nothing moves the camera between rows.
+  head_mode: "fixed"
   # Direction-only base control: once a stick direction passes the deadband and wins
   # single-axis selection, translation uses one fixed speed and yaw uses another.
   # Stick magnitude does not modulate chassis speed.
-  translation_speed: 0.15  # m/s
-  rotation_speed: 0.25     # rad/s
+  translation_speed: 0.18  # m/s
+  rotation_speed: 0.30     # rad/s
   # Joystick direction is explicit operator intent: switch axes immediately instead of
   # retaining the previous axis with the QP-noise hysteresis used by WBC base motion.
   single_axis_hysteresis_ratio: 0.0
+  # Reference lead clamp: the integrated command pose may run at most this far ahead of
+  # the MEASURED base pose (xy in m, yaw in rad). The reference is then a carrot a bounded
+  # distance ahead of the chassis instead of an open-loop integral: on episode 12 the
+  # chassis achieved ~0.11 m/s against the 0.15 m/s reference, the lead wound up to 0.9 m
+  # and 18 deg, and the PD repaid it as 1-3 s of coasting after every stick release (the
+  # base was driven 94% of the take against 57% stick activity). With the clamp the
+  # post-release catch-up is at most reference_lead_xy. 0 pins the reference to the
+  # measured pose (a pure velocity command with no pose feedback).
+  reference_lead_xy: 0.05
+  reference_lead_yaw: 0.10

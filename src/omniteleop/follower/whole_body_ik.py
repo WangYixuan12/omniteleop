@@ -436,8 +436,11 @@ class WBCConfig:
     # head turn/translation and is anchored when the head is still. "track" pins ALL head
     # DOFs; "ik" pins the subset in head_ik_pinned_joints (default head_j1/head_j2) and
     # leaves the rest (default head_j3) as IK DOFs -- so head yaw/pitch resolve through the
-    # base/body (turn-follow) rather than the neck. NOTE this is a WBCConfig/wbik.yaml
-    # field, distinct from vr_robot_controller's unrelated head_mode (track/fixed).
+    # base/body (turn-follow) rather than the neck. "fixed": like "track" (all head DOFs
+    # pinned, no head task) but the head is NOT commanded at all -- it stays at the
+    # nominal_posture head joints for the whole take (solve() ignores head_joints and the
+    # followers skip solve_head). NOTE this is a WBCConfig/wbik.yaml field, distinct from
+    # vr_robot_controller's unrelated head_mode (track/fixed).
     head_mode: str = _DEFAULTS["head_mode"]
     # Head FrameTask weights for head_mode "ik" (ignored in "track"). Follow rby1
     # head_pos_cost / head_ori_cost (10000). Roll about the camera forward axis is
@@ -625,9 +628,9 @@ class VegaWholeBodyIK:
         if config is None and config_path is not None:
             config = WBCConfig.from_yaml(config_path)
         self.config = config or WBCConfig()
-        if self.config.head_mode not in ("track", "ik"):
+        if self.config.head_mode not in ("track", "ik", "fixed"):
             raise ValueError(
-                f"head_mode must be 'track' or 'ik', got {self.config.head_mode!r}"
+                f"head_mode must be 'track', 'ik' or 'fixed', got {self.config.head_mode!r}"
             )
         if self.config.base_dofs not in BASE_DOF_MODES:
             raise ValueError(
@@ -1393,8 +1396,9 @@ class VegaWholeBodyIK:
             # tracks the headset pose. head_joints is ignored in this mode.
             if head_target is not None:
                 self.head_task.set_target(_as_se3(head_target))
-        elif head_joints is not None:
+        elif self._head_mode == "track" and head_joints is not None:
             self._set_head_joints(head_joints)
+        # "fixed": the head stays where reset() put it (nominal_posture); head_joints ignored.
         self.left_ee_task.set_target(_as_se3(left_target))
         self.right_ee_task.set_target(_as_se3(right_target))
         tasks = self.tasks

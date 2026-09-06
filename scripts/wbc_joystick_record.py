@@ -55,7 +55,8 @@ from omniteleop.wbc_teleop import JoystickTeleopConfig, VRJointSubscriber, VRTel
 def _build_joystick_ik(config):
     """VegaWholeBodyIK with the joystick-mode overrides on the canonical wbik.yaml."""
     cfg = replace(
-        WBCConfig.from_yaml(config), lock_base_in_ik=True, head_mode="track",
+        WBCConfig.from_yaml(config), lock_base_in_ik=True,
+        head_mode=JoystickTeleopConfig.from_yaml(config).head_mode,  # as wbc_joystick_robot
     )
     return VegaWholeBodyIK(cfg), cfg
 
@@ -75,6 +76,8 @@ def _shaper_args(
         joystick_translation_speed=joystick.translation_speed,
         joystick_rotation_speed=joystick.rotation_speed,
         joystick_single_axis_hysteresis_ratio=joystick.single_axis_hysteresis_ratio,
+        joystick_reference_lead_xy=joystick.reference_lead_xy,
+        joystick_reference_lead_yaw=joystick.reference_lead_yaw,
     )
 
 
@@ -252,9 +255,13 @@ def main() -> None:
             head_target = head_lpf.filter(head_target, dt)
             head_target = head_planar_deadband.filter(head_target)
 
-            # Torso + arms (base locked out of the IK); head via the stiff live-config tracker.
-            head_joints = ik.solve_head(head_target, dt)
-            result = ik.solve(left_target, right_target, dt, head_joints=head_joints)
+            # Torso + arms (base locked out of the IK); head via the stiff live-config tracker
+            # ("track") or pinned at nominal ("fixed").
+            if cfg.head_mode == "fixed":
+                result = ik.solve(left_target, right_target, dt)
+            else:
+                head_joints = ik.solve_head(head_target, dt)
+                result = ik.solve(left_target, right_target, dt, head_joints=head_joints)
             robot.left_arm.set_joint_pos(result.left_arm)
             robot.right_arm.set_joint_pos(result.right_arm)
             robot.torso.set_joint_pos(result.torso)

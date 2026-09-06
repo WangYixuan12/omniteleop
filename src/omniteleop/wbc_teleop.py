@@ -165,6 +165,11 @@ class JoystickTeleopConfig:
     translation_speed: float
     rotation_speed: float
     single_axis_hysteresis_ratio: float
+    reference_lead_xy: float   # max integrated-reference lead over the measured pose (m)
+    reference_lead_yaw: float  # same for heading (rad); 0 = pure velocity command
+    head_mode: str             # "track" (neck follows the headset) or "fixed" (nominal)
+
+    HEAD_MODES = ("track", "fixed")
 
     @classmethod
     def from_yaml(cls, path: Optional[Union[str, Path]] = None) -> "JoystickTeleopConfig":
@@ -192,6 +197,14 @@ class JoystickTeleopConfig:
         values = {}
         for name in names:
             raw = block[name]
+            if name == "head_mode":
+                if raw not in cls.HEAD_MODES:
+                    raise ValueError(
+                        f"{cfg_path}: {JOYSTICK_TELEOP_SECTION}.head_mode must be one of "
+                        f"{cls.HEAD_MODES}, got {raw!r}"
+                    )
+                values[name] = str(raw)
+                continue
             try:
                 value = float(raw)
             except (TypeError, ValueError):
@@ -248,6 +261,9 @@ def bind_joystick_teleop_args(
     args.joystick_single_axis_hysteresis_ratio = (
         joystick_config.single_axis_hysteresis_ratio
     )
+    args.joystick_reference_lead_xy = joystick_config.reference_lead_xy
+    args.joystick_reference_lead_yaw = joystick_config.reference_lead_yaw
+    args.joystick_head_mode = joystick_config.head_mode
 
 
 class VRJointSubscriber:

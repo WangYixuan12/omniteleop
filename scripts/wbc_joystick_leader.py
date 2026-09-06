@@ -36,6 +36,11 @@ paradigm requires:
 Run in the dexmate conda env, same as the base leader::
 
     /home/yixuan/miniforge3/envs/dexmate/bin/python scripts/wbc_joystick_leader.py
+
+For measured 90-degree turns, pass ``--turn-90`` to wbc_joystick_robot.py only.
+After neutral, LEFT stick sideways starts one turn; release lets it finish and holding
+does not repeat. RIGHT-stick translation or opposite yaw cancels. The follower uses
+base odometry (or ARKit in control mode), which is unavailable to this leader.
 """
 
 from __future__ import annotations

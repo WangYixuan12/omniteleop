@@ -20,7 +20,7 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from omniteleop.common.schemas import VRJointData
-from omniteleop.follower.base_closed_loop import integrate_se2
+from omniteleop.follower.base_closed_loop import integrate_se2, wrap_pi
 from omniteleop.follower.joystick_base import (
     JoystickBaseShaper,
     fixed_speed_planar_twist,
@@ -57,6 +57,8 @@ def _shaper_args(vt: VRTeleopConfig) -> SimpleNamespace:
         joystick_translation_speed=joystick.translation_speed,
         joystick_rotation_speed=joystick.rotation_speed,
         joystick_single_axis_hysteresis_ratio=joystick.single_axis_hysteresis_ratio,
+        joystick_reference_lead_xy=joystick.reference_lead_xy,
+        joystick_reference_lead_yaw=joystick.reference_lead_yaw,
     )
 
 
@@ -119,13 +121,124 @@ def _drive(cfg, joy, ticks=300, blocked=False):
 
 def test_shaper_drives_forward():
     cmds, _ = _drive(WBCConfig(), [0.3, 0.0, 0.0])
-    assert cmds[-1][0] == pytest.approx(0.15)
+    assert cmds[-1][0] == pytest.approx(0.18)
     assert abs(cmds[-1][1]) < 1e-9 and abs(cmds[-1][2]) < 1e-9
 
 
+@pytest.mark.parametrize("sign,held,response", [(1, False, 1.0), (-1, True, 0.7)])
+def test_quarter_turn_uses_feedback_and_does_not_repeat(sign, held, response):
+    args = _shaper_args(VRTeleopConfig.from_yaml())
+    args.turn_90 = True
+    sh = JoystickBaseShaper.from_configs(WBCConfig(), args)
+    measured = np.array([0.2, -0.3, sign * np.deg2rad(170)])
+    start = measured.copy()
+    sh.reset(measured)
+    replay_shaper = JoystickBaseShaper.from_configs(
+        WBCConfig(), _shaper_args(VRTeleopConfig.from_yaml())
+    )
+    replay_shaper.reset(measured)
+    yaw = np.array([0.0, 0.0, sign * sh.rotation_speed])
+    # Engaging with an already-held stick cannot launch a macro.
+    assert np.allclose(sh.step(yaw, measured, 0.01)[0], 0)
+    sh.step(np.zeros(3), measured, 0.01)
+    commands = []
+    for i in range(1400):
+        stick = yaw if held or i == 0 else np.zeros(3)
+        cmd, _, _ = sh.step(stick, measured, 0.01)
+        replay_cmd, _, _ = replay_shaper.step(sh.last_projected_joystick, measured, 0.01)
+        if sh.turn_target_yaw is not None:
+            np.testing.assert_allclose(replay_cmd, cmd, atol=1e-12)
+        commands.append(cmd.copy())
+        if i == 30 and not held:
+            assert sh.last_projected_joystick[2] == yaw[2]  # dense policy label after release
+        measured = integrate_se2(measured, response * cmd, 0.01)
+    angle = float(wrap_pi(measured[2] - start[2]))
+    assert abs(angle - sign * np.pi / 2) <= sh.TURN_TOLERANCE_RAD
+    assert sh.turn_target_yaw is None
+    np.testing.assert_allclose(measured[:2], start[:2])
+    np.testing.assert_allclose(commands[-1], 0)
+    assert np.max(np.abs(np.asarray(commands)[:, 2])) <= sh.rotation_speed
+    assert np.any((np.abs(np.asarray(commands)[:, 2]) > 0.06)
+                  & (np.abs(np.asarray(commands)[:, 2]) < 0.20))
+    # Releasing AFTER completion rearms the next relative turn.
+    sh.step(np.zeros(3), measured, 0.01)
+    sh.step(yaw, measured, 0.01)
+    assert float(wrap_pi(sh.turn_target_yaw - measured[2])) == pytest.approx(sign * np.pi / 2)
+
+
+@pytest.mark.parametrize("cancel", ["hold", "translation", "opposite", "reset"])
+def test_quarter_turn_cancellation_discards_target(cancel):
+    args = _shaper_args(VRTeleopConfig.from_yaml())
+    args.turn_90 = True
+    sh = JoystickBaseShaper.from_configs(WBCConfig(), args)
+    measured = np.zeros(3)
+    sh.reset(measured)
+    sh.step(np.zeros(3), measured, 0.01)
+    sh.step(np.array([0., 0., 0.3]), measured, 0.01)
+    assert sh.turn_target_yaw is not None
+    if cancel == "hold":
+        sh.hold(measured)
+    elif cancel == "reset":
+        sh.reset(measured)
+    else:
+        stick = [0.18, 0., 0.] if cancel == "translation" else [0., 0., -0.3]
+        sh.step(np.array(stick), measured, 0.01)
+    assert sh.turn_target_yaw is None
+    # A held or opposite yaw cannot restart until neutral is observed.
+    for _ in range(10):
+        cmd, _, _ = sh.step(np.array([0., 0., 0.3]), measured, 0.01)
+        assert cmd[2] == 0
+        assert sh.turn_target_yaw is None
+
+
+def test_quarter_turn_parks_despite_xy_drift_and_heading_noise():
+    args = _shaper_args(VRTeleopConfig.from_yaml())
+    args.turn_90 = True
+    sh = JoystickBaseShaper.from_configs(WBCConfig(), args)
+    sh.reset(np.zeros(3))
+    sh.step(np.zeros(3), np.zeros(3), 0.01)
+    sh.step(np.array([0., 0., 0.3]), np.zeros(3), 0.01)
+    # Episode 2: translation drift during yaw must never steer the wheels to XY.
+    measured = np.array([0.13, 0.07, 0.0])
+    for heading in np.linspace(0, np.pi / 2 - 0.02, 650):
+        measured[2] = heading
+        cmd, _, _ = sh.step(np.zeros(3), measured, 0.01)
+        np.testing.assert_array_equal(cmd[:2], 0)
+    assert sh.turn_target_yaw is None
+    previous = cmd[2]
+    for i in range(2000):
+        measured = np.array([0.13 + 0.004 * np.sin(i), 0.07,
+                             np.pi / 2 + 0.04 * np.sin(i)])
+        cmd, _, _ = sh.step(np.zeros(3), measured, 0.01)
+        np.testing.assert_array_equal(cmd[:2], 0)
+        assert abs(cmd[2]) <= abs(previous) + 1e-12
+        assert abs(cmd[2] - previous) <= 2 * sh.accel * 0.01 + 1e-12
+        previous = cmd[2]
+        if i > 40:
+            np.testing.assert_array_equal(cmd, 0)
+        np.testing.assert_allclose(sh.cmd_pose, measured)
+    cmd, _, _ = sh.step(np.array([0.18, 0., 0.]), measured, 0.01)
+    assert cmd[0] > 0
+    assert cmd[1] == cmd[2] == 0
+
+
+def test_quarter_turn_blocked_timeout_and_configuration():
+    args = _shaper_args(VRTeleopConfig.from_yaml())
+    args.turn_90 = True
+    with pytest.raises(ValueError, match="xy_yaw"):
+        JoystickBaseShaper.from_configs(WBCConfig(base_dofs="xy"), args)
+    sh = JoystickBaseShaper.from_configs(WBCConfig(), args)
+    sh.step(np.zeros(3), np.zeros(3), 0.01)
+    sh.step(np.array([0., 0., 0.3]), np.zeros(3), 0.01)
+    with pytest.raises(RuntimeError, match="timed out"):
+        for _ in range(2000):
+            sh.step(np.zeros(3), np.zeros(3), 0.01)
+    assert sh.turn_target_yaw is None
+
+
 def test_shaper_command_speed_capped_when_blocked():
-    # The reference itself is unbounded when blocked (no lead clamp); the emitted wheel
-    # Pose-error feedback must not exceed the lower joystick fixed-speed envelope.
+    # Pose-error feedback must not exceed the lower joystick fixed-speed envelope even
+    # while the reference sits at its full lead over a blocked base.
     joystick = JoystickTeleopConfig.from_yaml()
     cmds, _ = _drive(WBCConfig(), [0.3, 0.0, 0.0], ticks=400, blocked=True)
     assert float(np.max(np.linalg.norm(cmds[:, :2], axis=1))) <= (
@@ -133,6 +246,84 @@ def test_shaper_command_speed_capped_when_blocked():
     )
     yaw_cmds, _ = _drive(WBCConfig(), [0.0, 0.0, 0.5], ticks=400, blocked=True)
     assert float(np.max(np.abs(yaw_cmds[:, 2]))) <= joystick.rotation_speed + 1e-6
+
+
+def test_shaper_reference_lead_is_bounded_when_base_lags():
+    # Episode 12 regression: the chassis achieved ~0.11 m/s against the 0.15 m/s
+    # reference and the open-loop integrator wound 0.9 m ahead, so the base kept driving
+    # for seconds after every stick release. The lead over the measured pose must stay
+    # bounded while the stick is held, and the post-release catch-up must be at most
+    # that lead.
+    joystick = JoystickTeleopConfig.from_yaml()
+    vt = VRTeleopConfig.from_yaml()
+    sh = JoystickBaseShaper.from_configs(WBCConfig(), _shaper_args(vt))
+    sh.reset(np.zeros(3))
+    meas = np.zeros(3)
+    leads = []
+    for _ in range(2000):  # 20 s of forward stick with the base at 70% of the command
+        cmd, _, err = sh.step(np.array([0.3, 0.0, 0.0]), meas, 0.01)
+        leads.append(float(np.hypot(*(sh.cmd_pose[:2] - meas[:2]))))  # lead this tick
+        meas = integrate_se2(meas, 0.7 * cmd, 0.01)
+    assert max(leads) <= joystick.reference_lead_xy + 1e-9
+    assert leads[-1] == pytest.approx(joystick.reference_lead_xy)   # saturated, not decaying
+    assert err[0] == pytest.approx(joystick.reference_lead_xy)      # body-frame error = lead
+    assert cmd[0] > 0.0                                             # still driving forward
+
+    released_from = meas.copy()
+    for _ in range(600):  # release: the base may repay the lead and nothing more
+        cmd, _, _ = sh.step(np.zeros(3), meas, 0.01)
+        meas = integrate_se2(meas, cmd, 0.01)
+    coast = float(np.hypot(*(meas[:2] - released_from[:2])))
+    assert coast <= joystick.reference_lead_xy + 1e-3
+    assert float(np.max(np.abs(cmd))) < 1e-6                        # and it has stopped
+
+
+def test_shaper_reference_yaw_lead_is_bounded_when_base_lags():
+    joystick = JoystickTeleopConfig.from_yaml()
+    vt = VRTeleopConfig.from_yaml()
+    sh = JoystickBaseShaper.from_configs(WBCConfig(), _shaper_args(vt))
+    sh.reset(np.zeros(3))
+    meas = np.zeros(3)
+    for _ in range(2000):
+        cmd, _, err = sh.step(np.array([0.0, 0.0, 0.5]), meas, 0.01)
+        meas = integrate_se2(meas, 0.7 * cmd, 0.01)
+        assert abs(float(wrap_pi(sh.cmd_pose[2] - meas[2]))) <= joystick.reference_lead_yaw + 1e-9
+    assert err[2] == pytest.approx(joystick.reference_lead_yaw)
+    assert cmd[2] > 0.0
+
+
+def test_shaper_zero_lead_is_a_pure_velocity_command():
+    vt = VRTeleopConfig.from_yaml()
+    args = _shaper_args(vt)
+    args.joystick_reference_lead_xy = 0.0
+    args.joystick_reference_lead_yaw = 0.0
+    sh = JoystickBaseShaper.from_configs(WBCConfig(), args)
+    sh.reset(np.zeros(3))
+    meas = np.zeros(3)
+    for _ in range(300):
+        cmd, pd_raw, err = sh.step(np.array([0.3, 0.0, 0.0]), meas, 0.01)
+        np.testing.assert_allclose(sh.cmd_pose, meas, atol=1e-12)  # pinned to measured
+        np.testing.assert_allclose(err, 0.0, atol=1e-12)
+        np.testing.assert_allclose(pd_raw, [0.18, 0.0, 0.0], atol=1e-9)  # feed-forward only
+        meas = integrate_se2(meas, 0.5 * cmd, 0.01)  # base far slower than commanded
+    assert meas[0] > 0.1  # the base did move, so the pin was exercised
+
+
+def test_shaper_rejects_negative_or_nonfinite_lead():
+    vt = VRTeleopConfig.from_yaml()
+    for bad in (-0.01, float("nan"), float("inf")):
+        args = _shaper_args(vt)
+        args.joystick_reference_lead_xy = bad
+        with pytest.raises(ValueError, match="reference_lead"):
+            JoystickBaseShaper.from_configs(WBCConfig(), args)
+
+
+def test_shaper_rejects_nonfinite_measured_pose():
+    vt = VRTeleopConfig.from_yaml()
+    sh = JoystickBaseShaper.from_configs(WBCConfig(), _shaper_args(vt))
+    sh.reset(np.zeros(3))
+    with pytest.raises(ValueError, match="measured_pose"):
+        sh.step(np.array([0.3, 0.0, 0.0]), np.array([np.nan, 0.0, 0.0]), 0.01)
 
 
 def test_fixed_speed_mapping_preserves_direction_not_stick_magnitude():
@@ -308,11 +499,11 @@ def test_leader_thumbstick_right_drives_left_turns():
         return {"left_thumbstick": np.array(left), "right_thumbstick": np.array(right)}
 
     vx, vy, wz = L._thumbstick_to_chassis(stick([0, 0], [0, -1]))  # right up -> forward
-    assert vx == pytest.approx(0.15) and abs(vy) < 1e-9 and abs(wz) < 1e-9
+    assert vx == pytest.approx(0.18) and abs(vy) < 1e-9 and abs(wz) < 1e-9
     vx, vy, wz = L._thumbstick_to_chassis(stick([0, 0], [1, 0]))   # right right -> strafe
-    assert abs(vx) < 1e-9 and vy == pytest.approx(-0.15) and abs(wz) < 1e-9
+    assert abs(vx) < 1e-9 and vy == pytest.approx(-0.18) and abs(wz) < 1e-9
     vx, vy, wz = L._thumbstick_to_chassis(stick([1, 0], [0, 0]))   # left right -> yaw
-    assert abs(vx) < 1e-9 and abs(vy) < 1e-9 and wz == pytest.approx(-0.25)
+    assert abs(vx) < 1e-9 and abs(vy) < 1e-9 and wz == pytest.approx(-0.30)
     vx, vy, wz = L._thumbstick_to_chassis(stick([0, 1], [0, 0]))   # left Y unused
     assert abs(vx) < 1e-9 and abs(vy) < 1e-9 and abs(wz) < 1e-9
 
@@ -327,7 +518,7 @@ def test_leader_publishes_diagonal_strafe_as_single_axis():
     vx, vy, wz = L._thumbstick_to_chassis(transforms)
 
     assert abs(vx) < 1e-9
-    assert vy == pytest.approx(-0.15)
+    assert vy == pytest.approx(-0.18)
     assert abs(wz) < 1e-9
     assert L._joystick_axis == 1
 
@@ -337,7 +528,9 @@ def test_leader_publishes_diagonal_strafe_as_single_axis():
 def test_real_follower_config_overrides():
     m = _load_script("wbc_joystick_robot")
     ik, cfg = m._build_joystick_ik(None)
-    assert cfg.lock_base_in_ik and cfg.head_mode == "track"
+    assert cfg.lock_base_in_ik
+    assert cfg.head_mode == JoystickTeleopConfig.from_yaml().head_mode  # joystick block
+    assert cfg.head_mode in ("track", "fixed")
     assert cfg.base_dofs in ("xy", "xy_yaw")  # read from wbik.yaml
     del ik
 
@@ -402,7 +595,7 @@ def test_real_follower_drive_base_and_hold():
     assert kind == "vel"
     assert abs(kw["vx"]) < 1e-9 and kw["vy"] > 0.0 and abs(kw["wz"]) < 1e-9
     np.testing.assert_allclose(d._dbg["rx_chassis"], [0.13, 0.17, 0.0])
-    np.testing.assert_allclose(d._dbg["projected_chassis"], [0.0, 0.15, 0.0])
+    np.testing.assert_allclose(d._dbg["projected_chassis"], [0.0, 0.18, 0.0])
     assert d._dbg["joystick_axis"] == 1
 
     metadata = d._recording_control_metadata()
@@ -416,9 +609,10 @@ def test_real_follower_drive_base_and_hold():
         "omniteleop_wbc_joystick_action/v1"
     )
     assert metadata["base_reference_source"] == np.bytes_("joystick_integrator")
+    assert metadata["chassis_turn_step_deg"] == 0
     assert metadata["chassis_intent_mapping"] == np.bytes_("fixed_direction/v1")
-    assert float(metadata["chassis_translation_speed_mps"]) == pytest.approx(0.15)
-    assert float(metadata["chassis_rotation_speed_radps"]) == pytest.approx(0.25)
+    assert float(metadata["chassis_translation_speed_mps"]) == pytest.approx(0.18)
+    assert float(metadata["chassis_rotation_speed_radps"]) == pytest.approx(0.30)
     assert metadata["applied_chassis_group"] == np.bytes_("action/joint")
     assert metadata["measured_chassis_group"] == np.bytes_("obs/joint")
     np.testing.assert_array_equal(
@@ -429,6 +623,10 @@ def test_real_follower_drive_base_and_hold():
     assert d._recording_control_metadata()["demonstration_source"] == np.bytes_(
         "policy_rollout"
     )
+    d._shaper.turn_90 = True
+    metadata = d._recording_control_metadata()
+    assert metadata["chassis_turn_step_deg"] == 90
+    assert metadata["base_reference_source"] == np.bytes_("joystick_integrator_with_quarter_turn_goal")
 
 
 def test_real_follower_debug_hdf5_keeps_joystick_reference_chain(tmp_path):
@@ -529,6 +727,11 @@ def test_real_follower_records_joystick_intent_chain_as_auxiliary_action():
     np.testing.assert_allclose(extra["chassis"]["source_body"], [0.2, 0.0, 0.0])
     np.testing.assert_allclose(extra["chassis"]["intent_body"], [0.2, 0.0, 0.0])
     np.testing.assert_allclose(extra["chassis"]["command_pose"], [0.4, -0.1, 0.2])
+    assert not extra["chassis"]["turn_active"]
+    d._shaper.turn_target_yaw = 1.2
+    extra = d._recording_extra_action()
+    assert extra["chassis"]["turn_active"]
+    assert extra["chassis"]["turn_target_yaw"] == pytest.approx(1.2)
 
 
 def test_joystick_parser_supplies_every_inherited_driver_argument(monkeypatch):
@@ -547,6 +750,7 @@ def test_joystick_parser_supplies_every_inherited_driver_argument(monkeypatch):
 
     args = captured["args"]
     assert args.arkit_base == "off"
+    assert not args.turn_90
     assert not args.streaming_recorder
     assert not args.no_head_depth
     assert not args.head_right_rgb
@@ -555,8 +759,15 @@ def test_joystick_parser_supplies_every_inherited_driver_argument(monkeypatch):
     assert args.record_max_camera_skew_ms >= 0.0
     assert args.record_max_camera_age_ms > 0.0
     assert args.lock_torso_in_ik is None
-    assert args.joystick_translation_speed == pytest.approx(0.15)
-    assert args.joystick_rotation_speed == pytest.approx(0.25)
+    assert args.joystick_translation_speed == pytest.approx(0.18)
+    assert args.joystick_rotation_speed == pytest.approx(0.30)
+    monkeypatch.setattr(sys, "argv", ["wbc_joystick_robot.py", "--turn-90"])
+    m.main()
+    assert captured["args"].turn_90
+    for flags in (["--enable", "none"], ["--replay", "episode.hdf5"]):
+        monkeypatch.setattr(sys, "argv", ["wbc_joystick_robot.py", "--turn-90", *flags])
+        with pytest.raises(SystemExit):
+            m.main()
 
 
 def test_joystick_exception_path_quarantines_recording():
@@ -675,3 +886,26 @@ def test_joystick_episode_replay_refuses_to_guess_intent_from_applied_twist(
 
     with pytest.raises(ValueError, match="action/chassis/intent_body"):
         ReplaySource.from_joystick_hdf5(str(path))
+
+
+def _yaml_with_joystick_head_mode(tmp_path, head_mode: str) -> str:
+    """The canonical wbik.yaml with joystick_teleop.head_mode swapped (top-level untouched)."""
+    import re
+
+    from omniteleop.follower.whole_body_ik import DEFAULT_CONFIG_PATH
+
+    src = Path(DEFAULT_CONFIG_PATH).read_text()
+    out, n = re.subn(r'^  head_mode:\s*"[a-z]+"', f'  head_mode: "{head_mode}"', src, flags=re.M)
+    assert n == 1
+    path = tmp_path / "wbik.yaml"
+    path.write_text(out)
+    return str(path)
+
+
+def test_joystick_ik_takes_head_mode_from_the_joystick_block(tmp_path):
+    m = _load_script("wbc_joystick_robot")
+    _ik, cfg = m._build_joystick_ik(_yaml_with_joystick_head_mode(tmp_path, "fixed"))
+    assert cfg.head_mode == "fixed" and cfg.lock_base_in_ik
+    _ik, cfg = m._build_joystick_ik(_yaml_with_joystick_head_mode(tmp_path, "track"))
+    assert cfg.head_mode == "track" and cfg.lock_base_in_ik   # top-level "ik" never leaks in
+    assert JoystickTeleopConfig.from_yaml().head_mode == "fixed"  # the collection default

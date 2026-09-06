@@ -15,16 +15,28 @@ reference: a joystick INTEGRATOR (``integrate_se2`` of the stick twist) rather t
 solver's ``result.base_pose``. When single-axis mode is enabled, the stick twist is
 projected before integration, matching the solver's base-pose update ordering.
 
-Like the WBC path, the reference is integrated open-loop: a base that cannot keep up
-(blocked / slipping / speed-clamped) winds it arbitrarily far ahead of the measured pose,
-and ``pd_twist`` then repays that whole lead as a catch-up once the base comes free. Only
-:meth:`JoystickBaseShaper.hold` bounds it, by parking the reference on the measured pose.
+Unlike the WBC path, the reference is NOT integrated open-loop: after each integration
+step it is clamped to at most ``reference_lead_xy`` / ``reference_lead_yaw`` ahead of the
+measured pose (``joystick_teleop:`` in ``wbik.yaml``). A base that cannot keep up (blocked
+/ slipping / speed-clamped) therefore accrues at most that bounded lead, and ``pd_twist``
+repays at most that much as a catch-up once the base comes free -- instead of the whole
+distance the stick was held, which on a real take grew to 0.9 m and kept the chassis
+driving for seconds after every stick release. :meth:`JoystickBaseShaper.hold` still parks
+the reference exactly on the measured pose.
 
 :class:`JoystickBaseShaper` owns the small amount of per-tick carry state (the integrated
 reference pose, the slew anchor, the single-axis latch). The caller does the actual
 dispatch (``chassis.set_velocity`` / the swerve quiet-hold), which differs between the
 SAPIEN sim and the real swerve base -- exactly as it already differs between the two WBC
 followers.
+
+With ``turn_90`` enabled, one live yaw gesture expands into a finite stream of these
+same fixed-speed intents. Integration stops just before the measured-relative heading
+goal, then the existing PD controller settles the remaining heading error. At completion,
+yaw slews to zero and the reference parks on feedback until new intent arrives. XY drift
+is discarded during turning so it cannot trigger steering corrections at the endpoint.
+Expanded intents remain recorded, but replay through the ordinary velocity controller
+does not reproduce this turn-specific stop state exactly.
 """
 
 from __future__ import annotations
@@ -40,6 +52,7 @@ from omniteleop.follower.base_closed_loop import (
     pd_twist,
     project_planar_twist_single_axis_for_base_dofs,
     shape_project_twist,
+    wrap_pi,
 )
 
 
@@ -106,6 +119,9 @@ class JoystickBaseShaper:
     intent_hysteresis_ratio: float
     translation_speed: float           # fixed active translation magnitude (m/s)
     rotation_speed: float              # fixed active yaw magnitude (rad/s)
+    reference_lead_xy: float           # max reference lead over the measured pose (m)
+    reference_lead_yaw: float          # max reference heading lead (rad); 0 = no lead
+    turn_90: bool = False              # live collection: one measured quarter-turn per gesture
 
     # -- per-tick carry state (reset on engage; parked on hold) --------------------
     cmd_pose: np.ndarray = field(default_factory=lambda: np.zeros(3))
@@ -113,6 +129,39 @@ class JoystickBaseShaper:
     prev_axis: Optional[int] = None
     last_projected_joystick: np.ndarray = field(default_factory=lambda: np.zeros(3))
     last_intent_axis: Optional[int] = None
+    turn_target_yaw: Optional[float] = field(default=None, init=False)
+    _turn_armed: bool = field(default=False, init=False)
+    _turn_elapsed: float = field(default=0.0, init=False)
+    _turn_parked: bool = field(default=False, init=False)
+
+    TURN_TOLERANCE_RAD = float(np.deg2rad(2.0))
+
+    def __post_init__(self) -> None:
+        leads = np.asarray([self.reference_lead_xy, self.reference_lead_yaw], dtype=float)
+        if not np.all(np.isfinite(leads)) or np.any(leads < 0.0):
+            raise ValueError(
+                "reference_lead_xy / reference_lead_yaw must be finite and >= 0, got "
+                f"{leads.tolist()}"
+            )
+        if self.turn_90:
+            if self.base_dofs != "xy_yaw":
+                raise ValueError("--turn-90 requires base_dofs: xy_yaw")
+            if self.accel <= 0 or self.kp_yaw <= 0:
+                raise ValueError("--turn-90 requires positive base_accel and base_kp_yaw")
+            angular_floor = max(
+                2 * self.deadband, self.post_angular_deadband,
+                self.dispatch_single_axis_deadband * self.yaw_max_vel,
+            )
+            if min(self.kp_yaw * self.TURN_TOLERANCE_RAD,
+                   self.rotation_speed, 2 * self.max_speed) <= angular_floor:
+                raise ValueError("--turn-90 yaw speed/gain is too low for the configured deadbands")
+
+    def cancel_turn(self) -> None:
+        """Discard a pending turn; require a fresh neutral input before another."""
+        self.turn_target_yaw = None
+        self._turn_armed = False
+        self._turn_elapsed = 0.0
+        self._turn_parked = True
 
     @property
     def _allow_yaw_hold(self) -> bool:
@@ -122,6 +171,7 @@ class JoystickBaseShaper:
 
     def reset(self, base_pose: Optional[np.ndarray] = None) -> None:
         """Engage: seed the reference at ``base_pose`` (default origin) and clear state."""
+        self.cancel_turn()
         self.cmd_pose = (
             np.zeros(3) if base_pose is None else np.asarray(base_pose, dtype=float).copy()
         )
@@ -136,11 +186,61 @@ class JoystickBaseShaper:
         Parking the integrated reference on the measured base means the PD error is zero
         on resume, so the base does not lunge to a stale reference after the hold clears.
         """
+        self.cancel_turn()
         self.cmd_pose = np.asarray(measured_pose, dtype=float).copy()
         self.prev_shaped = np.zeros(3)
         self.prev_axis = None
         self.last_projected_joystick = np.zeros(3)
         self.last_intent_axis = None
+
+    def _quarter_turn_intent(
+        self, joy: np.ndarray, measured: np.ndarray, dt: float
+    ) -> np.ndarray:
+        """Latch relative yaw from feedback, with no queued/repeated turns.
+
+        Neutral releases the gesture but lets an active turn finish. Translation or
+        opposite yaw cancels; safety holds use cancel_turn(). A timeout bounds motion
+        if valid odometry reports a blocked base. The returned intent remains a dense
+        fixed-speed policy label; endpoint deceleration belongs to the pose controller.
+        """
+        translating = bool(np.any(joy[:2]))
+        if self.turn_target_yaw is not None:
+            error = float(wrap_pi(self.turn_target_yaw - measured[2]))
+            self._turn_elapsed += dt
+            if translating or (joy[2] * error < 0):
+                self.cancel_turn()
+                self.cmd_pose = measured.copy()
+            elif abs(error) <= self.TURN_TOLERANCE_RAD:
+                self.cancel_turn()
+                return np.zeros(3)
+            elif self._turn_elapsed > 2 * (np.pi / 2) / min(
+                self.rotation_speed, 2 * self.max_speed
+            ) + 5.0:
+                self.cancel_turn()
+                raise RuntimeError("90-degree joystick turn timed out before reaching measured heading")
+        elif joy[2] == 0:
+            self._turn_armed = True
+        elif self._turn_armed and not translating:
+            self._turn_parked = False
+            self.turn_target_yaw = float(wrap_pi(
+                measured[2] + np.copysign(np.pi / 2, joy[2])
+            ))
+            self._turn_armed = False
+            self._turn_elapsed = 0.0
+
+        if self.turn_target_yaw is not None:
+            error = float(wrap_pi(self.turn_target_yaw - measured[2]))
+            reference_remaining = float(wrap_pi(self.turn_target_yaw - self.cmd_pose[2]))
+            # End the velocity intent before its next integration step crosses the
+            # goal. The existing bounded reference/PD/slew chain then brakes and
+            # settles, just as it does for a recorded or policy-produced release.
+            # No special turn-only controller is hidden behind the policy labels.
+            if np.sign(error) * reference_remaining <= self.rotation_speed * dt:
+                return np.zeros(3)
+            return np.array([0.0, 0.0, np.copysign(self.rotation_speed, error)])
+        joy = joy.copy()
+        joy[2] = 0.0
+        return joy
 
     def step(
         self, joystick_twist: np.ndarray, measured_pose: np.ndarray, dt: float
@@ -186,10 +286,50 @@ class JoystickBaseShaper:
             translation_speed=self.translation_speed,
             rotation_speed=self.rotation_speed,
         )
+        measured = np.asarray(measured_pose, dtype=float)
+        if measured.shape != (3,) or not np.all(np.isfinite(measured)):
+            raise ValueError(f"measured_pose must be finite (3,), got {measured_pose!r}")
+        if self.turn_90:
+            joy = self._quarter_turn_intent(joy, measured, dt)
+            intent_axis = 2 if joy[2] != 0.0 else (
+                intent_axis if np.any(joy) else None
+            )
         self.last_projected_joystick = np.asarray(joy, dtype=float).copy()
         self.last_intent_axis = intent_axis
-        # Open-loop reference integrator (see module docstring).
+        if self.turn_90 and self._turn_parked:
+            if np.any(joy):
+                self._turn_parked = False
+            else:
+                # A completed/cancelled gesture is a stop, not a request to recover
+                # accumulated XY drift or chase tracking noise. Brake only the yaw
+                # command actually dispatched, then remain parked until fresh intent.
+                self.cmd_pose = measured.copy()
+                previous_yaw = self.prev_shaped[2] if self.prev_axis == 2 else 0.0
+                yaw = np.sign(previous_yaw) * max(
+                    0.0, abs(previous_yaw) - 2.0 * self.accel * max(dt, 0.0)
+                )
+                cmd = np.array([0.0, 0.0, yaw])
+                self.prev_shaped = cmd.copy()
+                self.prev_axis = 2 if yaw else None
+                return cmd, np.zeros(3), np.zeros(3)
+        if self.turn_90 and self.turn_target_yaw is not None:
+            # Pure rotation must not accumulate a translation correction that can
+            # win the single-axis selector during endpoint braking.
+            self.cmd_pose[:2] = measured[:2]
+            self.prev_shaped[:2] = 0.0
+            intent_axis = 2
+        # Reference integrator, clamped to a bounded lead over the measured pose (see the
+        # module docstring): the carrot stays at most reference_lead_* ahead of the chassis.
         self.cmd_pose = integrate_se2(self.cmd_pose, joy, dt)
+        lead_xy = self.cmd_pose[:2] - measured[:2]
+        lead_dist = float(np.hypot(lead_xy[0], lead_xy[1]))
+        if lead_dist > self.reference_lead_xy:
+            self.cmd_pose[:2] = measured[:2] + lead_xy * (self.reference_lead_xy / lead_dist)
+        lead_yaw = float(wrap_pi(self.cmd_pose[2] - measured[2]))
+        if abs(lead_yaw) > self.reference_lead_yaw:
+            self.cmd_pose[2] = float(
+                wrap_pi(measured[2] + np.copysign(self.reference_lead_yaw, lead_yaw))
+            )
         raw, err = pd_twist(
             self.cmd_pose, joy, measured_pose,
             kp_xy=self.kp_xy, kp_yaw=self.kp_yaw,
@@ -252,4 +392,7 @@ class JoystickBaseShaper:
             intent_hysteresis_ratio=float(args.joystick_single_axis_hysteresis_ratio),
             translation_speed=float(args.joystick_translation_speed),
             rotation_speed=float(args.joystick_rotation_speed),
+            reference_lead_xy=float(args.joystick_reference_lead_xy),
+            reference_lead_yaw=float(args.joystick_reference_lead_yaw),
+            turn_90=bool(getattr(args, "turn_90", False)),
         )

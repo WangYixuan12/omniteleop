@@ -637,3 +637,19 @@ python scripts/wbc_vr_robot.py --replay /home/yixuan/Dexmate/wbc/real/move_sidew
 
 (yixuan_yifan) python scripts/misc/plot_drive_box.py --input /home/dexmate/yixuan/Dexmate/SLAM/test/box_closed.hdf5
 ```
+
+For joystick collection, run `scripts/wbc_joystick_leader.py` as usual and add
+`--turn-90` to `scripts/wbc_joystick_robot.py` alongside your recording flags.
+After engage, center the LEFT stick, then deflect it sideways once to request a
+relative 90° turn. Releasing lets it finish; holding does not repeat. Center it
+after completion before another turn. RIGHT-stick translation, opposite yaw, or a
+safety hold cancels the turn. Turning uses the configured angular speed (currently
+0.30 rad/s) and slows near the goal, with a 2° measured-heading tolerance; physical
+accuracy depends on odometry (or ARKit with `--arkit-base control`). The episode
+stores the mode, active target, expanded velocity intent, and applied commands.
+On completion, the remaining yaw command ramps to zero and the base stays parked until
+new intent arrives. XY drift during turning is not corrected afterward. This prevents
+steering chatter but does not restore the original position. The stop behavior is saved
+in `meta/chassis_turn_stop_semantics`; ordinary velocity replay of the dense intent labels
+does not exactly reproduce this turn-specific stop state.
+The flag is for live collection; replay/policies consume the dense intent labels.

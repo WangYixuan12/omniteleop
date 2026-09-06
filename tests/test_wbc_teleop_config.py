@@ -76,9 +76,12 @@ def test_vr_teleop_config_rejects_non_bool_xy_yaw_hold_flag(tmp_path):
 
 def _write_joystick_teleop_yaml(path: Path, **overrides) -> None:
     values = {
-        "translation_speed": 0.15,
-        "rotation_speed": 0.25,
+        "translation_speed": 0.18,
+        "rotation_speed": 0.30,
         "single_axis_hysteresis_ratio": 0.0,
+        "reference_lead_xy": 0.05,
+        "reference_lead_yaw": 0.10,
+        "head_mode": "fixed",
     }
     values.update(overrides)
     path.write_text(yaml.safe_dump({"joystick_teleop": values}), encoding="utf-8")
@@ -90,9 +93,12 @@ def test_joystick_teleop_config_loads_shared_axis_policy(tmp_path):
 
     cfg = JoystickTeleopConfig.from_yaml(path)
 
-    assert cfg.translation_speed == 0.15
-    assert cfg.rotation_speed == 0.25
+    assert cfg.translation_speed == 0.18
+    assert cfg.rotation_speed == 0.30
     assert cfg.single_axis_hysteresis_ratio == 0.0
+    assert cfg.reference_lead_xy == 0.05
+    assert cfg.reference_lead_yaw == 0.10
+    assert cfg.head_mode == "fixed"
 
 
 @pytest.mark.parametrize(
@@ -101,6 +107,9 @@ def test_joystick_teleop_config_loads_shared_axis_policy(tmp_path):
         ("translation_speed", 0.0),
         ("rotation_speed", -0.1),
         ("single_axis_hysteresis_ratio", -0.1),
+        ("reference_lead_xy", -0.01),
+        ("reference_lead_yaw", float("nan")),
+        ("head_mode", "ik"),
     ),
 )
 def test_joystick_teleop_config_rejects_invalid_values(tmp_path, field, value):
@@ -142,5 +151,5 @@ def test_shared_arg_binding_keeps_wbc_values_and_applies_joystick_head_override(
     assert vt.stick_deadzone == 0.1
     assert joystick_args.joystick_stick_max_vx == vt.stick_max_vx
     assert joystick_args.joystick_stick_max_vy == vt.stick_max_vy
-    assert joystick_args.joystick_translation_speed == 0.15
-    assert joystick_args.joystick_rotation_speed == 0.25
+    assert joystick_args.joystick_translation_speed == 0.18
+    assert joystick_args.joystick_rotation_speed == 0.30

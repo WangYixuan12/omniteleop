@@ -17,15 +17,24 @@ also differs in Cartesian target frame and head mode, not only in how the base m
     ``head_mode: track`` (neck pan/tilt via ``solve_head``; the base does NOT follow it).
 
 Config comes from the canonical ``follower/wbik.yaml`` (``--config`` to override) with three
-joystick-mode overrides applied in code: ``lock_base_in_ik=True``, ``head_mode="track"``,
-and the head planar deadbands forced to 0 (that deadband suppresses head-driven base motion
-in ``head_mode: ik`` -- meaningless here, and it otherwise gives head-track a ~17deg pan
-dead zone). ``base_dofs`` is read FROM the config (``xy`` restricts the joystick to
-translation, ``xy_yaw`` allows yaw); the arm IK sees a locked base either way.
+joystick-mode overrides applied in code: ``lock_base_in_ik=True``, ``head_mode`` taken from
+``joystick_teleop.head_mode`` (``"track"``, or ``"fixed"`` = head held at nominal for the
+whole take, solve_head never called) instead of the top-level key, and the head planar
+deadbands forced to 0 (that
+deadband suppresses head-driven base motion in ``head_mode: ik`` -- meaningless here, and it
+otherwise gives head-track a ~17deg pan dead zone). ``base_dofs`` is read FROM the config
+(``xy`` restricts the joystick to translation, ``xy_yaw`` allows yaw); the arm IK sees a
+locked base either way.
 
 Run in the dexmate conda env (pinocchio + pink + dexcomm + dexcontrol). SAME safety rules
 as wbc_vr_robot.py -- route base motion only through ``set_velocity``; the robot homes to
 nominal, then moves. KEEP CLEAR.
+
+Optional ``--turn-90`` (live collection): after neutral, deflect the LEFT stick sideways
+once for a relative +/-90 degree turn measured by the selected base pose source. Releasing
+the stick lets it finish; holding it does not repeat. Translation/opposite yaw or a safety
+hold cancels it. Endpoint tolerance is 2 degrees; wheel slip can affect physical accuracy.
+The leader needs no extra argument.
 """
 
 from __future__ import annotations
@@ -128,16 +137,24 @@ class JoystickHardwareDriver(HardwareDriver):
             self._dbg["joystick_axis"] = -1
             super()._drive_base(result, hold, enable, dt)
             return
-        base_state = self.policy_base_pose_snapshot()
-        snap = base_state["odom"]
-        measured_pose = base_state["pose"]
-        self._dbg["odom"] = snap
-        self._dbg["arkit"] = base_state["arkit"]
         chassis = self.robot.chassis
         if hold:
+            self._shaper.cancel_turn()
+            # A hold must not demand a finite pose: under --arkit-base control the pose
+            # is legitimately NaN before an engage captures the origin (extra_hold's
+            # "arkit-no-origin"), and that hold only clears via engage_reset, which
+            # re-zeros the shaper anyway. Read tolerantly here; the strict
+            # policy_base_pose_snapshot() below stays reserved for active driving.
+            snap = self._odom.snapshot()
+            arkit = self._arkit.snapshot() if self._arkit is not None else None
+            self._dbg["odom"] = snap
+            self._dbg["arkit"] = arkit
+            selected = arkit if self._arkit_drives_base() else snap
+            measured_pose = np.asarray(selected["pose"], dtype=np.float64)
             # Park the joystick reference on the measured base so there is no lunge on
             # resume, and zero the wheels (the parent's hold behavior).
-            self._shaper.hold(measured_pose)
+            if measured_pose.shape == (3,) and np.all(np.isfinite(measured_pose)):
+                self._shaper.hold(measured_pose)
             chassis.set_velocity(vx=0.0, vy=0.0, wz=0.0, wait_time=0.0)
             self._prev_base_cmd = np.zeros(3)
             self._base_quiet_elapsed = 0.0
@@ -149,6 +166,13 @@ class JoystickHardwareDriver(HardwareDriver):
             self._dbg["projected_chassis"] = np.zeros(3)
             self._dbg["joystick_axis"] = -1
             return
+        # Active driving: extra_hold() has already forced a hold (and returned above) if
+        # the pose source is stale, jumped, or has no origin, so the strict finiteness
+        # check here can only trip on a genuine sensor fault.
+        base_state = self.policy_base_pose_snapshot()
+        measured_pose = base_state["pose"]
+        self._dbg["odom"] = base_state["odom"]
+        self._dbg["arkit"] = base_state["arkit"]
         rx_chassis = self._read_joystick()
         cmd, pd_raw, pd_err = self._shaper.step(rx_chassis, measured_pose, dt)
         if self.cfg.enable_base_single_axis and np.count_nonzero(np.abs(cmd) > 1e-9) > 1:
@@ -223,6 +247,11 @@ class JoystickHardwareDriver(HardwareDriver):
         if bad:
             raise RuntimeError(f"cannot record malformed joystick action fields: {bad}")
         values["active_axis"] = np.int8(self._dbg.get("joystick_axis", -1))
+        target_yaw = getattr(self._shaper, "turn_target_yaw", None)
+        values["turn_active"] = np.bool_(target_yaw is not None)
+        values["turn_target_yaw"] = np.float64(
+            self._shaper.cmd_pose[2] if target_yaw is None else target_yaw
+        )
         return {"chassis": values}
 
     def _recording_control_metadata(self) -> dict:
@@ -258,12 +287,21 @@ class JoystickHardwareDriver(HardwareDriver):
             "chassis_rotation_speed_radps": np.float64(
                 self._shaper.rotation_speed
             ),
+            "chassis_reference_lead_m": np.float64(self._shaper.reference_lead_xy),
+            "chassis_reference_lead_rad": np.float64(self._shaper.reference_lead_yaw),
             "applied_chassis_group": np.bytes_("action/joint"),
             "measured_chassis_group": np.bytes_("obs/joint"),
             "chassis_dataset_axes": np.asarray(
                 [b"chassis_vx", b"chassis_vy", b"chassis_wz"]
             ),
         })
+        out["chassis_turn_step_deg"] = np.float64(90 if self._shaper.turn_90 else 0)
+        if self._shaper.turn_90:
+            out["chassis_turn_stop_semantics"] = np.bytes_("yaw_slew_to_zero_park_pose_until_new_intent/v1")
+            out["base_reference_source"] = np.bytes_("joystick_integrator_with_quarter_turn_goal")
+            out["chassis_intent_stage"] = np.bytes_("post_mask_projection_turn_expansion_pre_controller")
+            out["chassis_turn_tolerance_rad"] = np.float64(self._shaper.TURN_TOLERANCE_RAD)
+            out["chassis_turn_trigger"] = np.bytes_("neutral_then_yaw_no_repeat_until_neutral_after_turn")
         return out
 
     def _recording_provenance_metadata(self) -> dict:
@@ -329,7 +367,10 @@ def _build_joystick_ik(
     cfg = replace(
         cfg,
         lock_base_in_ik=True,   # base excluded from the whole-body IK (joystick-driven)
-        head_mode="track",      # neck pan/tilt tracks the headset; base does not follow it
+        # joystick_teleop.head_mode: "track" (neck pan/tilt follows the headset; the base
+        # never follows it) or "fixed" (head held at nominal for the whole take). The
+        # top-level head_mode ("ik" couples the base to the head) is deliberately ignored.
+        head_mode=JoystickTeleopConfig.from_yaml(config).head_mode,
     )
     ik = VegaWholeBodyIK(cfg)
     ik.reset()
@@ -419,9 +460,12 @@ def _run_joystick_ik_mode(args: argparse.Namespace, enable: dict) -> None:
             "joystick_stick_max_wz": float(args.joystick_stick_max_wz),
             "joystick_translation_speed": float(args.joystick_translation_speed),
             "joystick_rotation_speed": float(args.joystick_rotation_speed),
+            "chassis_turn_step_deg": 90 if getattr(args, "turn_90", False) else 0,
             "joystick_single_axis_hysteresis_ratio": float(
                 args.joystick_single_axis_hysteresis_ratio
             ),
+            "joystick_reference_lead_xy": float(args.joystick_reference_lead_xy),
+            "joystick_reference_lead_yaw": float(args.joystick_reference_lead_yaw),
             "replay_file": str(args.replay) if replay else "",
         }
         traj = _TrajLog(args.debug_dir, meta=meta)
@@ -433,6 +477,10 @@ def _run_joystick_ik_mode(args: argparse.Namespace, enable: dict) -> None:
           f"{args.joystick_rotation_speed:g}rad/s | base_dofs={cfg.base_dofs} | "
           f"torso_ik={'fixed' if cfg.lock_torso_in_ik else 'free'} | "
           f"single_axis={cfg.enable_base_single_axis}")
+    if getattr(args, "turn_90", False):
+        print("[wbc_joystick_robot] 90-degree turns: neutral then LEFT stick sideways; "
+              "release lets the turn finish, translation/opposite yaw cancels. "
+              "Measured endpoint tolerance=2deg; safety holds cancel pending turns.")
     if args.arkit_base != "off":
         arkit_role = (
             "closes the joystick base PD loop"
@@ -521,6 +569,10 @@ def main() -> None:
     parser.add_argument("--record", action="store_true",
                         help="record an episode while engaged (vr_reader EpisodeRecorder "
                              "format). Needs --enable arms,torso,head,base.")
+    parser.add_argument("--turn-90", action="store_true",
+                        help="live joystick: one measured +/-90deg turn per LEFT-stick "
+                             "gesture; release lets it finish, translation/opposite yaw "
+                             "cancels. Requires neutral before each turn. Leader unchanged.")
     parser.add_argument("--streaming-recorder", action="store_true",
                         help="write through the bounded streaming HDF5 recorder. "
                              "Requires --record.")
@@ -598,6 +650,15 @@ def main() -> None:
         parser.error(str(exc))
     if args.arkit_base != "off" and not enable["base"]:
         parser.error("--arkit-base needs --enable base")
+    if args.turn_90:
+        if args.replay is not None:
+            parser.error("--turn-90 is for live gestures, not replayed dense action labels")
+        if not enable["base"]:
+            parser.error("--turn-90 needs --enable base")
+        try:
+            JoystickBaseShaper.from_configs(WBCConfig.from_yaml(args.config), args)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     _run_joystick_ik_mode(args, enable)
 
