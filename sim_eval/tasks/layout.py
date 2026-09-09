@@ -25,6 +25,8 @@ import os
 
 import numpy as np
 
+from .nav_map import _dataset_path
+
 #: source work surface: the Rs_int dining table every task picks from
 SRC_TABLE_XY = (1.47, 0.41)
 #: where the carried object starts on it
@@ -64,8 +66,7 @@ CLEAR_CHAIRS = (("straight_chair", (0.97, 0.38), (-1.72, 0.55)),
 #: planner, so nothing east of x = 0.96 was reachable at all.
 DECLUTTER_PAD = 0.10
 
-ASSETS = os.environ.get("OMNIGIBSON_DATASET_PATH",
-                        os.path.expanduser("~/BEHAVIOR-1K/datasets/behavior-1k-assets"))
+ASSETS = _dataset_path()
 
 
 def bbox_size(category, model, scale=None):
@@ -257,6 +258,72 @@ STATIONS = {s.key: s for s in [
 ]}
 
 RECEPTACLE_KEYS = ("dish_rack", "towel_rack", "book_shelf")
+
+#: Row position (world y) of each receptacle in the SHIPPED layout, captured at import before any
+#: permutation is applied. The three stand shoulder to shoulder along the east wall, so WHICH one
+#: occupies which slot is the layout's one free axis -- see `repack_row`.
+STATION_ROW_NOMINAL = {key: float(STATIONS[key].xy[1]) for key in RECEPTACLE_KEYS}
+
+
+def repack_row(nominal, widths, order):
+    """Re-lay a row of items in a new order, preserving its outer edges and its neighbour gaps.
+
+    `nominal` maps key -> the item's centre along the row axis in the shipped layout, `widths`
+    maps key -> its extent along that SAME axis, and `order` lists the keys in the new order,
+    ascending along the axis. The result reuses the nominal row's first edge and its sequence of
+    inter-item gaps verbatim, which is what makes permuting a hand-tuned row safe to ship:
+
+      * `order` equal to the nominal order reproduces `nominal` exactly, so turning randomization
+        on changes nothing until a different order is actually drawn;
+      * a permutation changes only WHICH item sits in a slot, never the sum of the widths, so
+        every ordering ends at the same far edge and keeps the same clearances between
+        neighbours -- the measured ones each station's scale was tuned against.
+
+    Recentring each item on the nominal SLOT CENTRES instead does not work: the three receptacles
+    are 0.47 / 0.64 / 0.76 m wide against 0.079 m gaps, so putting the widest in the narrowest
+    item's slot overlaps its neighbour by 68 mm.
+
+    Each item keeps its own position on the OTHER axis. That one is a property of the item -- a
+    station's standoff from the wall, a carried object's depth on the tabletop -- not of the slot.
+    """
+    order = tuple(order)
+    if sorted(order) != sorted(nominal):
+        raise ValueError(f"repack_row: {order} is not a permutation of {tuple(sorted(nominal))}")
+    missing = sorted(set(nominal) - set(widths))
+    if missing:
+        raise ValueError(f"repack_row: no width for {missing}")
+    if any(float(widths[key]) <= 0.0 for key in nominal):
+        raise ValueError(f"repack_row: non-positive widths {dict(widths)}")
+    base = sorted(nominal, key=lambda k: nominal[k])
+    lo = [float(nominal[k]) - float(widths[k]) / 2.0 for k in base]
+    hi = [float(nominal[k]) + float(widths[k]) / 2.0 for k in base]
+    gaps = [lo[i + 1] - hi[i] for i in range(len(base) - 1)]
+    if any(g < 0.0 for g in gaps):
+        raise ValueError(f"repack_row: nominal row {base} already overlaps (gaps {gaps})")
+    if order == tuple(base):
+        return dict(nominal)          # bit-exact, rather than one ULP off through the cursor
+    out, cursor = {}, lo[0]
+    for i, key in enumerate(order):
+        if i:
+            cursor += gaps[i - 1]
+        out[key] = cursor + float(widths[key]) / 2.0
+        cursor += float(widths[key])
+    return out
+
+
+def permute_stations(order):
+    """Move the three receptacles into the row order given, ascending in y (south -> north).
+
+    Mutates `STATIONS`, so it has to run BEFORE the env is built: `station_configs` spawns each
+    station where this leaves it, and every park, keepout, block box and liner pose is derived
+    from `STATIONS[key].xy` at the moment it is needed. Each station keeps its own x, which is
+    its asset-specific standoff from the wall (the three backs differ by 17 mm). Repeat calls are
+    measured from `STATION_ROW_NOMINAL` rather than from each other, so they do not compound.
+    """
+    widths = {key: float(STATIONS[key].extent()[1]) for key in RECEPTACLE_KEYS}
+    for key, y in repack_row(STATION_ROW_NOMINAL, widths, order).items():
+        STATIONS[key] = dataclasses.replace(STATIONS[key], xy=(STATIONS[key].xy[0], float(y)))
+    return {key: STATIONS[key].xy for key in RECEPTACLE_KEYS}
 
 
 def station_configs(keys=None):

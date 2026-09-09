@@ -42,6 +42,8 @@ task is the trajectory that is already validated end to end; only the transit an
 from __future__ import annotations
 
 import dataclasses
+import itertools
+import os
 
 import numpy as np
 
@@ -252,7 +254,9 @@ class LHSpec:
     #: Object-frame axis separating the two grasp points.  A folded towel is pinched at its two
     #: side edges (local +/-y) while both wrists stay in the robot's validated forward pose.
     bimanual_axis: tuple = (1.0, 0.0, 0.0)
-    #: Where on the source table this object starts, overriding the shared `SRC_OBJ_XY` mark.
+    #: How far in from the tabletop's near face this object starts, overriding the shared
+    #: `SRC_OBJ_XY` mark. Only the x is read (`SOURCE_MARKS`); the y is the object's slot in the
+    #: desk row, which a layout permutation reassigns.
     #: The shared mark sits 115 mm in from the tabletop's near face (solid top measured at
     #: x = 1.085), so a LONG object centred there hangs over the edge --
     #: measured, a 300 mm towel overhung it by 35 mm, and a gripper closing on a towel whose end
@@ -288,6 +292,25 @@ class LHSpec:
     place_tilt_tol_deg: float = 20.0
     #: Maximum horizontal error from the scripted object-centre target at success.
     place_xy_tolerance: float | None = None
+    #: How far INSIDE the receptacle's own footprint the released object's footprint must sit,
+    #: checked per axis on the live AABBs. `place_xy_tolerance` is one circle and cannot express
+    #: a receptacle that is not square: the dish tray is 142 x 222 mm, so it supports a 61 mm cup
+    #: over +/-40.4 mm of depth but +/-80.6 mm along the wall. A single 45 mm circle is LOOSER
+    #: than the tight axis, so a cup 45 mm toward the wall scored as a success with its rim
+    #: already over the tray's edge -- visibly on the point of toppling in the L21 / L28 reviews.
+    #: This is a support test, not an accuracy test, which is why it reads the geometry rather
+    #: than a hand-set number, and why it belongs alongside the tolerance rather than replacing it.
+    place_support_margin: float | None = None
+    #: Half-width of the uniform per-episode jitter on this object's source mark, per axis.
+    #: +/-20 mm is free on both axes for an object that sits WHOLLY on the tabletop. It is not
+    #: free in x for one that deliberately overhangs the near face: measured on towel2rack seed 3,
+    #: an x draw of -16.6 mm put the 220 mm towel's centre of mass 7 mm PAST the solid top's edge
+    #: (x = 1.10), and it tipped onto the floor during the 10-step reset settle, before the robot
+    #: moved -- `obj_w` was already 5.6 rad/s at tick 0. Any draw below about -10 mm does this,
+    #: i.e. a quarter of them, and in a chained rollout one tipped object fails the whole episode.
+    #: y is the axis that carries the useful variation anyway: the base follows the mark, so the
+    #: body-relative reach is unchanged, and `SOURCE_ROW_NOMINAL` already spreads it 0.43-0.65 m.
+    jitter_xy: tuple = (0.02, 0.02)
 
 
 #: The pick-and-place tasks. WHERE each receptacle stands is `tasks.layout`, not here -- the room
@@ -303,22 +326,44 @@ SPECS = [
     # scale makes its jaw cross-section 61 mm. That leaves about 12 mm clearance per open pad,
     # against the old bowl's 1.5 mm, without using a transparent / refractive object.
     LHSpec(name="dish2rack",
-           obj={"category": "soda_cup", "model": "vicaqs", "scale": [0.78, 0.78, 1.0]},
+           # 0.62 planar, not 0.78. The jaw opens 85 mm, so a 61 mm cup left 12 mm of clearance
+           # per pad -- less than the approach error a well-fit policy actually delivers, so one
+           # pad reaches the cup first and shoves it. Measured: a 10 mm difference in the grasp
+           # approach moved the final placement by 63 mm, a 6x amplification, because the cup then
+           # sits differently in the hand for the whole carry. 0.62 gives a 48.6 mm cup and 18 mm
+           # per pad, which absorbs the centimetre-level error real hardware has. This is the same
+           # move the 82 mm bowl -> 61 mm cup change made, for the same reason, one step further.
+           obj={"category": "soda_cup", "model": "vicaqs", "scale": [0.62, 0.62, 1.0]},
            # coqeme is 142 x 222 mm, against the old hbjdlb's 177 x 390 mm. Its support area is
            # 54% smaller, so a learned placement must predict the cup centre accurately rather
            # than relying on a tray that covers almost the entire rack. It remains native scale and
            # sits at the rack's tested rail height, 0.408 m above its AABB bottom.
            station="dish_rack", on_top=True, release_dz=0.004,
-           # The actual Robotiq linkage puts the configured grasp rays 61.39 mm apart at +0.40,
-           # effectively equal to this cup's 61.9 mm nominal diameter; collision-mesh tolerance
-           # then made two-finger contact nondeterministic. +0.30 gives a measured 57.35 mm ray
-           # gap (about 2.3 mm preload per side), still far from the 0.785 rad fully-closed limit.
-           grip_close_cmd=0.30,
+           # RECALIBRATED for the 48.6 mm cup; +0.30 was set for the old 61 mm one and would now
+           # stop 9 mm short of touching it. Measured on the actual linkage (opposing pad origins,
+           # minus the 16.0 mm pad inset that reconciles with the documented 57.35 mm ray gap at
+           # +0.30): ray_gap(cmd) ~= 44.8 + 42.5 * cmd mm over cmd in [-0.2, +0.2]. Solving for
+           # this cup's 48.6 mm at the same ~2.3 mm preload per side gives -0.02 -- still far from
+           # the -1.0 fully-closed limit, so the pinch remains width-matched rather than crushing.
+           grip_close_cmd=-0.02,
            grasp_hold_ticks=65,
            liner={"category": "tray", "model": "coqeme"},
            liner_z_from_bottom=0.408,
            carry_attitude_tol_deg=20.0, place_up_axis=(0.0, 0.0, 1.0),
-           place_xy_tolerance=0.045),
+           # No isotropic circle: the tray is 142 x 222 mm, so it supports the cup over
+           # +/-40.4 mm of depth but +/-80.6 mm along the wall, and ANY single radius is the
+           # wrong shape for it. A 45 mm circle rejected a cup sitting 62 mm along the wall with
+           # 18 mm of tray still under it -- physically a good placement, scored a failure. The
+           # support margin below is the same requirement stated in the geometry's own terms.
+           place_xy_tolerance=None,
+           # 3 mm of tray rim beyond the cup's own footprint, i.e. essentially the physical
+           # limit: the tray supports the 61 mm cup over +/-40.4 mm of depth, so this admits
+           # +/-37.4 mm (3.7 cm) there and +/-77.6 mm along the wall. Sized for a real arm's
+           # centimetre-level error rather than for the simulator's -- anything tighter would be
+           # scoring precision the hardware cannot deliver. It cannot usefully go further: at
+           # +/-40.4 mm the cup's rim is over the tray edge, and buying more tolerance than that
+           # needs a larger tray or a smaller cup, which is a task change and not a scoring one.
+           place_support_margin=0.003),
     # A folded towel onto the clothes airer.  Asset survey: the old bath_towel/thmepr was the only
     # bath_towel model and needed [0.2212, 0.0999, 1.7921] to become a rigid 240 x 57 x 50 mm stick.
     # dishtowel/ltydgg is naturally 157 x 218 x 26 mm; the scale below preserves that folded-towel
@@ -346,7 +391,12 @@ SPECS = [
            # attachment mechanism, not a prim_type flag).
            obj={"category": "dishtowel", "model": "ltydgg",
                 "scale": [1.40, 1.20, 1.20]},
-           station="towel_rack", on_top=True, obj_xy=(1.11, 0.40), slatted=True,
+           # x corrected from 1.11 for the MEASURED near face of the solid top. The geometry
+           # above is derived from an edge at 1.085, but the real edge is 1.10: towel2rack seed 3
+           # tipped with its centre of mass at 1.0934, and two chained rollouts (L14, L28) tipped
+           # again at 1.104. 1.125 restores what that geometry intended against the true edge --
+           # 25 mm of COM margin, an 84 mm overhang, and a grasp 45 mm outside the edge.
+           station="towel_rack", on_top=True, obj_xy=(1.125, 0.40), slatted=True,
            release_dz=0.045, grasp_offset=(-0.070, 0.0, 0.006),
            # Keep the verified object target on the rack. The source pinch changes the
            # hand-to-object transform, so the release hand naturally sits inward.
@@ -358,6 +408,16 @@ SPECS = [
            # contact window: that hand otherwise pulls the towel out of the second gripper.
            grasp_hold_ticks=65,
            bimanual_half_span=0.080, bimanual_axis=(0.0, 1.0, 0.0),
+           # NO place_support_margin. The airer IS huge next to the towel (+/-89 mm of x
+           # footprint margin), but `place_offset` below puts the towel 110 mm off the rack
+           # centre on purpose, so a footprint-containment test is unsatisfiable by construction
+           # -- measured, it failed the expert's own correct placement by 18.7 mm, which is
+           # exactly 110 - 89 + 3. The slatted deck is scored by `Touching` plus the AABB-bottom
+           # height guard instead, which is what `LHSpec.slatted` exists to say. Reducing
+           # `place_offset` would be the alternative, but that moves a validated placement.
+           # x is capped so the worst draw still leaves the centre of mass 4 mm inside the solid
+           # top's near face at 1.10; see `LHSpec.jitter_xy` for the measured tip it prevents.
+           jitter_xy=(0.006, 0.02),
            carry_attitude_tol_deg=20.0, place_up_axis=(0.0, 0.0, 1.0),
            place_xy_tolerance=0.10),
     # A compact dark hardback already standing in its final insertion attitude: its world AABB is
@@ -396,6 +456,192 @@ SPECS = [
            place_outward_axis=(0.0, -1.0, 0.0), carry_attitude_tol_deg=15.0,
            place_xy_tolerance=0.08),
 ]
+
+
+def _tolerant(spec):
+    """Geometry sized for a CENTIMETRE-level error budget, not a millimetre one.
+
+    Opt-in via LH_TOLERANT_GEOMETRY=1; the shipped task is unchanged.
+
+    Measured motivation: with a policy whose actions are accurate to 4 mm, the CUP still landed
+    42 mm off and hung 52 mm over the tray edge. The amplification is the expert's own
+    `attachment_reaim` -- it measures where it actually grasped the object and shifts its
+    destination waypoints to compensate, so the demonstration is accurate because of a
+    correction the imitator does not inherit. Any grasp variation therefore lands whole on the
+    placement, and the task's PHYSICAL margins have to exceed the error budget, not just the
+    scorer's thresholds:
+
+      * cup 0.78 -> 0.60 planar scale: jaw clearance per pad 12 mm -> 19 mm, so a centimetre of
+        approach error still closes on the cup rather than knocking it.
+      * tray coqeme (142 x 222 mm) -> hbjdlb (177 x 390 mm), the tray this suite used before:
+        placement margin +/-30/71 mm -> +/-58/165 mm.
+
+    The smaller tray was chosen deliberately so a learned placement "must predict the cup centre
+    accurately rather than relying on a tray that covers almost the entire rack" -- sound for a
+    precise policy, but it sets a tolerance below what any real arm delivers.
+    """
+    if spec.name != "dish2rack":
+        return spec
+    # ONLY the tray, and only its PLANAR scale. Two other routes were tried and measured:
+    #
+    #   * shrinking the cup (0.78 -> 0.60): `grip_close_cmd=0.30` is width-matched to this cup's
+    #     61.9 mm diameter (61.39 mm of ray gap at +0.40, 57.35 mm at +0.30), so a 47 mm cup
+    #     needs about -0.07, an extrapolation 3.7x beyond the calibrated range. The expert
+    #     closed short and never picked the cup up at all.
+    #   * swapping to the larger `hbjdlb` tray: it is 52 mm DEEP where coqeme is 18 mm flat, and
+    #     the release height comes from the liner's AABB TOP -- the rim on a deep tray, not its
+    #     interior floor. The cup was released 4 mm above the rim, fell 30 mm into the tray and
+    #     tipped over, which its final z of 0.818 (upright would be 0.879) confirms.
+    #
+    # Scaling coqeme in x/y only keeps it flat, so the release geometry is untouched, and 1.25
+    # keeps it within the rack's own 182 mm width.
+    return dataclasses.replace(
+        spec, liner={"category": "tray", "model": "coqeme", "scale": [1.25, 1.25, 1.0]})
+
+
+if os.environ.get("LH_TOLERANT_GEOMETRY") == "1":
+    SPECS = [_tolerant(s) for s in SPECS]
+    print("[long_horizon] LH_TOLERANT_GEOMETRY=1: dish2rack tray scaled 1.25 in plane", flush=True)
+
+SPEC_BY_NAME = {s.name: s for s in SPECS}
+
+
+def spawn_extent(spec):
+    """The carried object's world-axis (dx, dy, dz) in its SPAWN orientation, from the asset's
+    own bounding box. No sim needed, and no dependence on where it has since been pushed."""
+    from scipy.spatial.transform import Rotation as R
+    ext = layout.bbox_size(spec.obj["category"], spec.obj["model"], spec.obj.get("scale"))
+    return np.abs(R.from_quat(list(spec.obj_quat)).as_matrix()) @ ext
+
+
+#: Row position (world y) of each carried object on the source table, in the shipped layout. This
+#: is one row across the tabletop, and it is the same row for a single task and for the chained
+#: rollout: `SOURCE_MARKS` is what every task actually spawns from. Measured, the tabletop is
+#: solid over x 1.10-1.85, y -0.05..+0.87, so the row sits well inside it -- at these marks book /
+#: towel / cup occupy y = 0.117..0.163 / 0.270..0.531 / 0.749..0.811. Lateral is the right axis to
+#: spread on: the base is never commanded to a park, it follows the head command (`work_point +
+#: rest_stand_off`), so moving a mark in y moves the CHASSIS by the same amount and leaves the
+#: body-relative reach -- the thing the single tasks validated -- untouched. Moving them in x
+#: would not: x is depth, and it stays a property of the OBJECT (`LHSpec.obj_xy`), because a
+#: 220 mm towel centred on the shared mark overhangs the tabletop's near face.
+#:
+#: `permute_source_marks` re-packs this row, so the numbers to hold onto are the ones that
+#: survive every ordering: 0.107 m between neighbours (0.067 m once both have taken the +/-20 mm
+#: reset jitter toward each other), and the row's own edges, 0.117 and 0.811, which keep the
+#: outermost object 0.15 / 0.04 m clear of the tabletop after that jitter.  The bimanual towel is
+#: no longer pinned near the body's midline: it works from any of the three slots because the
+#: chassis follows it.
+SOURCE_ROW_NOMINAL = {"book2shelf": 0.14, "dish2rack": 0.78, "towel2rack": 0.40}
+
+#: Where each carried object waits on the source table: its own x, and its slot in the row above.
+SOURCE_MARKS = {name: (float(SPEC_BY_NAME[name].obj_xy[0])
+                       if SPEC_BY_NAME[name].obj_xy is not None
+                       else float(layout.SRC_OBJ_XY[0]), y)
+                for name, y in SOURCE_ROW_NOMINAL.items()}
+
+
+def permute_source_marks(order):
+    """Move the three carried objects into the desk-row order given, ascending in y.
+
+    Mutates `SOURCE_MARKS` in place -- the tasks hold a reference to it -- so this has to run
+    BEFORE the task is constructed. See `layout.repack_row` for why the row is re-packed rather
+    than having the objects trade slot centres: the towel is 261 mm across against the cup's
+    61 mm, and dropping it on the northernmost slot centre would hang it over the tabletop's far
+    edge once the +/-20 mm reset jitter is added.
+    """
+    widths = {name: float(spawn_extent(SPEC_BY_NAME[name])[1]) for name in SOURCE_ROW_NOMINAL}
+    for name, y in layout.repack_row(SOURCE_ROW_NOMINAL, widths, order).items():
+        SOURCE_MARKS[name] = (SOURCE_MARKS[name][0], float(y))
+    return dict(SOURCE_MARKS)
+
+
+def apply_layout(station_order, source_order):
+    """Put the receptacle row and the desk row into the orders given (both ascending in y).
+
+    This is the dataset's scene randomization: which receptacle stands in which slot along the
+    east wall, and which object waits in which slot across the source table. It MUST be called
+    before the env is built and before the task is constructed -- both rows are read at those
+    points and never re-read.
+    """
+    stations = layout.permute_stations(station_order)
+    marks = permute_source_marks(source_order)
+    print(f"[layout] stations (S->N) {tuple(station_order)} -> "
+          + " ".join(f"{k}@{v[1]:+.3f}" for k, v in stations.items())
+          + f" | sources (S->N) {tuple(source_order)} -> "
+          + " ".join(f"{k}@{v[1]:+.3f}" for k, v in marks.items()), flush=True)
+    return {"station_order": tuple(station_order), "source_order": tuple(source_order),
+            "stations": {k: [float(v[0]), float(v[1])] for k, v in stations.items()},
+            "sources": {k: [float(v[0]), float(v[1])] for k, v in marks.items()}}
+
+
+def identity_layout():
+    """The unpermuted layout, as a descriptor.
+
+    `apply_layout` on the nominal orders is a bit-exact no-op (`repack_row` short-circuits the
+    identity), so this changes no geometry. It exists because a take collected with
+    `--fixed-layout` still has to RECORD the scene it was shot in: replay and evaluation rebuild
+    the scene from `sim_meta.json`, and a null layout there is not "the default", it is missing
+    data that they cannot act on.
+    """
+    return apply_layout(tuple(sorted(layout.STATION_ROW_NOMINAL, key=layout.STATION_ROW_NOMINAL.get)),
+                        tuple(sorted(SOURCE_ROW_NOMINAL, key=SOURCE_ROW_NOMINAL.get)))
+
+
+def randomize_layout(seed):
+    """Draw one layout permutation from `seed` and apply it. See `apply_layout` for the caveat
+    about when it has to run. The layout is a PER-PROCESS property: the stations are spawned
+    once, so every episode collected in one process shares one layout."""
+    rng = np.random.default_rng(seed)
+    # from the SAFE rows only -- see `station_order_is_safe`
+    stations = SAFE_STATION_ORDERS[int(rng.integers(len(SAFE_STATION_ORDERS)))]
+    return apply_layout(stations,
+                        tuple(str(k) for k in rng.permutation(sorted(SOURCE_ROW_NOMINAL))))
+
+
+def station_order_is_safe(order):
+    """Whether a receptacle row can be worked without the idle arm hitting a neighbour.
+
+    A single-arm task parks its base about 0.29 m SOUTH of the station it is working, and the
+    idle right hand rides a further 0.36 m south and 0.63 m ahead of the base at roughly 0.85 m.
+    It therefore sweeps the station immediately south of the one being worked, every time. It
+    clears the dish rack (0.743 m) and the drying rack (0.756 m). It does NOT clear the bookcase
+    (1.059 m), and driving into it lifts a wheel 11 mm, rolls the chassis to 4.8 deg and leaves
+    ~2.9 deg of heading error, which the place then inherits: measured, the cup landed 76 and
+    86 mm off its 45 mm tolerance in exactly the two rows that allow it, and within 12-22 mm in
+    the seven that do not.
+
+    So the bookcase must not stand immediately south of the dish rack. That is the only unsafe
+    pairing: `towel2rack` is bimanual and parks no idle arm, and the bookcase cannot neighbour
+    itself. Four of the six orders survive, and each receptacle still reaches all three slots.
+
+    `_nav` cannot cover this. It blocks the route, but the working park is derived from the place
+    target rather than planned, and `keepouts` deliberately carries no circle for the receptacles
+    because one big enough to hold a 1.07 m bookcase swallows the neighbouring station's park.
+    """
+    index = {key: i for i, key in enumerate(order)}
+    return index["book_shelf"] != index["dish_rack"] - 1
+
+
+#: The receptacle rows worth collecting on: every ordering the expert can actually execute.
+SAFE_STATION_ORDERS = tuple(o for o in itertools.permutations(layout.RECEPTACLE_KEYS)
+                            if station_order_is_safe(o))
+
+#: Every (receptacle row, desk row) ordering, in a canonical order. 4 x 3! = 24.
+LAYOUT_ORDERS = tuple((stations, sources)
+                      for stations in SAFE_STATION_ORDERS
+                      for sources in itertools.permutations(sorted(SOURCE_ROW_NOMINAL)))
+
+
+def layout_by_index(index):
+    """Apply the `index`-th layout of `LAYOUT_ORDERS`, wrapping.
+
+    Cycling this over a collection run covers all 36 evenly, which drawing one per episode from
+    a seed does not: over 50 draws some layouts land three times and others never appear, and
+    the destination position is the CONDITION the policy is being trained on, so a lopsided
+    sample there is a lopsided training signal rather than harmless noise.
+    """
+    return apply_layout(*LAYOUT_ORDERS[int(index) % len(LAYOUT_ORDERS)])
+
 
 # Two slim, fixed books flank the insertion target in the same top-right cubby.  They are guides,
 # not just decoration: the carried hardback is 46 mm thick after it is stood up, while their inner
@@ -471,6 +717,11 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
     # the towel never left the table (it slid 431 mm out of the hand frame). Making it work needs
     # either a width-aware close (which is just telling the robot the answer) or a force-limited
     # gripper drive; neither is a mode switch.
+    #: Score the STYLE of the execution as well as its outcome. True while collecting, so a
+    #: sloppy demonstration never enters the dataset; False when evaluating a policy, where the
+    #: question is whether the task was achieved. Only gates requirements about HOW -- never
+    #: whether the object was grasped, nor where it ended up.
+    REQUIRE_DEMONSTRATION_QUALITY = True
     GRASPING_MODE = "assisted"
     ROBOT_POS = layout.ROBOT_POS
     ROBOT_YAW = layout.ROBOT_YAW
@@ -499,6 +750,14 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
     REACH_SERVO_MAX = 0.12
     REACH_SERVO_AT = 0.45
     REACH_SERVO_MARGIN = 0.005
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Read the desk row HERE, not at class-creation time: a layout permutation rewrites
+        # `SOURCE_MARKS` after this module is imported and before the task is constructed. The
+        # chained rollout has no single mark of its own -- `_select` sets this per cycle.
+        if self.name in SOURCE_MARKS:
+            self.APPLE_XY = SOURCE_MARKS[self.name]
 
     # ---- scene ----
     @property
@@ -708,8 +967,9 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         self.table.keep_still()
         self.ztop = float(self.table.aabb[1][2])
         r = self.rng
-        ax = self.APPLE_XY[0] + r.uniform(-0.02, 0.02)
-        ay = self.APPLE_XY[1] + r.uniform(-0.02, 0.02)
+        jx, jy = spec.jitter_xy
+        ax = self.APPLE_XY[0] + r.uniform(-jx, jx)
+        ay = self.APPLE_XY[1] + r.uniform(-jy, jy)
         # Standing height computed ANALYTICALLY from the rotated bounding box, in one shot. The
         # first version dropped the object, stepped physics, then re-placed it using the AABB it
         # had after that step -- but a book on edge has already toppled by then, so it was re-placed
@@ -727,6 +987,12 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
                                spec.obj.get("scale"))
         rot = np.abs(R.from_quat(list(spec.obj_quat)).as_matrix())
         return float((rot @ ext)[2]) / 2.0
+
+    @staticmethod
+    def _aabb(obj):
+        """(lo, hi) of an object's live world AABB as numpy, whatever the backend returns."""
+        return tuple(np.asarray(v.detach().cpu() if hasattr(v, "detach") else v, dtype=float)
+                     for v in obj.aabb)
 
     def keepouts(self):
         """(x, y, r) circles the chassis must stay out of -- see `VegaOGEnv.base_keepouts`.
@@ -756,22 +1022,43 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         required_arms = ("left", "right") if self._is_bimanual() else (self.ARM,)
         if any(env.is_grasping(arm) is not None for arm in required_arms):
             return False        # still holding it: nothing has been placed
-        grasped = getattr(self, "_ever_grasped", {})
-        if not all(bool(grasped.get(arm, False)) for arm in required_arms):
-            print(f"[{self.name}] missing required grasp(s): {grasped}", flush=True)
+        # From the SIMULATOR's own record of what each hand held, not from the expert's
+        # bookkeeping. `_ever_grasped` is written by `expert_step`, so a rollout that no expert
+        # produced -- a replay of recorded actions, or a policy -- left it empty and failed here
+        # unconditionally, whatever the robot had actually achieved. Measured on the replay of
+        # episode 0: all three objects were carried their full 0.6-2.3 m and released on their
+        # receptacles within 13 mm of the demonstration, and all three scored False.
+        # This is also the stricter test, because it knows WHICH object was held.
+        name = getattr(self.apple, "name", None)
+        log = getattr(env, "grasp_log", None)
+        if log is None:
+            raise RuntimeError(f"{self.name}: env has no grasp_log; success cannot be scored "
+                               "without the simulator's record of what was held")
+        # Held by EVERY required arm while collecting, by AT LEAST ONE when scoring a policy.
+        # The point of this gate is to prove the object was CARRIED rather than nudged or slid
+        # into place, and one hand proves that. Whether the towel went across on two hands or one
+        # is the demonstration's technique -- measured, a policy carried it 2.071 m and placed it
+        # on the airer single-handed, which achieves the task and failed only this clause.
+        held = [arm for arm in required_arms if name in log[arm]]
+        enough = required_arms if self.REQUIRE_DEMONSTRATION_QUALITY else required_arms[:1]
+        if len(held) < len(enough):
+            print(f"[{self.name}] {name} was never held by {required_arms}: "
+                  f"left={sorted(log['left'])} right={sorted(log['right'])}", flush=True)
             return False
         quality = getattr(self, "_grasp_quality", None)
         if quality is not None and not bool(quality.get("ok", True)):
             print(f"[{self.name}] rejecting bad attached-object attitude: max error="
                   f"{quality.get('max_attitude_error_deg', float('nan')):.1f} deg", flush=True)
             return False
-        if self._is_bimanual():
-            simultaneous = getattr(self, "_bimanual_grasp_quality", {}).get(
-                "simultaneous", False
-            )
-            if not simultaneous:
-                print(f"[{self.name}] both hands never held the object simultaneously", flush=True)
-                return False
+        if (self.REQUIRE_DEMONSTRATION_QUALITY and self._is_bimanual()
+                and name not in log["simultaneous"]):
+            # Both pads on the SAME object on the same tick. This says the towel was carried the
+            # way the skill intends rather than fumbled between hands -- a property of a good
+            # DEMONSTRATION. It is not what the task asks for, which is a towel on the rack, so a
+            # policy is not scored on it: a real arm with centimetre-level error can place the
+            # towel correctly having lost one pad, and calling that a failure measures style.
+            print(f"[{self.name}] both hands never held {name} simultaneously", flush=True)
+            return False
         try:
             if not self.SPEC.on_top:
                 placed = bool(self.apple.states[Inside].get_value(self.bowl))
@@ -800,7 +1087,18 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
                     placed = float(self.apple.aabb[0][2]) > self._support_surface_z() - 0.06
             if not placed:
                 return False
-            if self.SPEC.place_xy_tolerance is not None:
+            # ---- metric placement: a DEMONSTRATION requirement, not a task one ----------------
+            # What the task asks is semantic: the book is IN the shelf, the can is ON the tray,
+            # the towel is ON the rack. That is exactly what the block above already established
+            # through the simulator's own `Inside` / `OnTop` / `Touching` predicates, plus the
+            # height guard that separates "on the rack" from "on the floor beside it".
+            #
+            # The two checks below ask for a POSITION within centimetres of the scripted target.
+            # No real arm delivers that, and a policy that puts the can squarely on the tray has
+            # done the task whether or not it matched the demonstration's chosen spot. They stay
+            # on while COLLECTING, where a sloppy placement should not enter the dataset, and go
+            # off when scoring a policy.
+            if self.REQUIRE_DEMONSTRATION_QUALITY and self.SPEC.place_xy_tolerance is not None:
                 goal = env.obj_pos(self.bowl).copy()
                 goal[:2] += (rot_z(float(self.station.yaw)) @ np.asarray(
                     self.SPEC.place_offset, dtype=float
@@ -809,6 +1107,19 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
                 if xy_error > self.SPEC.place_xy_tolerance:
                     print(f"[{self.name}] placement centre error {xy_error:.3f} m exceeds "
                           f"{self.SPEC.place_xy_tolerance:.3f} m", flush=True)
+                    return False
+            if self.REQUIRE_DEMONSTRATION_QUALITY and self.SPEC.place_support_margin is not None:
+                # Per AXIS, on the live world AABBs: does the object's footprint actually sit on
+                # the receptacle, with margin to spare? See `LHSpec.place_support_margin` -- an
+                # object balanced on the rim passes every centre-distance test there is.
+                margin = float(self.SPEC.place_support_margin)
+                lo_r, hi_r = (np.asarray(v[:2], dtype=float) for v in self._aabb(self.bowl))
+                lo_o, hi_o = (np.asarray(v[:2], dtype=float) for v in self._aabb(self.apple))
+                over = np.maximum(lo_r + margin - lo_o, hi_o - (hi_r - margin))
+                if np.any(over > 0.0):
+                    print(f"[{self.name}] placed object overhangs its support by "
+                          f"{np.round(np.maximum(over, 0.0) * 1000, 1)} mm in (x, y), against a "
+                          f"{margin * 1000:.0f} mm required margin", flush=True)
                     return False
             if self.SPEC.place_up_axis is not None:
                 q = self.apple.get_position_orientation()[1]
@@ -883,8 +1194,41 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
     #: upright, outward-facing attitude. The terminal shelf geometry can otherwise straighten a
     #: bad carry and turn it into a misleading success.
     BOOK_CARRY_ATTITUDE_TOL_DEG = 15.0
-    SETTLE_TICKS = 30
-    RELEASE_HOLD_TICKS = 30
+    #: DWELL at the grasp pose before the fingers close, and at the drop pose after they open.
+    #: Both segments hold a CONSTANT target, so their length sets how long the robot sits still
+    #: at the two poses that decide whether the episode succeeds.
+    #:
+    #: Raised from 30 ticks (0.3 s = 3 frames at the 10 Hz dataset rate). Three frames is too few
+    #: for two independent reasons. The scripted expert's own `_reach_servo` was tuned against "a
+    #: 200-tick settle" (see REACH_SERVO_SPEED) and at 30 ticks never gets the authority to close
+    #: its residual. And a policy trained on this data commands the pose with roughly 15 mm of
+    #: zero-mean sampling noise per step; the controller low-passes a held target, so a dwell of
+    #: N frames drives the ACHIEVED pose toward the mean of N noisy commands -- about 3 mm at 20
+    #: frames, against 15 mm at one. The dwell is what makes a noisy policy land accurately, and
+    #: it costs ~6% more episode length.
+    #:
+    #: That reasoning is right about PRECISION and wrong about the closed loop, and the two pull
+    #: against each other. A long dwell makes 21% of the demonstration's frames stationary, and
+    #: the policy sees two observation steps, so it can tell it is standing still. Standing still
+    #: is then evidence for "keep standing still", and any slowdown in a rollout is read as the
+    #: start of a dwell. Measured on the same task and the same cell, raising these from 30/30 to
+    #: 200/150 took closed-loop route coverage from 7.37 m to 5.34 m of the demonstration's 13.40
+    #: and doubled the share of rollout frames that are stationary (7.5% -> 13.6%); the MoF cell
+    #: on the long-dwell data stands still for 46.4% of its rollout, against its demonstration's
+    #: 20.5%, and never reaches the first object. Teacher-forced rollouts of the SAME checkpoints
+    #: drive the whole route, so this is the feedback loop, not the actions.
+    #:
+    #: So the default goes back to 30/30. The precision argument above also turned out to be much
+    #: weaker than it looks: it assumes the policy's error is zero-mean noise that a hold averages
+    #: away, but the measured error decomposes into ~9.2 mm of systematic bias and ~14.6 mm of
+    #: noise, and holding a biased command converges to the biased pose. Over the seven dwells of
+    #: one episode the achieved error fell during one and ROSE during three. A dwell buys a little
+    #: precision and costs the closed loop outright, which is a bad trade for training data.
+    #:
+    #: Overridable so the two can still be traded off without editing the task -- a run that wants
+    #: maximum scripted-expert precision and does not care about the closed loop can raise them.
+    SETTLE_TICKS = int(os.environ.get("LH_SETTLE_TICKS", 30))
+    RELEASE_HOLD_TICKS = int(os.environ.get("LH_RELEASE_HOLD_TICKS", 30))
     #: Local manipulation is arm-only. Once the open hand starts descending to a source, keep the
     #: head (and therefore the base target inferred from it) parked through the post-grasp lift.
     #: Do the same from the release-height descent through the final return to the neutral arms.
@@ -1878,10 +2222,11 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
 
 
 def _make(spec):
+    # APPLE_XY is NOT set here: it comes from `SOURCE_MARKS` per instance (see `__init__`), which
+    # is the one row both the single tasks and the chained rollout spawn from, and which a layout
+    # permutation rewrites after this module is imported.
     attrs = {"name": spec.name, "SPEC": spec,
              "__doc__": f"Long-horizon {spec.name} (see LHSpec)."}
-    if spec.obj_xy is not None:
-        attrs["APPLE_XY"] = tuple(spec.obj_xy)      # the documented subclass override point
     cls = type(
         "".join(p.capitalize() for p in spec.name.replace("2", "_to_").split("_")) + "Task",
         (LongHorizonPickPlace,),
@@ -1891,7 +2236,6 @@ def _make(spec):
 
 
 LH_TASKS = [_make(s) for s in SPECS]
-SPEC_BY_NAME = {s.name: s for s in SPECS}
 
 
 class LongHorizonSequence(LongHorizonPickPlace):
@@ -1930,15 +2274,16 @@ class LongHorizonSequence(LongHorizonPickPlace):
     name = "lh_all"
     #: Which specs to chain, in order. Farthest station first: the row runs dish rack (y = -0.41),
     #: towel rack (-1.05), bookcase (-1.83), so book -> dish -> towel walks the robot out to the far
-    #: end and back up it, and no return drive has to pass a station it has already loaded.
+    #: end and back up it, and no return drive has to pass a station it has already loaded. That
+    #: rationale is about the SHIPPED row; under a layout permutation the three receptacles swap
+    #: slots and this fixed task order visits them in whatever sequence that leaves. It stays
+    #: fixed deliberately -- each leg is planned by `_nav` against the row as it actually stands,
+    #: so re-deriving the order would add a variable without removing an obstacle.
     ORDER = ("book2shelf", "dish2rack", "towel2rack")
-    #: Where each object waits on the source table. Measured, the tabletop is solid over
-    #: x 1.10-1.85, y -0.05..+0.87, so these sit well inside it.  At the nominal marks, book /
-    #: towel / cup occupy about y=0.10..0.18 / 0.31..0.49 / 0.75..0.81, leaving at least 0.13 m
-    #: nominal clearance (at least 0.09 m under the +/-20 mm reset jitter).  The bimanual towel is
-    #: centred near the body's midline; the cup stays near the left hand's original mark.
-    SOURCE_MARKS = {"book2shelf": (1.20, 0.14), "dish2rack": (1.20, 0.78),
-                    "towel2rack": (1.11, 0.40)}
+    #: Where each object waits on the source table -- the module-level desk row itself, not a
+    #: copy, so a layout permutation rewrites it in place. See `SOURCE_ROW_NOMINAL` for why the
+    #: three are spread laterally and how much tabletop that leaves under the reset jitter.
+    SOURCE_MARKS = SOURCE_MARKS
     #: Ticks to raise the hand from the receptacle back to its rest height before driving off.
     CLEAR_TICKS = 60
     #: Floor on a return leg's duration, matching the outbound legs' own `max(40, ...)`.
@@ -2027,9 +2372,10 @@ class LongHorizonSequence(LongHorizonPickPlace):
         for task_name in self.ORDER:
             spec = SPEC_BY_NAME[task_name]
             mx, my = self.SOURCE_MARKS[task_name]
+            jx, jy = spec.jitter_xy
             self._objs[task_name].set_position_orientation(
-                position=[mx + self.rng.uniform(-0.02, 0.02),
-                          my + self.rng.uniform(-0.02, 0.02),
+                position=[mx + self.rng.uniform(-jx, jx),
+                          my + self.rng.uniform(-jy, jy),
                           self.ztop + self._upright_half_height(spec) + 0.004],
                 orientation=list(spec.obj_quat))
             self._objs[task_name].keep_still()
@@ -2048,6 +2394,38 @@ class LongHorizonSequence(LongHorizonPickPlace):
             self._select(live)
         print(f"[{self.name}] per-task success: {out}", flush=True)
         return all(out.values())
+
+    def objects_of_interest(self, env):
+        """Six positions, not two: [source, destination] for each cycle, in `ORDER`.
+
+        The parent returns whichever pair is LIVE, which at episode start is cycle 0 -- so a
+        chained rollout would condition on the first pick-and-place alone and leave the layout of
+        the other two invisible, which is precisely the thing a permuted scene has to express.
+        The porters already name a 2N-slot env-state `s1_src .. sN_dst` and take `--object-nums`
+        (see `port_wbc_mobile_hdf5.env_state_axes`), so this shape needs no schema change --
+        collect with `--object-nums 6`.
+
+        Each destination is the receptacle the parent's `success` actually judges against, i.e.
+        the liner where the spec lays one (`_liner_name`), not the station underneath it.
+        """
+        rows = []
+        for task_name in self.ORDER:
+            rows.append(env.obj_pos(self._objs[task_name]))
+            rows.append(env.obj_pos(self._stns[task_name]))
+        return np.stack(rows)
+
+    @property
+    def stage_index(self):
+        """The live cycle. `_select` moves it, `expert_step` calls `_select` on the tick the plan
+        crosses into the next cycle, so a frame recorded after `expert_step` carries the cycle
+        that produced it."""
+        return int(self._cycle)
+
+    @property
+    def task_sequence(self):
+        """Identity: `objects_of_interest` already writes the env-state rows in `ORDER`, which is
+        execution order, so stage k selects row k. `port_wbc_mobile_hdf5` accepts (0,1,2)."""
+        return tuple(range(len(self.ORDER)))
 
     # ---- expert ----
     def _src_park(self):
@@ -2186,3 +2564,9 @@ class LongHorizonSequence(LongHorizonPickPlace):
             print(f"[{self.name}] --- cycle {k}: {self.SPEC.name} "
                   f"-> {self.SPEC.station} ---", flush=True)
         return super().expert_step(env, obs)
+
+
+#: Tasks whose scene IS the two rows, and so the only ones a layout permutation means anything
+#: for: `pickplace` / `mobilepickplace` bring their own marks, and the two non-prehensile tasks
+#: spawn only their own station (`nonprehensile._StationTask.scene_station_keys`).
+LAYOUT_TASKS = frozenset(SOURCE_ROW_NOMINAL) | {LongHorizonSequence.name}

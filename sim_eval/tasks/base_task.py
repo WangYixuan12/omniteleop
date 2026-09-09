@@ -71,7 +71,31 @@ class SimTask(ABC):
     # ---- SceneDiff condition ----
     @abstractmethod
     def objects_of_interest(self, env) -> np.ndarray:
-        """Return (2,3) world XYZ of [source, target] for the 6-D env_state condition."""
+        """Return (2N,3) world XYZ, [source, target] per grasp cycle, for the env_state
+        condition. N is 1 for a single-stage task."""
+
+    # ---- stage ----
+    @property
+    def stage_index(self) -> int:
+        """Which grasp cycle the expert is in RIGHT NOW, 0-based; always 0 for one stage.
+
+        Recorded per frame as `progress_index`, which is both what the structured porter
+        requires (`port_wbc_mobile_hdf5`: (T,) int64, monotonic 0->1->2) and what the policy
+        learns to predict with its stage head. An evaluator needs it too: the actuator command
+        behind a 0..1 close intent is per-stage (see `LHSpec.grip_close_cmd`), so without a
+        stage label a recorded or predicted gripper action cannot be turned back into a command.
+        """
+        return 0
+
+    @property
+    def task_sequence(self) -> tuple:
+        """Task id occupying each stage slot, in execution order.
+
+        The model maps progress -> task_sequence[progress] and uses that to select the
+        environment-state row, so this is identity whenever the env_state rows are already
+        written in execution order.
+        """
+        return (0,)
 
     # ---- success ----
     @abstractmethod

@@ -44,7 +44,14 @@ class VegaOGEnv:
     def __init__(self, task=None, action_hz=100, physics_hz=200, render_hz=100, pos_kp=1500,
                  lock_base=True, wbc_port=5610, obs_hw=None, wbc_overrides=None,
                  scene_model="Rs_int", robot_pos=(-0.5, 0.4, 0.03), robot_yaw=0.0,
-                 grasping_mode="physical", grasping_direction="upper", mobile=False):
+                 grasping_mode="physical", grasping_direction="upper", mobile=False,
+                 connect_wbc=True, scene_options=None, head_only=False):
+        self.og = og
+        self.head_only = head_only
+        if head_only:
+            from omnigibson.macros import gm
+            gm.RENDER_VIEWER_CAMERA = False
+        self.scene_options = dict(scene_options or {})
         overrides = {} if wbc_overrides is None else dict(wbc_overrides)
         # The simulator and the real follower share one controller configuration.  Tasks may plan
         # different paths, but they may not silently replace solver DOFs or controller gains.
@@ -138,16 +145,22 @@ class VegaOGEnv:
         # the task-level convention stable: command -1 => CLOSE, +1 => OPEN.
         self.grip_close = -1.0
         self.grip_open = 1.0
+        #: How far the commanded gripper must rise above its tightest held value before the
+        #: simulated grasp joint is unloaded -- see `release_on_opening_command`. Small, so the
+        #: release lands on the first tick of the opening ramp (where the expert put it) rather
+        #: than partway through it, but above the interpolator's own noise.
+        self.ag_release_margin = 0.02
         # A VisionSensor's render product is sized at LOAD time -- headless, its image_width
         # setter is a no-op -- so the head render size has to be fixed here. Callers using the
         # ZED-parity path pass `zed_sim.head_render_hw(opts)` (the raw SVGA canvas, which
         # obs_pipeline then crops/resizes like the real publisher).
         obs_hw = zed_sim.DEFAULT_RENDER_HW if obs_hw is None else tuple(obs_hw)
+        # Head-only teleop skips depth_linear so Isaac never builds a depth render product.
+        # Full demos keep depth_linear (== distance_to_image_plane) for point-cloud policies;
+        # OmniGibson's "depth" is distance_to_camera and would bow the cloud at image edges.
+        vision_modalities = ["rgb"] if head_only else ["rgb", "depth_linear"]
         robot_cfg = {
-            # depth_linear == Isaac distance_to_image_plane (z-depth), which is what the pinhole
-            # unprojection in wbc_pointcloud wants; OmniGibson's "depth" is distance_to_camera
-            # (euclidean range) and would bow the recorded cloud outward at the image edges.
-            "model": "vega_robotiq", "obs_modalities": ["rgb", "depth_linear", "proprio"],
+            "model": "vega_robotiq", "obs_modalities": [*vision_modalities, "proprio"],
             "grasping_mode": grasping_mode, "grasping_direction": grasping_direction,
             # Holonomic-base robots cannot float; OmniGibson forces this on anyway and warns if
             # left at the default False, so state it explicitly.
@@ -187,14 +200,30 @@ class VegaOGEnv:
             "objects": task.object_configs() if task is not None else [],
             "task": {"type": "DummyTask"},
         }
+        if head_only:
+            from omnigibson.macros import gm
+            if not gm.HEADLESS:
+                robot_cfg["sensor_config"]["VisionSensor"]["sensor_kwargs"]["viewport_name"] = "Viewport"
+        if scene_model and scene_options:
+            cfg["scene"].update(scene_options)
         self.env = og.Environment(configs=cfg)
         self.robot = self.env.robots[0]
+        required_mounts = {f"{prefix}_{suffix}" for prefix in ("L", "R") for suffix in
+                           ("gripper_connector", "wrist_cam_bracket", "wrist_zed_mini", "wrist_camera")}
+        missing_mounts = required_mounts.difference(self.robot.links)
+        if missing_mounts:
+            raise RuntimeError(
+                "vega_robotiq is missing the follower's connector/camera assembly: "
+                f"{sorted(missing_mounts)}. Rebuild the asset using "
+                "sim_eval/port_vega_wrist_cameras.py; see sim_eval/ROBOT_ASSETS.md."
+            )
         self.names = self.robot.dof_names_ordered
         self.name2idx = {n: i for i, n in enumerate(self.names)}
         self.cai = self.robot.controller_action_idx
         if task is not None:
             task.bind(self)
-        self.wbc = WBCClient(port=wbc_port, lock_base=lock_base, overrides=wbc_overrides)
+        self.wbc = (WBCClient(port=wbc_port, lock_base=lock_base, overrides=wbc_overrides)
+                    if connect_wbc else None)
         self.T_align = None
         self.T_align_inv = None
 
@@ -209,6 +238,53 @@ class VegaOGEnv:
     def is_grasping(self, arm="left"):
         """Object magnetized to @arm under assisted/sticky grasping, else None."""
         return self.robot._ag_obj_in_hand.get(arm)
+
+    def release_on_opening_command(self, grip_cmd):
+        """Unload the simulated grasp joint as soon as the COMMAND starts opening.
+
+        OmniGibson's automatic release waits for the controller to reach fully open and then
+        leaves the object asleep at its constrained pose, with too little free time to settle
+        onto the support. `LongHorizonPickPlace._release_assisted_grasp` already worked around
+        that -- but it keys on the expert's own phase label, so only the scripted expert ever
+        triggered it. Measured on the replay of episode 0: the towel was carried and released
+        correctly and then froze 32 mm above the airer's deck, failing `Touching`, because
+        nothing unloaded the joint in time; the book and cup passed only because `Inside` and the
+        height tolerance are more forgiving.
+
+        Keying on the commanded gripper instead makes it a property of the SIMULATOR's grasp
+        model rather than of who is driving, so a replay and a policy get the same physics the
+        expert did. It never creates a grasp -- it only ends one the fingers are being commanded
+        to let go of, which is the no-unreal-artifacts rule, not an exception to it.
+
+        Re-attachment stays gated while the command keeps opening, so the still-closing fingers
+        cannot immediately re-magnetize the object they just dropped, and is restored once the
+        command closes again.
+        """
+        if self.grasping_mode == "physical":
+            return
+        for arm, cmd in grip_cmd.items():
+            if self.is_grasping(arm) is None:
+                if self._grip_hold_floor.pop(arm, None) is not None and not self._grip_hold_floor:
+                    self.set_assisted_grasp_handling(True)
+                continue
+            floor = self._grip_hold_floor.setdefault(arm, cmd)
+            if cmd < floor:
+                self._grip_hold_floor[arm] = cmd          # still closing: track the tightest hold
+            elif cmd > floor + self.ag_release_margin:
+                self.robot.release_grasp_immediately(arm=arm)
+                self.set_assisted_grasp_handling(False)
+
+    def note_grasps(self):
+        """Fold this tick's assisted-grasp state into `grasp_log`. Called every control tick."""
+        held = {}
+        for arm in ("left", "right"):
+            obj = self.is_grasping(arm)
+            if obj is not None:
+                name = getattr(obj, "name", None) or str(obj)
+                self.grasp_log[arm].add(name)
+                held[arm] = name
+        if len(held) == 2 and held["left"] == held["right"]:
+            self.grasp_log["simultaneous"].add(held["left"])
 
     def set_assisted_grasp_handling(self, enabled):
         """Gate automatic reattachment while a deliberately released gripper opens."""
@@ -322,6 +398,11 @@ class VegaOGEnv:
     def og_to_wbc(self, T_og):
         return self.T_align_inv @ np.asarray(T_og)
 
+    def wbc_to_og(self, T_wbc):
+        """Inverse of `og_to_wbc`. Recorded and predicted actions are both in the WBC
+        engage-origin frame (see obs_pipeline), while `wbc_tick` takes OmniGibson world."""
+        return self.T_align @ np.asarray(T_wbc)
+
     # ---- lifecycle ----
     def _hold_action(self):
         q = self.robot.get_joint_positions().detach().cpu().numpy()
@@ -334,7 +415,7 @@ class VegaOGEnv:
         a[self.cai["gripper_right"]] = self.grip_open
         return a
 
-    def reset(self, seed=None):
+    def reset(self, seed=None, *, expert=True):
         self.env.reset()
         self.set_assisted_grasp_handling(True)
         # AFTER env.reset(), never before: OmniGibson's `scene.reset(hard=True)` forces the live
@@ -368,6 +449,13 @@ class VegaOGEnv:
             "max_target_jump_deg": 0.0,
             "max_chassis_tilt_deg": 0.0,
         }
+        # Which objects each hand held at ANY point this episode, and which were held by both at
+        # once. Observed from the simulator rather than recorded by the expert, because a success
+        # predicate has to be able to score a rollout that no expert produced -- a replay, or a
+        # policy. It is also the stricter test: the expert only knew THAT a hand closed on
+        # something, while this knows WHICH object it was.
+        self.grasp_log = {"left": set(), "right": set(), "simultaneous": set()}
+        self._grip_hold_floor = {}
         self._previous_effective_targets = None
         if self.task is not None:
             self.task.reset(self)
@@ -378,9 +466,11 @@ class VegaOGEnv:
         self.T_align_inv = np.linalg.inv(self.T_align)
         self.base_hold_target = np.array(self.base_xyyaw())   # ~0 at spawn
         self.base_yaw_target = float(self.base_hold_target[2])
-        self._setup_third_person()
-        self.wbc.reset()
-        if self.task is not None:
+        if not self.head_only:
+            self._setup_third_person()
+        if self.wbc is not None:
+            self.wbc.reset()
+        if self.task is not None and expert:
             self.task.expert_reset(self)
 
     # ---- 3rd-person camera (for videos) ----
@@ -667,6 +757,7 @@ class VegaOGEnv:
         a[self.cai["base"]] = th.tensor(np.asarray(base_vel, dtype=float), dtype=th.float32)
         self.env.step(a)
         self.base_hold_target = np.array(self.base_xyyaw())
+        self.note_grasps()          # a carried object is still held while the base navigates
         return self.capture_third_person() if capture else None
 
     def wbc_tick(self, left_og, right_og, head_og=None, grip_l=-1.0, grip_r=-1.0):
@@ -721,6 +812,7 @@ class VegaOGEnv:
         a[self.cai["arm_right"]] = th.tensor([joints[n] for n in ARM_R])
         a[self.cai["gripper_left"]] = float(grip_l)
         a[self.cai["gripper_right"]] = float(grip_r)
+        self.release_on_opening_command({"left": float(grip_l), "right": float(grip_r)})
         self.env.step(a)
         self._tick += 1
         resp["hold"] = hold
@@ -762,6 +854,7 @@ class VegaOGEnv:
                         )
                     quality["max_target_jump_deg"] = max(quality["max_target_jump_deg"], dr)
             self._previous_effective_targets = effective
+        self.note_grasps()
         return resp
 
     #: Joint groups the follower clamps independently -- its `cmds` dict in `Driver.actuate`.
@@ -832,6 +925,7 @@ class VegaOGEnv:
 
     def close(self):
         try:
-            self.wbc.close()
+            if self.wbc is not None:
+                self.wbc.close()
         finally:
             og.shutdown()

@@ -15,8 +15,10 @@ the control loop -- see `vega_og_env.base_keepouts` for the runtime guard.
 """
 from __future__ import annotations
 
-import os
+import importlib.util
 from collections import deque
+import os
+from pathlib import Path
 
 import numpy as np
 
@@ -32,7 +34,10 @@ def _dataset_path():
     path = os.environ.get("OMNIGIBSON_DATASET_PATH")
     if path:
         return path
-    return os.path.expanduser("~/BEHAVIOR-1K/datasets/behavior-1k-assets")
+    spec = importlib.util.find_spec("omnigibson")
+    if spec is not None and spec.origin is not None:
+        return str(Path(spec.origin).resolve().parents[2] / "datasets/behavior-1k-assets")
+    return os.path.expanduser("~/workspace/BEHAVIOR-1K/datasets/behavior-1k-assets")
 
 
 class NavMap:

@@ -76,8 +76,9 @@ class PickPlaceTask(SimTask):
 
     def reset(self, env):
         # clear the chair that sits between the robot and the table's near edge
-        cp = env.obj_pos(self.block_chair)
-        self.block_chair.set_position_orientation(position=[cp[0], cp[1] - 1.7, cp[2]], orientation=[0, 0, 0, 1])
+        if self.block_chair is not None:
+            cp = env.obj_pos(self.block_chair)
+            self.block_chair.set_position_orientation(position=[cp[0], cp[1] - 1.7, cp[2]], orientation=[0, 0, 0, 1])
         self.ztop = float(self.table.aabb[1][2])   # existing table already rests correctly (~0.76)
         r = self.rng
         ax = self.APPLE_XY[0] + r.uniform(-0.02, 0.02); ay = self.APPLE_XY[1] + r.uniform(-0.02, 0.02)

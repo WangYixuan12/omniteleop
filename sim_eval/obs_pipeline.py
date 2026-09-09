@@ -32,9 +32,8 @@ which falls below `MIN_DEPTH_M` and is dropped by the unprojection.
 `zed_sim.ZedSimOptions` applies the measured depth-dropout process by default. Field-of-view and
 crop/resize changes remain opt-in, so enabling dropout does not alter camera geometry.
 
-vega_robotiq has no wrist camera prim, so `setup()` creates one under the eef link, pulled back
-and raised above the measured eef->fingertip direction (`finger_grasp_point`), then aimed at the
-grasp point so the fingers and grasped object fill the frame.
+`setup()` creates wrist camera prims under the eef links at the exact L/R_wrist_camera
+optical poses in the follower URDF. Their local poses are independent of the reset posture.
 
 All poses written are in the WBC **engage-origin world** (`VegaOGEnv.og_to_wbc`), the frame
 `obs/base/pose`, `action/*` and the env-state share on hardware.
@@ -47,9 +46,10 @@ from scipy.spatial.transform import Rotation as R
 import omnigibson as og
 
 import zed_sim
+from robot_model import OPTICAL_TO_USD, wrist_camera_poses
 
 # optical (x right, y down, z forward)  ->  USD camera (x right, y up, z backward)
-_OPTICAL_TO_USD = np.diag([1.0, -1.0, -1.0, 1.0])
+_OPTICAL_TO_USD = OPTICAL_TO_USD
 DEPTH_SCALE_M = 1e-3      # wbc_pointcloud.DEPTH_SCALE_M -- uint16 millimetres
 MAX_DEPTH_MM = 65535
 _NEAR_CLIP_M = zed_sim.NEAR_CLIP_M   # culls the robot's own chest (see zed_sim.NEAR_CLIP_M)
@@ -59,13 +59,6 @@ def _np(x):
     return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
 
 
-def _T(pos, rot3):
-    T = np.eye(4)
-    T[:3, :3] = rot3
-    T[:3, 3] = pos
-    return T
-
-
 class SimObsRecorder:
     """Camera setup + per-tick raw-HDF5 frames for one episode.
 
@@ -73,12 +66,16 @@ class SimObsRecorder:
     then `frame(cmd)` on every recorded tick.
     """
 
-    def __init__(self, env, arm="left", wrist_back=0.12, wrist_up=0.08, seed=0, zed=None):
+    def __init__(self, env, arm="left", seed=0, zed=None, urdf=None, wrist_cameras=True,
+                 head_depth=None):
         self.env = env
         self.arms = ("left", "right")
+        self.camera_arms = self.arms if wrist_cameras else ()
+        # Head-only teleop omits depth to cut capture latency; full demos keep it.
+        self.head_depth = (not getattr(env, "head_only", False) if head_depth is None
+                           else bool(head_depth))
         self.eef_links = {"left": "L_ee", "right": "R_ee"}
-        self.wrist_back = wrist_back
-        self.wrist_up = wrist_up
+        self._wrist_camera_poses = wrist_camera_poses(urdf)
         self.head_cam = None
         self.wrist_cams = {side: None for side in self.arms}
         self._head_key = None
@@ -90,6 +87,11 @@ class SimObsRecorder:
     def setup(self):
         robot = self.env.robot
         self.head_cam = next(iter(robot.sensors.values()))
+        if getattr(self.env, "head_only", False) and self.head_cam._viewport is not None:
+            # Disabling OmniGibson's third-person sensor can hide the main viewport
+            # during app startup. It is now bound to the head sensor, so show it.
+            with og.sim.editing_usd():
+                self.head_cam._viewport.visible = True
         self._retarget_head_camera()
         # Retargeting the camera prim (and the task's scene decluttering immediately before
         # setup) invalidates Fabric's camera data until a later render.  The exact number of
@@ -105,8 +107,8 @@ class SimObsRecorder:
                     raise
                 if attempt == 7:
                     raise RuntimeError("head camera did not synchronize with Fabric after 8 renders") from exc
-        for side in self.arms:
-            if self.wrist_cams[side] is None:  # created once; re-aimed on every reset
+        for side in self.camera_arms:
+            if self.wrist_cams[side] is None:  # created once; fixed URDF mount on every reset
                 self.wrist_cams[side] = self._make_wrist_camera(side)
                 zed_sim.configure_wrist_camera(self.wrist_cams[side], self.zed)
             self._place_wrist_camera(side)
@@ -145,7 +147,7 @@ class SimObsRecorder:
         self.head_cam.clipping_range = (_NEAR_CLIP_M, 1.0e7)
 
     def _make_wrist_camera(self, arm):
-        """Create a VisionSensor prim on the eef link (vega_robotiq ships no wrist camera)."""
+        """Create a VisionSensor prim on the eef link at its URDF camera offset."""
         from omnigibson.sensors import create_sensor
         from omnigibson.utils.usd_utils import absolute_prim_path_to_scene_relative
 
@@ -166,25 +168,8 @@ class SimObsRecorder:
         return sensor
 
     def _place_wrist_camera(self, arm):
-        """Mount the wrist camera above the approach axis and aim it at the grasp point."""
-        env = self.env
-        Tee = env.link_pose(self.eef_links[arm])
-        grasp_point = env.finger_grasp_point(arm)
-        approach = grasp_point - Tee[:3, 3]                           # eef -> fingertips (world)
-        approach /= max(np.linalg.norm(approach), 1e-9)
-        up = np.array([0.0, 0.0, 1.0])
-        right = np.cross(approach, up)
-        right /= max(np.linalg.norm(right), 1e-9)
-        mount_up = np.cross(right, approach)
-        camera_pos = Tee[:3, 3] - self.wrist_back * approach + self.wrist_up * mount_up
-        view_fwd = grasp_point - camera_pos
-        view_fwd /= max(np.linalg.norm(view_fwd), 1e-9)
-        right = np.cross(view_fwd, up)
-        right /= max(np.linalg.norm(right), 1e-9)
-        view_up = np.cross(right, view_fwd)
-        # optical frame: x right, y down, z forward
-        T_opt = _T(camera_pos, np.stack([right, -view_up, view_fwd], axis=1))
-        T_local = np.linalg.inv(Tee) @ T_opt @ _OPTICAL_TO_USD
+        """Use the fixed optical mount, including its URDF roll and downward tilt."""
+        T_local = self._wrist_camera_poses[arm]
         self.wrist_cams[arm].set_position_orientation(
             position=T_local[:3, 3].tolist(),
             orientation=R.from_matrix(T_local[:3, :3]).as_quat().tolist(),
@@ -198,6 +183,8 @@ class SimObsRecorder:
     # ---- per-frame data ----
     def _head_images(self):
         obs, _ = self.head_cam.get_obs()
+        if not self.head_depth:
+            return zed_sim.head_rgb_frame(_np(obs["rgb"]), self.zed), None
         return zed_sim.head_frame(_np(obs["rgb"]), _np(obs["depth_linear"]),
                                   self._rng, self._render_k, self.zed)
 
@@ -225,12 +212,14 @@ class SimObsRecorder:
         if effective["head"] is None:
             raise RuntimeError("recording requires a commanded head target")
         base = np.array(env.base_xyyaw(), dtype=np.float32)
+        images = {"head_left_rgb": rgb}
+        if depth is not None:
+            images["head_depth"] = depth
+        images.update({f"{side}_wrist_rgb": self._wrist_rgb(side) for side in self.camera_arms})
         frame = {
             "timestamp_ns": np.int64(timestamp_ns),
             "obs": {
-                "images": {"head_left_rgb": rgb, "head_depth": depth,
-                           "left_wrist_rgb": self._wrist_rgb("left"),
-                           "right_wrist_rgb": self._wrist_rgb("right")},
+                "images": images,
                 "joint": joints,
                 "base": {"pose": base},
                 # achieved gripper reading (hardware: raw FC03; sim: driven knuckle angle)

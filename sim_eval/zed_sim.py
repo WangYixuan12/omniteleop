@@ -51,16 +51,17 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import importlib.util
-import pathlib
 
 import cv2
 import numpy as np
+
+from robot_model import OMNITELEOP_SRC
 
 # The crop/resize geometry and ZED_K must stay in lock-step with the real publisher, so load them
 # from the real module rather than copying the numbers. `omniteleop.common.__init__` pulls loguru
 # (absent from the behavior env), so bypass the package and load the leaf file directly -- it
 # imports nothing but numpy.
-_HEAD_CAMERA_PY = pathlib.Path("/home/yixuan/omniteleop/src/omniteleop/common/head_camera.py")
+_HEAD_CAMERA_PY = OMNITELEOP_SRC / "omniteleop/common/head_camera.py"
 _spec = importlib.util.spec_from_file_location("_ot_head_camera", _HEAD_CAMERA_PY)
 _hc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_hc)
@@ -222,6 +223,17 @@ def head_intrinsic(render_k: np.ndarray, opts: ZedSimOptions) -> np.ndarray:
     if not opts.match_zed_fov:
         return k.astype(np.float32)
     return crop_resize_intrinsics(k, HEAD_CROP_TBLR, HEAD_RESIZE_HW).astype(np.float32)
+
+
+def head_rgb_frame(rgb_render: np.ndarray, opts: ZedSimOptions) -> np.ndarray:
+    """Raw RGB render -> published `head_left_rgb` uint8 (no depth path)."""
+    rgb = np.asarray(rgb_render)[..., :3]
+    if opts.match_zed_fov:
+        svga_h, svga_w = SVGA_HW
+        rgb = rgb[:svga_h, :svga_w]
+        rgb = _crop_resize(np.ascontiguousarray(rgb), HEAD_CROP_TBLR, HEAD_RESIZE_HW,
+                           cv2.INTER_AREA)
+    return np.ascontiguousarray(rgb).astype(np.uint8)
 
 
 def head_frame(rgb_render: np.ndarray, depth_render_m: np.ndarray, rng: np.random.Generator,

@@ -38,9 +38,11 @@ import sys
 
 import yaml
 
-#: Checkout that owns the real follower code. The WBC service already hardcodes this tree
-#: (see `wbc_service.DEFAULT_CONFIG`); the env var is here so a second checkout can be pointed at.
-OMNITELEOP_SRC = os.environ.get("OMNITELEOP_SRC", "/home/yixuan/omniteleop/src")
+from robot_model import OMNITELEOP_SRC as _SOURCE_ROOT, WBIK_YAML as _WBIK_YAML
+
+#: Checkout that owns the real follower code, shared with wbc_service.DEFAULT_CONFIG.
+#: Defaults to this checkout; OMNITELEOP_SRC can select another one.
+OMNITELEOP_SRC = str(_SOURCE_ROOT)
 if not os.path.isdir(OMNITELEOP_SRC):
     raise RuntimeError(
         f"OMNITELEOP_SRC={OMNITELEOP_SRC!r} is not a directory; the sim cannot reach the real "
@@ -65,8 +67,7 @@ def _load_by_path(name, relpath):
 
 #: The follower config both sides share. `wbc_service.py` loads its SOLVER half from this exact
 #: file; this module loads the control-loop half (`vr_teleop:`) from it.
-WBIK_YAML = os.environ.get(
-    "OMNITELEOP_WBIK_YAML", os.path.join(OMNITELEOP_SRC, "omniteleop/follower/wbik.yaml"))
+WBIK_YAML = str(_WBIK_YAML)
 
 
 class _YamlBlock:
