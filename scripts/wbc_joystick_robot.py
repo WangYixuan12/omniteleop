@@ -319,6 +319,7 @@ class JoystickHardwareDriver(HardwareDriver):
             "wbc_joystick_robot": Path(__file__).resolve(),
             "wbc_joystick_leader": repo / "scripts/wbc_joystick_leader.py",
             "joystick_base": repo / "src/omniteleop/follower/joystick_base.py",
+            "scenediff_collection": repo / "src/omniteleop/wbc_scenediff_collection.py",
             "wbc_record": repo / "src/omniteleop/wbc_record.py",
             "selected_wbik_yaml": selected_config,
         }
@@ -573,6 +574,18 @@ def main() -> None:
                         help="live joystick: one measured +/-90deg turn per LEFT-stick "
                              "gesture; release lets it finish, translation/opposite yaw "
                              "cancels. Requires neutral before each turn. Leader unchanged.")
+    parser.add_argument("--scenediff-sweep", action=argparse.BooleanOptionalAction,
+                        default=False, help="live --record: first right-grip hold parks arms "
+                        "and captures stereo; second hold aligns directly from the parked pose. "
+                        "Off unless passed.")
+    parser.add_argument("--scenediff-sweep-dir", default=None,
+                        help="directory for SceneDiff sweep HDF5s "
+                             "(default: <save-dir>/sweep_for_scenediff).")
+    parser.add_argument("--scenediff-park-reference",
+                        default="/data/Dexmate/reference_data/scenediff_begin.hdf5")
+    parser.add_argument("--scenediff-arm-speed", type=float, default=0.50,
+                        help="arm parking speed in rad/s (default: 0.50); "
+                             "head sweep speed remains 0.10 rad/s")
     parser.add_argument("--streaming-recorder", action="store_true",
                         help="write through the bounded streaming HDF5 recorder. "
                              "Requires --record.")
@@ -606,6 +619,7 @@ def main() -> None:
     hw.add_argument("--home-tol", type=float, default=_base.DEFAULT_HOME_TOL)
     hw.add_argument("--home-settle", type=float, default=_base.DEFAULT_HOME_SETTLE)
     hw.add_argument("--max-joint-step", type=float, default=_base.DEFAULT_MAX_JOINT_STEP)
+    hw.add_argument("--arm-cmd-lpf-tau", type=float, default=_base.DEFAULT_ARM_CMD_LPF_TAU)
     hw.add_argument("--source-timeout", type=float, default=_base.DEFAULT_SOURCE_TIMEOUT)
     hw.add_argument("--drive-state-mode", choices=("ms", "rad"), default="ms")
     hw.add_argument("--arkit-base", dest="arkit_base",
@@ -614,9 +628,20 @@ def main() -> None:
                          "joystick command-pose PD loop with it. Needs --enable base.")
     hw.add_argument("--base-quiet-hold-s", type=float, default=_base.DEFAULT_BASE_QUIET_HOLD_S)
     args = parser.parse_args()
+    if args.scenediff_sweep_dir is None:
+        args.scenediff_sweep_dir = str(Path(args.save_dir) / "sweep_for_scenediff")
+
+    if not np.isfinite(args.scenediff_arm_speed) or args.scenediff_arm_speed <= 0:
+        parser.error("--scenediff-arm-speed must be finite and > 0")
+    args.scenediff_sweep = bool(args.scenediff_sweep and args.record and args.replay is None)
+    if args.scenediff_sweep:
+        args.head_right_rgb = True
+        from omniteleop.wbc_scenediff_collection import load_park_pose
+        load_park_pose(args.scenediff_park_reference)  # validate before connecting hardware
 
     _bind_vr_teleop(args, parser)
     for flag, val in (("--home-tol", args.home_tol), ("--max-joint-step", args.max_joint_step),
+                      ("--arm-cmd-lpf-tau", args.arm_cmd_lpf_tau),
                       ("--home-settle", args.home_settle),
                       ("--record-stale-grace", args.record_stale_grace),
                       ("--record-max-camera-skew-ms", args.record_max_camera_skew_ms)):
@@ -650,6 +675,8 @@ def main() -> None:
         parser.error(str(exc))
     if args.arkit_base != "off" and not enable["base"]:
         parser.error("--arkit-base needs --enable base")
+    if args.scenediff_sweep and not all(enable[g] for g in ("arms", "head", "base")):
+        parser.error("--scenediff-sweep requires --enable arms,head,base (normally also torso)")
     if args.turn_90:
         if args.replay is not None:
             parser.error("--turn-90 is for live gestures, not replayed dense action labels")

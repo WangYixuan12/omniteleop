@@ -416,6 +416,9 @@ class WBCVRLeader:
         self._follower_status: Optional[WBCFollowerStatus] = None
         self._follower_status_t: Optional[float] = None
         self._status_lock = threading.Lock()
+        self._scenediff_request_id = ""
+        self._scenediff_ready = False
+        self._trigger_requires_release = False
 
         # Calibration reference head pose, from the whole-body IK model's *nominal*
         # posture (NOT the legacy INIT_JOINT constants). At nominal the planar base
@@ -472,7 +475,9 @@ class WBCVRLeader:
             ssl_certfile=args.cert, ssl_keyfile=args.key,
         )
         self._hud: Optional[WBCHeadsetHUD] = (
-            WBCHeadsetHUD(self.quest, args.hud_cameras) if args.headset_hud else None
+            WBCHeadsetHUD(self.quest, args.hud_cameras,
+                          sim_namespace=getattr(args, "sim_camera_namespace", None))
+            if args.headset_hud else None
         )
         self._hud_period = 1.0 / float(args.hud_rate) if args.hud_rate > 0.0 else float("inf")
         self._hud_rate = float(args.hud_rate)
@@ -557,13 +562,17 @@ class WBCVRLeader:
         val = float(transforms["right_hand_trigger"])
         now = time.perf_counter()
         if val > _TRIGGER_PRESS:
+            if getattr(self, "_trigger_requires_release", False):
+                return False
             if self._trigger_start is None:
                 self._trigger_start = now
             elif now - self._trigger_start >= self.hold_seconds:
                 self._trigger_start = None
+                self._trigger_requires_release = True
                 return True
         else:
             self._trigger_start = None
+            self._trigger_requires_release = False
         return False
 
     def _thumbstick_to_chassis(self, transforms) -> tuple[float, float, float]:
@@ -767,10 +776,11 @@ class WBCVRLeader:
             chassis_vx=float(chassis[0]),
             chassis_vy=float(chassis[1]),
             chassis_wz=float(chassis[2]),
-            estop=(self.stage == "static"),
+            estop=(self.stage not in ("align", "teleop")),
             exit_requested=bool(exit_requested),
             home_requested=bool(home_requested),
             calib_stage=self.stage,
+            scenediff_request_id=getattr(self, "_scenediff_request_id", ""),
             left_ee_pose=left_flat,
             right_ee_pose=right_flat,
             head_ee_pose=head_flat,
@@ -850,6 +860,9 @@ class WBCVRLeader:
                     self.last_right_target = None
                     self._trigger_start = None
                     self._last_alignment_status = None
+                    self._scenediff_request_id = ""
+                    self._scenediff_ready = False
+                    self._trigger_requires_release = True
                     self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
                     print("\n[wbc_vr_leader] episode ended -> static.")
                     continue
@@ -860,6 +873,8 @@ class WBCVRLeader:
                     prev=self._prev_left_trigger_home,
                 ):
                     self._prev_left_trigger_home = left_trigger_home_now
+                    self._scenediff_request_id = ""
+                    self._scenediff_ready = False
                     self._publish(
                         None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0),
                         home_requested=True,
@@ -881,8 +896,49 @@ class WBCVRLeader:
                 vr_l = transforms["left_wrist"]
                 vr_r = transforms["right_wrist"]
 
+                # Requests persist in every frame until acknowledged; no one-tick pulse.
+                if self.stage == "sweep":
+                    self._trigger_held(transforms)  # consume holds while busy
+                    status, age = self._follower_status_snapshot()
+                    if (status is not None and age is not None and age < 1.0
+                            and status.scenediff_request_id == self._scenediff_request_id
+                            and status.scenediff_state == "ready"):
+                        self._scenediff_ready = True
+                        self._trigger_start = None
+                        self._trigger_requires_release = True
+                        self.stage = "static"
+                        print("\n[wbc_vr_leader] sweep saved; RELEASE then hold RIGHT grip "
+                              "again to calibrate/align.")
+                    self._publish(None, None, None, 0., 0., (0., 0., 0.))
+                    if self._hud is not None:
+                        self._hud.update_state(stage="sweep", status=status,
+                                               status_age_s=age, alignment=None)
+                    time.sleep(dt)
+                    continue
+
                 if self.stage == "static":
                     if self._trigger_held(transforms):
+                        status, age = self._follower_status_snapshot()
+                        if status is None or age is None or age >= 1.0:
+                            print("\n[wbc_vr_leader] waiting for fresh follower status; "
+                                  "release and hold RIGHT grip again.")
+                            self._publish(None, None, None, 0., 0., (0., 0., 0.))
+                            time.sleep(dt)
+                            continue
+                        if status.scenediff_enabled and not self._scenediff_ready:
+                            self._scenediff_request_id = str(time.time_ns())
+                            self.stage = "sweep"
+                            self._publish(None, None, None, 0., 0., (0., 0., 0.))
+                            print("\n[wbc_vr_leader] first hold -> park arms and stereo sweep.")
+                            time.sleep(dt)
+                            continue
+                        if self._scenediff_ready and (
+                            status.scenediff_request_id != self._scenediff_request_id
+                            or status.scenediff_state != "ready"
+                        ):
+                            self._scenediff_ready = False
+                            print("\n[wbc_vr_leader] sweep acknowledgement lost; press again to scan.")
+                            continue
                         # Name the OFFENDING input(s). The grip-trigger hold that got us here
                         # is decoupled from the pose stream -- vr_client.html sets
                         # right_squeeze from the session squeezestart/squeezeend events, which

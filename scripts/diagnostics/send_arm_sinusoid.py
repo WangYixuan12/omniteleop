@@ -77,6 +77,17 @@ def main() -> None:
                    help="Half-cosine envelope length at each end (seconds).")
     p.add_argument("--hold-rate-hz", type=float, default=100.0,
                    help="Command-publish rate (matches dexmate-onboard watchdog).")
+    p.add_argument("--vel-ff", action="store_true",
+                   help="Also send the analytic sinusoid velocity as feedforward "
+                        "(``set_joint_pos_vel`` path: message carries pos + vel).")
+    p.add_argument("--lerp-rate-hz", type=float, default=0.0,
+                   help="sample the sinusoid at this rate and linearly interpolate it up "
+                        "to --hold-rate-hz, mirroring the follower's 1/cmd_rate lerp of "
+                        "the 10 Hz leader/policy stream (0 = smooth 100 Hz command).")
+    p.add_argument("--lpf-tau", type=float, default=0.0,
+                   help="first-order low-pass (s) on the streamed command, with --vel-ff "
+                        "taken from the filtered stream -- mirrors the follower's "
+                        "--arm-cmd-lpf-tau. 0 = off. Stats compare obs to the RAW command.")
     p.add_argument("--out", default="/home/yixuan/Dexmate/debug/arm_sinusoid/sinusoid.csv",
                    help="Output CSV path. Parent dir is created if missing.")
     args = p.parse_args()
@@ -111,12 +122,16 @@ def main() -> None:
         # each publish (mirrors probe_arm_latency_client.py).
         publisher = robot.right_arm._publisher  # noqa: SLF001
         cmd = init.copy()
+        filt = init.copy()
+        prev_sent = init.copy()
+        t_prev = None
         limiter = RateLimiter(args.hold_rate_hz)
         rows: list[dict] = []
 
         logger.info(
             f"Streaming sinusoid: j={j} (R_arm_j{j+1})  A={args.amplitude} rad  "
-            f"f={args.freq_hz} Hz  T={args.duration_s} s @ {args.hold_rate_hz:g} Hz"
+            f"f={args.freq_hz} Hz  T={args.duration_s} s @ {args.hold_rate_hz:g} Hz  "
+            f"vel_ff={args.vel_ff} lpf_tau={args.lpf_tau:g} lerp_rate={args.lerp_rate_hz:g}"
         )
         t_start = time.monotonic()
         while True:
@@ -124,12 +139,46 @@ def main() -> None:
             if t_rel >= args.duration_s:
                 break
 
+            def sin_at(tt: float) -> float:
+                return float(init[j] + _envelope(tt, args.duration_s, args.ramp_s)
+                             * args.amplitude * math.sin(omega * tt))
+
             env = _envelope(t_rel, args.duration_s, args.ramp_s)
-            cmd_j = float(init[j] + env * args.amplitude * math.sin(omega * t_rel))
+            if args.lerp_rate_hz > 0.0:
+                # Follower-style: hold the last 1/lerp_rate sample and glide toward the
+                # next one over that period (TargetInterpolator.push/at).
+                period = 1.0 / args.lerp_rate_hz
+                k = math.floor(t_rel / period)
+                alpha = (t_rel - k * period) / period
+                cmd_j = (1.0 - alpha) * sin_at(max(k - 1, 0) * period) + alpha * sin_at(k * period)
+            else:
+                cmd_j = sin_at(t_rel)
             cmd[j] = cmd_j
 
             t_send = time.time_ns()
-            publisher.publish({"pos": cmd.tolist(), "timestamp_ns": t_send})
+            if args.lpf_tau > 0.0:
+                dt_tick = 1.0 / args.hold_rate_hz if t_prev is None else max(t_rel - t_prev, 1e-4)
+                prev_filt = filt.copy()
+                filt += (cmd - filt) * (dt_tick / (args.lpf_tau + dt_tick))
+                msg = {"pos": filt.tolist(), "timestamp_ns": t_send}
+                if args.vel_ff:
+                    msg["vel"] = ((filt - prev_filt) / dt_tick).tolist()
+            else:
+                msg = {"pos": cmd.tolist(), "timestamp_ns": t_send}
+                if args.vel_ff:
+                    vel = np.zeros(7)
+                    if args.lerp_rate_hz > 0.0:
+                        # Follower-faithful: finite difference of the SENT stream, so the
+                        # feedforward is piecewise constant with a jump every lerp period.
+                        dt_tick = (1.0 / args.hold_rate_hz if t_prev is None
+                                   else max(t_rel - t_prev, 1e-4))
+                        vel = (cmd - prev_sent) / dt_tick
+                    else:
+                        vel[j] = env * args.amplitude * omega * math.cos(omega * t_rel)
+                    msg["vel"] = vel.tolist()
+            prev_sent = cmd.copy()
+            t_prev = t_rel
+            publisher.publish(msg)
 
             try:
                 obs_pos = robot.right_arm.get_joint_pos()
@@ -187,8 +236,11 @@ def main() -> None:
         obs_amp = (o_mid.max() - o_mid.min()) / 2.0
         atten_db = 20.0 * math.log10(obs_amp / cmd_amp) if cmd_amp > 0 else float("nan")
 
+        obs_acc = np.gradient(np.gradient(o_mid, dt_med), dt_med)
+        obs_acc_rms = float(np.sqrt(np.mean(obs_acc ** 2)))
         logger.info(
             "Tracking (steady-state window):\n"
+            f"  obs acc rms = {obs_acc_rms:7.2f} rad/s^2 (100 Hz, incl. encoder noise)\n"
             f"  rms error   = {rms * 1000:7.2f} mrad\n"
             f"  max error   = {max_err * 1000:7.2f} mrad\n"
             f"  cmd amp     = {cmd_amp * 1000:7.2f} mrad\n"

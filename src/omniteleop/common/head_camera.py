@@ -17,50 +17,56 @@ from __future__ import annotations
 
 import numpy as np
 
-# Crop applied to the raw SVGA frame as rows [top:bottom], cols [left:right], then a
-# resize to (height, width). SINGLE SOURCE OF TRUTH for the head-camera geometry,
-# consumed by every stage so they stay in lock-step:
-#   * tests/test_head_zedx_depth.py — --crop/--resize default to these (robot-side).
+# ZED capture resolution, then the crop applied to that raw frame as rows [top:bottom],
+# cols [left:right], then a resize to (height, width). SINGLE SOURCE OF TRUTH for the
+# head-camera geometry, consumed by every stage so they stay in lock-step:
+#   * tests/test_head_zedx_depth.py — --resolution/--crop/--resize default to these
+#     (robot-side).
 #   * leader/vr_reader.py, follower/policy_rollout.py — stamp ZED_K (derived below).
 #   * scripts/drive_box_record.py — records ZED_K alongside the head frames.
+#   * scripts/record_arm_scan.py — requires the head frames to be HEAD_RESIZE_HW.
 # Change them HERE and every consumer follows.
 #
-# Currently set to the FULL SVGA frame (no ROI crop and no resize): 960x600 (WxH).
-# To re-enable the manipulation-ROI crop, restore:
-#     HEAD_CROP_TBLR = (300, 600, 375, 775)   # 300x400 ROI
-#     HEAD_RESIZE_HW = (240, 320)
-# rerun the test_head_zedx_depth.py publisher after changing these constants.
-HEAD_CROP_TBLR: tuple[int, int, int, int] = (0, 600, 0, 960)  # (300, 600, 375, 775)
-HEAD_RESIZE_HW: tuple[int, int] = (600, 960)  # (240, 320)
-# (H, W); does not affect pose tracking on the raw SVGA (600, 960).
+# Currently: HD1200 capture (1920x1200, the sensor's full 16:10 field of view; SVGA is its
+# 2x2-binned 960x600) resized to 1200x750 (WxH) with no ROI crop -- 1.56x the pixels of the
+# SVGA profile at the SAME field of view. Chosen 2026-09-03 for the world model after a
+# six-eye probe: 72 Mbps, max recorder age 139 ms, zero rejects (raw HD1080 fails the 10 Hz
+# recorder contract). The earlier SVGA profile is
+#     HEAD_RESOLUTION = "SVGA"; HEAD_CROP_TBLR = (0, 600, 0, 960); HEAD_RESIZE_HW = (600, 960)
+# with HEAD_BASE_K fx 377.13342, cx 489.7027, cy 319.49548 (see git history); the
+# manipulation-ROI crop used before that was (300, 600, 375, 775) -> (240, 320).
+# Rerun the test_head_zedx_depth.py publisher after changing these constants.
+HEAD_RESOLUTION: str = "HD1200"
+HEAD_CROP_TBLR: tuple[int, int, int, int] = (0, 1200, 0, 1920)
+HEAD_RESIZE_HW: tuple[int, int] = (750, 1200)
+# (H, W); does not affect pose tracking, which runs on the raw capture.
 
-# Intrinsics of the raw SVGA head frame (960x600), pre-crop: the ZED SDK's RECTIFIED
-# left-cam calibration for this unit at SVGA, i.e. exactly what
+# Intrinsics of the raw HD1200 head frame (1920x1200), pre-crop: the ZED SDK's RECTIFIED
+# left-cam calibration for this unit at HD1200, i.e. exactly what
 # ``tests/test_head_zedx_depth.py`` reports as ``stereo.left_K`` before its crop/resize
 # (SDK ``camera_configuration.calibration_parameters.left_cam``; rectified, so fx == fy).
 # Taking the SDK value verbatim keeps ZED_K and the publisher's left_K algebraically
 # identical for ANY --crop/--resize, since both apply crop_resize_intrinsics() to this
-# same base -- which is what wbc_vr_robot_tmp's meta/head_stereo check compares.
+# same base -- which is what wbc_vr_robot's meta/head_stereo check compares.
 #
 # These are the repeatable RECTIFIED factory-derived values reported by the publisher with
-# ``init.camera_disable_self_calib = True``. The raw/unrectified values in
-# /usr/local/zed/settings/SN50571637.conf intentionally differ because VIEW.LEFT is
-# rectified by the SDK. With self-calibration enabled, three opens instead measured fx
-# 384.9714, 385.0734, and 385.2446 px; an earlier edit mistakenly promoted the middle
-# self-calibrated draw to the factory constant. Restarting the publisher with self-calib
-# disabled exposed the stable value below (fx 377.13342).
+# ``init.camera_disable_self_calib = True`` (self-calibration re-estimates fx at every open,
+# measured 0.145% spread on this unit, which breaks the 0.107% meta/head_stereo tolerance).
+# Read 2026-09-03 from sensors/head_camera/info at HD1200 -> 1200x750 (fx 471.34171,
+# cx 612.01920, cy 399.30573) and divided by the exact 0.625 resize; NOT 2x the SVGA
+# constant, which the SDK's HD1200 calibration differs from by ~0.1 px.
 #
-# CONSEQUENCE: obs/images/intrinsic changes by ~2% for NEW takes. port_wbc_mobile_zarr.py
-# requires ONE exact intrinsic across all source takes, so takes recorded before and after
-# this change cannot be ported together, and checkpoints trained on the old value expect it
-# at rollout. Stereo recordings now stamp the live publisher left_K directly; this constant
-# remains the compatibility fallback for legacy left+SDK-depth paths and other consumers.
-# These numbers are per-unit and resolution-specific (SVGA): re-read them from the
-# publisher's info service if the camera or --resolution changes.
+# CONSEQUENCE: obs/images/intrinsic differs from every SVGA-era take. port_wbc_mobile_zarr.py
+# requires ONE exact intrinsic across all source takes, so SVGA takes and HD1200 takes cannot
+# be ported together, and checkpoints trained on one expect it at rollout. Stereo recordings
+# stamp the live publisher left_K directly; this constant remains the compatibility fallback
+# for legacy left+SDK-depth paths and other consumers. These numbers are per-unit and
+# resolution-specific: re-read them from the publisher's info service if the camera or
+# HEAD_RESOLUTION changes.
 HEAD_BASE_K = np.array(
     [
-        [377.13342, 0.0, 489.7027],
-        [0.0, 377.13342, 319.49548],
+        [754.146728515625, 0.0, 979.230712890625],
+        [0.0, 754.146728515625, 638.88916015625],
         [0.0, 0.0, 1.0],
     ],
     dtype=np.float64,

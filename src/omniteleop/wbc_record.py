@@ -32,6 +32,7 @@ from omniteleop.wbc_policy_format import (
     JOYSTICK_FIXED_SPEED_MAPPING,
     JOYSTICK_POLICY_ACTION_SCHEMA,
     JOYSTICK_RAW_EPISODE_SCHEMA_V2,
+    JOYSTICK_SIM_EPISODE_SCHEMA,
     JOYSTICK_RAW_EPISODE_SCHEMAS,
 )
 
@@ -538,7 +539,7 @@ class ReplaySource:
                         f"{path}: incomplete/conflicting joystick replay contract: "
                         + "; ".join(bad)
                     )
-                if raw_schema == JOYSTICK_RAW_EPISODE_SCHEMA_V2:
+                if raw_schema in {JOYSTICK_RAW_EPISODE_SCHEMA_V2, JOYSTICK_SIM_EPISODE_SCHEMA}:
                     mapping = text("meta/chassis_intent_mapping")
                     if mapping != JOYSTICK_FIXED_SPEED_MAPPING:
                         raise ValueError(

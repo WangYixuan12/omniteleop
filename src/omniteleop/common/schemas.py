@@ -77,6 +77,7 @@ class VRJointData:
     estop: bool = True          # Default True (safe) until calibration completes
     exit_requested: bool = False
     home_requested: bool = False
+    scenediff_request_id: str = ""
     # Calibration stage published by the leader. wbc_vr_leader uses {static, teleop};
     # omni-vr/vr_reader uses {static, head, whole_body_alignment, whole_body, resetting}.
     calib_stage: str = "static"
@@ -111,3 +112,12 @@ class WBCFollowerStatus:
     safety_status: str = "ok"
     left_ee_error_mm: float = 0.0
     right_ee_error_mm: float = 0.0
+    scenediff_enabled: bool = False
+    scenediff_request_id: str = ""
+    scenediff_state: str = ""
+    scenediff_path: str = ""
+    # Index the follower's episode recorder will write next: the episode currently being
+    # recorded while ``recording``, otherwise the id the next take will claim (the
+    # recorder increments it on stop()). -1 when the follower runs without ``--record``,
+    # which is how the HUD knows to omit the line.
+    episode_id: int = -1

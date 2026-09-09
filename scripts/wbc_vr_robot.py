@@ -190,14 +190,21 @@ _RECORDER_SAVE_TIMEOUT_S = 120.0
 # A frame is recorded only once BOTH publisher timestamps advance, so the no-duplicate
 # guarantee is unchanged -- the grace converts a short delivery stall into one late frame
 # instead of a dead take. 0 restores the old abort-on-first-stale-tick behavior.
-DEFAULT_RECORD_STALE_GRACE = 0.20
+DEFAULT_RECORD_STALE_GRACE = 0.25
 # An episode boundary clears the alignment histories. Do not commit frame zero from a
 # single lucky cache snapshot: first observe multiple advancing frames from all three
 # physical cameras and at least one coherent head/wrist set. This is a startup-only
-# deadline; once armed, the stricter 200 ms mid-take stale/alignment grace is unchanged.
+# deadline; once armed, the stricter 250 ms mid-take stale/alignment grace is unchanged.
 DEFAULT_RECORD_STARTUP_TIMEOUT = 3.0
 _RECORD_STARTUP_MIN_HEAD_FRAMES = 4
 _RECORD_STARTUP_MIN_WRIST_FRAMES = 3
+# Frame-zero gate on the HEAD joints: every measured head joint must be within this of
+# the last head command AND have moved less than the "still" bound since the previous
+# tick. Episode 0 (2026-09-03) committed 13 rows (1.3 s) while the neck pitch was still
+# converging from a sagged -0.68 rad to the -0.25 nominal, so the head-camera pose of the
+# first rows was not the pose of the rest of the take.
+_RECORD_STARTUP_HEAD_TOL_RAD = 0.02
+_RECORD_STARTUP_HEAD_STILL_RAD = 0.002
 # Maximum absolute head-to-each-wrist capture skew in a saved row. The recorder maps
 # each publisher stamp into the local clock using meta/camera_ntp before comparing it,
 # so this contract remains meaningful when the three publishers run on different hosts.
@@ -239,7 +246,7 @@ _GRIPPER_STATUS_MAX_AGE_PERIODS = 2.5
 # Episode 8 measured sub-millisecond state assembly, so 0.1 period (10 ms at 10 Hz)
 # comfortably covers selection -> final timestamp without weakening the offline gate.
 _GRIPPER_STATUS_COMMIT_MARGIN_PERIODS = 0.1
-# Enough history for the 200 ms stale grace plus scheduling/transport jitter. Head
+# Enough history for the 250 ms stale grace plus scheduling/transport jitter. Head
 # history is essential when the low-latency head publisher runs at 30 Hz while the
 # wrists run at 15 Hz: always anchoring on the newest head frame can run ahead of the
 # later-arriving wrist frames and starve an otherwise feasible 10 Hz coherent set.
@@ -364,6 +371,17 @@ def _create_status_publisher(source):
     return node.create_publisher(_wbc_follower_status_topic(), encoder=DictDataCodec.encode)
 
 
+def _recorder_episode_id(driver) -> int:
+    """Episode index the driver's recorder will save next, or -1 without ``--record``.
+
+    Published in the follower status so the headset HUD can show the operator which
+    ``episode_<N>.hdf5`` the take they are about to (or currently) record lands in --
+    the recorder owns the id, and it only exists in THIS process.
+    """
+    recorder = getattr(driver, "_episode", None)
+    return -1 if recorder is None else int(getattr(recorder, "episode_id", -1))
+
+
 def _build_follower_status(
     vr,
     result,
@@ -371,6 +389,7 @@ def _build_follower_status(
     estop: bool,
     hold: bool,
     hold_reason: str,
+    episode_id: int = -1,
     timestamp_ns: Optional[int] = None,
 ) -> WBCFollowerStatus:
     """Build the lightweight status frame consumed by the WBC VR leader HUD."""
@@ -385,6 +404,7 @@ def _build_follower_status(
         safety_status=str(result.safety_status),
         left_ee_error_mm=float(result.left_ee_error) * 1000.0,
         right_ee_error_mm=float(result.right_ee_error) * 1000.0,
+        episode_id=int(episode_id),
     )
 
 def _build_abort_status(reason: str, timestamp_ns: Optional[int] = None) -> WBCFollowerStatus:
@@ -467,6 +487,18 @@ def _camera_clock_calibration_from_samples(
 # base velocity clamp, post-deadband) come from the vr_teleop: block above; only the
 # homing/joint-step/watchdog knobs live here.
 DEFAULT_MAX_JOINT_STEP = 0.05   # rad/IK-tick clamp on arm/torso/head joint commands
+# Seconds after an engage over which the leader targets are blended in from the solver's
+# anchor (nominal or the SceneDiff parked pose). Without it the first command is glided
+# over one 1/cmd_rate period, i.e. the arms cover the whole anchor-to-controller distance
+# at their velocity limit -- masked by firmware tracking lag before the arm velocity
+# feedforward, a lunge after it (joystick take 2026-09-06, second right-trigger hold).
+ENGAGE_GLIDE_S = 2.0
+# First-order low-pass time constant (s) on the ARM joint commands at the IK rate; the
+# velocity feedforward is taken from the filtered stream. Smooths the velocity steps the
+# 10 Hz lerp'd command stream has every 1/cmd_rate, which the feedforward otherwise
+# reproduces on the hardware. Applies identically to a 10 Hz leader and a 10 Hz policy,
+# so collection and rollout execute alike. 0 disables. ~40 ms adds ~40 ms of phase lag.
+DEFAULT_ARM_CMD_LPF_TAU = 0.04
 DEFAULT_SOURCE_TIMEOUT = 0.5    # s without a fresh command / odom sample -> hold
 # rad: measured-vs-nominal gate before the first engage. Sized to tolerate normal
 # position-control steady-state droop (gravity/friction on a loaded arm joint is a few
@@ -840,6 +872,8 @@ class HardwareDriver:
         # steering-hold-vs-recenter decision (base_quiet_dispatch). Reset on engage/hold.
         self._base_quiet_elapsed = 0.0
         self._prev_cmd: dict = {grp: None for grp in self._joint_names}
+        # Filtered arm command stream (None = re-seed on the next non-hold tick).
+        self._arm_filt: dict = {"left_arm": None, "right_arm": None}
         self._overstep_ticks = 0
         # Wall-clock bracket around the most recent hardware command dispatch. A
         # scalar frame timestamp cannot say whether an action preceded or followed
@@ -933,6 +967,9 @@ class HardwareDriver:
         self._camera_age_stale_since: Optional[float] = None
         self._record_camera_warmup_complete = True
         self._record_camera_warmup_since: Optional[float] = None
+        self._record_head_settled = True
+        self._record_head_prev_meas: Optional[np.ndarray] = None
+        self._record_head_since: Optional[float] = None
         # Publisher /info responses are queried for both stereo calibration and
         # reproducibility metadata. Cache one authoritative response per physical
         # camera so startup does not race two queries against a publisher restart.
@@ -1000,6 +1037,16 @@ class HardwareDriver:
                 self.robot = Robot(configs=configs)
             else:
                 self.robot = Robot()
+            # dexcontrol 0.5.0 idle-pauses (unsubscribes) any subscriber not read for 5 s
+            # and, on the next read, re-subscribes and BLOCKS up to 3 s per stream waiting
+            # for its first message. This follower reads the six camera streams only
+            # while recording, so every engage re-subscribed all six inside the 100 Hz
+            # loop and raced the 3 s --record-startup-timeout (2026-09-03: counts head 2 /
+            # left wrist 0 / right wrist 1, aborted before frame zero, publishers healthy
+            # at full rate). Keep every non-safety subscriber always-on -- the 0.4.6
+            # behaviour this follower was written against; battery/estop are skipped by
+            # dexcontrol itself.
+            self.robot.set_subscription_policy("always_on")
             # Component health: print the dexcontrol status table the same way the
             # official examples do (display_robot_info.py) -- report, don't gate.
             # The previous custom pass/fail check aborted startup on latched faults
@@ -1250,6 +1297,10 @@ class HardwareDriver:
                 f"record {live_source!r}"
             )
         self._refresh_camera_clock_offsets()
+        sweep = getattr(self, "_scenediff_session", None)
+        if sweep is not None:
+            self._record_static["meta"]["scenediff_sweep"] = sweep.episode_metadata()
+            self._episode.set_static(self._record_static)
         self._episode.start()
         self._grip_episode_start_wall_ns = time.time_ns()
         self._last_rec_head_ns = -1
@@ -1283,6 +1334,9 @@ class HardwareDriver:
         self._camera_age_stale_since = None
         self._record_camera_warmup_complete = False
         self._record_camera_warmup_since = None
+        self._record_head_settled = not bool(self.enable.get("head", False))
+        self._record_head_prev_meas = None
+        self._record_head_since = None
         self._next_record_t = 0.0
         self._stale_since = None
         self._frame_age_log.clear()
@@ -1545,9 +1599,22 @@ class HardwareDriver:
                   "left_arm": enable["arms"], "right_arm": enable["arms"]}
         self._dbg["cmd_joints"] = {g: np.asarray(c, dtype=float) for g, c in cmds.items()}
         if hold:
-            # Freeze joints (send nothing) and re-seed the clamp anchor on resume.
+            # Freeze joints (send nothing) and re-seed the clamp anchor on resume -- except
+            # the head, which keeps receiving its last command (nominal before any): with
+            # dexcontrol 0.5 the neck pitch SAGS once commands stop (episode 0: head_j1
+            # drifted -0.25 -> -0.68 rad over the pre-engage hold, then swung back through
+            # the first 0.4 s of the take). Re-sending the held position is zero motion.
             for grp in self._prev_cmd:
-                self._prev_cmd[grp] = None
+                if grp != "head":
+                    self._prev_cmd[grp] = None
+            if grp_on["head"]:
+                head_hold = self._prev_cmd["head"]
+                if head_hold is None:
+                    head_hold = np.asarray(self._nominal["head"], dtype=float)
+                    self._prev_cmd["head"] = head_hold
+                self._comp("head").set_joint_pos(
+                    self._to_hw("head", head_hold).tolist(), wait_time=0.0
+                )
             self._dbg["sent_joints"] = None
             self._dbg["clamp_max_over"] = float("nan")
         else:
@@ -1557,11 +1624,34 @@ class HardwareDriver:
                 if not grp_on[grp]:
                     continue
                 prev = self._prev_cmd[grp]
-                if prev is None:
+                first_tick = prev is None
+                if first_tick:
                     prev = np.asarray(self._comp(grp).get_joint_pos(), dtype=float)
                 clamped, requested = clamp_joint_step(prev, cmd, self.args.max_joint_step)
                 max_over = max(max_over, requested)
-                self._comp(grp).set_joint_pos(self._to_hw(grp, clamped).tolist(), wait_time=0.0)
+                if grp in ("left_arm", "right_arm") and not first_tick:
+                    # Velocity feedforward: send_arm_sinusoid.py measured the arm's
+                    # position-only tracking at ~290 ms lag / -3.8 dB (0.5 Hz, 0.2 rad);
+                    # with the finite-difference velocity of the sent trajectory it is
+                    # ~70 ms / 0 dB. First tick after (re)engage has no sent history.
+                    # The stream is low-passed first (DEFAULT_ARM_CMD_LPF_TAU) so the
+                    # feedforward is continuous across the 1/cmd_rate lerp segments.
+                    tau = float(getattr(self.args, "arm_cmd_lpf_tau", DEFAULT_ARM_CMD_LPF_TAU))
+                    prev_filt = self._arm_filt[grp]
+                    if prev_filt is None:
+                        prev_filt = prev
+                    filt = prev_filt + (clamped - prev_filt) * (dt / (tau + dt))
+                    vel = (filt - prev_filt) / dt
+                    self._arm_filt[grp] = filt
+                    self._comp(grp).set_joint_pos_vel(
+                        self._to_hw(grp, filt).tolist(), self._to_hw(grp, vel).tolist()
+                    )
+                else:
+                    if grp in self._arm_filt:
+                        self._arm_filt[grp] = None
+                    self._comp(grp).set_joint_pos(
+                        self._to_hw(grp, clamped).tolist(), wait_time=0.0
+                    )
                 self._prev_cmd[grp] = clamped
                 sent[grp] = clamped
             self._dbg["sent_joints"] = sent
@@ -2165,6 +2255,9 @@ class HardwareDriver:
             "gripper_action_semantics": np.asarray(b"latest_fc16_command_sent"),
             "gripper_command_max_rate_hz": np.float64(
                 _GRIPPER_COMMAND_MAX_RATE_HZ
+            ),
+            "arm_cmd_lpf_tau_s": np.float64(
+                getattr(self.args, "arm_cmd_lpf_tau", DEFAULT_ARM_CMD_LPF_TAU)
             ),
             "gripper_command_keepalive_s": np.float64(
                 _GRIPPER_COMMAND_KEEPALIVE_S
@@ -3563,6 +3656,52 @@ class HardwareDriver:
             f"{history if history else ' <none recorded yet>'}"
         )
 
+    def _record_head_startup_ready(self, now: float) -> bool:
+        """Arm frame zero only once the measured head sits still on its command.
+
+        Startup-only, after the camera gate. The head is commanded every tick (nominal
+        in head_mode "fixed", the tracker output otherwise), so "settled" means every
+        joint within _RECORD_STARTUP_HEAD_TOL_RAD of the last sent command and moving
+        less than _RECORD_STARTUP_HEAD_STILL_RAD per tick. Gets its own
+        --record-startup-timeout budget, counted from its first evaluation (right after
+        the camera gate passes).
+        """
+        if bool(getattr(self, "_record_head_settled", True)):
+            return True
+        if self._record_head_since is None:
+            self._record_head_since = now
+        target = self._prev_cmd.get("head")
+        if target is None:
+            return False  # no head command has been sent yet this engage
+        meas = np.asarray(self._comp("head").get_joint_pos(), dtype=float)
+        if meas.shape != np.shape(target) or not np.all(np.isfinite(meas)):
+            raise RuntimeError(
+                f"[wbc_vr_robot] --record: head joint readback {meas!r} is not a finite "
+                f"{np.shape(target)} vector -- cannot arm frame zero."
+            )
+        prev = self._record_head_prev_meas
+        self._record_head_prev_meas = meas
+        err = float(np.max(np.abs(meas - np.asarray(target, dtype=float))))
+        step = float("inf") if prev is None else float(np.max(np.abs(meas - prev)))
+        if err <= _RECORD_STARTUP_HEAD_TOL_RAD and step <= _RECORD_STARTUP_HEAD_STILL_RAD:
+            print(
+                f"\n[wbc_vr_robot] --record: head settled on its command "
+                f"(|err| {err * 1e3:.1f} mrad, step {step * 1e3:.2f} mrad); arming frame zero."
+            )
+            self._record_head_settled = True
+            self._next_record_t = now
+            return True
+        if now - self._record_head_since > self._record_startup_timeout_s:
+            raise RuntimeError(
+                "[wbc_vr_robot] --record: head never settled on its command within "
+                f"--record-startup-timeout {self._record_startup_timeout_s:g}s: measured "
+                f"{np.round(meas, 3).tolist()} vs commanded "
+                f"{np.round(np.asarray(target, dtype=float), 3).tolist()} (|err| "
+                f"{err * 1e3:.0f} mrad > {_RECORD_STARTUP_HEAD_TOL_RAD * 1e3:.0f}, step "
+                f"{step * 1e3:.1f} mrad). No frame was committed."
+            )
+        return False
+
     def _recording_extra_action(self) -> dict:
         """Subclass-specific raw action fields merged into each recorded frame."""
         return {}
@@ -3608,6 +3747,8 @@ class HardwareDriver:
         # from stale subscriber caches; normal 10 Hz throttling and the stricter
         # mid-episode retry/abort contracts begin immediately after it passes.
         if not self._record_camera_startup_ready(now):
+            return
+        if not self._record_head_startup_ready(now):
             return
         # Throttle to --record-rate, locked to ideal timestamps (re-anchor if we fall
         # >1 period behind) so the saved HDF5 has a consistent FPS, like vr_reader.
@@ -4275,8 +4416,11 @@ def run_loop(
     last_cmd_ns = -1
     last_cmd_receive_wall_ns = -1
     last_home_request_ns = -1
+    engage_glide_until = -float("inf")
     last_cmd_wall: Optional[float] = None
     prev_estop = True
+    sweep_enabled = bool(getattr(args, "scenediff_sweep", False)) and not replay
+    sweep = None
     source.start()
     status_pub = None if replay else _create_status_publisher(source)
     status_period = 1.0 / DEFAULT_STATUS_PUBLISH_RATE
@@ -4287,25 +4431,39 @@ def run_loop(
           f"({'replay ' + format(args.speed, 'g') + 'x' if replay else 'live'}); "
           f"enable={[k for k, v in enable.items() if v]} grippers=on")
 
-    def resync_to_nominal(reason: str) -> None:
-        """Re-anchor the solver and the target streams on the nominal posture.
+    def resync_controller(reason: str, joint_seed: Optional[dict] = None) -> None:
+        """Re-anchor the solver and target streams on nominal or measured joints.
 
-        The engage transition and a home request both leave the HARDWARE at nominal, so
-        the model, the interpolator/filters and the odometry origin have to be put back
-        there in lock-step. Without this after a home request the solver kept tracking the
-        pre-home targets from its stale configuration, so the leader HUD kept bannering
-        that posture's self-collision warning while the robot stood at nominal.
+        Home leaves hardware at nominal. SceneDiff alignment instead starts directly
+        from its measured parked pose, avoiding a redundant return move and a command
+        jump. In both cases the model, filters and odometry origin move in lock-step.
         """
         nonlocal left_cmd, right_cmd, head_cmd, last_cmd_ns, last_cmd_receive_wall_ns
-        ik.reset()
-        interp.reset(left0, right0, head0)
-        head_lpf.reset(head0)
-        head_planar_deadband.reset(head0)
-        left_cmd, right_cmd, head_cmd = left0.copy(), right0.copy(), head0.copy()
+        if joint_seed is None:
+            ik.reset()
+        else:
+            q = ik.nominal_q()
+            for grp, names in driver._joint_names.items():
+                values = np.asarray(joint_seed[grp], dtype=float)
+                if values.shape != (len(names),) or not np.all(np.isfinite(values)):
+                    raise RuntimeError(f"invalid measured {grp} alignment seed")
+                for name, value in zip(names, values, strict=True):
+                    q[ik._idx_q[name]] = float(value)
+            ik.reset(q)
+        left_anchor = _to_mat(ik.frame_pose(LEFT_EE_FRAME))
+        right_anchor = _to_mat(ik.frame_pose(RIGHT_EE_FRAME))
+        head_anchor = _to_mat(ik.frame_pose(HEAD_FRAME))
+        interp.reset(left_anchor, right_anchor, head_anchor)
+        head_lpf.reset(head_anchor)
+        head_planar_deadband.reset(head_anchor)
+        left_cmd, right_cmd, head_cmd = (
+            left_anchor.copy(), right_anchor.copy(), head_anchor.copy()
+        )
         last_cmd_ns = -1
         last_cmd_receive_wall_ns = -1
-        driver.engage_reset(ik, left0, right0, head0)
-        print(f"\n[wbc_vr_robot] {reason}: reset IK to nominal.")
+        driver.engage_reset(ik, left_anchor, right_anchor, head_anchor)
+        anchor = "measured parked pose" if joint_seed is not None else "nominal"
+        print(f"\n[wbc_vr_robot] {reason}: reset IK to {anchor}.")
 
     while True:
         now = clock()
@@ -4329,8 +4487,60 @@ def run_loop(
             # Left X is an immediate stop request, not a training frame: stop motion
             # before recorder shutdown, and do not append the exit/stop state.
             driver.stop_all_motion()
+            if sweep is not None:
+                sweep.close()
             print("\n[wbc_vr_robot] leader requested exit; motion stopped.")
             break
+
+        if sweep_enabled:
+            from omniteleop.wbc_scenediff_collection import CollectionSweep
+
+            request_id = str(getattr(vr, "scenediff_request_id", ""))
+            stage = str(getattr(vr, "calib_stage", "static"))
+            fresh = (vr is not None and
+                     0 <= (time.time_ns() - vr_receive_wall_ns) / 1e9 < args.source_timeout)
+            # X/home clear the token; stale streams and Y cannot leave motion latched.
+            if sweep is not None and (not fresh or request_id != sweep.request_id):
+                sweep.close()
+                sweep = None
+                driver._scenediff_session = None
+                if not fresh:
+                    raise RuntimeError("controller stream lost during SceneDiff collection")
+            if fresh and stage == "sweep" and sweep is None:
+                if not request_id or not vr.estop:
+                    raise RuntimeError("sweep request needs a token and teleop e-stop")
+                driver.stop_recording_episode()
+                driver._refresh_camera_clock_offsets()
+                sweep = CollectionSweep(driver, request_id)
+                driver._scenediff_session = sweep
+            if sweep is not None and stage in ("align", "teleop"):
+                if sweep.state == "ready":
+                    sweep.begin_alignment()
+                elif sweep.state != "aligned":
+                    raise RuntimeError("leader requested alignment before sweep completion")
+            if sweep is not None and sweep.state != "aligned":
+                try:
+                    sweep.tick()
+                except BaseException:
+                    sweep.close()
+                    raise
+                if status_pub is not None and now - last_status_publish >= status_period:
+                    status = WBCFollowerStatus(
+                        timestamp_ns=time.time_ns(), stage="sweep", estop=True,
+                        hold=True, hold_reason=sweep.detail, scenediff_enabled=True,
+                        scenediff_request_id=sweep.request_id, scenediff_state=sweep.state,
+                        scenediff_path=str(sweep.path) if sweep.sha256 else "",
+                        episode_id=_recorder_episode_id(driver),
+                    )
+                    status_pub.publish(asdict(status))
+                    last_status_publish = now
+                prev_estop = True
+                time.sleep(dt)
+                continue
+            if (stage in ("align", "teleop") and
+                    (not fresh or sweep is None or sweep.state != "aligned")):
+                driver.stop_all_motion()
+                raise RuntimeError("collection requires first-trigger sweep before alignment")
 
         estop = bool(vr.estop) if vr is not None else True
         recorder = getattr(driver, "_episode", None)
@@ -4356,9 +4566,13 @@ def run_loop(
                 # Homing moves the HARDWARE only. Re-anchor the solver on nominal too, or
                 # it keeps solving the pre-home targets and the gate keeps reporting that
                 # posture's self-collision distance until the next engage.
-                resync_to_nominal("home")
+                resync_controller("home")
         if prev_estop and not estop:
-            resync_to_nominal("engage")
+            joint_seed = (
+                getattr(sweep, "alignment_joints", None) if sweep is not None else None
+            )
+            resync_controller("engage", joint_seed)
+            engage_glide_until = now + ENGAGE_GLIDE_S
         prev_estop = estop
 
         left_cmd, right_cmd = vr_to_ee_targets(vr, left_cmd, right_cmd)
@@ -4375,6 +4589,13 @@ def run_loop(
                         f"limit ({DEFAULT_REPLAY_GAP_LIMIT_MULTIPLE:g}x nominal "
                         f"{base_dur:.6g}s); inspect or re-record before replaying."
                     )
+            if not replay and now < engage_glide_until:
+                # Engage glide: restart each segment from the CURRENT blended pose (push
+                # normally starts from the previous raw command) and aim it at the end of
+                # the glide window, so successive leader commands refine the destination
+                # without cutting the approach short.
+                interp.reset(*interp.at(now))
+                duration = max(duration, engage_glide_until - now)
             interp.push(left_cmd, right_cmd, head_cmd, now=now, duration=duration)
             last_cmd_ns = vr.timestamp_ns
             last_cmd_receive_wall_ns = int(vr_receive_wall_ns)
@@ -4392,6 +4613,8 @@ def run_loop(
             head_target = head_planar_deadband.filter(head_target)
         if cfg.head_mode == "ik":
             result = ik.solve(left_target, right_target, dt, head_target=head_target)
+        elif cfg.head_mode == "fixed":
+            result = ik.solve(left_target, right_target, dt)  # head pinned at nominal
         else:
             head_joints = ik.solve_head(head_target, dt)
             result = ik.solve(left_target, right_target, dt, head_joints=head_joints)
@@ -4421,7 +4644,13 @@ def run_loop(
                 estop=estop,
                 hold=hold,
                 hold_reason=hold_reason or "",
+                episode_id=_recorder_episode_id(driver),
             )
+            status.scenediff_enabled = sweep_enabled
+            if sweep is not None:
+                status.scenediff_request_id = sweep.request_id
+                status.scenediff_state = sweep.state
+                status.scenediff_path = str(sweep.path) if sweep.sha256 else ""
             status_pub.publish(asdict(status))
             last_status_publish = now
 
@@ -4750,6 +4979,10 @@ def main() -> None:
                     help=f"per-tick joint command clamp (rad), arms/torso/head (default "
                          f"{DEFAULT_MAX_JOINT_STEP:g}; 0 disables). Repeatedly exceeding 2x "
                          "this aborts the run.")
+    hw.add_argument("--arm-cmd-lpf-tau", type=float, default=DEFAULT_ARM_CMD_LPF_TAU,
+                    help="first-order low-pass time constant (s) on the arm joint commands "
+                         "feeding the velocity feedforward (default "
+                         f"{DEFAULT_ARM_CMD_LPF_TAU:g}; 0 disables).")
     hw.add_argument("--source-timeout", type=float, default=DEFAULT_SOURCE_TIMEOUT,
                     help=f"hold (zero base, freeze joints) if no fresh command/odom for this "
                          f"many seconds (default {DEFAULT_SOURCE_TIMEOUT:g}).")
@@ -4782,6 +5015,7 @@ def main() -> None:
     bind_vr_teleop_args(args, _VR_TELEOP)
 
     for flag, val in (("--home-tol", args.home_tol), ("--max-joint-step", args.max_joint_step),
+                      ("--arm-cmd-lpf-tau", args.arm_cmd_lpf_tau),
                       ("--home-settle", args.home_settle),
                       ("--record-stale-grace", args.record_stale_grace),
                       ("--record-max-camera-skew-ms", args.record_max_camera_skew_ms)):

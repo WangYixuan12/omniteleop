@@ -19,27 +19,41 @@ import numpy as np
 from omniteleop.common.schemas import WBC_FOLLOWER_STAGE_ABORTED, WBCFollowerStatus
 
 CameraStream = str
-_DEFAULT_HUD_CAMERAS: list[CameraStream] = ["head_left_rgb", "left_wrist_rgb"]
+# Operator-facing tile order: left wrist | head | right wrist, so the HUD reads like
+# the robot's own point of view (each hand on its own side of the head view).
+_DEFAULT_HUD_CAMERAS: list[CameraStream] = [
+    "left_wrist_rgb",
+    "head_left_rgb",
+    "right_wrist_rgb",
+]
 _HEAD_STREAM_TO_OBS_KEY: dict[CameraStream, str] = {
     "head_left_rgb": "left_rgb",
     "head_right_rgb": "right_rgb",
     "head_depth": "depth",
 }
-_WRIST_STREAM_TO_OBS_KEY: dict[CameraStream, str] = {
-    "left_wrist_rgb": "left_rgb",
-    "right_wrist_rgb": "right_rgb",
+# Each wrist is its OWN ZED-M with its own publisher, and "left"/"right" name the ARM
+# it is mounted on -- matching wbc_vr_robot._WRIST_SENSOR_IDS. (These two stream names
+# used to mean the two stereo EYES of a single shared wrist camera.)
+_WRIST_STREAM_TO_SENSOR_ID: dict[CameraStream, str] = {
+    "left_wrist_rgb": "left_wrist_zedm",
+    "right_wrist_rgb": "right_wrist_zedm",
 }
-_WRIST_SENSOR_ID = "wrist_zedm"
+# Every wrist publisher sends only its stereo left eye (tests/test_wrist_zedm_depth.py
+# defaults to --skip-right-rgb), so this is the obs key for BOTH wrist sensors.
+_WRIST_OBS_KEY = "left_rgb"
 
 _WHITE = (255, 255, 255)
 _RED = (0, 0, 255)
 _YELLOW = (0, 255, 255)
 _GREEN = (0, 255, 0)
 
-# Camera-tile geometry for the composed HUD frame. The published RGB/depth streams are
-# 4:3 (head SVGA 960x600 -> 640x480; wrist HD720 -> 640x480), so each tile is rendered
-# at 4:3 (_TILE_W:_TILE_H) to MATCH the source and not stretch it -- a 16:9 tile squashed
-# the 4:3 frame horizontally. At _HUD_SCALE=2 the tile equals the published 640x480 (1:1,
+# Camera-tile geometry for the composed HUD frame. Tiles are concatenated horizontally
+# in ``self.cameras`` order, so the default three-camera layout gives a 3:1-wide frame
+# (left wrist | head | right wrist); ``camPanelH`` in web/vr_client.html sizes the panel
+# in the headset and its width auto-follows this aspect. The published RGB/depth streams
+# are 4:3 (head SVGA 960x600 -> 640x480; wrist HD720 -> 640x480), so each tile is
+# rendered at 4:3 (_TILE_W:_TILE_H) to MATCH the source and not stretch it -- a 16:9 tile
+# squashed the 4:3 frame horizontally. At _HUD_SCALE=2 the tile equals the published 640x480 (1:1,
 # no resample); _HUD_SCALE=1 downsamples to 320x240, cutting pixel count (and JPEG
 # encode/transfer cost) to a quarter -- traded for latency, per the README note.
 # Raising _HUD_SCALE upsamples + scales the text overlay together. The APPARENT size of
@@ -49,6 +63,19 @@ _GREEN = (0, 255, 0)
 _HUD_SCALE = 1.25
 _TILE_W = round(320 * _HUD_SCALE)
 _TILE_H = round(240 * _HUD_SCALE)
+
+# Status/alignment text is drawn on the MIDDLE tile (the head view in the default
+# left-wrist | head | right-wrist layout) rather than across the whole montage from the
+# left edge, so it annotates the view the operator is actually looking at instead of
+# covering the left wrist camera. Confining it to one tile shrinks the text budget from
+# the full montage width to a single _TILE_W, so the font is reduced to match: at the
+# previous 0.4 * _HUD_SCALE a long alignment line measures 427px and would overflow a
+# 400px tile into the right wrist view; 0.32 brings that to 342px. Lines are additionally
+# truncated to _OVERLAY_MAX_W by _fit_text, which is what actually guarantees containment
+# for unbounded strings (e.g. a follower ABORTED reason).
+_OVERLAY_FONT_SCALE = 0.32 * _HUD_SCALE
+_OVERLAY_PAD = round(8 * _HUD_SCALE)
+_OVERLAY_MAX_W = _TILE_W - 2 * _OVERLAY_PAD
 
 
 @dataclass(frozen=True)
@@ -135,6 +162,16 @@ def follower_status_overlay_lines(
         return ["Follower: no status"]
 
     lines = []
+    # Which episode_<N>.hdf5 the current/next take saves as. Comes from the FOLLOWER's
+    # recorder (the leader has no recorder of its own), and is -1 when the follower runs
+    # without --record -- then there is no file to name, so the line is dropped.
+    if status.episode_id >= 0:
+        lines.append(f"Episode: {status.episode_id}")
+    if status.scenediff_enabled:
+        if status.scenediff_state == "ready":
+            lines.append("Scan saved. Release + hold RIGHT grip.")
+        elif not status.scenediff_state:
+            lines.append("Hold RIGHT grip: park arms + scan.")
     if status.stage == WBC_FOLLOWER_STAGE_ABORTED:
         # Terminal frame: the follower process died. hold_reason carries the exception's
         # first line; this status never refreshes, so the line (and abort_banner) persist.
@@ -300,17 +337,17 @@ def alignment_overlay_lines(alignment: Optional[HandAlignmentStatus]) -> list[HU
 class WBCHeadsetHUD:
     """Poll robot camera streams and push a composed HUD frame to the Quest browser."""
 
-    def __init__(self, quest, cameras: list[CameraStream]) -> None:
+    def __init__(self, quest, cameras: list[CameraStream], *, sim_namespace=None) -> None:
         self.quest = quest
         self.cameras = list(dict.fromkeys(cameras or _DEFAULT_HUD_CAMERAS))
         self._head_keys = [
             _HEAD_STREAM_TO_OBS_KEY[c] for c in self.cameras if c in _HEAD_STREAM_TO_OBS_KEY
         ]
-        self._wrist_keys = [
-            _WRIST_STREAM_TO_OBS_KEY[c] for c in self.cameras if c in _WRIST_STREAM_TO_OBS_KEY
-        ]
+        # Wrist streams are tracked by STREAM NAME (one sensor each), not by obs key --
+        # both wrist sensors publish under the same obs key (_WRIST_OBS_KEY).
+        self._wrist_streams = [c for c in self.cameras if c in _WRIST_STREAM_TO_SENSOR_ID]
         self._last_head_imgs: dict[str, np.ndarray] = {}
-        self._last_wrist_imgs: dict[str, np.ndarray] = {}
+        self._last_wrist_imgs: dict[CameraStream, np.ndarray] = {}
         self._last_camera_warn_t = 0.0
         self._cam_robot = None
 
@@ -323,6 +360,28 @@ class WBCHeadsetHUD:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._period = float("inf")
+
+        self._sim_node = None
+        self._sim_subscribers = []
+        if sim_namespace is not None:
+            from dexcomm import Node
+            from dexcomm.codecs import RGBImageCodec
+
+            self._sim_node = Node(name="behavior_headset_cameras", namespace=sim_namespace)
+            for stream in self.cameras:
+                if stream == "head_left_rgb":
+                    sensor, cache, key = "head_camera", self._last_head_imgs, "left_rgb"
+                elif stream in _WRIST_STREAM_TO_SENSOR_ID:
+                    sensor, cache, key = _WRIST_STREAM_TO_SENSOR_ID[stream], self._last_wrist_imgs, stream
+                else:
+                    raise ValueError(f"BEHAVIOR HUD does not publish {stream}")
+
+                def receive(data, cache=cache, key=key):
+                    cache[key] = np.asarray(data["data"])
+
+                self._sim_subscribers.append(self._sim_node.create_subscriber(
+                    f"sensors/{sensor}/left_rgb", receive, decoder=RGBImageCodec.decode))
+            return
 
         try:
             from dexbot_utils.configs.components.sensors.cameras import (  # noqa: PLC0415
@@ -342,22 +401,38 @@ class WBCHeadsetHUD:
                     )
                     self._head_keys = []
 
-            if self._wrist_keys and _WRIST_SENSOR_ID not in configs.sensors:
-                configs.sensors[_WRIST_SENSOR_ID] = ZedXCameraConfig(
-                    name=_WRIST_SENSOR_ID,
-                    enable_rgb=True,
-                    enable_depth=False,
-                )
-            if _WRIST_SENSOR_ID in configs.sensors:
-                configs.sensors[_WRIST_SENSOR_ID].enabled = bool(self._wrist_keys)
+            # Enable exactly the wrist sensors this HUD asked for; each needs its own
+            # ZED-SDK publisher running on sensors/<sensor_id>/*.
+            wanted_wrist_ids = {
+                _WRIST_STREAM_TO_SENSOR_ID[c] for c in self._wrist_streams
+            }
+            for sensor_id in _WRIST_STREAM_TO_SENSOR_ID.values():
+                if sensor_id in wanted_wrist_ids and sensor_id not in configs.sensors:
+                    configs.sensors[sensor_id] = ZedXCameraConfig(
+                        name=sensor_id,
+                        enable_rgb=True,
+                        enable_depth=False,
+                    )
+                if sensor_id in configs.sensors:
+                    configs.sensors[sensor_id].enabled = sensor_id in wanted_wrist_ids
 
-            if self._head_keys or self._wrist_keys:
+            if self._head_keys or self._wrist_streams:
                 self._cam_robot = _Robot(configs=configs)
                 print(f"[wbc_vr_leader] headset HUD cameras={self.cameras}")
         except Exception as exc:  # pragma: no cover - hardware/config dependent
-            print(f"[wbc_vr_leader] WARNING: headset HUD cameras unavailable: {exc}")
+            # A failed Robot is disposed by its own __del__, which calls
+            # Robot.shutdown() -> dexcomm.cleanup_session() and closes the
+            # PROCESS-WIDE Zenoh session. Callers must therefore create their
+            # publishers AFTER constructing the HUD, or they silently end up holding a
+            # closed publisher (wbc_vr_leader does exactly this -- see its __init__).
+            print(
+                f"[wbc_vr_leader] WARNING: headset HUD cameras unavailable: {exc}\n"
+                "[wbc_vr_leader] WARNING: teleop continues WITHOUT the headset HUD. "
+                "Note this also tore down the shared Zenoh session; publishers created "
+                "before now are dead."
+            )
             self._head_keys = []
-            self._wrist_keys = []
+            self._wrist_streams = []
             self._cam_robot = None
 
     def _warn_camera_poll(self, exc: Exception) -> None:
@@ -436,18 +511,23 @@ class WBCHeadsetHUD:
                     frame = obs.get(key)
                     if frame is not None:
                         self._last_head_imgs[key] = np.asarray(frame)
-            if self._wrist_keys and hasattr(self._cam_robot.sensors, _WRIST_SENSOR_ID):
-                wrist = getattr(self._cam_robot.sensors, _WRIST_SENSOR_ID)
-                obs = wrist.get_obs(obs_keys=self._wrist_keys)
-                for key in self._wrist_keys:
-                    frame = obs.get(key)
-                    if frame is None:
-                        for obs_key, obs_val in obs.items():
-                            if str(obs_key).endswith(key):
-                                frame = obs_val
-                                break
-                    if frame is not None:
-                        self._last_wrist_imgs[key] = np.asarray(frame)
+            # One get_obs per wrist camera; a missing sensor is skipped so a single
+            # down publisher never blocks the other wrist or the head tile.
+            for stream in self._wrist_streams:
+                sensor_id = _WRIST_STREAM_TO_SENSOR_ID[stream]
+                if not hasattr(self._cam_robot.sensors, sensor_id):
+                    continue
+                obs = getattr(self._cam_robot.sensors, sensor_id).get_obs(
+                    obs_keys=[_WRIST_OBS_KEY]
+                )
+                frame = obs.get(_WRIST_OBS_KEY)
+                if frame is None:  # tolerate a sensor-name-prefixed key
+                    for obs_key, obs_val in obs.items():
+                        if str(obs_key).endswith(_WRIST_OBS_KEY):
+                            frame = obs_val
+                            break
+                if frame is not None:
+                    self._last_wrist_imgs[stream] = np.asarray(frame)
         except Exception as exc:  # pragma: no cover - hardware dependent
             self._warn_camera_poll(exc)
 
@@ -456,8 +536,8 @@ class WBCHeadsetHUD:
             key = _HEAD_STREAM_TO_OBS_KEY[stream]
             img = self._last_head_imgs.get(key)
         else:
-            key = _WRIST_STREAM_TO_OBS_KEY[stream]
-            img = self._last_wrist_imgs.get(key)
+            key = _WRIST_OBS_KEY
+            img = self._last_wrist_imgs.get(stream)
         if img is None:
             return None
 
@@ -479,18 +559,68 @@ class WBCHeadsetHUD:
         return cv2.resize(img[:, :, ::-1], (_TILE_W, _TILE_H))
 
     @staticmethod
-    def _draw_line(img: np.ndarray, text: str, y: int, color: tuple[int, int, int]) -> None:
-        # Char capacity is aspect-invariant: the font scales with the tile width, so a
-        # line that fit at _HUD_SCALE=1 still fits after scaling. Keep the 108 cap.
-        if len(text) > 108:
-            text = text[:105] + "..."
+    def _placeholder_tile(stream: CameraStream) -> np.ndarray:
+        """Labeled dark tile for a configured stream with no frame yet.
+
+        Keeps tile POSITIONS fixed: with the default left-wrist | head | right-wrist
+        layout, dropping an unfilled tile would slide the head view sideways and leave
+        the operator unsure which wrist they are looking at.
+        """
+        tile = np.zeros((_TILE_H, _TILE_W, 3), np.uint8)
+        text = f"{stream}: no frame"
+        scale = 0.45 * _HUD_SCALE
+        thickness = max(1, round(_HUD_SCALE))
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        cv2.putText(
+            tile,
+            text,
+            (max((_TILE_W - tw) // 2, 2), (_TILE_H + th) // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            _YELLOW,
+            thickness,
+        )
+        return tile
+
+    @staticmethod
+    def _fit_text(text: str, thickness: int) -> str:
+        """Truncate ``text`` with an ellipsis until it measures within one tile.
+
+        Replaces the previous fixed 108-character cap, which was tuned for text spanning
+        the FULL montage width. Now that the overlay lives on a single tile the budget is
+        both narrower and font-dependent, so measure instead of guessing -- a character
+        count cannot bound proportional-font strings such as a follower abort reason.
+        """
+        def width(s: str) -> int:
+            return cv2.getTextSize(
+                s, cv2.FONT_HERSHEY_SIMPLEX, _OVERLAY_FONT_SCALE, thickness
+            )[0][0]
+
+        if width(text) <= _OVERLAY_MAX_W:
+            return text
+        # Binary-search the longest prefix that still fits once the ellipsis is added.
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if width(text[:mid] + "...") <= _OVERLAY_MAX_W:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo] + "..."
+
+    @staticmethod
+    def _draw_line(
+        img: np.ndarray, text: str, y: int, color: tuple[int, int, int], x0: int = 0
+    ) -> None:
+        """Draw one overlay line, left-aligned at ``x0`` (the middle tile's origin)."""
+        thickness = max(1, round(_HUD_SCALE))
         cv2.putText(
             img,
-            text,
-            (round(8 * _HUD_SCALE), y),
+            WBCHeadsetHUD._fit_text(text, thickness),
+            (x0 + _OVERLAY_PAD, y),
             fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-            fontScale=0.4 * _HUD_SCALE,
-            thickness=max(1, round(_HUD_SCALE)),
+            fontScale=_OVERLAY_FONT_SCALE,
+            thickness=thickness,
             color=color,
         )
 
@@ -527,22 +657,29 @@ class WBCHeadsetHUD:
             if stream == "head_depth":
                 continue
             tile = self._render_tile(stream)
-            if tile is not None:
-                tiles.append(tile)
+            tiles.append(tile if tile is not None else self._placeholder_tile(stream))
         vis_img = (
             np.concatenate(tiles, axis=1)
             if tiles
             else np.zeros((_TILE_H, _TILE_W, 3), np.uint8)
         )
 
+        # Anchor the overlay on the MIDDLE tile -- the head view in the default
+        # left-wrist | head | right-wrist layout -- so the status annotates what the
+        # operator is looking at instead of covering the left wrist camera. Derived from
+        # the rendered tile count (head_depth is skipped above), so it still lands on the
+        # centre tile for any --hud-cameras selection, and on the only tile when there is
+        # one. Guarded for the empty-tiles placeholder frame.
+        x0 = (len(tiles) // 2) * _TILE_W if tiles else 0
+
         y = round(22 * _HUD_SCALE)
-        self._draw_line(vis_img, f"Stage: {stage}", y, _YELLOW)
+        self._draw_line(vis_img, f"Stage: {stage}", y, _YELLOW, x0)
         y += round(22 * _HUD_SCALE)
         for line in follower_status_overlay_lines(status, status_age_s):
-            self._draw_line(vis_img, line, y, follower_status_overlay_color(line))
+            self._draw_line(vis_img, line, y, follower_status_overlay_color(line), x0)
             y += round(18 * _HUD_SCALE)
         for line in alignment_overlay_lines(alignment):
-            self._draw_line(vis_img, line.text, y, line.color)
+            self._draw_line(vis_img, line.text, y, line.color, x0)
             y += round(18 * _HUD_SCALE)
 
         # Prominent alert, drawn last so it sits on top. Uses the follower status

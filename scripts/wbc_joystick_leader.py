@@ -235,6 +235,8 @@ def main() -> None:
                         help="right-grip hold time to calibrate/start (default 1.0).")
     parser.add_argument("--headset-hud", action=argparse.BooleanOptionalAction, default=True,
                         help="show the robot camera/status HUD in the Quest (default: enabled).")
+    parser.add_argument("--sim-cameras", action="store_true",
+                        help="read BEHAVIOR camera topics in --namespace for the headset HUD")
     parser.add_argument("--hud-rate", type=float, default=DEFAULT_HEADSET_HUD_RATE,
                         help="headset HUD refresh rate in Hz "
                              f"(default {DEFAULT_HEADSET_HUD_RATE:g}).")
@@ -261,6 +263,7 @@ def main() -> None:
                              "twist at ~2 Hz. Bring-up aid for a base that will not drive; "
                              "off by default.")
     args = parser.parse_args()
+    args.sim_camera_namespace = args.namespace if args.sim_cameras else None
 
     # Publish rate = follower cmd_rate from wbik.yaml (leader/follower cannot drift).
     cfg = WBCConfig.from_yaml(args.config)
