@@ -10,7 +10,12 @@
 # same limits, and base/arm_center/zed_depth_frame/L_ee/R_ee are placed identically,
 # so the IK targets (L_ee/R_ee) are unchanged; L/R_robotiq sit 5.811 mm closer to
 # the wrist and the gripper meshes are seated on the connector rather than floating
-# at L_ee. There is no matching Dexmate collision-spheres URDF for this robot --
+# at L_ee. As of 2026-09 it also carries L/R_fingertip_pos/neg: the printed ALOHA
+# clamp + UMI soft finger (aloha_clamp_robotiq_v7) that replaced the stock Robotiq
+# C-083 pads on the hardware. They bolt to the same 2F-85 fingertip interface, so the
+# grip plane and therefore the closed-gripper geometry are unchanged, but each tip now
+# reaches 91.9 mm further (link z +0.041 vs -0.051) and sits 6.3 mm wider when open.
+# There is no matching Dexmate collision-spheres URDF for this robot --
 # vega_1_gripper_collision_spheres.collision.urdf is the Dexmate two-finger gripper,
 # not Robotiq. Self-collision uses vega_1_collision_spheres.collision.urdf (body,
 # stops at L_ee/R_ee) plus ROBOTIQ_PROXY_SPHERES and WRIST_CAM_PROXY_SPHERES in
@@ -210,8 +215,10 @@ enable_collision_avoidance: true
 # Body-only sphere model (no gripper links). Do NOT swap in
 # vega_1_gripper_collision_spheres.collision.urdf -- that file is Dexmate's
 # L/R_gripper_* two-finger geometry, not the Robotiq 2F-85 on vega_with_robotiq.
-# Distal gripper volume is the three fixed proxy spheres per L_robotiq/R_robotiq
-# in whole_body_ik.ROBOTIQ_PROXY_SPHERES, and the wrist cameras added by
+# Distal gripper volume is the nine fixed proxy spheres per L_robotiq/R_robotiq
+# in whole_body_ik.ROBOTIQ_PROXY_SPHERES (three for the 2F-85 body, six more added
+# 2026-09 for the longer ALOHA/UMI fingertips -- without those the tips protruded up
+# to 118 mm outside the sphere model the barrier actually sees), and the wrist cameras added by
 # vega_with_robotiq_wrist_cam.urdf are three more per L/R_wrist_zed_mini in
 # whole_body_ik.WRIST_CAM_PROXY_SPHERES (they also cover the mount bracket, which
 # gets none of its own). Mesh collision (robotiq_2f85.obj) lives on the robot URDF

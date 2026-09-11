@@ -166,11 +166,34 @@ TORSO_TOP_FRAME = "arm_center"
 # Fixed Robotiq 2F-85 proxy spheres, expressed in the L_robotiq/R_robotiq link frame.
 # The external Dexmate collision-sphere URDF stops at L_ee/R_ee, so these append enough
 # distal gripper volume for the WBC self-collision barrier without switching to mesh
-# distances inside the QP.
+# distances inside the QP.  +z points AWAY from the wrist, toward the fingertips: the
+# stock gripper body spans z -0.204 .. -0.051.
+#
+# The tip_* spheres (2026-09) cover the printed ALOHA clamp + UMI finger that replaced
+# the stock C-083 pads -- L/R_fingertip_pos/neg in vega_with_robotiq_wrist_cam.urdf.
+# Those tips reach z = +0.041 (91.9 mm past the stock pad's -0.051), so WITHOUT them the
+# barrier saw nothing beyond z = -0.070: 40% of the fingertip mesh sat outside the sphere
+# model with the gripper OPEN and 54% CLOSED, worst protrusion 111 mm / 118 mm. The QP
+# would have held the modelled geometry at self_collision_safe_dist with the real tip
+# already ~0.11 m inside an obstacle.
+#
+# The gripper is ONE rigid link here, so these fixed spheres must cover the tip at EVERY
+# opening, not just the URDF's open pose. x = +/-0.041 is the midpoint of the tip's swept
+# range along the opening axis (link x 0 .. 0.0825 per side, the M5 axis running 0.0139
+# closed -> 0.0564 open), and r = 0.055 -- the same radius the palm/finger proxies use --
+# is the smallest that still wraps the corners from there. Verified 0.0% of tip vertices
+# outside at BOTH extremes (worst -2.1 mm open, -5.5 mm closed). Re-check after any tip
+# change with scripts/diagnostics/view_collision_spheres_viser.py --fit.
 ROBOTIQ_PROXY_SPHERES: tuple[tuple[str, tuple[float, float, float], float], ...] = (
     ("palm", (0.0, 0.0, -0.205), 0.055),
     ("finger_pos", (0.050, 0.0, -0.125), 0.055),
     ("finger_neg", (-0.050, 0.0, -0.125), 0.055),
+    ("tip_root_pos", (0.041, 0.0, -0.068), 0.055),
+    ("tip_root_neg", (-0.041, 0.0, -0.068), 0.055),
+    ("tip_mid_pos", (0.041, 0.0, -0.014), 0.055),
+    ("tip_mid_neg", (-0.041, 0.0, -0.014), 0.055),
+    ("tip_end_pos", (0.041, 0.0, 0.040), 0.055),
+    ("tip_end_neg", (-0.041, 0.0, 0.040), 0.055),
 )
 
 # Fixed ZED-Mini proxy spheres, expressed in the L_wrist_zed_mini/R_wrist_zed_mini link

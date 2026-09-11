@@ -57,6 +57,15 @@ PROBE_MESHES = (
     ("L_wrist_cam_bracket",
      "meshes/visual/2f85_zed_mini_mount_revised_v3_16.15_fixed.stl", 0.001,
      pin.SE3.Identity()),
+    # ALOHA clamp + UMI finger (2026-09). Identity visual origin; the placement lives
+    # in the L_fingertip_pos/neg JOINTS, so probing the link frames covers both tips at
+    # the URDF's (open) pose. The closed pose is not reachable here -- the gripper is a
+    # rigid link -- so ROBOTIQ_PROXY_SPHERES was sized against the swept range by hand;
+    # see its comment in whole_body_ik.py.
+    ("L_fingertip_pos", "meshes/collision/robotiq_fingertip_umi.obj", 1.0,
+     pin.SE3.Identity()),
+    ("L_fingertip_neg", "meshes/collision/robotiq_fingertip_umi.obj", 1.0,
+     pin.SE3.Identity()),
 )
 
 GROUP_COLORS = {"body": (110, 130, 160), "left": (70, 170, 110), "right": (200, 130, 60)}
