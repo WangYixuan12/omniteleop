@@ -35,6 +35,7 @@ once for a relative +/-90 degree turn measured by the selected base pose source.
 the stick lets it finish; holding it does not repeat. Translation/opposite yaw or a safety
 hold cancels it. Endpoint tolerance is 2 degrees; wheel slip can affect physical accuracy.
 The leader needs no extra argument.
+
 """
 
 from __future__ import annotations
@@ -551,6 +552,8 @@ def main() -> None:
                            "without that intent field are rejected.")
     mode.add_argument("--source", choices=("live",), default=None,
                       help="drive from the live leader (default when --replay is omitted).")
+    parser.add_argument("--speed", type=float, default=_base.DEFAULT_SPEED,
+                        help=f"--replay speed multiplier (default {_base.DEFAULT_SPEED:g}; <1 = slower).")
     parser.add_argument("--config", default=None,
                         help="wbik.yaml path (default: canonical follower/wbik.yaml). "
                              "base_dofs is read from it; lock_base_in_ik / head_mode:track / "
@@ -618,6 +621,8 @@ def main() -> None:
     hw = parser.add_argument_group("hardware")
     hw.add_argument("--home-tol", type=float, default=_base.DEFAULT_HOME_TOL)
     hw.add_argument("--home-settle", type=float, default=_base.DEFAULT_HOME_SETTLE)
+    hw.add_argument("--home-speed", type=float, default=None,
+                    help="pace nominal homing at this joint speed in rad/s (default: unpaced -- each 0.01 rad substep runs at the joint velocity limit). Lower = slower, easier to watch and abort.")
     hw.add_argument("--max-joint-step", type=float, default=_base.DEFAULT_MAX_JOINT_STEP)
     hw.add_argument("--arm-cmd-lpf-tau", type=float, default=_base.DEFAULT_ARM_CMD_LPF_TAU)
     hw.add_argument("--source-timeout", type=float, default=_base.DEFAULT_SOURCE_TIMEOUT)
@@ -655,6 +660,8 @@ def main() -> None:
             parser.error(f"{flag} must be finite and > 0")
     if not np.isfinite(args.base_quiet_hold_s):
         parser.error("--base-quiet-hold-s must be finite")
+    if args.home_speed is not None and (not np.isfinite(args.home_speed) or args.home_speed <= 0):
+        parser.error("--home-speed must be finite and > 0")
     for flag, val in (
         ("--source-timeout", args.source_timeout),
         ("--record-rate", args.record_rate),

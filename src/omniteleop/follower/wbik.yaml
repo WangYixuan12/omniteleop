@@ -23,7 +23,16 @@
 # neither the Robotiq nor the wrist cameras this URDF adds.
 # "${yixuan_utilities}" resolves to the installed package, a YIXUAN_UTILITIES_ROOT
 # override, or a ~/yixuan_utilities checkout -- see _resolve_package_root().
-urdf_path: "${yixuan_utilities}/assets/robot/vega-urdf/vega_with_robotiq_wrist_cam.urdf"
+# 2026-09-17 CALIBRATED variant (basket_calib/charuco, ChArUco hand-eye on the live robot):
+#   * L/R_wrist_camera_mount origins re-solved (board reprojection 28 px -> 0.8 px through the
+#     full chain; the wrist optical frames move 31 mm / 3.0 deg (L) and 28 mm / 8.2 deg (R));
+#     zed_left_camera_mount is left at the Dexmate nominal.
+#   * 2F-85 body mesh = 2F85-OPENED-NO_20FINGER.step (no stock pads nested in the clamps);
+#     fingertips = aloha_clamp_robotiq_v7.STL + hard_soft_finger_v2.STL (same fingertip frames).
+#   Joints, limits, L_ee/R_ee/arm_center/zed_depth_frame and the proxy spheres are unchanged, so
+#   IK targets and self-collision behave identically; only the camera frames and gripper meshes differ.
+urdf_path: "${yixuan_utilities}/assets/robot/vega-urdf/vega_with_robotiq_wrist_cam_calib.urdf"
+# previous:     "${yixuan_utilities}/assets/robot/vega-urdf/vega_with_robotiq_wrist_cam.urdf"
 # alternatives: "${yixuan_utilities}/assets/robot/vega-urdf/vega_with_robotiq.urdf"
 #               "${yixuan_utilities}/assets/robot/vega-urdf/vega_no_effector.urdf"
 
