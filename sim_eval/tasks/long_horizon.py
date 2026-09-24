@@ -533,6 +533,18 @@ def spawn_extent(spec):
 #: chassis follows it.
 SOURCE_ROW_NOMINAL = {"book2shelf": 0.14, "dish2rack": 0.78, "towel2rack": 0.40}
 
+#: What to say to a text-prompted segmenter to find a task's carried object and its receptacle,
+#: so `collect_demos --perception` can plan without reading object poses out of physics. Only
+#: listed tasks can be collected that way; the rest raise rather than silently using ground truth.
+#:
+#: The wording is measured, not guessed. On the dish2rack spawn frame, against GT: the cup is
+#: about ten pixels across at 1.96 m and "a plastic drinking cup" finds NOTHING, while "a red
+#: object on the table" scores 0.73 and lands 1.8 cm out. The receptacle is the tray liner, not
+#: the rack under it -- "a tray on the rack" gives 0.9 cm, "a black metal rack" 2.2 cm.
+SEGMENTER_PROMPTS = {
+    "dish2rack": {"object": "a red object on the table", "station": "a tray on the rack"},
+}
+
 #: Where each carried object waits on the source table: its own x, and its slot in the row above.
 SOURCE_MARKS = {name: (float(SPEC_BY_NAME[name].obj_xy[0])
                        if SPEC_BY_NAME[name].obj_xy is not None
@@ -847,6 +859,15 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
 
     #: Name of the liner instance for a spec, or None. Keyed by station so a chained rollout that
     #: serves several stations gets one liner each rather than a shared handle.
+    def object_prompts(self, env):
+        """Prompts for this spec's object and receptacle, keyed by scene-registry name."""
+        entry = SEGMENTER_PROMPTS.get(self.SPEC.name)
+        if entry is None:
+            raise ValueError(
+                f"{self.name}: no SEGMENTER_PROMPTS entry, so it cannot be collected with "
+                f"--perception. Have: {sorted(SEGMENTER_PROMPTS)}")
+        return {self.apple.name: entry["object"], self.bowl.name: entry["station"]}
+
     @staticmethod
     def _liner_name(spec):
         return None if spec.liner is None else f"lh_liner_{spec.station}"
@@ -1285,7 +1306,10 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         self._grasp_quality = {"ok": True, "max_attitude_error_deg": 0.0}
         go = env.grip_open
         gc = env.grip_close if self.SPEC.grip_close_cmd is None else self.SPEC.grip_close_cmd
-        obj0 = env.obj_pos(self.apple).copy()
+        # est_pos, not obj_pos: this is the PLAN's view of where the object is, and it has to
+        # come from the head camera or the recorded actions depend on something the recorded
+        # observation does not contain. With no estimator attached it IS obj_pos.
+        obj0 = env.est_pos(self.apple).copy()
         if not hasattr(self, "_right_start_center"):
             self._right_start_center = np.asarray(env.finger_grasp_point("right"), dtype=float)
         if not hasattr(self, "_head_pos0"):
@@ -1865,7 +1889,9 @@ class LongHorizonPickPlace(MobilePickPlaceTask):
         back out here, exactly as it was added when picking. Once sticky grasp has attached,
         `_calibrate_grasp_delta` replaces this nominal offset with the one actual contact transform.
         """
-        gp = env.obj_pos(self.bowl)
+        # est_pos for the same reason as the source object. Only gp[0:2] is used -- the height
+        # comes from `_support_surface_z` below -- so this needs the receptacle's PLAN xy only.
+        gp = env.est_pos(self.bowl)
         # The live AABB preserves per-instance scaling (and test doubles); applying the scripted
         # relative rotation gives the post-rotation half-height. All reoriented specs currently spawn
         # axis-aligned, so this is exact rather than a metadata approximation.

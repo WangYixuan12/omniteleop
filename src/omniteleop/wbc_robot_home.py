@@ -9,6 +9,7 @@ out of ``scripts/wbc_vr_robot.py``.
 
 from __future__ import annotations
 
+import time
 from typing import Callable, Optional
 
 import numpy as np
@@ -20,19 +21,33 @@ def _interp_joint(
     waypoints: list,
     step: float = 0.01,
     guard: Optional[Callable[[np.ndarray], None]] = None,
+    speed: Optional[float] = None,
 ) -> None:
+    """Step ``grp`` to each waypoint, optionally paced to ``speed`` rad/s.
+
+    Each substep commands ``set_joint_pos(..., exit_on_reach=True)``, which returns as
+    soon as dexcontrol reports the (tiny) target reached -- at the joint's own velocity
+    limit, so unpaced homing runs as fast as the arm will go. ``speed`` holds each
+    substep to ``step/speed`` seconds of wall time instead, without changing the
+    trajectory or bypassing the per-substep self-collision guard.
+    """
     comp = driver._comp(grp)
     cur = np.asarray(comp.get_joint_pos(), dtype=float)
     for wp in waypoints:
         wp = np.asarray(wp, dtype=float)
-        n = max(1, int(np.max(np.abs(wp - cur)) / step))
+        span = float(np.max(np.abs(wp - cur)))
+        n = max(1, int(span / step))
+        substep_s = 0.0 if not speed else span / n / float(speed)
         for i in range(n):
+            started = time.perf_counter()
             q = cur + (wp - cur) * (i + 1) / n
             # Vet the candidate posture for self-collision BEFORE commanding it; the
             # guard raises SystemExit (after stopping motion) on a worsening violation.
             if guard is not None:
                 guard(q)
             comp.set_joint_pos(q.tolist(), wait_time=0.1, exit_on_reach=True)
+            if substep_s:
+                time.sleep(max(0.0, substep_s - (time.perf_counter() - started)))
         cur = wp
 
 
@@ -102,9 +117,20 @@ def home_to_nominal(driver, *, arm_home_step: float) -> None:
     homing = [g for g in driver._joint_names if on[g]]
     skipped = [g for g in driver._joint_names if not on[g]]
     guarded = driver.ik.collision_enabled
+    speed = getattr(driver.args, "home_speed", None)
+    # Report the distance and the paced estimate: homing is proportional to how far the
+    # joints already are, so "--home-speed had no effect" is usually "nothing to move".
+    spans = {
+        grp: float(np.max(np.abs(np.asarray(driver._comp(grp).get_joint_pos(), dtype=float)
+                                 - nom[grp])))
+        for grp in homing
+    }
+    furthest = max(spans.values(), default=0.0)
     print(
         f"[wbc_vr_robot] homing to WBC nominal (move clear; watch the robot). "
-        f"homing={homing}"
+        f"homing={homing} (furthest joint {furthest:.3f} rad"
+        + (f", ~{sum(spans.values()) / speed:.1f} s at {speed:g} rad/s)" if speed
+           else ", unpaced -- pass --home-speed to slow it)")
         + (f"; assuming-at-nominal={skipped}" if skipped else "")
         + (
             "; self-collision guard ON"
@@ -123,6 +149,7 @@ def home_to_nominal(driver, *, arm_home_step: float) -> None:
             [nom["torso"]],
             step=arm_home_step,
             guard=_make_home_guard(driver, "torso"),
+            speed=speed,
         )
     if on["left_arm"]:
         _interp_joint(
@@ -131,6 +158,7 @@ def home_to_nominal(driver, *, arm_home_step: float) -> None:
             [nom["left_arm"]],
             step=arm_home_step,
             guard=_make_home_guard(driver, "left_arm"),
+            speed=speed,
         )
     if on["right_arm"]:
         _interp_joint(
@@ -139,9 +167,11 @@ def home_to_nominal(driver, *, arm_home_step: float) -> None:
             [nom["right_arm"]],
             step=arm_home_step,
             guard=_make_home_guard(driver, "right_arm"),
+            speed=speed,
         )
     if on["head"]:
-        _interp_joint(driver, "head", [nom["head"]], guard=_make_home_guard(driver, "head"))
+        _interp_joint(driver, "head", [nom["head"]],
+                      guard=_make_home_guard(driver, "head"), speed=speed)
     # Settle each enabled group at nominal: the stepped ramp can outrun the arm (each
     # dexcontrol substep returns after its wait_time whether or not the joint caught
     # up, so lag accumulates), so block here until the MEASURED joints are within

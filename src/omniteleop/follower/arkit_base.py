@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drift-free base pose from the mount-rigid iPhone (ARKit), as an odometry drop-in.
+"""Tracked base pose from the mount-rigid iPhone (ARKit), as an odometry drop-in.
 
 The phone bolted to the E-stop tower publishes ``<robot>/tracking/base_pose`` from
 ``record3d/tracking/base_pose_pub.py`` (robot side, ~15 Hz): the base pose in the ARKit
@@ -10,10 +10,10 @@ SESSION world, already through the phone->base extrinsic from
 (``pose`` / ``age`` / ``snapshot`` / ``reset_origin`` / ``close``) so the follower can
 read a measured base pose from either source through the same calls. Like the wheel
 odometry, :attr:`pose` is planar ``(x, y, yaw)`` in the ENGAGE-ORIGIN frame -- the ARKit
-world pose at the last :meth:`reset_origin`. Unlike it, the underlying measurement does
-not accumulate drift, which is the whole point: swerve odometry integrates steering and
-wheel velocity, so its yaw walks away over a take and every world-frame quantity derived
-from it (``obs/base/pose``, and the offline ``world_t_cam``) walks with it.
+world pose at the last :meth:`reset_origin`. ARKit is the selected localization source;
+it can drift and its phone-to-base extrinsic still requires physical validation.
+The existing publisher's t_ns is a robot-host callback stamp after USB delivery,
+not a phone acquisition timestamp. Preserve raw packets for offline calibration.
 
 Two failure modes are surfaced rather than smoothed over, because both silently corrupt
 every pose derived from them:
@@ -27,6 +27,7 @@ every pose derived from them:
 """
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from typing import Optional
@@ -51,11 +52,15 @@ class ARKitBaseTracker:
     the ROBOT namespace, not the leader/follower one.
     """
 
-    def __init__(self, namespace: str, *, name: str = "wbc_vr_arkit") -> None:
+    def __init__(self, namespace: str, *, name: str = "wbc_vr_arkit", event_sink=None) -> None:
         if not namespace:
             raise ValueError(
                 "ARKitBaseTracker needs the robot's Zenoh namespace (export ROBOT_NAME)"
             )
+        self._event_sink = event_sink
+        self._raw = None
+        self._callback_wall_ns = 0
+        self._callback_monotonic_ns = 0
         self.topic = f"{namespace}/{TOPIC}"
         self._lock = threading.Lock()
         self._world = np.full(3, np.nan)     # (x, y, yaw) in the ARKit session world
@@ -71,18 +76,24 @@ class ARKitBaseTracker:
         )
 
     def _on_msg(self, msg: dict) -> None:
+        wall_ns, mono_ns = time.time_ns(), time.monotonic_ns()
         try:
             planar = np.asarray(msg["planar"], dtype=np.float64)
             rp = np.asarray(msg["rp_rad"], dtype=np.float64)
             seq, jumps = int(msg["seq"]), int(msg["jumps"])
         except (KeyError, TypeError, ValueError):
             return                            # ignore malformed frames
-        if planar.shape != (3,) or rp.shape != (2,) or not np.all(np.isfinite(planar)):
+        if planar.shape != (3,) or rp.shape != (2,) or not np.all(np.isfinite(planar)) or not np.all(np.isfinite(rp)):
             return
         with self._lock:
             self._world, self._rp = planar, rp
             self._seq, self._jumps = seq, jumps
             self._update_t = time.perf_counter()
+            self._raw = copy.deepcopy(msg)
+            self._callback_wall_ns, self._callback_monotonic_ns = wall_ns, mono_ns
+        if self._event_sink is not None:
+            self._event_sink('arkit', dict(raw=msg, receive_wall_ns=wall_ns,
+                                           receive_monotonic_ns=mono_ns))
 
     def wait_first(self, timeout: float) -> bool:
         """Block until the first pose arrives (True) or ``timeout`` elapses (False)."""
@@ -150,6 +161,14 @@ class ARKitBaseTracker:
                 "jumped": self._origin is not None and self._jumps > self._origin_jumps,
                 "has_origin": self._origin is not None,
             }
+
+    def recording_context(self) -> dict:
+        """Stable origin and timestamp provenance; excludes NaN pre-origin snapshots."""
+        with self._lock:
+            return dict(origin=None if self._origin is None else self._origin.tolist(),
+                        origin_jumps=self._origin_jumps, topic=self.topic,
+                        source_stamp='t_ns: robot-host callback after USB; acquisition latency unmeasured',
+                        latest_raw=copy.deepcopy(self._raw))
 
     def reset_origin(self) -> bool:
         """Re-zero on the latest sample -- called on the engage edge, like the odometry.

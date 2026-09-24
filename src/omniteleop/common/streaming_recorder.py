@@ -28,8 +28,10 @@ Two consequences worth knowing:
   slow disk cannot stall the control loop. If the writer falls behind for long
   enough to fill the queue, ``record()`` raises rather than silently dropping a
   frame: a gap in a take is worse than a failed take.
-* A crash mid-take leaves ``episode_<N>.hdf5.partial`` holding everything
-  written so far, instead of losing the whole take. It is renamed to
+* The writer checkpoints metadata and small state datasets every ten written
+  frames and when the queue becomes idle. A crash mid-take can retain the last
+  checkpoint in ``episode_<N>.hdf5.partial``; uncheckpointed frames may be lost.
+  This is not an atomic transaction or a power-loss durability guarantee. It is renamed to
   ``episode_<N>.hdf5`` only on a clean close, so a partial file can never be
   picked up by ``port_wbc_mobile_*.py`` as if it were complete.
 
@@ -340,8 +342,11 @@ class StreamingEpisodeRecorder:
         dsets: dict[str, Any] = {}
         chunk_frames = 1
         batch: list[dict[str, np.ndarray]] = []
+        static_paths: list[str] = []
+        checkpoint_frames = 0
 
         def flush() -> None:
+            nonlocal checkpoint_frames
             if not batch:
                 return
             for path, dset in dsets.items():
@@ -351,12 +356,24 @@ class StreamingEpisodeRecorder:
                 dset[start:] = block
             self._n_written += len(batch)
             batch.clear()
+            if self._n_written - checkpoint_frames >= 10:
+                # h5py assignment only fills caches. Without H5Fflush, a killed
+                # process can leave GB of RGB data but no readable state headers.
+                h5file.attrs['n_frames'] = self._n_written
+                h5file.flush()
+                checkpoint_frames = self._n_written
 
         try:
             while True:
                 try:
                     item = self._queue.get(timeout=0.5)
                 except queue.Empty:
+                    if batch:
+                        flush()
+                    if h5file is not None and self._n_written != checkpoint_frames:
+                        h5file.attrs['n_frames'] = self._n_written
+                        h5file.flush()
+                        checkpoint_frames = self._n_written
                     if self._closing:
                         break
                     continue
@@ -380,6 +397,9 @@ class StreamingEpisodeRecorder:
                             chunks=(chunk_frames,) + arr.shape,
                             compression=self._compression,
                         )
+                    static_paths = self._write_static(h5file)
+                    h5file.attrs['n_frames'] = 0
+                    h5file.flush()
                 else:
                     got = {k: (v.shape, v.dtype) for k, v in flat.items()}
                     if got != self._schema:
@@ -399,6 +419,10 @@ class StreamingEpisodeRecorder:
 
             flush()
             if h5file is not None and not self._abort:
+                # Metadata may be updated during recording. Refresh only leaves
+                # written at startup, keeping per-frame collision checks intact.
+                for path in static_paths:
+                    del h5file[path]
                 self._write_static(h5file)
                 h5file.attrs["n_frames"] = self._n_written
                 keep_partial = self._keep_partial or self._save_invalidated.is_set()
@@ -510,10 +534,12 @@ class StreamingEpisodeRecorder:
             self._request_writer_close()
             thread.join(timeout=_WRITER_JOIN_TIMEOUT_S)
 
-    def _write_static(self, h5file) -> None:
+    def _write_static(self, h5file) -> list[str]:
         """Write the ``set_static`` tree, refusing to shadow a per-frame path."""
-        for path, arr in _flatten(self._static).items():
+        leaves = _flatten(self._static)
+        for path, arr in leaves.items():
             if path in h5file:
                 raise ValueError(f"static leaf {path!r} collides with a per-frame field")
             dset = h5file.create_dataset(path, shape=arr.shape, dtype=arr.dtype)
             dset[...] = arr
+        return list(leaves)

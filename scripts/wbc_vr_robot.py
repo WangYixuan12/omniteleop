@@ -121,6 +121,7 @@ import numpy as np
 from dexcomm.codecs import DictDataCodec, JsonDataCodec
 
 from omniteleop.common import get_config
+from omniteleop.common.native_state_recorder import record_event
 from omniteleop.common.head_camera import ZED_K
 from omniteleop.common.recorder import EpisodeRecorder, peek_next_episode_id
 from omniteleop.common.schemas import WBC_FOLLOWER_STAGE_ABORTED, WBCFollowerStatus
@@ -493,6 +494,16 @@ DEFAULT_MAX_JOINT_STEP = 0.05   # rad/IK-tick clamp on arm/torso/head joint comm
 # at their velocity limit -- masked by firmware tracking lag before the arm velocity
 # feedforward, a lunge after it (joystick take 2026-09-06, second right-trigger hold).
 ENGAGE_GLIDE_S = 2.0
+# Ticks' worth of wall time the TARGET pipeline's clock may advance in ONE loop iteration.
+# TargetInterpolator.at() and the engage glide above are paced on that clock rather than on
+# the raw wall clock, because a blocking call inside the loop otherwise fast-forwards their
+# alpha straight to 1: start_recording_episode() spends ~0.84 s on four sequential NTP
+# round-trips, so pressing record inside the engage glide dumped the whole remaining
+# anchor-to-leader distance into one tick -- measured at 2.1/3.0 rad/s on the arms
+# (episode_0, 2026-09-20), exactly the lunge ENGAGE_GLIDE_S exists to prevent. Normal loop
+# jitter is far below this, so ordinary ticks still pace on wall time; whatever the clamp
+# withholds is treated as a stall and glided in over its own duration (see run_loop).
+MAX_TARGET_CLOCK_ADVANCE_TICKS = 4
 # First-order low-pass time constant (s) on the ARM joint commands at the IK rate; the
 # velocity feedforward is taken from the filtered stream. Smooths the velocity steps the
 # 10 Hz lerp'd command stream has every 1/cmd_rate, which the feedforward otherwise
@@ -858,6 +869,8 @@ class HardwareDriver:
         self._arkit: Optional[ARKitBaseTracker] = None
         self._world_frame_epoch = 0
         self._episode: Optional[EpisodeRecorder | StreamingEpisodeRecorder] = None
+        self._camera_motion_recorder = None
+        self._native_state_recorder = None
         # Optional per-tick /debug log (passed by _run_ik_mode when --debug-dir is set).
         # stop_recording_episode() flushes it once per saved episode so RAM stays bounded.
         self._traj: Optional[_TrajLog] = traj
@@ -1188,7 +1201,9 @@ class HardwareDriver:
         if not namespace:
             raise SystemExit("[wbc_vr_robot] --arkit-base needs $ROBOT_NAME (the robot's "
                              "Zenoh namespace, e.g. dm/vg3cfe65689d-1).")
-        tracker = ARKitBaseTracker(namespace, name="wbc_vr_robot_arkit")
+        native = getattr(self, "_native_state_recorder", None)
+        tracker = ARKitBaseTracker(namespace, name="wbc_vr_robot_arkit",
+                                   event_sink=native.event if native is not None else None)
         if not tracker.wait_first(timeout):
             tracker.close()
             raise SystemExit(
@@ -1301,7 +1316,35 @@ class HardwareDriver:
         if sweep is not None:
             self._record_static["meta"]["scenediff_sweep"] = sweep.episode_metadata()
             self._episode.set_static(self._record_static)
+        native = getattr(self, "_native_state_recorder", None)
+        if native is not None:
+            self._record_static["meta"]["ntp"] = self._query_ntp_calibration()
+            native_file = native.start(self._episode.episode_id, {
+                "ntp": self._record_static["meta"]["ntp"],
+                "camera_ntp": self._record_static["meta"]["camera_ntp"],
+                "recording_context": {
+                    "base_pose_source": configured_source,
+                    "arkit": (self._arkit.recording_context()
+                              if getattr(self, "_arkit", None) is not None else None),
+                },
+            })
+            self._record_static["meta"]["native_state"] = {
+                "file": np.asarray(native_file.encode()),
+                "schema": np.asarray(getattr(native, "SCHEMA", "native_state_v1").encode()),
+            }
+            self._episode.set_static(self._record_static)
         self._episode.start()
+        motion_recorder = getattr(self, "_camera_motion_recorder", None)
+        if motion_recorder is not None:
+            motion_file = motion_recorder.start(
+                self._episode.episode_id, self._record_static["meta"]["camera_ntp"]
+            )
+            self._record_static["meta"]["camera_motion"] = {
+                "file": np.asarray(motion_file.encode()),
+                "format": np.asarray(b"timestamped_jsonl_v1"),
+                "association": np.asarray(b"sensor_id + image_timestamp_ns; independent tracker worlds"),
+            }
+            self._episode.set_static(self._record_static)
         self._grip_episode_start_wall_ns = time.time_ns()
         self._last_rec_head_ns = -1
         self._last_rec_wrist_ns = {arm: -1 for arm in _WRIST_SENSOR_IDS}
@@ -1390,6 +1433,12 @@ class HardwareDriver:
         # with the episode_<N>.hdf5 written this call.
         saved_id = getattr(self._episode, "episode_id", None)
         n = self._episode.num_frames()
+        native = getattr(self, "_native_state_recorder", None)
+        if native is not None:
+            native.stop(aborted=n == 0)
+        motion_recorder = getattr(self, "_camera_motion_recorder", None)
+        if motion_recorder is not None:
+            motion_recorder.stop(aborted=n == 0)
         path = self._episode.stop()
         if path is None:
             print("\n[wbc_vr_robot] recording: 0 frames -- nothing saved.")
@@ -1430,6 +1479,12 @@ class HardwareDriver:
         """
         if self._episode is None or not self._episode.recording:
             return
+        native = getattr(self, "_native_state_recorder", None)
+        if native is not None:
+            native.stop(aborted=True)
+        motion_recorder = getattr(self, "_camera_motion_recorder", None)
+        if motion_recorder is not None:
+            motion_recorder.stop(aborted=True)
         n = self._episode.num_frames()
         abort = getattr(self._episode, "abort", None)
         if not callable(abort):
@@ -1577,7 +1632,10 @@ class HardwareDriver:
             if not (changed_due or keepalive_due):
                 continue
 
+            send_start = time.time_ns()
             self._send_ee_pass_through(arms[side], message)
+            record_event(self, "gripper_command", dict(side=side, normalized=commands[side],
+                         wire_hex=message.hex(), start_wall_ns=send_start, end_wall_ns=time.time_ns()))
             self._last_gripper_wire_message[side] = message
             self._last_gripper_wire_send_monotonic[side] = now_mono
             setattr(self, f"_last_gripper_cmd_{side}", commands[side])
@@ -1628,6 +1686,7 @@ class HardwareDriver:
                 if first_tick:
                     prev = np.asarray(self._comp(grp).get_joint_pos(), dtype=float)
                 clamped, requested = clamp_joint_step(prev, cmd, self.args.max_joint_step)
+                actual_sent = clamped
                 max_over = max(max_over, requested)
                 if grp in ("left_arm", "right_arm") and not first_tick:
                     # Velocity feedforward: send_arm_sinusoid.py measured the arm's
@@ -1643,6 +1702,7 @@ class HardwareDriver:
                     filt = prev_filt + (clamped - prev_filt) * (dt / (tau + dt))
                     vel = (filt - prev_filt) / dt
                     self._arm_filt[grp] = filt
+                    actual_sent = filt
                     self._comp(grp).set_joint_pos_vel(
                         self._to_hw(grp, filt).tolist(), self._to_hw(grp, vel).tolist()
                     )
@@ -1653,7 +1713,7 @@ class HardwareDriver:
                         self._to_hw(grp, clamped).tolist(), wait_time=0.0
                     )
                 self._prev_cmd[grp] = clamped
-                sent[grp] = clamped
+                sent[grp] = actual_sent.copy()
             self._dbg["sent_joints"] = sent
             self._dbg["clamp_max_over"] = max_over
             # Grippers are always active. Their serial pass-through is scheduled below
@@ -1672,8 +1732,17 @@ class HardwareDriver:
                     )
             else:
                 self._overstep_ticks = 0
+        base_start = time.time_ns()
         self._drive_base(result, hold, enable, dt)
         self._last_action_dispatch_end_wall_ns = time.time_ns()
+        record_event(self, "dispatch", dict(
+            start_wall_ns=self._last_action_dispatch_start_wall_ns,
+            end_wall_ns=self._last_action_dispatch_end_wall_ns,
+            base_start_wall_ns=base_start, hold=bool(hold), enable=dict(enable),
+            sent_joints=self._dbg.get("sent_joints"),
+            base_action=self._dbg.get("base_action"), base_cmd=self._dbg.get("base_cmd"),
+            rx_chassis=self._dbg.get("rx_chassis"),
+            held_head=(self._prev_cmd.get("head") if hold and grp_on["head"] else None)))
 
     def _drive_base(self, result, hold, enable, dt) -> None:
         if self._odom is None or not enable["base"]:
@@ -1873,6 +1942,7 @@ class HardwareDriver:
         period = self._gripper_status_poll_period_s()
         for side, monitor in self._grip_monitors.items():
             event = monitor.send_status_request()
+            record_event(self, "gripper_request", dict(side=side, request=event))
             sent_mono = float(event["send_monotonic_ns"]) / 1e9
             self._next_grip_status_request_monotonic[side] = sent_mono + period
 
@@ -1902,12 +1972,17 @@ class HardwareDriver:
             }
         for side, monitor in self._grip_monitors.items():
             events = monitor.drain_status_events()
+            for status_event in events:
+                record_event(self, "gripper_status", dict(side=side, status=status_event))
             if events:
+                record_event(self, "gripper_monitor", dict(side=side, stats=monitor.stats()))
                 latest = dict(events[-1])
                 setattr(self, f"_last_obs_grip_{side}", float(latest["actual"]))
                 self._last_grip_status[side] = latest
                 self._grip_status_event_count[side] += len(events)
-            monitor.expire_timeouts(_GRIPPER_STATUS_REQUEST_TIMEOUT_S)
+            expired = monitor.expire_timeouts(_GRIPPER_STATUS_REQUEST_TIMEOUT_S)
+            if expired:
+                record_event(self, "gripper_timeout", dict(side=side, requests=expired))
             # Keep at most one read outstanding and one scheduled request per record
             # period. A timed-out slot advances normally rather than causing the old
             # 500 ms hole; late retries are re-anchored instead of sent in a burst.
@@ -1918,6 +1993,7 @@ class HardwareDriver:
                 and monitor.stats()["pending_status_requests"] == 0
             ):
                 event = monitor.send_status_request()
+                record_event(self, "gripper_request", dict(side=side, request=event))
                 sent_mono = now_mono
                 if isinstance(event, dict) and "send_monotonic_ns" in event:
                     sent_mono = float(event["send_monotonic_ns"]) / 1e9
@@ -2213,6 +2289,31 @@ class HardwareDriver:
         if wrist_stereo is not None:
             static["meta"]["wrist_stereo"] = wrist_stereo
         static["meta"].update(self._recording_control_metadata())
+        # Tracking telemetry uses its own full-rate stream and writer. Discovery is
+        # from already-queried publisher metadata; record_tick never waits for poses.
+        motion_info = {
+            sensor: info for sensor, info in getattr(self, "_camera_info_responses", {}).items()
+            if info.get("motion", {}).get("enabled", False)
+        }
+        if motion_info:
+            from omniteleop.common.camera_motion_recorder import CameraMotionRecorder
+            self._camera_motion_recorder = CameraMotionRecorder(
+                self.robot._node, self.args.save_dir, motion_info
+            )
+        from omniteleop.common.native_state_recorder import NativeStateRecorder
+        groups = ("left_arm", "right_arm", "head", "torso")
+        components = {g: getattr(self.robot, g) for g in groups}
+        self._native_state_recorder = NativeStateRecorder(
+            self.robot._node, self.args.save_dir,
+            {g: list(c.get_joint_name()) for g, c in components.items()},
+            {g: c._control_pub_topic for g, c in components.items()},
+        )
+        self._native_state_recorder.start_clock_sampling({
+            "soc": self._query_ntp_calibration,
+            **{label: (lambda label=label, sid=sid: self._query_camera_clock_calibration(label, sid))
+               for label, sid in (("head", _HEAD_SENSOR_ID),
+                                  *((f"{arm}_wrist", sid) for arm, sid in _WRIST_SENSOR_IDS.items()))},
+        })
         self._record_static = static  # refreshed per episode, see _refresh_camera_clock_offsets
         self._episode.set_static(static)
         head_keys = (
@@ -2252,6 +2353,17 @@ class HardwareDriver:
             "obs_base_pose_source": np.asarray(configured_base_source.encode()),
             "base_control_pose_source": np.asarray(configured_base_source.encode()),
             "arkit_mode": np.asarray(arkit_mode.encode()),
+            # Head contract for action/head (policy action dims 20-28). "fixed" pins the
+            # head at the nominal posture and ik.solve() ignores head_target, so those
+            # dims record where the LEADER looked while the robot head -- and the head
+            # camera -- never move. ``head_actuated`` is recorded alongside because
+            # deciding that needs the --enable mask too, which nothing else writes out:
+            # without it a consumer cannot tell an executed head target from a label the
+            # take never applied.
+            "head_mode": np.asarray(str(self.cfg.head_mode).encode()),
+            "head_actuated": np.bool_(
+                bool(self.enable.get("head", False)) and self.cfg.head_mode != "fixed"
+            ),
             "gripper_action_semantics": np.asarray(b"latest_fc16_command_sent"),
             "gripper_command_max_rate_hz": np.float64(
                 _GRIPPER_COMMAND_MAX_RATE_HZ
@@ -2379,6 +2491,11 @@ class HardwareDriver:
             "wbik_yaml": Path(DEFAULT_CONFIG_PATH).resolve(),
             "head_zed_publisher": repo / "tests/test_head_zedx_depth.py",
             "wrist_zed_publisher": repo / "tests/test_wrist_zedm_depth.py",
+            "zed_motion": repo / "src/omniteleop/common/zed_motion.py",
+            "camera_motion_recorder": repo / "src/omniteleop/common/camera_motion_recorder.py",
+            "native_state_recorder": repo / "src/omniteleop/common/native_state_recorder.py",
+            "arkit_base": repo / "src/omniteleop/follower/arkit_base.py",
+            "robotiq": repo / "src/omniteleop/follower/robotiq.py",
         }
         source_snapshot: dict = {}
         for label, path in source_paths.items():
@@ -3722,7 +3839,7 @@ class HardwareDriver:
         Throttled to ``--record-rate``; skips while ``hold`` (e-stop / failed solve /
         safety hold / stale source) so only live teleop is recorded. Must run AFTER
         :meth:`actuate` so ``self._prev_base_cmd`` holds this tick's chassis command and
-        ``self._dbg['sent_joints']`` holds this tick's post-clamp joint commands.
+        ``self._dbg['sent_joints']`` holds this tick's post-clamp, post-filter joint commands.
 
         ``left_target`` / ``right_target`` / ``head_target`` are the WORLD-frame
         (engage-origin) 4x4 targets given to ``ik.solve()`` this tick -- the head
@@ -4349,6 +4466,17 @@ class HardwareDriver:
         # daemon thread, so block here until it finishes -- otherwise process exit could
         # kill the save mid-write.
         self.stop_recording_episode()
+        motion_recorder = getattr(self, "_camera_motion_recorder", None)
+        if motion_recorder is not None:
+            # Normally already stopped; quarantine any orphan after an abort.
+            motion_recorder.stop(aborted=True)
+            motion_recorder.close()
+        native = getattr(self, "_native_state_recorder", None)
+        if native is not None:
+            try:
+                native.close()
+            except Exception as exc:
+                print(f"Native sidecar incomplete: {exc}", flush=True)
         # Best-effort teardown of the FC03 gripper-status subscribers.
         for monitor in getattr(self, "_grip_monitors", {}).values():
             try:
@@ -4413,6 +4541,14 @@ def run_loop(
     )
 
     left_cmd, right_cmd, head_cmd = left0.copy(), right0.copy(), head0.copy()
+    # Stall-immune clock for the target pipeline (interpolator + engage glide). A dry run
+    # advances an injected virtual clock as fast as the CPU allows, so the clamp applies
+    # only to the realtime hardware loop; elsewhere this tracks ``clock()`` exactly.
+    max_target_advance = (
+        MAX_TARGET_CLOCK_ADVANCE_TICKS * dt if realtime else float("inf")
+    )
+    target_now = 0.0
+    prev_now: Optional[float] = None
     last_cmd_ns = -1
     last_cmd_receive_wall_ns = -1
     last_home_request_ns = -1
@@ -4467,6 +4603,20 @@ def run_loop(
 
     while True:
         now = clock()
+        # Advance the target clock by the elapsed wall time, clamped. Anything withheld is
+        # time the loop spent blocked rather than actuating, so the leader targets that
+        # accumulated meanwhile are glided in over the stall's own length instead of being
+        # compressed into one command period. Cap it at the engage glide: that is already
+        # the slowest re-approach this loop ever commands.
+        elapsed = dt if prev_now is None else now - prev_now
+        prev_now = now
+        advance = min(elapsed, max_target_advance)
+        target_now += advance
+        stall = elapsed - advance
+        if stall > 0.0:
+            engage_glide_until = max(
+                engage_glide_until, target_now + min(stall, ENGAGE_GLIDE_S)
+            )
         t = now - t0
         if replay and source.done:
             break
@@ -4572,7 +4722,7 @@ def run_loop(
                 getattr(sweep, "alignment_joints", None) if sweep is not None else None
             )
             resync_controller("engage", joint_seed)
-            engage_glide_until = now + ENGAGE_GLIDE_S
+            engage_glide_until = target_now + ENGAGE_GLIDE_S
         prev_estop = estop
 
         left_cmd, right_cmd = vr_to_ee_targets(vr, left_cmd, right_cmd)
@@ -4589,19 +4739,19 @@ def run_loop(
                         f"limit ({DEFAULT_REPLAY_GAP_LIMIT_MULTIPLE:g}x nominal "
                         f"{base_dur:.6g}s); inspect or re-record before replaying."
                     )
-            if not replay and now < engage_glide_until:
+            if not replay and target_now < engage_glide_until:
                 # Engage glide: restart each segment from the CURRENT blended pose (push
                 # normally starts from the previous raw command) and aim it at the end of
                 # the glide window, so successive leader commands refine the destination
                 # without cutting the approach short.
-                interp.reset(*interp.at(now))
-                duration = max(duration, engage_glide_until - now)
-            interp.push(left_cmd, right_cmd, head_cmd, now=now, duration=duration)
+                interp.reset(*interp.at(target_now))
+                duration = max(duration, engage_glide_until - target_now)
+            interp.push(left_cmd, right_cmd, head_cmd, now=target_now, duration=duration)
             last_cmd_ns = vr.timestamp_ns
             last_cmd_receive_wall_ns = int(vr_receive_wall_ns)
             last_cmd_wall = now
 
-        left_target, right_target, head_target = interp.at(now)
+        left_target, right_target, head_target = interp.at(target_now)
         head_targets_pre_filtered = bool(
             getattr(source, "head_targets_pre_filtered", replay)
         )
@@ -4870,6 +5020,8 @@ def main() -> None:
                            "IK unfiltered (record-time head LPF/deadband already applied).")
     mode.add_argument("--source", choices=("live",), default=None,
                       help="drive from the live leader (default when --replay is omitted).")
+    parser.add_argument("--speed", type=float, default=DEFAULT_SPEED,
+                        help=f"replay speed multiplier (default {DEFAULT_SPEED:g}; <1 = slower).")
     parser.add_argument("--enable", default="arms,torso,head,base",
                         help="comma list of DOF groups to actuate: any of "
                              "arms,torso,head,base (or 'all'/'none'). Default "
@@ -4975,6 +5127,10 @@ def main() -> None:
                          f"blocking until joints converge within --home-tol (default "
                          f"{DEFAULT_HOME_SETTLE:g}; 0 disables). Drains the ramp's tracking "
                          "lag so the gate snapshot is settled, not mid-flight.")
+    hw.add_argument("--home-speed", type=float, default=None,
+                    help="pace nominal homing at this joint speed in rad/s (default: "
+                         "unpaced -- each 0.01 rad substep runs at the joint velocity "
+                         "limit). Lower = slower, easier to watch and abort.")
     hw.add_argument("--max-joint-step", type=float, default=DEFAULT_MAX_JOINT_STEP,
                     help=f"per-tick joint command clamp (rad), arms/torso/head (default "
                          f"{DEFAULT_MAX_JOINT_STEP:g}; 0 disables). Repeatedly exceeding 2x "
@@ -5021,6 +5177,8 @@ def main() -> None:
                       ("--record-max-camera-skew-ms", args.record_max_camera_skew_ms)):
         if not np.isfinite(val) or val < 0.0:
             parser.error(f"{flag} must be finite and >= 0")
+    if args.home_speed is not None and (not np.isfinite(args.home_speed) or args.home_speed <= 0):
+        parser.error("--home-speed must be finite and > 0")
     if (
         not np.isfinite(args.record_max_camera_age_ms)
         or args.record_max_camera_age_ms <= 0.0

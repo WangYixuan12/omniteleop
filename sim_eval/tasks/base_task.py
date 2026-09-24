@@ -69,6 +69,16 @@ class SimTask(ABC):
         """Randomize object poses for a new episode (called each episode, after play)."""
 
     # ---- SceneDiff condition ----
+    def object_prompts(self, env) -> dict:
+        """Text naming what the expert must SEE, keyed by scene-registry object name.
+
+        Supplied to a text-prompted segmenter so the expert can plan from its own cameras
+        instead of `env.obj_pos`. Empty means this task has not been converted to
+        perception-grounded planning; `collect_demos --perception` refuses it rather than
+        quietly falling back to ground truth and writing privileged data under an honest name.
+        """
+        return {}
+
     @abstractmethod
     def objects_of_interest(self, env) -> np.ndarray:
         """Return (2N,3) world XYZ, [source, target] per grasp cycle, for the env_state

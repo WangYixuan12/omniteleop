@@ -199,7 +199,7 @@ class SimSession:
                                               "task_sequence": np.asarray(self.task.task_sequence, dtype=np.int64)}
             elif self.task is not None:
                 self.scene_static["meta"]["annotation_status"] = np.bytes_("unannotated_human_demo")
-                self.scene_static["meta"]["object_physics"] = np.bytes_("rigid_pillow_and_folded_towel")
+                self.scene_static["meta"]["object_physics"] = np.bytes_("rigid_pillow")
             return self.snapshot()
         if cmd == "step":
             return self.step(req["joints"], req["base"], req["grippers"])

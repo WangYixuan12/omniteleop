@@ -27,6 +27,11 @@ GROUPS = {"torso": [f"torso_j{i}" for i in range(1, 4)],
 CAMERA_TOPICS = {"head_left_rgb": "head_camera", "left_wrist_rgb": "left_wrist_zedm",
                  "right_wrist_rgb": "right_wrist_zedm"}
 
+#: BEHAVIOR drives the base faster than the hardware contract. wbik.yaml's
+#: joystick_teleop speeds are the REAL robot's and stay that way; this scales only the
+#: simulator's copy of them (see main()).
+SIM_BASE_SPEED_SCALE = 2.0
+
 
 def load_reference():
     path = OMNITELEOP_SRC.parent / "scripts/wbc_joystick_robot.py"
@@ -269,6 +274,17 @@ def main():
     args.max_joint_step = reference._base.DEFAULT_MAX_JOINT_STEP
     args.arm_cmd_lpf_tau = reference._base.DEFAULT_ARM_CMD_LPF_TAU
     args.turn_90 = False
+    # Only the two fixed speeds scale; direction selection, PD/slew shaping and the
+    # recorded intent labels are the shared ones, and metadata records the scaled values.
+    args.joystick_translation_speed *= SIM_BASE_SPEED_SCALE
+    args.joystick_rotation_speed *= SIM_BASE_SPEED_SCALE
+    if (args.joystick_translation_speed > args.base_max_speed
+            or args.joystick_rotation_speed > 2 * args.base_max_speed):
+        parser.error(
+            f"scaled joystick speeds {args.joystick_translation_speed:.3g} m/s / "
+            f"{args.joystick_rotation_speed:.3g} rad/s exceed base_max_speed "
+            f"{args.base_max_speed:g} m/s (angular cap {2 * args.base_max_speed:g} rad/s); "
+            "JoystickBaseShaper would silently clamp them")
     ik, cfg = reference._build_joystick_ik(args.config)
     source = reference.VRJointSubscriber(args.namespace, name="behavior_joystick_follower")
     conn = socket.socket(fileno=args.fd)

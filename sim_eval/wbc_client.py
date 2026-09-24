@@ -25,7 +25,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _wire import recv_msg, send_msg  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEXMATE_PYTHON = "/home/yixuan/miniforge3/envs/dexmate/bin/python"
+#: Interpreter that runs `wbc_service.py` (pinocchio/pink/daqp, numpy 2) -- a DIFFERENT env
+#: from the simulator's. The default is the path on the machine this repo is mounted from;
+#: set OMNITELEOP_DEXMATE_PYTHON to run the pair anywhere else.
+DEXMATE_PYTHON = os.environ.get("OMNITELEOP_DEXMATE_PYTHON",
+                                "/home/yixuan/miniforge3/envs/dexmate/bin/python")
 SERVICE_PATH = os.path.join(HERE, "wbc_service.py")
 
 TORSO_JOINTS = ["torso_j1", "torso_j2", "torso_j3"]
@@ -53,7 +57,8 @@ class WBCClient:
 
     # -- process / connection ------------------------------------------------
     def _spawn(self, dexmate_python, config, lock_base=False, overrides=None):
-        cmd = [dexmate_python, SERVICE_PATH, "--host", self.host, "--port", str(self.port)]
+        cmd = [dexmate_python, SERVICE_PATH, "--host", self.host, "--port", str(self.port),
+               "--exit-on-disconnect"]
         if config:
             cmd += ["--config", config]
         if lock_base:
@@ -121,6 +126,23 @@ class WBCClient:
             "current_q": None if current_q is None else np.asarray(current_q, dtype=float).tolist(),
             "dt": float(dt),
         })
+
+    def policy_fk(self, torso, left_arm, right_arm, head):
+        """base_T_{left, right, head} at the MEASURED joints, for `observation.state`.
+
+        Served by the same solver the follower uses, because the porter builds the offline state
+        on that model and the offline == online guarantee depends on there being exactly one of
+        them (see `WBCPolicyFK`). Returns {"left","right","head"} -> (4,4).
+        """
+        resp = self._rpc({
+            "cmd": "policy_fk",
+            "torso": np.asarray(torso, dtype=float).tolist(),
+            "left_arm": np.asarray(left_arm, dtype=float).tolist(),
+            "right_arm": np.asarray(right_arm, dtype=float).tolist(),
+            "head": np.asarray(head, dtype=float).tolist(),
+        })
+        return {name: np.asarray(resp[name], dtype=float).reshape(4, 4)
+                for name in ("left", "right", "head")}
 
     # -- joint mapping -------------------------------------------------------
     @staticmethod

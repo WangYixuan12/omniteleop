@@ -159,6 +159,7 @@ from omniteleop.wbc_policy_format import (
     JOYSTICK_POLICY_ACTION_SCHEMA,
     JOYSTICK_RAW_EPISODE_SCHEMA_V1,
     JOYSTICK_RAW_EPISODE_SCHEMA_V2,
+    JOYSTICK_SIM_EPISODE_SCHEMA,
     JOYSTICK_RAW_EPISODE_SCHEMAS,
     SKIP_NORMALIZATION_DIMS,
     STATE_AXES,
@@ -210,7 +211,7 @@ _GRIPPER_STATUS_REQUEST_TIMEOUT_V4_S = 0.5
 _GRIPPER_STATUS_REQUEST_TIMEOUT_V5_S = 0.075
 
 _REQUIRED_ACTION_TARGETS = ("action/eef/left", "action/eef/right", "action/head")
-_BASE_POSE_SOURCES = frozenset({"wheel_odometry", "arkit"})
+_BASE_POSE_SOURCES = frozenset({"wheel_odometry", "arkit", "sim_ground_truth"})
 _RAW_SCHEMA_V3 = "omniteleop_wbc_mobile_raw/v3"
 _RAW_SCHEMA_V4 = "omniteleop_wbc_mobile_raw/v4"
 _RAW_SCHEMA_V5 = "omniteleop_wbc_mobile_raw/v5"
@@ -501,6 +502,11 @@ def _inspect_open_base_pose_contract(
     )
     legacy_inferred = declared_source is None
     base_pose_source = declared_source or "wheel_odometry"
+    if base_pose_source == "sim_ground_truth":
+        if schema != JOYSTICK_SIM_EPISODE_SCHEMA:
+            raise RuntimeError(f"{source}: sim_ground_truth requires {JOYSTICK_SIM_EPISODE_SCHEMA}")
+        if "obs/base/pose_sim" not in f:
+            raise RuntimeError(f"{source}: sim_ground_truth requires obs/base/pose_sim")
     if base_pose_source not in _BASE_POSE_SOURCES:
         raise RuntimeError(
             f"{source}: meta/obs_base_pose_source={base_pose_source!r}; expected one "
@@ -510,6 +516,10 @@ def _inspect_open_base_pose_contract(
     control_source = _read_optional_hdf5_text(
         f, "meta/base_control_pose_source", source
     )
+    if schema == JOYSTICK_SIM_EPISODE_SCHEMA and (
+        base_pose_source != "sim_ground_truth" or control_source != "sim_ground_truth"
+    ):
+        raise RuntimeError(f"{source}: simulator schema requires explicit sim_ground_truth pose sources")
     if control_source is not None and control_source not in _BASE_POSE_SOURCES:
         raise RuntimeError(
             f"{source}: meta/base_control_pose_source={control_source!r}; expected one "
@@ -535,9 +545,8 @@ def _inspect_open_base_pose_contract(
                 f"{source}: {schema} requires diagnostic obs/base/pose_odom"
             )
 
-    reference_key = (
-        "obs/base/pose_arkit" if base_pose_source == "arkit" else "obs/base/pose_odom"
-    )
+    reference_key = {"arkit": "obs/base/pose_arkit", "wheel_odometry": "obs/base/pose_odom",
+                     "sim_ground_truth": "obs/base/pose_sim"}[base_pose_source]
     if base_pose_source == "arkit" and reference_key not in f:
         raise RuntimeError(
             f"{source}: ARKit is the declared canonical base pose but {reference_key} "
@@ -678,7 +687,7 @@ def _inspect_open_policy_action_contract(
                 f"{source}: action/chassis/intent_body frame count {intent.shape[0]} "
                 f"!= action/eef/left {f['action/eef/left'].shape[0]}"
             )
-        if raw_schema == _RAW_JOYSTICK_SCHEMA_V2:
+        if raw_schema in {_RAW_JOYSTICK_SCHEMA_V2, JOYSTICK_SIM_EPISODE_SCHEMA}:
             intent_mapping = _read_optional_hdf5_text(
                 f, "meta/chassis_intent_mapping", source
             )

@@ -108,6 +108,7 @@ recorded as exactly 0 so ``align_static_teleop.py`` works unchanged.
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing as mp
 from collections import deque
 import os
@@ -134,6 +135,9 @@ except ImportError as exc:  # pragma: no cover - environment problem, not logic
 # Native D455 848x480 for both IR and colour. Depth+IR must share a frame, so they
 # stay the same size; colour matches so the stored streams share one geometry.
 # This is NOT the 1280x720 / 1280x800 layout of record_pw_episode.py.
+from omniteleop.common import realsense_capture_meta as rsmeta
+from omniteleop.common.realsense_frameset_guard import FramesetGuard
+
 IR_W, IR_H = 848, 480
 COLOR_W, COLOR_H = 848, 480
 FPS = 30
@@ -217,6 +221,141 @@ def probe_clock_offset(host: str, samples: int = 7) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# colour control
+# --------------------------------------------------------------------------- #
+_COLOR_OPTS = {"exposure": rs.option.exposure, "gain": rs.option.gain,
+               "white_balance": rs.option.white_balance}
+
+
+LOCK_GAIN = 16.0          # --exposure auto-lock: fixed colour gain (low = less noise)
+LOCK_TARGET = 110.0       # --exposure auto-lock: target frame mean, 0..255
+LOCK_ITERS = 6
+LOCK_SETTLE_FRAMES = 8    # frames for a new exposure to take effect on the D455
+
+
+def lock_exposure(pipe, color_sensor, rs_id, target, gain, max_exposure):
+    """Software auto-exposure that CONVERGES ONCE and then stays fixed.
+
+    The D455 auto-exposure cannot be read back on this host (no UVC frame
+    metadata), so instead: fix the gain, then iterate the manual exposure with
+    e <- e * target / mean until the colour frame mean sits at ``target``. Returns
+    the final exposure. Raises if the scene cannot be brought to target within
+    the exposure range without clipping.
+    """
+    rng = color_sensor.get_option_range(rs.option.exposure)
+    lo, hi = max(rng.min, 1.0), min(rng.max, max_exposure)
+    color_sensor.set_option(rs.option.enable_auto_exposure, 0.0)
+    color_sensor.set_option(rs.option.gain, float(gain))
+    exp = float(np.clip(100.0, lo, hi))
+    mean = None
+    for _ in range(LOCK_ITERS):
+        color_sensor.set_option(rs.option.exposure, exp)
+        for _ in range(LOCK_SETTLE_FRAMES):
+            fr = pipe.wait_for_frames().get_color_frame()
+        img = np.asanyarray(fr.get_data())
+        mean = float(img.mean())
+        if mean < 1.0:
+            raise ValueError(f"{rs_id}: colour frame is black at exposure {exp:g}")
+        if abs(mean - target) / target < 0.03:
+            break
+        exp = float(np.clip(exp * target / mean, lo, hi))
+    sat = float((img >= 250).mean())
+    if abs(mean - target) / target > 0.15:
+        raise ValueError(
+            f"{rs_id}: auto-lock could not reach mean {target:g} (got {mean:.0f} at "
+            f"exposure {exp:g}, range [{lo:g}, {hi:g}]) -- scene too dark or too bright "
+            f"for gain {gain:g}")
+    if sat > MAX_SATURATED:
+        raise ValueError(f"{rs_id}: auto-lock exposure {exp:g} leaves {sat * 100:.1f}% saturated")
+    return exp, mean
+
+
+def parse_color_control(exposure, gain, white_balance, n_cams=2):
+    """--exposure/--gain/--white-balance -> {name: None | "auto-lock" | [v_cam0, v_cam1]}.
+
+    Each flag is ``auto``, one value applied to every camera, or a comma pair in
+    camera_0,camera_1 order. ``--exposure auto-lock`` converges a software
+    auto-exposure once at start-up and then freezes it (per camera), at a fixed
+    gain (``--gain`` value, default LOCK_GAIN). Manual exposure REQUIRES manual
+    gain: leaving gain to whatever the device last held is the silent
+    inheritance this script otherwise guards against.
+    """
+    out = {}
+    for name, raw in (("exposure", exposure), ("gain", gain), ("white_balance", white_balance)):
+        if raw is None or str(raw).strip().lower() == "auto":
+            out[name] = None
+            continue
+        if name == "exposure" and str(raw).strip().lower() == "auto-lock":
+            out[name] = "auto-lock"
+            continue
+        parts = [p.strip() for p in str(raw).split(",")]
+        try:
+            vals = [float(p) for p in parts]
+        except ValueError:
+            raise ValueError(f"--{name.replace('_', '-')}: expected 'auto', V or V0,V1; got {raw!r}")
+        if len(vals) == 1:
+            vals = vals * n_cams
+        if len(vals) != n_cams:
+            raise ValueError(f"--{name.replace('_', '-')}: need 1 or {n_cams} values, got {len(vals)}")
+        out[name] = vals
+    if out["exposure"] == "auto-lock":
+        if out["gain"] is None:
+            out["gain"] = [LOCK_GAIN] * n_cams
+    elif (out["exposure"] is None) != (out["gain"] is None):
+        raise ValueError("--exposure and --gain must both be manual or both be auto")
+    return out
+
+
+def apply_color_control(color_sensor, rs_id, cam_idx, ctl, pipe=None, max_exposure=None):
+    """Set auto / auto-lock / manual exposure-gain-white-balance and read back.
+
+    Options persist on the device across processes, so auto is set EXPLICITLY
+    when requested rather than assumed. Returns the effective settings.
+    """
+    lock = ctl["exposure"] == "auto-lock"
+    manual_exp = ctl["exposure"] is not None
+    manual_wb = ctl["white_balance"] is not None
+    color_sensor.set_option(rs.option.enable_auto_exposure, 0.0 if manual_exp else 1.0)
+    color_sensor.set_option(rs.option.enable_auto_white_balance, 0.0 if manual_wb else 1.0)
+    eff = {"auto_exposure": not manual_exp, "auto_white_balance": not manual_wb,
+           "exposure_mode": "auto-lock" if lock else ("manual" if manual_exp else "auto")}
+    if lock:
+        if pipe is None or max_exposure is None:
+            raise ValueError("auto-lock needs the pipeline and the exposure ceiling")
+        gain = float(ctl["gain"][cam_idx])
+        exp, mean = lock_exposure(pipe, color_sensor, rs_id, LOCK_TARGET, gain, max_exposure)
+        eff.update(exposure=exp, gain=gain, lock_mean=mean)
+    for name, opt in _COLOR_OPTS.items():
+        if ctl[name] is None or (lock and name in ("exposure", "gain")):
+            continue
+        want = float(ctl[name][cam_idx])
+        rng = color_sensor.get_option_range(opt)
+        if not rng.min <= want <= rng.max:
+            raise ValueError(f"{rs_id}: {name} {want:g} outside [{rng.min:g}, {rng.max:g}]")
+        color_sensor.set_option(opt, want)
+        got = float(color_sensor.get_option(opt))
+        if abs(got - want) > max(rng.step, 1e-6):
+            raise ValueError(f"{rs_id}: {name} set to {want:g} but device reports {got:g}")
+        eff[name] = got
+    return eff
+
+
+def describe_color_control(eff):
+    if eff["auto_exposure"] and eff["auto_white_balance"]:
+        return "auto exposure, auto white balance"
+    parts = []
+    if eff["auto_exposure"]:
+        parts.append("auto exposure")
+    elif eff.get("exposure_mode") == "auto-lock":
+        parts.append(f"locked exposure {eff['exposure']:g} gain {eff['gain']:g} "
+                     f"(mean {eff['lock_mean']:.0f})")
+    else:
+        parts.append(f"exposure {eff['exposure']:g} gain {eff['gain']:g}")
+    parts.append("auto WB" if eff["auto_white_balance"] else f"WB {eff['white_balance']:g}K")
+    return ", ".join(parts)
+
+
+# --------------------------------------------------------------------------- #
 # grabber
 # --------------------------------------------------------------------------- #
 def _grabber(rs_id, cam_idx, args, streams, barrier, info_q, frame_q, stop_evt, t0_box):
@@ -225,8 +364,8 @@ def _grabber(rs_id, cam_idx, args, streams, barrier, info_q, frame_q, stop_evt, 
     Emits exactly one record per schedule tick, always carrying the freshest
     frameset held at that instant (poll, don't wait -- ``wait_for_frames`` would
     hand us a frame up to 33 ms stale and blow the head-camera sync budget).
-    A tick with no new frameset repeats the previous one; the frame numbers
-    travel with every record so a repeat is auditable downstream, not silent.
+    A tick without a new complete frameset waits; missed ticks and SDK frame
+    numbers remain observable in the metadata.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)   # parent owns Ctrl-C; we stop on stop_evt
     try:
@@ -255,6 +394,8 @@ def _grabber(rs_id, cam_idx, args, streams, barrier, info_q, frame_q, stop_evt, 
             rng = depth_sensor.get_option_range(rs.option.laser_power)
             depth_sensor.set_option(rs.option.laser_power,
                                     rng.max if args.emitter else rng.min)
+        # Scan/manual tools leave device options behind; explicitly restore IR AE.
+        rsmeta.set_option_checked(depth_sensor, rs.option.enable_auto_exposure, 1)
         depth_scale = float(depth_sensor.get_depth_scale())
 
         # global_time is what makes get_timestamp() a HOST epoch clock instead of
@@ -273,10 +414,20 @@ def _grabber(rs_id, cam_idx, args, streams, barrier, info_q, frame_q, stop_evt, 
         # Sensor options persist on the device across processes: a manual exposure
         # left behind by any earlier tool would be inherited silently.
         color_sensor = dev.first_color_sensor()
-        color_sensor.set_option(rs.option.enable_auto_exposure, 1)
-        color_sensor.set_option(rs.option.enable_auto_white_balance, 1)
+        color_ctl = apply_color_control(color_sensor, rs_id, cam_idx, args.color_control,
+                                        pipe=pipe, max_exposure=1e6 / (100.0 * FPS))
 
         col = profile.get_stream(rs.stream.color).as_video_stream_profile()
+        serial_profile = getattr(args, "camera_profiles", {}).get(rs_id, {})
+        rsmeta.apply_serial_profile(dev, rs, serial_profile)
+        if serial_profile:
+            color_ctl["serial_profile_json"] = json.dumps(serial_profile, sort_keys=True)
+            if "color_exposure_option" in serial_profile:
+                color_ctl.update(auto_exposure=False, exposure_mode="manual",
+                                 exposure=serial_profile["color_exposure_option"], gain=serial_profile["color_gain"])
+            if "white_balance" in serial_profile:
+                color_ctl.update(auto_white_balance=False, white_balance=serial_profile["white_balance"])
+
         ir1 = profile.get_stream(rs.stream.infrared, 1).as_video_stream_profile()
         ir2 = profile.get_stream(rs.stream.infrared, 2).as_video_stream_profile()
         k_ir, k_rgb = ir1.get_intrinsics(), col.get_intrinsics()
@@ -305,7 +456,8 @@ def _grabber(rs_id, cam_idx, args, streams, barrier, info_q, frame_q, stop_evt, 
         while time.perf_counter() < deadline:
             probe = pipe.wait_for_frames()
         sample = np.asanyarray(probe.get_color_frame().get_data())
-        saturated = float((sample >= 250).mean())
+        quality_roi = tuple(getattr(args, "quality_roi_values", (0., 0., 1., 1.)))
+        saturated = float(rsmeta.color_statistics(sample, quality_roi)[6])
         if saturated > MAX_SATURATED:
             raise ValueError(
                 f"{rs_id}: colour is {saturated * 100:.1f}% saturated after settling "
@@ -313,11 +465,14 @@ def _grabber(rs_id, cam_idx, args, streams, barrier, info_q, frame_q, stop_evt, 
                 f"left manual exposure on the device)")
 
         info_q.put({
-            "rs_id": rs_id, "cam": cam_idx, "ok": True,
+            "rs_id": rs_id, "photometric_telemetry": True, "quality_roi": quality_roi, "frameset_guard": True,
+            "sensor_settings_json": rsmeta.sensor_settings(dev, rs),
+            "ir_distortion_model": str(k_ir.model),
+            "rgb_distortion_model": str(k_rgb.model), "cam": cam_idx, "ok": True,
             "K_ir": K_ir, "K_rgb": K_rgb, "T_rgb_to_ir": T_rgb_to_ir,
             "baseline": baseline, "depth_scale": depth_scale,
             "ir_coeffs": list(k_ir.coeffs), "rgb_coeffs": list(k_rgb.coeffs),
-            "saturated": saturated,
+            "saturated": saturated, "color_control": color_ctl,
         })
     except Exception as exc:
         info_q.put({"rs_id": rs_id, "cam": cam_idx, "ok": False,
@@ -343,6 +498,10 @@ def _grabber(rs_id, cam_idx, args, streams, barrier, info_q, frame_q, stop_evt, 
     period_ns = int(round(1e9 / args.rate))
 
     latest = None
+    option_readback = None
+    frameset_guard = FramesetGuard(streams)
+    rejected_since = None
+    next_option_readback = 0.0
     tick = 0
     try:
         while not stop_evt.is_set():
@@ -378,8 +537,27 @@ def _grabber(rs_id, cam_idx, args, streams, barrier, info_q, frame_q, stop_evt, 
                 "fnums": (int(f1.get_frame_number()), int(f2.get_frame_number()),
                           int(fc.get_frame_number()), int(fd.get_frame_number())),
             }
+            rec.update(rsmeta.frame_metadata([f1, f2, fc, fd], rs))
+            rejected = frameset_guard.inspect(rec["fnums"], rec["stream_timestamp_ms"])
+            if rejected is not None:
+                latest = None
+                if rejected_since is None:
+                    rejected_since = time.monotonic()
+                if frameset_guard.rejected <= 5 or frameset_guard.rejected % 30 == 0:
+                    print(f"[{rs_id}] dropped invalid frameset #{frameset_guard.rejected}: "
+                          f"{rejected}; tick={tick}, frame_numbers={rec['fnums']}", flush=True)
+                if time.monotonic() - rejected_since > 1.0:
+                    raise ValueError(f"{rs_id}: no coherent advancing frameset for 1 second: {rejected}")
+                continue
+            rejected_since = None
+            rec["framesets_rejected_total"] = np.int64(frameset_guard.rejected)
+            if time.monotonic() >= next_option_readback:
+                option_readback = rsmeta.option_snapshot([color_sensor, depth_sensor], rs)
+                next_option_readback = time.monotonic() + 1.0
+            rec.update(option_readback)
+            rec["color_quality"] = rsmeta.color_statistics(np.asanyarray(fc.get_data()), quality_roi)
             for s in streams:
-                rec[s] = np.asanyarray(src[s].get_data())
+                rec[s] = np.array(src[s].get_data(), copy=True)
 
             try:
                 frame_q.put(rec, timeout=2.0)
@@ -407,6 +585,8 @@ class EpisodeWriter:
     def __init__(self, path, cams, streams, info, seeds, compression):
         self.path = path
         self.cams = cams
+        self.guard_cams = {c for c in cams if info[c].get("frameset_guard", False)}
+        self.telemetry_cams = {c for c in cams if info[c].get("photometric_telemetry", False)}
         self.streams = streams
         self.info = info
         self.seeds = seeds
@@ -441,7 +621,28 @@ class EpisodeWriter:
                 self.ds[(c, name)] = self.mg.create_dataset(
                     f"camera_{c}_{name}", shape=(0,) + shp, maxshape=(None,) + shp,
                     dtype=dt, chunks=(256,) + shp)
+            for name, shape, dtype in rsmeta.specs(4):
+                self.ds[(c, name)] = self.mg.create_dataset(
+                    f"camera_{c}_{name}", shape=(0,) + shape, maxshape=(None,) + shape,
+                    dtype=dtype, chunks=(256,) + shape)
+            if c in self.guard_cams:
+                self.ds[(c, "framesets_rejected_total")] = self.mg.create_dataset(
+                    f"camera_{c}_framesets_rejected_total", shape=(0,), maxshape=(None,), dtype=np.int64, chunks=(256,))
+                self.mg.attrs[f"camera_{c}_frameset_guard"] = 'stored streams advance; IR pair <=2 ms; RGB/IR <=20 ms; counter cumulative since process start'
+            if c in self.telemetry_cams:
+                for name, shape, dtype in rsmeta.telemetry_specs():
+                    self.ds[(c, name)] = self.mg.create_dataset(
+                        f"camera_{c}_{name}", shape=(0,) + shape, maxshape=(None,) + shape,
+                        dtype=dtype, chunks=(256,) + shape)
+                self.mg.attrs[f"camera_{c}_sensor_option_fields"] = json.dumps(rsmeta.OPTION_FIELDS)
+                self.mg.attrs[f"camera_{c}_sensor_option_order"] = 'color,depth'
+                self.mg.attrs[f"camera_{c}_sensor_option_semantics"] = '1 Hz SDK option readback with query bounds; NOT per-frame actual exposure'
+                self.mg.attrs[f"camera_{c}_color_quality_fields"] = json.dumps(rsmeta.COLOR_FIELDS)
+                self.mg.attrs[f"camera_{c}_quality_roi"] = info[c]["quality_roi"]
+            rsmeta.describe(self.mg, f"camera_{c}", ["left_ir", "right_ir", "color", "depth"])
             self.mg.attrs[f"camera_{c}_serial"] = info[c]["rs_id"]
+            for key in ("sensor_settings_json", "ir_distortion_model", "rgb_distortion_model"):
+                self.mg.attrs[f"camera_{c}_{key}"] = info[c][key]
             self.mg.attrs[f"camera_{c}_ir_coeffs"] = info[c]["ir_coeffs"]
             self.mg.attrs[f"camera_{c}_rgb_coeffs"] = info[c]["rgb_coeffs"]
 
@@ -460,6 +661,19 @@ class EpisodeWriter:
                 d = self.ds[(c, name)]
                 d.resize(i + 1, axis=0)
                 d[i] = val
+            for name, _, _ in rsmeta.specs(4):
+                d = self.ds[(c, name)]
+                d.resize(i + 1, axis=0)
+                d[i] = r[name]
+            if c in self.guard_cams:
+                d = self.ds[(c, "framesets_rejected_total")]
+                d.resize(i + 1, axis=0)
+                d[i] = r["framesets_rejected_total"]
+            if c in self.telemetry_cams:
+                for name, _, _ in rsmeta.telemetry_specs():
+                    d = self.ds[(c, name)]
+                    d.resize(i + 1, axis=0)
+                    d[i] = r[name]
         self.n += 1
 
     def close(self, extra_attrs):
@@ -579,8 +793,10 @@ def report_take(path: Path, cams, rate: float, teleop_host, clock_pre, clock_pos
 def parse_args():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out-dir", type=Path, required=True,
-                    help="episode_<N>.hdf5 is written here; use LOCAL disk")
+    ap.add_argument("--out-dir", type=Path, default=None,
+                    help="episode_<N>.hdf5 is written here; use LOCAL disk. Required "
+                         "unless --follow-teleop-dir is given, where it defaults to "
+                         "<follow-teleop-dir>_static")
     ap.add_argument("--episode", type=int, default=None,
                     help="default: next free index in --out-dir")
     ap.add_argument("--rate", type=float, default=15.0,
@@ -594,6 +810,19 @@ def parse_args():
                          "throughput); full = fs + ASIC depth; rs = colour + ASIC depth only")
     ap.add_argument("--emitter", type=int, default=1, choices=[0, 1],
                     help="1 = IR projector on (better depth on bare tabletops)")
+    ap.add_argument("--exposure", default="auto",
+                    help="colour exposure: 'auto' (device AE, drifts as the arm moves); "
+                         "'auto-lock' (converge once at start-up to a frame mean of "
+                         f"{LOCK_TARGET:g} at fixed gain, then FREEZE -- per camera); one "
+                         "value for both cameras; or V0,V1 in camera_0,camera_1 order "
+                         "(D455 units of 100 us). Manual values need --gain too.")
+    ap.add_argument("--gain", default="auto",
+                    help="colour gain 0..128, same forms as --exposure; low gain + "
+                         f"longer exposure is less noisy (auto-lock default {LOCK_GAIN:g})")
+    ap.add_argument("--white-balance", default="auto",
+                    help="colour temperature in K (2800..6500), same forms as "
+                         "--exposure; tune per camera so a shared white surface "
+                         "matches between views")
     ap.add_argument("--duration", type=float, default=None,
                     help="stop after this many seconds (default: until Ctrl-C)")
     ap.add_argument("--seed-from", type=Path, default=None,
@@ -626,11 +855,63 @@ def parse_args():
                          "more than two RealSenses are attached (e.g. the handheld scan "
                          "camera is still plugged in); camera_<c> is still assigned by "
                          "ascending serial")
-    return ap.parse_args()
+    ap.add_argument("--camera-profile", type=Path, help="JSON keyed by selected D455 serial; exposure/gain in SDK option units")
+    ap.add_argument("--allow-auto-color", action="store_true", help="intentional tuning only: allow automatic RGB controls on the mobile static pair instead of requiring/selecting its measured profile")
+    ap.add_argument("--quality-roi", default="0,0,1,1", help="normalized task ROI x0,y0,x1,y1 for photometric statistics")
+    args = ap.parse_args()
+    if args.out_dir is None:
+        if args.follow_teleop_dir is None:
+            ap.error("--out-dir is required without --follow-teleop-dir")
+        d = args.follow_teleop_dir
+        args.out_dir = d.with_name(d.name + "_static")
+    return args
+
+
+MOBILE_STATIC_SERIALS = frozenset(('239222302971', '244622300362'))
+MOBILE_PROFILE = Path(__file__).resolve().parents[1] / 'configs/camera_profiles/static_mobile_20260920.json'
+
+
+def resolve_mobile_profile(args, serials, profile_path=MOBILE_PROFILE):
+    """Prevent default 'auto' from undoing the measured mobile-camera settings.
+
+    Other camera pairs retain their existing behavior. Intentional automatic-color
+    experiments on this pair require --allow-auto-color and remain visible in QC.
+    """
+    if frozenset(serials) != MOBILE_STATIC_SERIALS or args.allow_auto_color:
+        return
+    if args.camera_profile is None:
+        manual = all(isinstance(args.color_control[k], list)
+                     for k in ('exposure', 'gain', 'white_balance'))
+        defaults = all(args.color_control[k] is None
+                       for k in ('exposure', 'gain', 'white_balance'))
+        if manual:
+            return
+        if not defaults:
+            raise ValueError('Mobile static capture needs manual RGB exposure/gain AND white balance; '
+                             'use --camera-profile, or --allow-auto-color for an intentional experiment')
+        if not profile_path.is_file():
+            raise ValueError(f'Measured mobile camera profile missing: {profile_path}; '
+                             'pass --camera-profile explicitly; refusing silent auto exposure')
+        args.camera_profile = profile_path
+        args.camera_profiles = json.loads(profile_path.read_text())
+        print(f'profile   automatically selected measured mobile profile: {profile_path}', flush=True)
+    if not isinstance(args.camera_profiles, dict):
+        raise ValueError('Mobile camera profile must be an object keyed by serial')
+    required = {'color_exposure_option', 'color_gain', 'white_balance'}
+    for serial in serials:
+        settings = args.camera_profiles.get(serial)
+        if not isinstance(settings, dict) or required - settings.keys():
+            raise ValueError(f'{serial}: mobile profile must specify RGB exposure, gain and white balance; '
+                             'refusing partial profile with an automatic-color fallback')
 
 
 def main():
     args = parse_args()
+    args.camera_profiles = json.loads(args.camera_profile.read_text()) if args.camera_profile else {}
+    if not isinstance(args.camera_profiles, dict):
+        raise ValueError('Camera profile must be an object keyed by serial')
+    args.quality_roi_values = tuple(float(v) for v in args.quality_roi.split(','))
+    rsmeta.color_statistics(np.zeros((COLOR_H, COLOR_W, 3), np.uint8), args.quality_roi_values)
     if args.rate <= 0 or args.rate > FPS:
         raise ValueError(f"--rate must be in (0, {FPS}]; got {args.rate}")
     if (args.seed_from is None) == (args.seed is None):
@@ -640,6 +921,11 @@ def main():
             "solved calibration delta in config.json.")
 
     streams = _STREAM_SETS[args.streams]
+    args.color_control = parse_color_control(args.exposure, args.gain, args.white_balance)
+    max_exp = 1e6 / (100.0 * FPS)
+    if isinstance(args.color_control["exposure"], list) \
+            and max(args.color_control["exposure"]) > max_exp:
+        raise ValueError(f"--exposure above {max_exp:g} cannot sustain {FPS} fps")
     attached = sorted(d.get_info(rs.camera_info.serial_number) for d in rs.context().devices)
     if args.serials is not None:
         serials = sorted(x.strip() for x in args.serials.split(",") if x.strip())
@@ -654,6 +940,9 @@ def main():
             raise ValueError(
                 f"expected exactly 2 RealSense devices, found {serials}; pass --serials "
                 "<static_a>,<static_b> to pick the two static ones")
+    resolve_mobile_profile(args, serials)
+    if set(args.camera_profiles) - set(serials):
+        raise ValueError(f"Profile contains unselected serials: {set(args.camera_profiles) - set(serials)}")
     cams = list(range(len(serials)))          # camera_<c> by ascending serial
     serial_of = {c: serials[c] for c in cams}
 
@@ -737,7 +1026,7 @@ def main():
         p.start()
 
     info = {}
-    print(f"\nsettling auto-exposure ({SETTLE_S:.0f}s)...")
+    print(f"\nsettling colour ({SETTLE_S:.0f}s)...")
     try:
         for _ in cams:
             r = info_q.get(timeout=SETTLE_S + 90)
@@ -753,7 +1042,8 @@ def main():
     for c in cams:
         print(f"  camera_{c} ({info[c]['rs_id']}): baseline "
               f"{info[c]['baseline'] * 1000:.1f} mm, colour "
-              f"{info[c]['saturated'] * 100:.1f}% saturated")
+              f"{info[c]['saturated'] * 100:.1f}% saturated, "
+              f"{describe_color_control(info[c]['color_control'])}")
 
     # Anchor the shared tick schedule only once both cameras are past settling, so
     # tick 0 is a real frame on both and the two streams stay index-aligned.
@@ -772,6 +1062,9 @@ def main():
         "capture_host": os.uname().nodename,
         "timestamp_domain": "global_time (host epoch, ms)",
     }
+    for c in cams:
+        for k, v in info[c]["color_control"].items():
+            base_attrs[f"camera_{c}_color_{k}"] = v
 
     def _clock_attrs(pre, post) -> dict:
         out = {}

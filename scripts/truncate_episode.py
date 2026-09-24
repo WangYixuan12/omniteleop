@@ -26,6 +26,16 @@ if that is all that exists. A cut does not rename a ``.partial`` to ``.hdf5``.
         --static_dir /data/Dexmate/static_09_05 \
         --episode 3 \
         --n-frames 311 --apply
+
+``--cuts`` takes several episodes at once as ``EP:KEEP`` pairs. The count travels with its
+own episode, so a transposed pair is visible at the call site rather than silently cutting
+the wrong take to the wrong length. Every episode is resolved and checked BEFORE anything
+is written, so a bad pair aborts the batch instead of leaving it half applied.
+
+    python scripts/truncate_episode.py \
+        --teleop_dir /data/Dexmate/data_mobile/basket \
+        --static_dir /data/Dexmate/static_mobile/basket \
+        --cuts 2:495 5:3347 --apply
 """
 
 from __future__ import annotations
@@ -111,6 +121,98 @@ def static_keep_count(align, teleop: Path, static: Path, n: int) -> tuple[int, f
     return keep, (int(head_ns[n - 1]) - int(head_ns[0])) / 1e9
 
 
+def _parse_cuts(args) -> list[tuple[int, int]]:
+    """The requested cuts as ``(episode, n_frames)``, from either argument form."""
+    if args.cuts is None:
+        if args.n_frames is None:
+            raise ValueError("--episode requires --n-frames")
+        return [(args.episode, args.n_frames)]
+    if args.n_frames is not None:
+        raise ValueError("--n-frames belongs to the --episode form; --cuts carries its own counts")
+    pairs: list[tuple[int, int]] = []
+    for item in args.cuts:
+        episode, sep, keep = item.partition(":")
+        if not sep:
+            raise ValueError(f"--cuts takes EP:KEEP pairs, got {item!r}")
+        try:
+            pairs.append((int(episode), int(keep)))
+        except ValueError:
+            raise ValueError(f"--cuts takes EP:KEEP integers, got {item!r}") from None
+    episodes = [e for e, _ in pairs]
+    duplicated = sorted({e for e in episodes if episodes.count(e) > 1})
+    if duplicated:
+        raise ValueError(f"--cuts names an episode more than once: {duplicated}")
+    return pairs
+
+
+def plan_cut(align, teleop_dir: Path, static_dir: Path | None, episode: int, n_frames: int) -> dict:
+    """Resolve one episode and work out its cut. Read-only: nothing is modified here."""
+    if n_frames < 1:
+        raise ValueError(f"episode {episode}: rows to keep must be >= 1, got {n_frames}")
+    if episode < 0:
+        raise ValueError(f"episode index must be >= 0, got {episode}")
+
+    teleop = _episode_path(teleop_dir, episode)
+    static = None if static_dir is None else _episode_path(static_dir, episode)
+
+    with h5py.File(teleop, "r") as tf:
+        n_total = int(tf.attrs["n_frames"])
+        if int(tf["timestamp_ns"].shape[0]) != n_total:
+            raise ValueError(f"{teleop}: n_frames attr {n_total} != timestamp rows")
+        if n_frames > n_total:
+            raise ValueError(f"{teleop}: asked to keep {n_frames} of {n_total} recorded rows")
+        n_teleop_ds = len(_per_frame_datasets(tf, n_total, "meta/"))
+
+    keep_static = s_total = n_static_ds = None
+    kept_s = 0.0
+    if static is not None:
+        keep_static, kept_s = static_keep_count(align, teleop, static, n_frames)
+        with h5py.File(static, "r") as sf:
+            s_total = int(sf.attrs["num_frames"])
+            n_static_ds = len(_per_frame_datasets(sf, s_total, "\0"))
+
+    return dict(episode=episode, teleop=teleop, static=static, n_total=n_total,
+                n_frames=n_frames, n_teleop_ds=n_teleop_ds, keep_static=keep_static,
+                s_total=s_total, n_static_ds=n_static_ds, kept_s=kept_s)
+
+
+def report(p: dict, prefix: str) -> bool:
+    """Print what the cut would do; True when there is anything to cut."""
+    if p["teleop"].name.endswith(".partial"):
+        print(f"{prefix}teleop {p['teleop']} is a quarantined .partial (inspect/cut only; not renamed)")
+    if p["static"] is not None and p["static"].name.endswith(".partial"):
+        print(f"{prefix}static {p['static']} is a quarantined .partial (inspect/cut only; not renamed)")
+    print(f"{prefix}teleop {p['teleop']}: {p['n_total']} -> {p['n_frames']} rows "
+          f"({p['n_teleop_ds']} per-frame datasets)")
+    if p["static"] is not None:
+        print(f"{prefix}static {p['static']}: {p['s_total']} -> {p['keep_static']} rows "
+              f"({p['n_static_ds']} per-frame datasets; kept teleop span {p['kept_s']:.2f}s)")
+    return p["n_frames"] != p["n_total"] or (
+        p["static"] is not None and p["keep_static"] != p["s_total"])
+
+
+def apply_cut(align, p: dict, prefix: str) -> None:
+    """Shrink the files in place."""
+    with h5py.File(p["teleop"], "r+") as tf:
+        for ds in _per_frame_datasets(tf, p["n_total"], "meta/"):
+            _truncate(ds, p["n_frames"])
+        tf.attrs["n_frames"] = np.int64(p["n_frames"])
+    print(f"{prefix}teleop cut to {p['n_frames']} rows")
+
+    if p["static"] is None:
+        return
+    with h5py.File(p["static"], "r+") as sf:
+        for ds in _per_frame_datasets(sf, p["s_total"], "\0"):
+            _truncate(ds, p["keep_static"])
+        sf.attrs["num_frames"] = np.int64(p["keep_static"])
+    print(f"{prefix}static cut to {p['keep_static']} rows")
+    head_ns = align.head_on_teleop_clock(p["teleop"])
+    for cam in (0, 1):
+        m = align.match(align.static_on_teleop_clock(p["static"], cam), head_ns, int(70e6))
+        print(f"{prefix}  verify camera_{cam}: {(m['static_idx'] >= 0).sum()}/{len(head_ns)} teleop rows "
+              f"matched within 70 ms, max gap {m['gap_ns'].max() / 1e6:.0f} ms")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument(
@@ -125,71 +227,45 @@ def main() -> int:
         default=None,
         help="directory of record_static_cams.py episode_<N>.hdf5[.partial] files paired with --teleop_dir",
     )
-    ap.add_argument(
+    which = ap.add_mutually_exclusive_group(required=True)
+    which.add_argument(
         "--episode",
         type=int,
-        required=True,
         help="episode index N; loads episode_N.hdf5, or .hdf5.partial if that is all that exists",
     )
-    ap.add_argument("--n-frames", type=int, required=True, help="teleop rows to KEEP (0..N-1)")
+    which.add_argument(
+        "--cuts",
+        nargs="+",
+        metavar="EP:KEEP",
+        help="several episodes at once, each as episode:rows-to-keep (e.g. 2:495 5:3347)",
+    )
+    ap.add_argument("--n-frames", type=int, help="teleop rows to KEEP (0..N-1); use with --episode")
     ap.add_argument("--apply", action="store_true", help="modify the files (default: dry run)")
     args = ap.parse_args()
-    if args.n_frames < 1:
-        raise ValueError("--n-frames must be >= 1")
-    if args.episode < 0:
-        raise ValueError("--episode must be >= 0")
 
-    teleop = _episode_path(args.teleop_dir, args.episode)
-    static = None if args.static_dir is None else _episode_path(args.static_dir, args.episode)
-    if teleop.name.endswith(".partial"):
-        print(f"teleop {teleop} is a quarantined .partial (inspect/cut only; not renamed)")
-    if static is not None and static.name.endswith(".partial"):
-        print(f"static {static} is a quarantined .partial (inspect/cut only; not renamed)")
+    cuts = _parse_cuts(args)
+    align = None if args.static_dir is None else _load_align()
 
-    with h5py.File(teleop, "r") as tf:
-        n_total = int(tf.attrs["n_frames"])
-        if int(tf["timestamp_ns"].shape[0]) != n_total:
-            raise ValueError(f"{teleop}: n_frames attr {n_total} != timestamp rows")
-        if args.n_frames > n_total:
-            raise ValueError(f"--n-frames {args.n_frames} exceeds the {n_total} recorded rows")
-        n_teleop_ds = len(_per_frame_datasets(tf, n_total, "meta/"))
-    print(f"teleop {teleop}: {n_total} -> {args.n_frames} rows ({n_teleop_ds} per-frame datasets)")
+    # Resolve and check every episode before writing anything, so one bad pair aborts the
+    # batch rather than leaving some episodes cut and the rest untouched.
+    plans = [plan_cut(align, args.teleop_dir, args.static_dir, ep, n) for ep, n in cuts]
 
-    keep_static = None
-    if static is not None:
-        align = _load_align()
-        keep_static, kept_s = static_keep_count(align, teleop, static, args.n_frames)
-        with h5py.File(static, "r") as sf:
-            s_total = int(sf.attrs["num_frames"])
-            n_static_ds = len(_per_frame_datasets(sf, s_total, "\0"))
-        print(f"static {static}: {s_total} -> {keep_static} rows "
-              f"({n_static_ds} per-frame datasets; kept teleop span {kept_s:.2f}s)")
-
-    if args.n_frames == n_total and (keep_static is None or keep_static == s_total):
-        print("nothing to cut")
+    multi = len(plans) > 1
+    pending = []
+    for p in plans:
+        prefix = f"episode_{p['episode']}: " if multi else ""
+        if report(p, prefix):
+            pending.append(p)
+        else:
+            print(f"{prefix}nothing to cut")
+    if not pending:
         return 0
     if not args.apply:
-        print("dry run; re-run with --apply to cut in place")
+        print(f"dry run; re-run with --apply to cut {len(pending)} episode(s) in place")
         return 0
 
-    with h5py.File(teleop, "r+") as tf:
-        for ds in _per_frame_datasets(tf, n_total, "meta/"):
-            _truncate(ds, args.n_frames)
-        tf.attrs["n_frames"] = np.int64(args.n_frames)
-    print(f"teleop cut to {args.n_frames} rows")
-
-    if static is not None:
-        assert keep_static is not None
-        with h5py.File(static, "r+") as sf:
-            for ds in _per_frame_datasets(sf, s_total, "\0"):
-                _truncate(ds, keep_static)
-            sf.attrs["num_frames"] = np.int64(keep_static)
-        print(f"static cut to {keep_static} rows")
-        head_ns = align.head_on_teleop_clock(teleop)
-        for cam in (0, 1):
-            m = align.match(align.static_on_teleop_clock(static, cam), head_ns, int(70e6))
-            print(f"  verify camera_{cam}: {(m['static_idx'] >= 0).sum()}/{len(head_ns)} teleop rows "
-                  f"matched within 70 ms, max gap {m['gap_ns'].max() / 1e6:.0f} ms")
+    for p in pending:
+        apply_cut(align, p, f"episode_{p['episode']}: " if multi else "")
     return 0
 
 

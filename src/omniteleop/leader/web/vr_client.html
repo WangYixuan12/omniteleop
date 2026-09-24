@@ -179,10 +179,37 @@ function renderCameras(pose) {
     // Panel height is fixed; width follows the received image's aspect ratio
     // (camAspect, captured in _decodeCamTex) so vr_reader._camera_poll can change
     // the preview (depth tile, RGB tiles, montage width) without re-stretching
-    // here. Falls back to the default 2-tile 4:3 montage (8:3) before any decode lands.
-    const camPanelH = 0.55;
-    const camPanelW = camPanelH * (camAspect.img || (8 / 3));
-    if (camTex.img)  drawQuad(proj, _eyeView, 0.0, -0.3, -1.2, camPanelW, camPanelH, camTex.img);
+    // here. Falls back to the default 3-tile 4:3 montage (4:1) before any decode lands.
+    //
+    // APPARENT SIZE KNOB. The panel sits at z = -1.2, so its horizontal field of view is
+    //     fov = 2 * atan(camPanelH * aspect / 2 / 1.2)
+    // With the default 3-tile montage (aspect = 4.0):
+    //     camPanelH 0.55 -> 85 deg (too wide: the wrist tiles sit outside the comfortable
+    //                               reading zone, so you must turn your head to see them)
+    //     camPanelH 0.50 -> 80 deg (previous: the outer tiles clipped out of view)
+    //     camPanelH 0.45 -> 74 deg
+    //     camPanelH 0.40 -> 67 deg   <- current
+    //     camPanelH 0.35 -> 61 deg
+    //     camPanelH 0.30 -> 53 deg
+    // Because the aspect is fixed by the composed image, narrowing the panel also shrinks
+    // it VERTICALLY -- there is no way to reduce angular width alone for a flat quad. To
+    // keep large tiles AND a narrow panel, compose fewer tiles (--hud-cameras) or stack
+    // them in two rows in wbc_headset_hud.poll_and_send (which lowers the aspect).
+    const camPanelH = 0.40;
+    const camPanelW = camPanelH * (camAspect.img || 4.0);
+    // VERTICAL PLACEMENT KNOB. The quad is drawn in EYE space, so it stays pinned to this
+    // spot in the field of view wherever the operator looks. Dropping camPanelY moves the
+    // tiles out of the central passthrough cone -- dashboard style -- so the straight-ahead
+    // see-through view of the real scene stays unobstructed and the camera tiles are read
+    // with a downward glance. At z = -1.2 with camPanelH 0.40 the panel's top/bottom edges
+    // sit this far BELOW eye level:
+    //     camPanelY -0.30 ->  5 / 23 deg  (previous: tiles sat over the centre of view)
+    //     camPanelY -0.45 -> 12 / 31 deg
+    //     camPanelY -0.65 -> 21 / 35 deg   <- current
+    //     camPanelY -0.75 -> 25 / 38 deg
+    //     camPanelY -0.85 -> 28 / 41 deg  (near the headset's ~45 deg lower FOV edge)
+    const camPanelY = -0.65;
+    if (camTex.img)  drawQuad(proj, _eyeView, 0.0, camPanelY, -1.2, camPanelW, camPanelH, camTex.img);
   }
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }

@@ -29,10 +29,13 @@ from __future__ import annotations
 import os
 import pathlib
 import subprocess
+import sys
 from typing import Callable, Optional
 
 import h5py
 import numpy as np
+
+from omniteleop.follower.live_object_condition import LiveObjectArtifacts
 
 # Single-frame "before" HDF5 dataset keys — the contract with make_deploy_before_hdf5.py
 # / extract_first_hdf5_rgb_depth.py. Keep in lock-step with those readers.
@@ -40,11 +43,124 @@ RGB_KEY = "obs/images/head_left_rgb"
 DEPTH_KEY = "obs/images/head_depth"
 EXTRINSIC_KEY = "obs/images/extrinsic"
 INTRINSIC_KEY = "obs/images/intrinsic"
+CAMERA_TIMESTAMP_KEY = "obs/images/head_timestamp_ns"
+WORLD_FRAME_EPOCH_KEY = "meta/world_frame_epoch"
 
 # The scene_diff driver script (lives in the scene_diff repo, run in .venv-merged).
 RUN_SCRIPT_NAME = "run_live_pos_condition.sh"
 
 _Log = Callable[[str], None]
+
+BOOTSTRAP_SCHEMA = "scenediff_live_object_bootstrap_v1"
+
+
+def load_live_tracker_api(repo: "os.PathLike[str] | str"):
+    """Import the configured in-process SceneDiff tracker and probe dependencies."""
+    repo = pathlib.Path(repo).expanduser().resolve()
+    if not repo.is_dir():
+        raise FileNotFoundError(f"SceneDiff checkout not found: {repo}")
+    repo_text = str(repo)
+    if repo_text not in sys.path:
+        sys.path.insert(0, repo_text)
+    module = __import__("modules.vos_tracker", fromlist=["Sam31VosTracker"])
+    actual = pathlib.Path(module.__file__).resolve()
+    if repo not in actual.parents:
+        raise RuntimeError(f"imported vos_tracker from {actual}, not {repo}")
+    module.probe_live_dependencies()
+    return module
+
+
+def load_live_object_artifacts(
+    bootstrap_path: "os.PathLike[str] | str",
+    capture_hdf5: "os.PathLike[str] | str",
+) -> LiveObjectArtifacts:
+    """Load the fresh size-slot bootstrap plus its native RGB-D capture."""
+    bootstrap_path = pathlib.Path(bootstrap_path)
+    capture_hdf5 = pathlib.Path(capture_hdf5)
+    with np.load(bootstrap_path, allow_pickle=False) as data:
+        required = (
+            "schema", "positions", "valid", "scene_diff_obj_ids",
+            "seed_size_slots", "frame", "positions_sha256",
+            "object_masks_sha256", "rgb_scenediff_sha256",
+        )
+        missing = [key for key in required if key not in data.files]
+        if missing:
+            raise ValueError(f"{bootstrap_path}: missing {missing}")
+        if str(data["schema"]) != BOOTSTRAP_SCHEMA:
+            raise ValueError(
+                f"{bootstrap_path}: schema {str(data['schema'])!r} != "
+                f"{BOOTSTRAP_SCHEMA!r}"
+            )
+        if str(data["frame"]) != "world":
+            raise ValueError(f"{bootstrap_path}: positions are not in world frame")
+        dino = None
+        dino_metadata = {
+            "dino_model": None,
+            "dino_source": None,
+            "dino_input_scale": None,
+        }
+        if "dino_region_feats" in data.files:
+            dino_required = ("dino_valid", "dino_model", "dino_source", "dino_input_scale")
+            dino_missing = [key for key in dino_required if key not in data.files]
+            if dino_missing:
+                raise ValueError(f"{bootstrap_path}: incomplete DINO fields {dino_missing}")
+            if str(data["dino_input_scale"]) != "[0,1]":
+                raise ValueError(f"{bootstrap_path}: DINO input scale is not [0,1]")
+            dino = np.asarray(data["dino_region_feats"])
+            dino_valid = np.asarray(data["dino_valid"])
+            if dino.ndim != 2 or dino_valid.shape != (dino.shape[0],):
+                raise ValueError(
+                    f"{bootstrap_path}: DINO feature/valid shapes disagree: "
+                    f"{dino.shape}/{dino_valid.shape}"
+                )
+            if not np.array_equal(
+                dino_valid, np.ones(dino.shape[0], dtype=dino_valid.dtype)
+            ):
+                raise ValueError(f"{bootstrap_path}: dino_valid is not all ones")
+            dino_metadata = {
+                "dino_model": str(data["dino_model"]),
+                "dino_source": str(data["dino_source"]),
+                "dino_input_scale": str(data["dino_input_scale"]),
+            }
+        hashes = tuple(str(data[key]) for key in (
+            "positions_sha256", "object_masks_sha256", "rgb_scenediff_sha256"
+        ))
+        for value in hashes:
+            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise ValueError(f"{bootstrap_path}: invalid SHA-256 value {value!r}")
+        fields = {
+            "positions_size": np.asarray(data["positions"]),
+            "valid_size": np.asarray(data["valid"]),
+            "scene_diff_obj_ids_size": np.asarray(data["scene_diff_obj_ids"]),
+            "seed_size_slots": np.asarray(data["seed_size_slots"]),
+            "dino_region_feats_size": dino,
+            "provenance_hashes": hashes,
+            **dino_metadata,
+        }
+    with h5py.File(capture_hdf5, "r") as capture:
+        required_capture = (
+            RGB_KEY, DEPTH_KEY, EXTRINSIC_KEY, INTRINSIC_KEY,
+            CAMERA_TIMESTAMP_KEY, WORLD_FRAME_EPOCH_KEY,
+        )
+        missing = [key for key in required_capture if key not in capture]
+        if missing:
+            raise ValueError(f"{capture_hdf5}: missing {missing}")
+        rgb = np.asarray(capture[RGB_KEY])
+        depth = np.asarray(capture[DEPTH_KEY])
+        if rgb.shape[0] != 1 or depth.shape[0] != 1:
+            raise ValueError(f"{capture_hdf5}: expected one RGB-D frame")
+        fields.update({
+            "bootstrap_rgb": rgb[0],
+            "bootstrap_depth_mm": depth[0],
+            "intrinsic": np.asarray(capture[INTRINSIC_KEY]),
+            "world_t_cam": np.asarray(capture[EXTRINSIC_KEY]),
+            "camera_timestamp_ns": int(np.asarray(capture[CAMERA_TIMESTAMP_KEY])),
+            "world_frame_epoch": int(np.asarray(capture[WORLD_FRAME_EPOCH_KEY])),
+        })
+    return LiveObjectArtifacts(
+        source_artifact=bootstrap_path,
+        **fields,
+    )
 
 
 def write_live_capture_hdf5(
@@ -53,6 +169,9 @@ def write_live_capture_hdf5(
     depth: np.ndarray,
     extrinsic: np.ndarray,
     intrinsic: np.ndarray,
+    *,
+    camera_timestamp_ns: int | None = None,
+    world_frame_epoch: int | None = None,
 ) -> None:
     """Write one live head frame as a single-frame deploy-style "before" HDF5.
 
@@ -74,12 +193,24 @@ def write_live_capture_hdf5(
         raise ValueError(f"extrinsic must be (4, 4), got {extrinsic.shape}")
     if intrinsic.shape != (3, 3):
         raise ValueError(f"intrinsic must be (3, 3), got {intrinsic.shape}")
+    if rgb.dtype != np.uint8 or depth.dtype != np.uint16:
+        raise ValueError(
+            f"live RGB-D must be uint8/uint16, got {rgb.dtype}/{depth.dtype}"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
-    with h5py.File(path, "w") as f:
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(f"live capture exists: {path}; delete it manually")
+    with h5py.File(path, "x") as f:
         f.create_dataset(RGB_KEY, data=np.ascontiguousarray(rgb, dtype=np.uint8)[None, ...])
         f.create_dataset(DEPTH_KEY, data=np.ascontiguousarray(depth, dtype=np.uint16)[None, ...])
         f.create_dataset(EXTRINSIC_KEY, data=extrinsic.astype(np.float32))
         f.create_dataset(INTRINSIC_KEY, data=intrinsic.astype(np.float32))
+        if camera_timestamp_ns is not None:
+            if int(camera_timestamp_ns) < 0:
+                raise ValueError("camera_timestamp_ns must be non-negative")
+            f.create_dataset(CAMERA_TIMESTAMP_KEY, data=np.int64(camera_timestamp_ns))
+        if world_frame_epoch is not None:
+            f.create_dataset(WORLD_FRAME_EPOCH_KEY, data=np.int64(world_frame_epoch))
 
 
 def show_slot_overlay(overlay_path: "os.PathLike[str] | str", *, log: _Log = print) -> None:
@@ -107,7 +238,7 @@ def show_slot_overlay(overlay_path: "os.PathLike[str] | str", *, log: _Log = pri
             return
         except FileNotFoundError:
             continue
-        except Exception as exc:  # noqa: BLE001 - viewer is strictly best-effort
+        except Exception as exc:  # viewer is strictly best-effort
             log(f"{opener} failed ({exc}); open {overlay_path} manually.")
             return
     log(f"no image viewer found on PATH; open {overlay_path} manually.")
@@ -159,7 +290,7 @@ def prompt_for_slot_order(
                 ok = False
                 break
         if ok and sorted(chosen) == list(range(object_nums)):
-            log(f"order = {chosen}  ({list(zip(names, chosen))})")
+            log(f"order = {chosen}  ({list(zip(names, chosen, strict=True))})")
             return chosen
         if ok:
             log(f"  {chosen} is not a permutation of 0..{object_nums - 1} "
@@ -177,6 +308,7 @@ def invoke_scenediff(
     obj_num: int,
     matching: str,
     frame_label: str,
+    dino: bool = False,
     config: Optional[str] = None,
     timeout: Optional[float] = None,
     script_name: str = RUN_SCRIPT_NAME,
@@ -207,6 +339,17 @@ def invoke_scenediff(
             f"SceneDiff interpreter not found: {python} (expected scene_diff/.venv-merged)")
     if not pathlib.Path(reference).exists():
         raise FileNotFoundError(f"position-condition reference not found: {reference}")
+    existing = [
+        path for path in (
+            out_dir / "episode_0.npz",
+            out_dir / "bootstrap_size_slots.npz",
+        ) if path.exists() or path.is_symlink()
+    ]
+    if existing:
+        raise FileExistsError(
+            "refusing to reuse SceneDiff output; delete manually: "
+            + ", ".join(str(path) for path in existing)
+        )
 
     # Clean env: drop the rollout's PYTHONPATH (e.g. lerobot_original/src) and PYTHONHOME
     # so they cannot shadow the .venv-merged interpreter's modules.
@@ -218,6 +361,7 @@ def invoke_scenediff(
     env["SAM"] = str(sam)
     env["OBJ_NUM"] = str(obj_num)
     env["POS_COND_MATCHING"] = str(matching)
+    env["DINO"] = "1" if dino else "0"
     # The npz's frame field is METADATA stamped by extract_object_positions.py -- it must
     # name the frame of the extrinsic embedded in live_hdf5 (tabletop base_T_cam ->
     # "robot_base"; mobile WBC world_T_zed -> "world"). Downstream consumers fail closed
@@ -229,7 +373,9 @@ def invoke_scenediff(
     cmd = ["bash", str(script), str(live_hdf5), str(out_dir)]
     log(f"running SceneDiff: PYTHON={python} {' '.join(cmd)}")
     # Inherit stdio so SAM3 progress is visible; enforce a wall-clock timeout.
-    result = subprocess.run(cmd, env=env, cwd=str(repo), timeout=timeout)
+    result = subprocess.run(
+        cmd, env=env, cwd=str(repo), timeout=timeout, check=False
+    )
     npz = out_dir / "episode_0.npz"
     if result.returncode != 0:
         raise RuntimeError(
@@ -241,4 +387,9 @@ def invoke_scenediff(
             f"object count / too few valid pixels). Inspect "
             f"{out_dir / 'deploy_before_overlay.png'} and {out_dir / '_work' / 'skip.json'}, "
             "fix the scene/params, and rerun.")
+    bootstrap = out_dir / "bootstrap_size_slots.npz"
+    if not bootstrap.exists():
+        raise FileNotFoundError(
+            f"SceneDiff produced {npz} but no versioned bootstrap {bootstrap}"
+        )
     return npz

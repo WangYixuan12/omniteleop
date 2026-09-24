@@ -33,10 +33,14 @@ Important: only one process can hold the V4L2 device. Stop
 
 Usage::
 
-    # production: run until Ctrl-C, RGB-only
-    python tests/test_wrist_zedm_depth.py
+    # production: one process per wrist camera, run until Ctrl-C, RGB-only.
+    # The serial is pinned by sensor_id (_ARM_SERIALS), so no --serial-number needed
+    # and a mismatched one is rejected rather than silently swapping the arms.
+    python tests/test_wrist_zedm_depth.py --sensor-id left_wrist_zedm
+    python tests/test_wrist_zedm_depth.py --sensor-id right_wrist_zedm
     # debug round-trip fps / depth
-    python tests/test_wrist_zedm_depth.py --verify --enable-depth --save-dir ~/Dexmate
+    python tests/test_wrist_zedm_depth.py --sensor-id left_wrist_zedm \
+        --verify --enable-depth --save-dir ~/Dexmate
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import pathlib
+import sys
 import time
 from typing import Literal, Optional
 
@@ -55,8 +60,44 @@ from dexcomm import Node
 from dexcomm.codecs import DepthImageCodec, JsonDataCodec, RGBImageCodec
 from loguru import logger
 
-Resolution = Literal["HD720", "HD1080", "HD2K", "VGA"] # 2208 × 1242, 1920 × 1080, 1280 × 720, 672 × 376
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+from omniteleop.common.zed_motion import ZedMotion, resolve_depth_mode
+from omniteleop.common.zed_photometric import PhotometricTelemetry
+
+# Native sizes: 2208x1242, 1920x1080, 1280x720, 672x376.
+Resolution = Literal["HD720", "HD1080", "HD2K", "VGA"]
 DepthMode = Literal["NEURAL", "NEURAL_LIGHT", "ULTRA", "QUALITY", "PERFORMANCE"]
+
+# Which physical camera belongs on which arm. Publishing one arm's camera under the
+# other arm's sensor_id mislabels every recorded frame downstream and is unrecoverable
+# from the files, so the pairing is checked rather than trusted to the command line.
+# Update this table (and only this) if a wrist camera is replaced.
+_ARM_SERIALS: dict[str, int] = {
+    "left_wrist_zedm": 12417276,
+    "right_wrist_zedm": 12930616,
+    # Aliases: NOT the ids anything consumes (wbc_vr_robot.py, the leader HUD and the
+    # scan scripts all read sensors/<left|right>_wrist_zedm/*), but dexcontrol's built-in
+    # sensors carry these names and a launch under them is an easy slip. Pinned so that
+    # slip still cannot swap the arms on top of publishing to a topic nobody reads.
+    "left_wrist_camera": 12417276,
+    "right_wrist_camera": 12930616,
+}
+
+# Abort after this long with no successful grab. A camera that has dropped off USB
+# (e.g. a SuperSpeed link stuck in a reset loop) fails EVERY subsequent grab, so
+# retrying forever just spins the CPU while publishing nothing -- the process looks
+# alive, the stream is dead, and the failure only surfaces much later as a
+# record-side stale-frame abort. Die loudly instead so the operator sees which
+# camera went and can restart it.
+_GRAB_FAILURE_ABORT_S = 5.0
+
+# Keep images below VR/actuator traffic under congestion while retaining the
+# existing best-effort/latest-frame behavior.
+_CAMERA_QOS = {
+    "reliability": "best_effort",
+    "congestion_control": "drop",
+    "priority": "data_low",
+}
 
 
 @dataclasses.dataclass
@@ -67,21 +108,40 @@ class Args:
     """Sensor id used to derive topic names: sensors/<sensor_id>/{rgb,depth}.
     Must match what vr_reader.py / dexcontrol will subscribe to."""
 
+    serial_number: int = 0
+    """ZED serial to open. For a known --sensor-id (left_wrist_zedm /
+    right_wrist_zedm) this is filled in from _ARM_SERIALS and a CONFLICTING value
+    is rejected, so the arm assignment cannot flip between runs. Only an
+    unrecognized sensor_id falls back to 0 = first available camera."""
+
     namespace: str = ""
     """Zenoh namespace passed to dexcomm.Node (matches vr_reader.py:257)."""
 
     resolution: Resolution = "HD720"
     """ZED capture resolution."""
 
+    enable_imu: bool = False
+    """Publish timestamped full-rate IMU batches without visual pose estimation."""
+
+    enable_tracking: bool = False
+    """Publish GEN_3 camera pose and full-rate IMU after stereo image delivery."""
+
+    tracking_mode: Literal["GEN_1", "GEN_2", "GEN_3"] = "GEN_3"
+    # Compute depth for tracking only; does not publish depth or change RGB size.
+    tracking_depth_mode: Optional[DepthMode] = None
+    """GEN_3 supports tracking with depth disabled."""
+
+    area_memory: bool = False
+    """Enable loop closure; off for continuous collection odometry."""
+
     enable_depth: bool = False
     """Compute + publish depth. Off by default — vr_reader uses the wrist
     RGB-only, and the stereo matcher throttles the capture loop. Turn on only
     to debug depth."""
 
-    skip_right_rgb: bool = True
-    """Skip the right_rgb stream. On by default — vr_reader only consumes the
-    left wrist view, so publishing right doubles the bandwidth for no use.
-    Turn off to debug stereo."""
+    skip_right_rgb: bool = False
+    """Skip the right_rgb stream. Off by default so recordings can retain the
+    rectified pair for offline FoundationStereo. Turn on for a mono-only run."""
 
     depth_mode: DepthMode = "NEURAL_LIGHT"
     """Depth estimation algorithm (only used when --enable-depth). NEURAL is
@@ -93,6 +153,24 @@ class Args:
     rate (e.g. 20 -> 15). Default 15 matches the downstream record cadence
     (wbc_vr_robot 10 Hz, vr_reader 15 Hz). Bump to 30 only if grab latency,
     not bandwidth, is the limiter."""
+
+    enable_self_calib: bool = False
+    """Allow the ZED SDK to refine stereo calibration during open. Off by default
+    because these remounted wrist units have previously returned
+    POTENTIAL_CALIBRATION_ISSUE. This switch exists for a controlled pixel-level
+    rectification diagnostic; always re-run probe_camera_bandwidth.py --verify and
+    inspect calibration repeatability before adopting it for data collection."""
+
+    image_validity_check: int = 1
+    """ZED SDK InitParameters.enable_image_validity_check level (0 = off). The ZED
+    Mini occasionally delivers a TORN frame -- a byte slip in its side-by-side USB
+    video frame, so the rows below one line belong to a neighbouring capture,
+    wrapped horizontally, in both eyes at once (episode_9 left wrist frames 1300 and
+    2058: 2 of 2339). Nothing downstream can tell: the SDK timestamp and sequence
+    are regular. With the check on, grab() returns ERROR_CODE.CORRUPTED_FRAME for
+    such a frame and it is SKIPPED (counted in the fps line and /info
+    statistics), so a torn image never reaches a recording or a policy. A skipped
+    15 fps frame leaves a 133 ms gap, inside wbc_vr_robot's 250 ms stale grace."""
 
     depth_min: float = 0.3
     """Minimum depth in metres."""
@@ -176,37 +254,77 @@ def _clock_response(sensor_id: str, sequence: int) -> dict:
     }
 
 
+def _resolve_serial(sensor_id: str, serial_number: int) -> int:
+    """Serial to open, cross-checked against the arm this sensor_id names.
+
+    For a known wrist sensor_id the serial is pinned: omitting it fills in the
+    right camera, and passing a different one is a swapped launch -- exactly the
+    mistake that silently mislabels an entire recording session.
+    """
+    expected = _ARM_SERIALS.get(sensor_id)
+    if expected is None:
+        return serial_number  # unknown/ad-hoc sensor_id: caller is on their own
+    if serial_number > 0 and serial_number != expected:
+        other = next(
+            (sid for sid, sn in _ARM_SERIALS.items() if sn == serial_number), None
+        )
+        hint = f" -- that serial is {other}" if other else ""
+        raise SystemExit(
+            f"sensor_id {sensor_id!r} is serial {expected}, but --serial-number "
+            f"{serial_number} was given{hint}. Publishing one arm's camera under the "
+            "other arm's topic mislabels every recorded frame. Fix the command, or "
+            "update _ARM_SERIALS if a camera was replaced."
+        )
+    return expected
+
+
 def main() -> None:
     args = tyro.cli(Args)
     verify = args.verify or args.save_dir is not None
+    serial_number = _resolve_serial(args.sensor_id, args.serial_number)
     zenoh_config = _configure_zenoh_like_dexcontrol()
 
     # ── 1. Open ZED-M via SDK ─────────────────────────────────────────────────
     # DEPTH_MODE.NONE skips the stereo matcher entirely — that is what keeps the
     # RGB-only capture loop at full fps.
-    depth_mode = (
-        getattr(sl.DEPTH_MODE, args.depth_mode)
-        if args.enable_depth
-        else sl.DEPTH_MODE.NONE
-    )
+    depth_mode = getattr(sl.DEPTH_MODE, resolve_depth_mode(args))
     init = sl.InitParameters(
         camera_resolution=getattr(sl.RESOLUTION, args.resolution),
         camera_fps=args.rate,
         depth_mode=depth_mode,
+        coordinate_system=sl.COORDINATE_SYSTEM.IMAGE,
         coordinate_units=sl.UNIT.METER,
         depth_minimum_distance=args.depth_min,
         depth_maximum_distance=args.depth_max,
     )
+    if serial_number > 0:
+        init.set_from_serial_number(serial_number)
+    # The SDK re-runs self-calibration on open and rejects its own result once a
+    # camera has been remounted (ERROR_CODE.POTENTIAL_CALIBRATION_ISSUE). Pin it
+    # to the factory /usr/local/zed/settings/SN<serial>.conf instead.
+    init.camera_disable_self_calib = not args.enable_self_calib
+    if args.image_validity_check < 0:
+        raise ValueError(f"--image-validity-check must be >= 0, got {args.image_validity_check}")
+    init.enable_image_validity_check = int(args.image_validity_check)
     runtime = sl.RuntimeParameters()
     zed = sl.Camera()
     err = zed.open(init)
     if err != sl.ERROR_CODE.SUCCESS:
         raise SystemExit(
-            f"ZED open failed: {err}. "
-            f"Is dexsensor still holding /dev/video10?"
+            f"ZED open failed for serial "
+            f"{serial_number if serial_number > 0 else '<first available>'}: "
+            f"{err}. Is dexsensor or another publisher holding the device?"
         )
 
     info = zed.get_camera_information()
+    # Guard the whole point of --serial-number: never publish one arm's camera
+    # under the other arm's sensor_id.
+    if serial_number > 0 and int(info.serial_number) != serial_number:
+        zed.close()
+        raise ValueError(
+            f"Requested serial {serial_number} but the SDK opened "
+            f"{info.serial_number}."
+        )
     logger.info(
         f"Camera: {info.camera_model} sn={info.serial_number} "
         f"fw={info.camera_configuration.firmware_version}"
@@ -227,6 +345,39 @@ def main() -> None:
     width, height = (out_hw[1], out_hw[0]) if out_hw is not None else (raw_w, raw_h)
     logger.info(f"Capture {raw_w}x{raw_h} → publish {width}x{height} (WxH)")
 
+    # FoundationStereo returns disparity; metric depth additionally needs the
+    # rectified focal length and physical baseline. VIEW.LEFT/VIEW.RIGHT use the
+    # SDK's rectified calibration, and both eyes undergo the same resize below.
+    # The current 16:9 -> 4:3 default has different x/y scales, so adjust each
+    # intrinsic axis independently rather than assuming one uniform scale.
+    calib = info.camera_configuration.calibration_parameters
+    baseline_m = float(calib.get_camera_baseline())
+    if not 0.01 < baseline_m < 0.5:
+        zed.close()
+        raise SystemExit(
+            f"implausible ZED stereo baseline {baseline_m} m; coordinate_units is "
+            "METER, so this should be the physical inter-lens distance"
+        )
+
+    def _published_k(cam) -> list[list[float]]:
+        sx, sy = width / raw_w, height / raw_h
+        return [
+            [float(cam.fx) * sx, 0.0, float(cam.cx) * sx],
+            [0.0, float(cam.fy) * sy, float(cam.cy) * sy],
+            [0.0, 0.0, 1.0],
+        ]
+
+    stereo = {
+        "baseline_m": baseline_m,
+        "rectified": True,
+        "left_K": _published_k(calib.left_cam),
+        "right_K": _published_k(calib.right_cam),
+    }
+    logger.info(
+        f"Stereo calibration: baseline {baseline_m * 1000:.2f} mm, "
+        f"left fx {stereo['left_K'][0][0]:.2f} px (published geometry)"
+    )
+
     # ── 2. Set up Zenoh pub/sub via dexcomm ──────────────────────────────────
     left_topic = f"sensors/{args.sensor_id}/left_rgb"
     right_topic = f"sensors/{args.sensor_id}/right_rgb"
@@ -241,17 +392,25 @@ def main() -> None:
     logger.info(
         f"ROBOT_NAME={os.getenv('ROBOT_NAME')!r}; node.namespace={node.namespace!r}"
     )
-    left_pub = node.create_publisher(left_topic, encoder=RGBImageCodec.encode)
+    left_pub = node.create_publisher(
+        left_topic, encoder=RGBImageCodec.encode, qos=_CAMERA_QOS
+    )
     right_pub = (
-        node.create_publisher(right_topic, encoder=RGBImageCodec.encode)
+        node.create_publisher(
+            right_topic, encoder=RGBImageCodec.encode, qos=_CAMERA_QOS
+        )
         if not args.skip_right_rgb
         else None
     )
     depth_pub = (
-        node.create_publisher(depth_topic, encoder=DepthImageCodec.encode)
+        node.create_publisher(
+            depth_topic, encoder=DepthImageCodec.encode, qos=_CAMERA_QOS
+        )
         if args.enable_depth
         else None
     )
+    motion = ZedMotion(zed, node, info, args, _CAMERA_QOS)
+    photometric = PhotometricTelemetry(zed, sl)
     # Self-verify subscribers are opt-in: decoding every frame in-process
     # throttles the publisher and starves the info queryable.
     left_sub = right_sub = depth_sub = None
@@ -267,6 +426,9 @@ def main() -> None:
         "right_rgb": {"published": 0, "last_timestamp_ns": 0},
         "depth": {"published": 0, "last_timestamp_ns": 0},
     }
+    # Torn frames rejected by the SDK validity check; kept OUT of frame_stats, whose
+    # values are per-stream dicts updated on every publish.
+    corrupted_stats = {"skipped": 0}
     sequence_state = {"latest": 0}
     info_stats = {"queries": 0, "last_log_s": 0.0}
 
@@ -291,18 +453,36 @@ def main() -> None:
                 "height": int(height),
                 "fps": int(args.rate),
             },
+            # Queried once by wbc_vr_robot.py when wrist stereo recording is
+            # enabled, then stored under meta/wrist_stereo/<arm> in the episode.
+            "stereo": stereo,
             "configured": {
                 "resolution": args.resolution,
+                "self_calibration": bool(args.enable_self_calib),
+                "image_validity_check": int(args.image_validity_check),
                 "depth_mode": args.depth_mode,
+                "sdk_depth_mode": resolve_depth_mode(args),
+                "tracking_depth_mode": args.tracking_depth_mode,
                 "depth_min": float(args.depth_min),
                 "depth_max": float(args.depth_max),
+                "resize_hw": [int(height), int(width)],
             },
             "streams": {
+                "motion": {
+                    "enabled": motion.enabled, "transport": "zenoh",
+                    "topic": f"sensors/{args.sensor_id}/motion", "schema_version": 1,
+                },
                 "left_rgb": {"enabled": True, "transport": "zenoh", "topic": left_topic},
-                "right_rgb": {"enabled": not args.skip_right_rgb, "transport": "zenoh", "topic": right_topic},
+                "right_rgb": {
+                    "enabled": not args.skip_right_rgb,
+                    "transport": "zenoh",
+                    "topic": right_topic,
+                },
                 "depth": {"enabled": args.enable_depth, "transport": "zenoh", "topic": depth_topic},
             },
-            "statistics": frame_stats,
+            "motion": motion.info(),
+            "photometric": photometric.snapshot,
+            "statistics": {**frame_stats, "corrupted_skipped": corrupted_stats["skipped"]},
         }
 
     def _clock(_request: bytes | None = None) -> dict:
@@ -345,7 +525,12 @@ def main() -> None:
     right_mat = sl.Mat()
     depth_mat = sl.Mat()
 
+    # seq is the monotonic frame identity carried in every payload; pub_count is only the
+    # fps-log window counter and IS zeroed every second, so it cannot double as the
+    # sequence source (that made seq cycle 1..15 and defeated downstream drop detection).
+    seq = 0
     pub_count = 0
+    corrupted_count = 0  # torn frames skipped in the current fps window
     sub_left_count = 0
     sub_right_count = 0
     sub_depth_count = 0
@@ -353,11 +538,46 @@ def main() -> None:
     t_start = t_window
     t_last_save = 0.0
     first_logged = False
+    # perf_counter of the first failure in the current grab-failure streak (None while
+    # grabs are succeeding); drives the _GRAB_FAILURE_ABORT_S bail-out below.
+    grab_failed_since: Optional[float] = None
 
     try:
         while True:
-            if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+            grab_err = motion.read(runtime)
+            if grab_err == sl.ERROR_CODE.CORRUPTED_FRAME:
+                # Torn USB frame (see Args.image_validity_check): drop it. Not a link
+                # failure -- the next grab is normally fine -- so it must not feed the
+                # _GRAB_FAILURE_ABORT_S timer.
+                corrupted_count += 1
+                corrupted_stats["skipped"] += 1
                 continue
+            if grab_err != sl.ERROR_CODE.SUCCESS:
+                t_fail = time.perf_counter()
+                if grab_failed_since is None:
+                    grab_failed_since = t_fail
+                    logger.error(
+                        f"ZED grab failed ({grab_err}) on {args.sensor_id} "
+                        f"sn={info.serial_number}; retrying up to "
+                        f"{_GRAB_FAILURE_ABORT_S:g}s. If this persists, check "
+                        "'journalctl -k | grep -i usb' for SuperSpeed resets."
+                    )
+                elif t_fail - grab_failed_since >= _GRAB_FAILURE_ABORT_S:
+                    raise SystemExit(
+                        f"ZED grab failed continuously for {_GRAB_FAILURE_ABORT_S:g}s on "
+                        f"{args.sensor_id} sn={info.serial_number} (last error: "
+                        f"{grab_err}). The camera has stopped delivering frames -- most "
+                        "likely its USB SuperSpeed link dropped. Exiting rather than "
+                        "publishing nothing while appearing healthy."
+                    )
+                time.sleep(0.01)  # never hot-spin while the link is down
+                continue
+            if grab_failed_since is not None:
+                logger.info(
+                    f"ZED grab recovered after "
+                    f"{time.perf_counter() - grab_failed_since:.1f}s"
+                )
+                grab_failed_since = None
             # SDK timestamp of the grabbed image. This rides the codec-preserved
             # timestamp_ns field; extra payload keys are dropped by RGBImageCodec.
             ts = _zed_image_timestamp_ns(zed)
@@ -386,7 +606,7 @@ def main() -> None:
                     depth_m, nan=0.0, posinf=0.0, neginf=0.0
                 ).astype(np.float32)
 
-            seq = pub_count + 1
+            seq += 1
             left_pub.publish(
                 {
                     "data": left_rgb,
@@ -416,6 +636,8 @@ def main() -> None:
                         "height": height,
                     }
                 )
+            motion.after_images(ts, seq, runtime)
+            photometric.update(ts)
             sequence_state["latest"] = seq
             for stream_stats in frame_stats.values():
                 stream_stats["published"] = seq
@@ -465,6 +687,8 @@ def main() -> None:
             if now - t_window >= 1.0:
                 dt = now - t_window
                 line = f"pub: {pub_count / dt:5.1f} fps"
+                if corrupted_count:
+                    line += f"  | skipped {corrupted_count} CORRUPTED_FRAME"
                 if verify:
                     line += (
                         f"  | sub L/R/D: {sub_left_count / dt:5.1f} / "
@@ -472,6 +696,7 @@ def main() -> None:
                     )
                 logger.info(line)
                 pub_count = sub_left_count = sub_right_count = sub_depth_count = 0
+                corrupted_count = 0
                 t_window = now
 
             if (
@@ -507,6 +732,7 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
     finally:
+        motion.close()
         zed.close()
         clock_service.shutdown()
         info_service.shutdown()

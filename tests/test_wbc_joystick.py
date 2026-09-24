@@ -563,7 +563,11 @@ def test_real_follower_drive_base_and_hold():
     d._odom = Odom()
     d._arkit = None
     d.robot = SimpleNamespace(chassis=Chassis())
-    d.cfg = WBCConfig()
+    # Collection runs joystick_teleop.head_mode "fixed" (head pinned at nominal), and
+    # the recorded head contract reads the --enable mask, so both must be present here
+    # exactly as the real driver carries them.
+    d.cfg = replace(WBCConfig(), head_mode="fixed")
+    d.enable = {"arms": True, "torso": True, "head": True, "base": True}
     d.args = SimpleNamespace(base_quiet_hold_s=-1.0)
     d._dbg = {}
     d._base_quiet_elapsed = 0.0
@@ -605,6 +609,11 @@ def test_real_follower_drive_base_and_hold():
     assert metadata["eef_target_frame"] == np.bytes_("current_base")
     assert metadata["action_target_frame"] == np.bytes_("current_base")
     assert metadata["head_target_frame"] == np.bytes_("current_base")
+    # head_mode "fixed" pins the head at nominal, so action/head (policy dims 20-28) is
+    # a leader-side label this take never executed. Both facts are recorded because
+    # head_actuated also depends on the --enable mask, which nothing else writes out.
+    assert metadata["head_mode"] == np.bytes_("fixed")
+    assert bool(metadata["head_actuated"]) is False
     assert metadata["policy_action_schema"] == np.bytes_(
         "omniteleop_wbc_joystick_action/v1"
     )
@@ -623,6 +632,14 @@ def test_real_follower_drive_base_and_hold():
     assert d._recording_control_metadata()["demonstration_source"] == np.bytes_(
         "policy_rollout"
     )
+    # head_mode "track" drives the neck from action/head, so the same dims ARE executed.
+    d.cfg = replace(d.cfg, head_mode="track")
+    assert bool(d._recording_control_metadata()["head_actuated"]) is True
+    # ...unless the head group was never enabled for actuation on this take.
+    d.enable = {**d.enable, "head": False}
+    assert bool(d._recording_control_metadata()["head_actuated"]) is False
+    d.enable = {**d.enable, "head": True}
+    d.cfg = replace(d.cfg, head_mode="fixed")
     d._shaper.turn_90 = True
     metadata = d._recording_control_metadata()
     assert metadata["chassis_turn_step_deg"] == 90
@@ -878,6 +895,16 @@ def test_joystick_episode_replay_accepts_fixed_speed_raw_v2(tmp_path):
     assert source.replay_kind == "joystick_episode"
 
 
+def test_generated_fixed_speed_episode_rejects_clock_stretch(tmp_path):
+    path = tmp_path / 'trajectory.hdf5'
+    _write_joystick_replay_episode(path, schema='omniteleop_joystick_mobile_raw/v2')
+    with h5py.File(path, 'a') as f:
+        f['meta/required_replay_speed'] = 1.
+    with pytest.raises(ValueError, match='fixed-speed.*--speed'):
+        ReplaySource.from_joystick_hdf5(str(path), speed=.5)
+    assert ReplaySource.from_joystick_hdf5(str(path), speed=1.).speed == 1.
+
+
 def test_joystick_episode_replay_refuses_to_guess_intent_from_applied_twist(
     tmp_path,
 ):
@@ -909,3 +936,57 @@ def test_joystick_ik_takes_head_mode_from_the_joystick_block(tmp_path):
     _ik, cfg = m._build_joystick_ik(_yaml_with_joystick_head_mode(tmp_path, "track"))
     assert cfg.head_mode == "track" and cfg.lock_base_in_ik   # top-level "ik" never leaks in
     assert JoystickTeleopConfig.from_yaml().head_mode == "fixed"  # the collection default
+
+
+# --- recording disposition on operator stop vs fault --------------------------------------
+
+@pytest.mark.parametrize("failure,quarantined", [(KeyboardInterrupt, False), (RuntimeError, True)])
+def test_ctrl_c_publishes_the_take_while_a_fault_quarantines_it(monkeypatch, failure, quarantined):
+    """Ctrl-C is an operator boundary: frames recorded so far publish as a normal take.
+
+    ``driver.close()`` runs ``stop_recording_episode()``, so reaching close() without
+    ``abort_recording_episode()`` is what saves the partial recording as ``episode_<N>.hdf5``.
+    A runtime fault instead quarantines it as ``.hdf5.partial`` with ``complete=false``.
+    """
+    mod = _load_script("wbc_joystick_robot")
+    events = []
+
+    class _Driver:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def abort_recording_episode(self, reason):
+            events.append("quarantine")
+
+        def close(self):
+            events.append("close")   # -> HardwareDriver.stop_recording_episode()
+
+    ik = SimpleNamespace(model=SimpleNamespace(nq=24, nv=23))
+    cfg = SimpleNamespace(head_mode="fixed", base_dofs="xy_yaw", lock_base_in_ik=True,
+                          lock_torso_in_ik=True, urdf_path="a/b.urdf",
+                          enable_base_single_axis=True)
+    monkeypatch.setattr(mod, "_build_joystick_ik", lambda *a, **kw: (ik, cfg))
+    monkeypatch.setattr(mod, "ReplaySource", SimpleNamespace(
+        from_joystick_hdf5=lambda *a, **kw: SimpleNamespace(
+            _vr=[0], total_duration=1.0, replay_kind="joystick_episode",
+            head_targets_pre_filtered=True, close=lambda: None)))
+    monkeypatch.setattr(mod, "JoystickHardwareDriver", _Driver)
+    monkeypatch.setattr(mod, "_publish_abort_status", lambda *a, **kw: None)
+
+    def _fail(*a, **kw):
+        raise failure("stopped")
+
+    monkeypatch.setattr(mod, "run_loop", _fail)
+    args = SimpleNamespace(replay="take.hdf5", speed=1.0, config=None, lock_torso_in_ik=None,
+                           debug_dir=None, record=False, arkit_base="off", turn_90=False,
+                           joystick_translation_speed=0.18, joystick_rotation_speed=0.30)
+    enable = dict.fromkeys(["arms", "torso", "head", "base"], True)
+
+    if quarantined:
+        with pytest.raises(RuntimeError):
+            mod._run_joystick_ik_mode(args, enable)
+    else:
+        mod._run_joystick_ik_mode(args, enable)   # Ctrl-C is swallowed, not re-raised
+
+    assert ("quarantine" in events) is quarantined
+    assert "close" in events

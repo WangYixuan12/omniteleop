@@ -562,6 +562,15 @@ class ReplaySource:
                             raise ValueError(
                                 f"{path}: {key} must be a finite positive scalar"
                             )
+                if 'meta/required_replay_speed' in f:
+                    required = np.asarray(f['meta/required_replay_speed'][()])
+                    if required.shape != () or not np.isfinite(float(required)) or float(required) <= 0:
+                        raise ValueError(f'{path}: invalid required replay speed')
+                    if not np.isclose(speed, float(required), rtol=0., atol=1e-9):
+                        raise ValueError(
+                            f'{path}: fixed-speed trajectory requires --speed {float(required):g}; '
+                            'stretching the clock also lengthens translation and yaw commands'
+                        )
                 wanted = (
                     _EPISODE_TIME_DATASET,
                     *_EPISODE_POSE_DATASETS.values(),

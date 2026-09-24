@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Head ZED-X-Mini publisher: left RGB + depth via SDK → Zenoh, cropped+resized.
+"""Head ZED-X-Mini publisher: stereo RGB (optionally depth) via SDK → Zenoh, cropped+resized.
 
 Drop-in replacement for ``dexsensor launch --sensor head_camera`` that crops and
 downsamples *before* the Zenoh encode, so only the small frames cross WiFi. The
@@ -11,7 +11,7 @@ the same pattern; this one adds the ZED-X-Mini/GMSL open, depth, and crop+resize
 
   pyzed (ZED X Mini, GMSL port 0)
      │
-     ├─ grab → LEFT view (+ RIGHT only if --no-skip-right-rgb) + DEPTH
+     ├─ grab → LEFT view + RIGHT view (+ DEPTH only if --enable-depth)
      │
      ├─ crop [top:bottom, left:right]  then resize → (resize_h, resize_w)
      │     RGB:   INTER_AREA   (anti-aliased downscale)
@@ -19,19 +19,19 @@ the same pattern; this one adds the ZED-X-Mini/GMSL open, depth, and crop+resize
      │            mix invalid 0/NaN pixels with valid ones)
      │
      ├─ publisher → sensors/<id>/left_rgb   (RGBImageCodec, RGB uint8)
-     ├─ publisher → sensors/<id>/right_rgb  (RGBImageCodec)            [opt-in]
-     ├─ publisher → sensors/<id>/depth      (DepthImageCodec, float32 m)
+     ├─ publisher → sensors/<id>/right_rgb  (RGBImageCodec, RGB uint8)
+     ├─ publisher → sensors/<id>/depth      (DepthImageCodec, float32 m) [opt-in]
      ├─ publisher → sensors/<id>/pose       (JsonDataCodec, quat+trans) [--enable-tracking]
      ├─ service   → sensors/<id>/info       (JsonDataCodec)
      └─ service   → sensors/<id>/clock      (JsonDataCodec, publisher host clock)
 
-With ``--enable-tracking`` the SDK positional-tracking module (VSLAM+IMU) also
-runs and the camera pose in the tracking world is published each grab
-(full-rate, uncropped — tracking uses the raw stereo stream internally, so the
-crop/resize above does not affect it). Fuse with FK via the (now legacy)
-``legacy/VSLAM/scripts/zed_base_pose_node.py`` to get the robot base pose.
-ZED VSLAM base positioning is retired (wheel odometry + closed-loop control
-replaced it); this tracking path is kept off by default and unused.
+``--enable-imu`` publishes full-rate inertial batches; ``--enable-tracking``
+adds GEN_3 visual-inertial pose estimation and also enables IMU telemetry.
+Both are opt-in. Pose estimation uses the full stereo input and can stall the
+next capture even though the current RGB pair is published first. Live tests
+failed the strict latency gate; use the diagnostics before enabling for recording.
+Each tracker has an independent origin. Its pose is auxiliary data, not robot
+base odometry or calibrated world-frame ground truth.
 
 Topic naming matches the head_camera convention (left_rgb / right_rgb / depth)
 so dexcontrol's ``ZedCameraSensor`` (what ``vr_reader.py`` polls via the Robot
@@ -48,8 +48,10 @@ running for the whole vr_reader session (no ``--duration``).
 
 Usage::
 
-    # production: matches recording rate, RGB-only + depth, default crop/resize
+    # production: low-latency 30 Hz capture, stereo RGB, default crop/resize
     python tests/test_head_zedx_depth.py
+    # add the SDK depth stream
+    python tests/test_head_zedx_depth.py --enable-depth
     # debug round-trip fps / inspect cropped frames
     python tests/test_head_zedx_depth.py --verify --save-dir ~/Dexmate
 """
@@ -72,10 +74,34 @@ from dexcomm.codecs import DepthImageCodec, JsonDataCodec, RGBImageCodec
 from loguru import logger
 
 sys.path.insert(0, (pathlib.Path(__file__).resolve().parent.parent / "src").as_posix())
-from omniteleop.common.head_camera import HEAD_CROP_TBLR, HEAD_RESIZE_HW  # noqa: E402
+from omniteleop.common.head_camera import (  # noqa: E402
+    HEAD_CROP_TBLR,
+    HEAD_RESIZE_HW,
+    HEAD_RESOLUTION,
+    crop_resize_intrinsics,
+)
+
+from omniteleop.common.zed_motion import ZedMotion
 
 Resolution = Literal["SVGA", "HD1080", "HD1200"]
 DepthMode = Literal["NEURAL", "NEURAL_LIGHT", "ULTRA", "QUALITY", "PERFORMANCE"]
+
+# The head ZED X Mini, pinned by serial. Selecting by index (set_from_camera_id)
+# resolves against the SDK's whole device list, so any other ZED on the machine --
+# including a wrist ZED-M that has dropped off USB3 and lingers as a dead
+# sn=0/NOT AVAILABLE entry -- can occupy slot 0 and get opened instead of the head.
+# That surfaces as a bare CAMERA STREAM FAILED TO START with nothing wrong with the
+# head at all. The serial is unambiguous. Update this if the head camera is replaced.
+_HEAD_SERIAL: int = 50571637
+
+# Camera payloads must yield to VR/actuator traffic if any link is congested.
+# Best-effort + drop preserves the existing latest-frame semantics; data_low
+# prevents large JPEG/PNG fragments from sharing control's interactive priority.
+_CAMERA_QOS = {
+    "reliability": "best_effort",
+    "congestion_control": "drop",
+    "priority": "data_low",
+}
 
 
 @dataclasses.dataclass
@@ -90,30 +116,31 @@ class Args:
     namespace: str = ""
     """Zenoh namespace passed to dexcomm.Node (matches vr_reader.py)."""
 
-    camera_id: int = 0
-    """GMSL2 port of the ZED X Mini (dexsensor's head_camera uses 0)."""
+    resolution: Resolution = HEAD_RESOLUTION  # type: ignore[assignment]
+    """ZED capture resolution. Default = omniteleop.common.head_camera.HEAD_RESOLUTION
+    (HD1200); SVGA (960x600) is the SDK floor for ZED X Mini. The crop below is
+    validated against the frame this resolution actually delivers."""
 
-    resolution: Resolution = "SVGA"
-    """ZED capture resolution. SVGA (960x600) is the SDK floor for ZED X Mini;
-    the crop coordinates below assume SVGA."""
-
-    rate: int = 15
+    rate: int = 30
     """Camera fps. The ZED X Mini at SVGA only supports a discrete set
     (15/30/60/120); any other value silently rounds DOWN to the nearest
-    supported rate (e.g. 20 -> 15). Default 15 matches the downstream record
-    cadence (wbc_vr_robot 10 Hz, vr_reader 15 Hz) and minimises head-camera
-    bandwidth. Bump to 30 only if grab latency, not bandwidth, is the limiter."""
+    supported rate (e.g. 20 -> 15). Default 30 is intentional: live six-stream
+    measurements at full 600x960 found 44--52 ms head arrival age versus
+    144--150 ms at 15 Hz. The resulting aggregate camera uplink was ~29 Mbps,
+    and bounded head history still supplies coherent 10 Hz rows with 15 Hz wrists."""
 
     depth_mode: DepthMode = "NEURAL"
 
-    enable_depth: bool = True
-    """Compute + publish depth. On by default — vr_reader's default --cameras
-    records head_depth."""
+    enable_depth: bool = False
+    """Compute + publish depth. Off by default — the SDK depth pass is the
+    dominant grab-loop cost and the frames are the bandwidth hog, and stereo
+    consumers reconstruct depth themselves from left+right. Turn on for
+    consumers that want the SDK's depth directly."""
 
-    skip_right_rgb: bool = True
-    """Skip the right_rgb stream. On by default — vr_reader's default --cameras
-    consumes only head_left_rgb + head_depth, so publishing right wastes
-    bandwidth. Turn off to debug stereo."""
+    skip_right_rgb: bool = False
+    """Skip the right_rgb stream. Off by default — the pair is published so
+    downstream stereo (FoundationStereo, via the meta/head_stereo fx+baseline)
+    has both views. Turn on to halve RGB bandwidth when only left is consumed."""
 
     depth_min: float = 0.1
     """Minimum depth in metres (matches the dexsensor head_camera config)."""
@@ -123,7 +150,7 @@ class Args:
 
     crop: tuple[int, int, int, int] = HEAD_CROP_TBLR
     """Crop applied to every stream as (top, bottom, left, right) pixel indices on
-    the raw SVGA frame, i.e. img[top:bottom, left:right]. Default = the shared
+    the raw capture frame (HEAD_RESOLUTION), i.e. img[top:bottom, left:right]. Default = the shared
     omniteleop.common.head_camera.HEAD_CROP_TBLR — the single source of truth for
     crop geometry + ZED_K (vr_reader / policy_rollout). Override on the CLI for a
     one-off without touching the consumers."""
@@ -136,6 +163,9 @@ class Args:
     """Output width after the crop (default = head_camera.HEAD_RESIZE_HW[1]). Set
     to 0 (with resize_h=0) to skip resize."""
 
+    enable_imu: bool = False
+    """Publish timestamped full-rate IMU batches without visual pose estimation."""
+
     enable_tracking: bool = False
     """Enable ZED positional tracking (VSLAM+IMU) and publish the camera pose
     on sensors/<id>/pose each grab as quaternion_xyzw + translation. Off by
@@ -145,14 +175,9 @@ class Args:
     legacy/VSLAM/scripts/zed_base_pose_node.py to get the robot base pose."""
 
     tracking_mode: Literal["GEN_1", "GEN_2", "GEN_3"] = "GEN_3"
-    """sl.POSITIONAL_TRACKING_MODE. GEN_3 (default) is the current feature-based
-    VSLAM with loop closure: mean APE 0.56 m vs GEN_1's 0.62-0.8 m indoors and
-    0.29 m vs 2.45-3.9 m outdoors per Stereolabs, at ~13% CPU / 44% GPU on a
-    Jetson Orin NX. Watch the pub fps line after start — if grab fps drops below
-    the camera rate, fall back to GEN_1 (lightest, VIO-only). GEN_2 is
-    deprecated by the SDK and will be removed."""
+    """GEN_3 supports tracking without depth and image-first processing."""
 
-    area_memory: bool = True
+    area_memory: bool = False
     """SDK enable_area_memory: drift correction via relocalization/loop closure
     (pose may jump on closure). Disable for smooth pure-odometry output."""
 
@@ -290,14 +315,20 @@ def main() -> None:
         depth_minimum_distance=args.depth_min,
         depth_maximum_distance=args.depth_max,
     )
-    init.set_from_camera_id(args.camera_id)
+    init.set_from_serial_number(_HEAD_SERIAL)
+    # Pin the FACTORY calibration. With self-calibration on, the SDK re-estimates fx at
+    # every open() (measured 0.145% spread across three opens of this unit), so the
+    # published left_K is not reproducible across publisher restarts and drifts past the
+    # 0.107% tolerance of wbc_vr_robot_tmp's meta/head_stereo check. See
+    # omniteleop.common.head_camera.HEAD_BASE_K, which stores the pinned values.
+    init.camera_disable_self_calib = True
     runtime = sl.RuntimeParameters()
     zed = sl.Camera()
     err = zed.open(init)
     if err != sl.ERROR_CODE.SUCCESS:
         raise SystemExit(
             f"ZED open failed: {err}. Is dexsensor still holding the head_camera "
-            f"(GMSL port {args.camera_id})? Stop it first."
+            f"(serial {_HEAD_SERIAL})? Stop it first."
         )
 
     info = zed.get_camera_information()
@@ -306,34 +337,6 @@ def main() -> None:
         f"fw={info.camera_configuration.firmware_version}"
     )
 
-    # ── 1b. Positional tracking (opt-in) ──────────────────────────────────────
-    zed_pose = None
-    if args.enable_tracking:
-        if depth_mode == sl.DEPTH_MODE.NONE:
-            raise ValueError(
-                "--enable-tracking needs depth (the SDK tracker consumes it); "
-                "do not combine with --no-enable-depth."
-            )
-        tracking_params = sl.PositionalTrackingParameters()
-        tracking_params.mode = getattr(sl.POSITIONAL_TRACKING_MODE, args.tracking_mode)
-        tracking_params.enable_area_memory = args.area_memory
-        if area_path is not None:
-            tracking_params.area_file_path = area_path.as_posix()
-            tracking_params.enable_localization_only = args.localization_only
-        err = zed.enable_positional_tracking(tracking_params)
-        if err != sl.ERROR_CODE.SUCCESS:
-            zed.close()
-            raise SystemExit(f"enable_positional_tracking failed: {err}")
-        zed_pose = sl.Pose()
-        pose_orientation = sl.Orientation()
-        pose_translation = sl.Translation()
-        logger.info(
-            f"Positional tracking ON: mode={args.tracking_mode}, "
-            f"area_memory={args.area_memory}, imu_fusion={tracking_params.enable_imu_fusion}, "
-            f"localization_only={tracking_params.enable_localization_only}, "
-            f"area_file={area_path}, "
-            f"coordinate_system={init.coordinate_system} (camera frame = optical)"
-        )
     cam_res = info.camera_configuration.resolution
     raw_w, raw_h = cam_res.width, cam_res.height
     logger.info(f"Raw capture resolution: {raw_w}x{raw_h}")
@@ -345,6 +348,38 @@ def main() -> None:
     logger.info(
         f"Pipeline: raw {raw_w}x{raw_h} → crop [{top}:{bottom},{left}:{right}] "
         f"({crop_w}x{crop_h}) → resize {out_w}x{out_h} (WxH)"
+    )
+
+    # ── 1c. Stereo calibration for the PUBLISHED frames ───────────────────────
+    # FoundationStereo needs (left, right, fx, baseline) to turn disparity into
+    # metric depth. `calibration_parameters` (not `_raw`) is the RECTIFIED pair,
+    # which is what VIEW.LEFT/VIEW.RIGHT return, and left/right go through the
+    # SAME _crop_resize below -- so the rows stay epipolar-aligned and only the
+    # intrinsics need adjusting. The baseline is a physical distance and does
+    # not scale with crop/resize.
+    _calib = info.camera_configuration.calibration_parameters
+    _baseline_m = float(_calib.get_camera_baseline())
+    if not 0.01 < _baseline_m < 0.5:
+        raise SystemExit(
+            f"implausible ZED stereo baseline {_baseline_m} m; coordinate_units is "
+            f"METER, so this should be the physical inter-lens distance"
+        )
+
+    def _sdk_k(cam) -> np.ndarray:
+        return np.array([[cam.fx, 0.0, cam.cx], [0.0, cam.fy, cam.cy],
+                         [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    _stereo = {
+        "baseline_m": _baseline_m,
+        "rectified": True,
+        "left_K": crop_resize_intrinsics(
+            _sdk_k(_calib.left_cam), args.crop, (out_h, out_w)).tolist(),
+        "right_K": crop_resize_intrinsics(
+            _sdk_k(_calib.right_cam), args.crop, (out_h, out_w)).tolist(),
+    }
+    logger.info(
+        f"Stereo calibration: baseline {_baseline_m * 1000:.2f} mm, "
+        f"left fx {_stereo['left_K'][0][0]:.2f} px (published geometry)"
     )
 
     # ── 2. Set up Zenoh pub/sub via dexcomm ───────────────────────────────────
@@ -360,22 +395,24 @@ def main() -> None:
         f"Zenoh config: {zenoh_config if zenoh_config is not None else '<dexcomm default>'}"
     )
     logger.info(f"ROBOT_NAME={os.getenv('ROBOT_NAME')!r}; node.namespace={node.namespace!r}")
-    left_pub = node.create_publisher(left_topic, encoder=RGBImageCodec.encode)
+    left_pub = node.create_publisher(
+        left_topic, encoder=RGBImageCodec.encode, qos=_CAMERA_QOS
+    )
     right_pub = (
-        node.create_publisher(right_topic, encoder=RGBImageCodec.encode)
+        node.create_publisher(
+            right_topic, encoder=RGBImageCodec.encode, qos=_CAMERA_QOS
+        )
         if not args.skip_right_rgb
         else None
     )
     depth_pub = (
-        node.create_publisher(depth_topic, encoder=DepthImageCodec.encode)
+        node.create_publisher(
+            depth_topic, encoder=DepthImageCodec.encode, qos=_CAMERA_QOS
+        )
         if args.enable_depth
         else None
     )
-    pose_pub = (
-        node.create_publisher(pose_topic, encoder=JsonDataCodec.encode)
-        if args.enable_tracking
-        else None
-    )
+    motion = ZedMotion(zed, node, info, args, _CAMERA_QOS)
     left_sub = right_sub = depth_sub = None
     if verify:
         left_sub = node.create_subscriber(left_topic, decoder=RGBImageCodec.decode)
@@ -410,6 +447,10 @@ def main() -> None:
             "serial_number": int(info.serial_number),
             "firmware_version": str(info.camera_configuration.firmware_version),
             "actual": {"width": int(out_w), "height": int(out_h), "fps": int(args.rate)},
+            # Consumed by wbc_vr_robot_tmp.py --head-right-rgb so a stereo take
+            # carries everything FoundationStereo needs (fx, baseline) without a
+            # hardcoded constant anywhere downstream.
+            "stereo": _stereo,
             "configured": {
                 "resolution": args.resolution,
                 "depth_mode": args.depth_mode,
@@ -437,6 +478,10 @@ def main() -> None:
                 },
             },
             "streams": {
+                "motion": {
+                    "enabled": motion.enabled, "transport": "zenoh",
+                    "topic": f"sensors/{args.sensor_id}/motion", "schema_version": 1,
+                },
                 "left_rgb": {"enabled": True, "transport": "zenoh", "topic": left_topic},
                 "right_rgb": {
                     "enabled": not args.skip_right_rgb,
@@ -452,6 +497,7 @@ def main() -> None:
                 },
             },
             "statistics": frame_stats,
+            "motion": motion.info(),
         }
 
     def _clock(_request: bytes | None = None) -> dict:
@@ -468,7 +514,7 @@ def main() -> None:
         pub_topics += f", '{right_topic}'"
     if args.enable_depth:
         pub_topics += f", '{depth_topic}'"
-    if pose_pub is not None:
+    if motion.tracking_enabled:
         pub_topics += f", '{pose_topic}'"
     logger.info(f"Publishing on {pub_topics}  (depth={'on' if args.enable_depth else 'off'})")
     logger.info(f"Serving camera info on '{info_topic}'")
@@ -478,7 +524,7 @@ def main() -> None:
         resolved += f", right={node.resolve_topic(right_topic)!r}"
     if args.enable_depth:
         resolved += f", depth={node.resolve_topic(depth_topic)!r}"
-    if pose_pub is not None:
+    if motion.tracking_enabled:
         resolved += f", pose={node.resolve_topic(pose_topic)!r}"
     resolved += f", info={node.resolve_topic(info_topic)!r}"
     logger.info(f"Resolved head keys: {resolved}")
@@ -498,7 +544,6 @@ def main() -> None:
 
     seq = 0
     pub_count = 0
-    last_tracking_state = "OFF"
     sub_left_count = sub_right_count = sub_depth_count = 0
     t_window = time.perf_counter()
     t_start = t_window
@@ -507,7 +552,7 @@ def main() -> None:
 
     try:
         while True:
-            if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+            if motion.read(runtime) != sl.ERROR_CODE.SUCCESS:
                 continue
             # SDK timestamp of the grabbed image. This rides the codec-preserved
             # timestamp_ns field; extra payload keys are dropped by RGBImageCodec.
@@ -540,6 +585,8 @@ def main() -> None:
                      "width": out_w, "height": out_h}
                 )
 
+            motion.after_images(ts, seq, runtime)
+
             depth_safe = None
             if args.enable_depth:
                 zed.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
@@ -550,63 +597,20 @@ def main() -> None:
                     depth_crop, nan=0.0, posinf=0.0, neginf=0.0
                 ).astype(np.float32)
 
-            pose_msg = None
-            if pose_pub is not None:
-                tracking_state = zed.get_position(zed_pose, sl.REFERENCE_FRAME.WORLD)
-                state_name = str(tracking_state).split(".")[-1]
-                if state_name != last_tracking_state:
-                    logger.info(
-                        f"Tracking state: {last_tracking_state} → {state_name} "
-                        f"(confidence={zed_pose.pose_confidence})"
-                    )
-                    last_tracking_state = state_name
-                # quaternion+translation are the precise pose source: the SDK's
-                # 4x4 matrix is denormalized float32 (det(R)≈1.002 observed
-                # live), while a unit quaternion re-normalized in float64 yields
-                # an exactly orthonormal rotation. The consumer
-                # (legacy/VSLAM/scripts/zed_base_pose_node.py) builds T_world_cam from these,
-                # so the raw matrix is not published.
-                quat_xyzw = np.asarray(
-                    zed_pose.get_orientation(pose_orientation).get(), dtype=np.float64
-                )
-                translation = np.asarray(
-                    zed_pose.get_translation(pose_translation).get(), dtype=np.float64
-                )
-                if quat_xyzw.shape != (4,) or translation.shape != (3,):
-                    raise ValueError(
-                        f"SDK pose getters returned quat {quat_xyzw.shape}, "
-                        f"translation {translation.shape}; expected (4,) and (3,)"
-                    )
-                pose_msg = {
-                    "quaternion_xyzw": quat_xyzw.tolist(),
-                    "translation": translation.tolist(),
-                    "state": state_name,
-                    "confidence": int(zed_pose.pose_confidence),
-                    "zed_timestamp_ns": int(zed_pose.timestamp.get_nanoseconds()),
-                    "coordinate_system": "IMAGE_optical",
-                    "area_memory": args.area_memory,
-                    "area_file_path": area_path.as_posix() if area_path else None,
-                    "localization_only": args.localization_only,
-                }
-
             if depth_pub is not None:
                 depth_pub.publish(
                     {"depth_values": depth_safe, "timestamp_ns": ts, "sequence": seq,
                      "width": out_w, "height": out_h}
                 )
-            if pose_pub is not None:
-                pose_msg["timestamp_ns"] = ts
-                pose_msg["sequence"] = seq
-                pose_pub.publish(pose_msg)
             if right_pub is not None:
                 frame_stats["right_rgb"]["published"] = seq
                 frame_stats["right_rgb"]["last_timestamp_ns"] = ts
             if depth_pub is not None:
                 frame_stats["depth"]["published"] = seq
                 frame_stats["depth"]["last_timestamp_ns"] = ts
-            if pose_pub is not None:
-                frame_stats["pose"]["published"] = seq
-                frame_stats["pose"]["last_timestamp_ns"] = ts
+            if motion.tracking_enabled:
+                frame_stats["pose"]["published"] = motion.stats["published"]
+                frame_stats["pose"]["last_timestamp_ns"] = motion.stats.get("last_published_pose_ns", 0)
             pub_count += 1
 
             now = time.perf_counter()
@@ -681,6 +685,7 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
     finally:
+        motion.close()
         if args.enable_tracking:
             zed.disable_positional_tracking()
         zed.close()

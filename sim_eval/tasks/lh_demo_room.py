@@ -1,6 +1,6 @@
 """Human demonstration scene approximating lh_data/episode_0.hdf5.
 
-Pillow and folded towel are rigid proxies; this is not a cloth simulation.
+The pillow is a rigid proxy; this is not a cloth simulation.
 Stages and success require human annotation after collection.
 """
 import numpy as np
@@ -15,40 +15,39 @@ class LHDemoRoom(Episode7PickPlaceTask):
     ROBOT_POS = (-.55, -2.65, .03)
 
     def object_configs(self):
-        objects = [o for o in super().object_configs() if o['name'] not in ('apple', 'bowl')]
+        objects = [o for o in super().object_configs()
+                   if o['name'] not in ('apple', 'bowl')
+                   and not o['name'].startswith('right_rack_')]
         for obj in objects:
-            if obj['name'].startswith('right_rack_post_'):
-                obj['scale'][2] = 1.10
-                obj['position'][2] = .565
-            elif obj['name'].startswith('right_rack_shelf_'):
-                obj['position'][2] = (.12, .43, .75, 1.07)[int(obj['name'][-1])]
+            if obj['name'] == 'front_bookshelf':
+                # The inherited njwsoa packs 7 shelves into 2.00 m, so at any height that
+                # fits the room its openings stay ~0.25 m -- too tight to reach into, and
+                # stretching it only scales the whole unit. xgvyyv is the same kind of tall
+                # bookcase (1.96 m native) with 3 bays instead of 7: measured off its USD,
+                # at 1.90 m the shelf surfaces land at 0.10 / 0.74 / 1.25 m with 0.60 m and
+                # 0.48 m of clear space between them, and 0.74 m matches the table height.
+                obj['model'] = 'xgvyyv'
+                obj['bounding_box'] = [.38, .80, 1.90]
+                obj['position'][2] = 1.90 / 2 + .02
         objects.extend([
             dict(type="DatasetObject", name="pillow", category="pillow", model="iyjelw",
                  bounding_box=[.34, .44, .12], position=[1.02, -2.38, 1.0]),
             dict(type="DatasetObject", name="basket", category="wicker_basket", model="unasxd",
                  bounding_box=[.34, .36, .16], position=[1.02, -2.93, 1.0]),
-            dict(type="DatasetObject", name="towel", category="dishtowel", model="ltydgg",
-                 bounding_box=[.30, .42, .035], position=[-.65, -3.55, 1.15]),
-            dict(type="DatasetObject", name="table_chair", category="straight_chair", model="amgwaw",
-                 bounding_box=[.46, .46, .82], position=[.35, -2.65, .45]),
         ])
         return objects
 
     def bind(self, env):
         registry = env.env.scene.object_registry
         self.table = registry('name', 'right_table')
-        self.props = {name: registry('name', name) for name in ('pillow', 'basket', 'towel', 'table_chair')}
+        self.props = {name: registry('name', name) for name in ('pillow', 'basket')}
 
     def reset(self, env):
         self.reset_furniture(env)
-        registry = env.env.scene.object_registry
         table_z = float(self.table.aabb[1][2])
-        stand_z = float(registry('name', 'right_rack_shelf_3').aabb[1][2])
         for name, xy, bottom in (
             ('pillow', (1.02, -2.38), table_z + .01),
             ('basket', (1.02, -2.93), table_z + .01),
-            ('towel', (-.65, -3.55), stand_z + .01),
-            ('table_chair', (.35, -2.65), .015),
         ):
             obj = self.props[name]
             lo, hi = (v.detach().cpu().numpy() for v in obj.aabb)
@@ -58,7 +57,7 @@ class LHDemoRoom(Episode7PickPlaceTask):
             obj.set_position_orientation(position=pos)
 
     def objects_of_interest(self, env):
-        return np.stack([env.obj_pos(self.props[n]) for n in ('pillow', 'basket', 'towel', 'table_chair')])
+        return np.stack([env.obj_pos(self.props[n]) for n in ('pillow', 'basket')])
 
     def success(self, env):
         raise NotImplementedError('Human long-horizon demonstrations require manual outcome annotation')

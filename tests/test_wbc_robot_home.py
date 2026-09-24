@@ -52,7 +52,7 @@ def _fake_home_driver(*, collision_enabled: bool = False):
         "head": np.array([0.44]),
     }
     driver.enable = {"arms": True, "torso": False, "head": False, "base": True}
-    driver.args = types.SimpleNamespace(home_settle=0.0, home_tol=0.1)
+    driver.args = types.SimpleNamespace(home_settle=0.0, home_tol=0.1, home_speed=None)
     driver.cfg = types.SimpleNamespace(self_collision_floor=0.01, self_collision_safe_dist=0.02)
     driver.has_chassis = True
     driver.robot = types.SimpleNamespace(chassis=_FakeChassis())
@@ -123,3 +123,29 @@ def test_home_guard_aborts_immediately_below_safe_distance():
     with pytest.raises(SystemExit, match="homing ABORTED: left_arm self-collision"):
         guard(np.array([1.0]))
     assert driver.stop_calls == 1
+
+
+def test_home_speed_paces_the_ramp_in_wall_time():
+    """--home-speed holds each substep to step/speed seconds without changing the path."""
+    import time
+
+    unpaced = _fake_home_driver()
+    t0 = time.perf_counter()
+    wbc_robot_home.home_to_nominal(unpaced, arm_home_step=0.01)
+    fast = time.perf_counter() - t0
+
+    paced = _fake_home_driver()
+    paced.args.home_speed = 0.5   # 0.22 rad of left_arm travel -> ~0.44 s
+    t0 = time.perf_counter()
+    wbc_robot_home.home_to_nominal(paced, arm_home_step=0.01)
+    slow = time.perf_counter() - t0
+
+    # Both arms home in sequence: 0.22 rad + 0.33 rad at 0.5 rad/s = 1.1 s.
+    assert 0.9 <= slow <= 1.6, slow
+    assert fast < 0.2, fast
+    # Same commanded trajectory, only the wall-clock pacing differs.
+    for grp in ("left_arm", "right_arm"):
+        np.testing.assert_allclose(
+            [c[0] for c in paced._components[grp].commands],
+            [c[0] for c in unpaced._components[grp].commands],
+        )

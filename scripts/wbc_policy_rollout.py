@@ -1226,14 +1226,28 @@ class ActionScheduleBuffer:
     episode immediately and rejects late chunks. Behaviorally identical otherwise: the
     ``TargetInterpolator`` holds its segment end with or without a verbatim
     re-push.
+
+    ``underflow_grace`` (``--underflow-grace``, default 0 = the abort above) instead
+    returns ``None`` for up to that many seconds of empty samples: the interpolator
+    holds the terminal target, ``last_cmd_wall`` still ages toward the stale-source
+    watchdog, and a chunk arriving within the grace resumes from the last executed
+    sample. Samples that find a knot are unaffected, so only a would-be abort changes.
+    Each recovered dry spell's length is appended to ``dry_spells``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, underflow_grace: float = 0.0) -> None:
+        if not np.isfinite(underflow_grace) or underflow_grace < 0.0:
+            raise ValueError(
+                f"underflow_grace must be finite and >= 0, got {underflow_grace}"
+            )
         self._lock = threading.Lock()
         self._buffer: deque[ScheduledPolicyAction] = deque()
         self._last_executed: ScheduledPolicyAction | None = None
         self._armed = False
         self._terminal_underflow = False
+        self._underflow_grace = float(underflow_grace)
+        self._dry_since: float | None = None
+        self.dry_spells: list[float] = []
 
     def __len__(self) -> int:
         with self._lock:
@@ -1270,7 +1284,8 @@ class ActionScheduleBuffer:
         """Scheduled-trajectory value at ``query_time``; ``None`` when idle.
 
         ``None`` before the first chunk arrives. Once armed, exhaustion after the
-        terminal knot raises and permanently poisons the buffer.
+        terminal knot returns ``None`` for at most ``underflow_grace`` seconds, then
+        raises and permanently poisons the buffer.
         The returned action carries ``timestamp=query_time`` and is remembered
         as the last-executed anchor for the next call.
         """
@@ -1293,11 +1308,25 @@ class ActionScheduleBuffer:
             )
             if out is None or discrete_source is None:
                 if self._armed:
+                    if self._dry_since is None:
+                        self._dry_since = float(query_time)
+                    dry = float(query_time) - self._dry_since
+                    if dry < self._underflow_grace:  # grace 0: abort on the first
+                        return None
                     self._terminal_underflow = True
                     raise RuntimeError(
                         "terminal action-buffer underflow after the first chunk was armed"
+                        + (
+                            f" (dry {dry:.2f}s >= --underflow-grace "
+                            f"{self._underflow_grace:g}s)"
+                            if self._underflow_grace > 0.0
+                            else ""
+                        )
                     )
                 return None
+            if self._dry_since is not None:
+                self.dry_spells.append(float(query_time) - self._dry_since)
+                self._dry_since = None
             executed = replace(
                 out,
                 timestamp=float(query_time),
@@ -1621,6 +1650,8 @@ def wbc_tick(
     if head_mode == "track":
         head_joints = ik.solve_head(head_target, dt)
         result = ik.solve(left_target, right_target, dt, head_joints=head_joints)
+    elif head_mode == "fixed":
+        result = ik.solve(left_target, right_target, dt)  # head pinned at nominal
     else:
         result = ik.solve(left_target, right_target, dt, head_target=head_target)
     hold_reason = driver.extra_hold(now, last_cmd_wall, estop=estop)
@@ -3443,6 +3474,9 @@ def _set_policy_io_static(io_log, policy, *, args=None) -> None:
             ),
             "policy_interval_s": np.asarray(args.policy_interval, np.float64),
             "execution_latency_s": np.asarray(args.execution_latency, np.float64),
+            "underflow_grace_s": np.asarray(
+                getattr(args, "underflow_grace", 0.0), np.float64
+            ),
             "command_fps": np.asarray(args.cmd_rate, np.float64),
             "n_action_steps": np.asarray(
                 0 if policy is None else policy.n_action_steps, np.int64
@@ -3642,6 +3676,17 @@ def _finish_rollout_episode(
         first = cleanup_errors[0]
         effective_abort_reason = f"{type(first).__name__}: {first}"
 
+    # The paired save below calls main_log.stop()/abort() directly, bypassing
+    # driver.stop_recording_episode(); close the driver's side recorders here or the
+    # next episode's start_recording_episode() fails "Native recorder already active".
+    side_aborted = effective_abort_reason is not None or not (
+        main_log is not None and main_log.recording and main_log.num_frames() > 0
+    )
+    for side_name in ("_native_state_recorder", "_camera_motion_recorder"):
+        side = getattr(driver, side_name, None)
+        if side is not None:
+            run_cleanup_step(lambda side=side: side.stop(aborted=side_aborted))
+
     if main_log is None:
         recorder_errors.append(
             RuntimeError("[wbc_policy_rollout] main episode recorder is unavailable")
@@ -3805,7 +3850,9 @@ def _run_rollout_episode(
         TargetInterpolator,
     )
 
-    schedule_buffer = ActionScheduleBuffer()
+    schedule_buffer = ActionScheduleBuffer(
+        underflow_grace=getattr(args, "underflow_grace", 0.0)
+    )
     stop_event = threading.Event()
     worker: _InferenceWorker | None = None
     left0, right0, head0 = (pose.copy() for pose in nominal_poses)
@@ -3926,6 +3973,7 @@ def _run_rollout_episode(
         grip_l = np.float32(0.0)
         grip_r = np.float32(0.0)
         ticks = 0
+        dry_spells_reported = 0
         while True:
             now = time.perf_counter()
             if worker is not None and worker.failed.is_set():
@@ -4016,6 +4064,12 @@ def _run_rollout_episode(
                 # push time by construction (the old inline path backdated the
                 # interpolator segment by the inference duration).
                 scheduled = schedule_buffer.sample(now)
+                if len(schedule_buffer.dry_spells) > dry_spells_reported:
+                    dry_spells_reported = len(schedule_buffer.dry_spells)
+                    print(f"\n[wbc_policy_rollout] action buffer ran dry for "
+                          f"{schedule_buffer.dry_spells[-1]:.2f}s (spell "
+                          f"#{dry_spells_reported}); held the last target within "
+                          f"--underflow-grace and resumed on the late chunk")
                 if scheduled is not None:
                     if callable(latch_chassis):
                         if scheduled.chassis is None:
@@ -4227,10 +4281,12 @@ def _run_rollout(args: argparse.Namespace, *, policy_factory=None,
         driver_factory = lambda: joystick_mod.JoystickHardwareDriver(
             args, ik, cfg, enable, source=None
         )
-        if cfg.head_mode != "track" or not cfg.lock_base_in_ik:
+        # joystick_teleop.head_mode: "track" follows the head target, "fixed" pins
+        # the head at nominal (wbc_tick handles both, like the joystick follower).
+        if cfg.head_mode not in ("track", "fixed") or not cfg.lock_base_in_ik:
             raise SystemExit(
-                "[wbc_policy_rollout] joystick policy requires head_mode=track and "
-                "lock_base_in_ik=true"
+                "[wbc_policy_rollout] joystick policy requires joystick_teleop.head_mode "
+                "track or fixed and lock_base_in_ik=true"
             )
     else:
         ik, cfg = (
@@ -4458,6 +4514,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="stale-action cutoff offset: chunk frames scheduled at or "
                              "before inference-end + this many seconds are dropped, "
                              "never time-shifted (default 0.0).")
+    parser.add_argument("--underflow-grace", type=float, default=0.0,
+                        help="seconds the 10 Hz sampler may find the scheduled buffer "
+                             "empty (holding the last target) before the terminal "
+                             "underflow aborts the episode; a chunk arriving within "
+                             "the grace resumes motion (default 0.0: abort at once).")
     parser.add_argument("--dataset-fps", type=float, default=10.0,
                         help="fps the TRAINING dataset was ported at (sets the "
                              "synthesized chunk timestep and the observation-history "
@@ -4675,6 +4736,8 @@ def finalize_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--policy-interval must be finite and > 0")
     if not np.isfinite(args.execution_latency) or args.execution_latency < 0:
         parser.error("--execution-latency must be finite and >= 0")
+    if not np.isfinite(args.underflow_grace) or args.underflow_grace < 0:
+        parser.error("--underflow-grace must be finite and >= 0")
     if not np.isfinite(args.dataset_fps) or args.dataset_fps <= 0:
         parser.error("--dataset-fps must be finite and > 0")
     if (

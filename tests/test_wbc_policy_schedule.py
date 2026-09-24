@@ -183,6 +183,43 @@ def test_sample_exhaustion_returns_terminal_once_then_aborts():
         buf.queue([_act(mod, 1.3, x=0.8)], now=1.2)
 
 
+def test_underflow_grace_holds_then_resumes_from_last_executed():
+    mod = _load_rollout()
+    buf = mod.ActionScheduleBuffer(underflow_grace=0.3)
+    buf.queue([_act(mod, 1.0, x=0.7)], now=0.0)
+    terminal = buf.sample(1.05)
+    assert terminal is not None and terminal.left[0, 3] == pytest.approx(0.7)
+    assert buf.sample(1.15) is None  # dry: hold, no fresh command
+    assert buf.sample(1.25) is None
+    buf.queue([_act(mod, 1.5, x=1.0)], now=1.3)  # late chunk is accepted
+    out = buf.sample(1.35)
+    # Anchored on the terminal sample actually sent at 1.05:
+    # alpha = (1.35-1.05)/(1.5-1.05) = 2/3 -> x = 0.7 + 2/3*0.3 = 0.9.
+    assert out is not None and out.left[0, 3] == pytest.approx(0.9)
+    assert buf.dry_spells == [pytest.approx(0.2)]
+
+
+def test_underflow_grace_expiry_still_aborts_and_rejects_late_chunks():
+    mod = _load_rollout()
+    buf = mod.ActionScheduleBuffer(underflow_grace=0.2)
+    buf.queue([_act(mod, 1.0, x=0.7)], now=0.0)
+    assert buf.sample(1.05) is not None
+    assert buf.sample(1.15) is None
+    assert buf.sample(1.3) is None
+    with pytest.raises(RuntimeError, match="underflow.*--underflow-grace"):
+        buf.sample(1.4)
+    with pytest.raises(RuntimeError, match="late chunks"):
+        buf.queue([_act(mod, 1.5, x=0.8)], now=1.45)
+    assert buf.dry_spells == []
+
+
+def test_underflow_grace_must_be_finite_and_non_negative():
+    mod = _load_rollout()
+    for bad in (-0.1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="underflow_grace"):
+            mod.ActionScheduleBuffer(underflow_grace=bad)
+
+
 # ── predict_chunk / select_action shim (needs lerobot + torch) ──────────────
 class _FakeDiffusionPolicy:
     """Minimal modeling_diffusion contract: obs queues + predict_action_chunk.

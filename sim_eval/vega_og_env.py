@@ -15,7 +15,7 @@ import torch as th
 from scipy.spatial.transform import Rotation as R
 import omnigibson as og
 
-from wbc_client import WBCClient
+from wbc_client import PIN_JOINT_ORDER, WBCClient
 import base_ctrl
 import zed_sim
 
@@ -48,6 +48,8 @@ class VegaOGEnv:
                  connect_wbc=True, scene_options=None, head_only=False):
         self.og = og
         self.head_only = head_only
+        #: Optional `perception.tabletop.TabletopEstimator`. None => `est_pos` is `obj_pos`.
+        self.estimator = None
         if head_only:
             from omnigibson.macros import gm
             gm.RENDER_VIEWER_CAMERA = False
@@ -101,6 +103,8 @@ class VegaOGEnv:
         # and `DEFAULT_MAX_JOINT_STEP` / `_JOINT_STEP_ABORT_TICKS`.
         self.base_quiet_hold_s = -1.0
         self.max_joint_step = 0.05
+        self.home_ticks = 400     # ticks allowed to reach the WBC nominal at reset (torso_j2 is
+        #                           the slow one: ~0.0075 rad/tick lifting against gravity)
         self.joint_step_abort_ticks = 25
         self._base_quiet_elapsed = 0.0
         self._prev_joint_cmd = {}
@@ -234,6 +238,36 @@ class VegaOGEnv:
 
     def obj_pos(self, obj):
         return obj.get_position_orientation()[0].detach().cpu().numpy()
+
+    def est_pos(self, obj):
+        """Where the robot BELIEVES @obj is -- the seam between privileged and honest data.
+
+        `obj_pos` reads the physics engine. That is the right answer for a success predicate,
+        which has to score rollouts nobody scripted, and the wrong one for an expert that is
+        generating policy training data: actions derived from it depend on information the
+        recorded observation does not carry, so a policy fitted to that stream has to
+        hallucinate it, and never learns to look before it reaches.
+
+        So PLANNING reads go through here. With no estimator attached this is `obj_pos` and
+        nothing changes -- that is the privileged baseline the honest run is measured against.
+        Attach a `perception.tabletop.TabletopEstimator` (the collector drives it with the
+        frames it is already rendering) and the same expert runs on what the head camera can
+        actually see. Scoring keeps calling `obj_pos`.
+
+        A never-seen object raises rather than returning a placeholder: reaching at a guessed
+        pose would silently produce exactly the unlearnable data this seam exists to prevent.
+        Objects out of view but seen before return the last estimate; ask the estimator's
+        `stale` count if the caller wants to go looking instead.
+        """
+        if self.estimator is None:
+            return self.obj_pos(obj)
+        state = self.estimator.state
+        if obj.name not in state:
+            raise ValueError(f"estimator does not track {obj.name!r}; it knows {sorted(state)}")
+        centre = state[obj.name].centre
+        if not np.all(np.isfinite(centre)):
+            raise RuntimeError(f"{obj.name!r} has never been seen; the expert cannot plan to it")
+        return centre.copy()
 
     def is_grasping(self, arm="left"):
         """Object magnetized to @arm under assisted/sticky grasping, else None."""
@@ -469,9 +503,53 @@ class VegaOGEnv:
         if not self.head_only:
             self._setup_third_person()
         if self.wbc is not None:
-            self.wbc.reset()
+            self._home_to_wbc_nominal()
         if self.task is not None and expert:
             self.task.expert_reset(self)
+
+    def _home_to_wbc_nominal(self):
+        """Drive the robot to the solver's nominal posture, then reset the solver there.
+
+        The two halves of the bridge keep separate configurations. OmniGibson spawns the robot
+        at the asset's joint defaults; `VegaWholeBodyIK.reset()` returns to `nominal_posture` in
+        wbik.yaml. Measured, they disagree by 1.59 rad at L_arm_j4 and 1.51 at torso_j2, so the
+        first solve asked for the nominal, `_clamp_joint_step` read the whole gap as a step
+        demand, and the runaway guard aborted after 26 ticks while the 0.05 rad/tick clamp needs
+        ~32 to walk there. Every episode died before the expert moved.
+
+        Homing is the direction to close it in: `verify_vega_assets.py` drives to this same
+        nominal and asserts the robot reaches it within 0.08 rad, so starting there is the
+        contract, not a convenience. Measured chassis tilt over a pickplace episode -- against a
+        2.0 deg gate -- says the same: 3.9 deg homed, 12.8 deg with the solver seeded from the
+        spawn pose instead, because from that pose the expert has much further to reach.
+
+        Driven through the position controllers rather than `set_joint_positions`, which is an
+        instantaneous jump PhysX turns into an impulse through the arms (7.1 deg of tilt, still
+        3.9 after zeroing joint velocities).
+        """
+        nominal = np.asarray(self.wbc.reset()["q"], dtype=float)
+        if nominal.shape != (24,):
+            raise ValueError(f"WBC reset returned q{nominal.shape}, expected (24,)")
+        # pinocchio q: [0:4] planar root, then the 20 controlled joints in PIN_JOINT_ORDER
+        target = dict(zip(PIN_JOINT_ORDER, nominal[4:24], strict=True))
+        groups = (("trunk", TORSO), ("camera", HEAD), ("arm_left", ARM_L), ("arm_right", ARM_R))
+        action = self._hold_action()
+        for group, names in groups:
+            action[self.cai[group]] = th.tensor([target[n] for n in names],
+                                                dtype=action.dtype)
+        for _ in range(self.home_ticks):
+            self.env.step(action)
+        q = self.robot.get_joint_positions().detach().cpu().numpy()
+        lo = self.robot.joint_lower_limits.detach().cpu().numpy()
+        hi = self.robot.joint_upper_limits.detach().cpu().numpy()
+        off = sorted(((abs(float(q[self.name2idx[n]]) - v), n, float(q[self.name2idx[n]]), v,
+                       float(lo[self.name2idx[n]]), float(hi[self.name2idx[n]]))
+                      for n, v in target.items()), reverse=True)
+        if off[0][0] > 0.08:                        # the verifier's own tolerance
+            detail = "; ".join(f"{n}: at {got:+.3f} want {want:+.3f} limits [{low:+.3f},{up:+.3f}]"
+                               for d, n, got, want, low, up in off[:4] if d > 0.08)
+            raise RuntimeError(f"robot did not reach the WBC nominal posture in "
+                               f"{self.home_ticks} ticks -- {detail}")
 
     # ---- 3rd-person camera (for videos) ----
     def _set_cam_lookat(self, eye, target, up=(0, 0, 1)):

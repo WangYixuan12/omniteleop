@@ -367,6 +367,10 @@ class _VRLog:
 class WBCVRLeader:
     """Reads Quest poses, calibrates once, and streams Cartesian EEF targets."""
 
+    # Stages that stream live targets to an engaged (non-e-stop) follower, besides the
+    # pre-record "align" stage.
+    _TELEOP_STAGES: tuple[str, ...] = ("teleop",)
+
     def __init__(
         self,
         args: argparse.Namespace,
@@ -776,7 +780,9 @@ class WBCVRLeader:
             chassis_vx=float(chassis[0]),
             chassis_vy=float(chassis[1]),
             chassis_wz=float(chassis[2]),
-            estop=(self.stage not in ("align", "teleop")),
+            estop=(
+                self.stage not in ("align", *getattr(self, "_TELEOP_STAGES", ("teleop",)))
+            ),
             exit_requested=bool(exit_requested),
             home_requested=bool(home_requested),
             calib_stage=self.stage,
@@ -790,6 +796,31 @@ class WBCVRLeader:
         self.pub.publish(asdict(data))
 
     # -- main loop --------------------------------------------------------------
+
+    def _handle_episode_buttons(self, transforms) -> bool:
+        """Left X: end the current episode and return to ``static`` (e-stop).
+
+        Runs every tick after the left-Y stop check. Returns True when the press consumed
+        the tick, so the caller skips this tick's stage logic.
+        """
+        x_now = bool(transforms["left_x_button"])
+        pressed = _button_rising_edge(now=x_now, prev=self._prev_x)
+        self._prev_x = x_now
+        if not pressed:
+            return False
+        self.stage = "static"
+        self.robot_base_t_vr_base_eef = None
+        self._head_ori_offset = None
+        self.last_left_target = None
+        self.last_right_target = None
+        self._trigger_start = None
+        self._last_alignment_status = None
+        self._scenediff_request_id = ""
+        self._scenediff_ready = False
+        self._trigger_requires_release = True
+        self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
+        print("\n[wbc_vr_leader] episode ended -> static.")
+        return True
 
     def run(self) -> None:
         """Main loop: poll the Quest, calibrate on a grip-hold, then stream EEF targets."""
@@ -819,9 +850,8 @@ class WBCVRLeader:
                     continue
 
                 # left Y -> publish one final exit frame so followers stop/save/exit.
-                # left X -> end the current episode and return to static/e-stop.
+                # left X -> end the current episode (_handle_episode_buttons).
                 # left trigger in static -> request follower homing to nominal.
-                x_now = bool(transforms["left_x_button"])
                 y_now = bool(transforms["left_y_button"])
                 left_trigger_home_now = (
                     self.stage == "static"
@@ -851,22 +881,8 @@ class WBCVRLeader:
                     break
                 self._prev_y = y_now
 
-                if _button_rising_edge(now=x_now, prev=self._prev_x):
-                    self._prev_x = x_now
-                    self.stage = "static"
-                    self.robot_base_t_vr_base_eef = None
-                    self._head_ori_offset = None
-                    self.last_left_target = None
-                    self.last_right_target = None
-                    self._trigger_start = None
-                    self._last_alignment_status = None
-                    self._scenediff_request_id = ""
-                    self._scenediff_ready = False
-                    self._trigger_requires_release = True
-                    self._publish(None, None, None, 0.0, 0.0, (0.0, 0.0, 0.0))
-                    print("\n[wbc_vr_leader] episode ended -> static.")
+                if self._handle_episode_buttons(transforms):
                     continue
-                self._prev_x = x_now
 
                 if _button_rising_edge(
                     now=left_trigger_home_now,
@@ -1012,7 +1028,7 @@ class WBCVRLeader:
                         transforms["left_index_trigger"], transforms["right_index_trigger"],
                         self._thumbstick_to_chassis(transforms),
                     )
-                elif self.stage == "teleop":
+                elif self.stage in self._TELEOP_STAGES:
                     # Head target FIRST: the hands are mapped relative to the live head-yaw
                     # frame, so they need head_target this tick. Hold-last-good on a
                     # malformed/NaN headset frame -> empty head target (the follower keeps
@@ -1060,7 +1076,8 @@ class WBCVRLeader:
                 t = now - t0
                 if t - last_print >= 0.5:
                     last_print = t
-                    if self.stage in ("align", "teleop") and self.last_left_target is not None:
+                    if (self.stage in ("align", *self._TELEOP_STAGES)
+                            and self.last_left_target is not None):
                         lp = self.last_left_target[:3, 3]
                         rp = self.last_right_target[:3, 3]
                         print(f"t={t:6.1f}s  {self.stage:6s}  "
